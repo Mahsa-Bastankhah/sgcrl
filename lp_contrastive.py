@@ -20,12 +20,12 @@ import os
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string('log_dir_path', 'logs/', 'Where to log metrics')
-flags.DEFINE_integer('time_delta_minutes', 5, 'how often to save checkpoints')
-flags.DEFINE_integer('seed', 42, 'Specify seed, only used if use_slurm_array is false')
+flags.DEFINE_integer('time_delta_minutes', 2, 'how often to save checkpoints')
+flags.DEFINE_integer('seed', 32, 'Specify seed, only used if use_slurm_array is false')
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
 flags.DEFINE_string('alg', 'contrastive_cpc', 'Algorithm type, e.g. default is contrastive_cpc with no entropy or KL losses')
 flags.DEFINE_string('env', 'sawyer_bin', 'Environment type, e.g. default is sawyer bin')
-flags.DEFINE_integer('num_steps', 8_000_000, 'Number of steps to run', lower_bound=0)
+flags.DEFINE_integer('num_steps', 12_000_000, 'Number of steps to run', lower_bound=0)
 flags.DEFINE_bool('sample_goals', False, 'sample the goal position uniformly according to the environment (corresponds to the original contrastive_rl algorithm)')
 
 # fixed goal coordinates for supported environments

@@ -110,7 +110,7 @@ class CheckpointingConfig:
     
     """Configuration options for learner checkpointer."""
     # The maximum number of checkpoints to keep.
-    self.max_to_keep: int = 10
+    self.max_to_keep: int = 1000
     # Which directory to put the checkpoint in.
     self.directory: str = save_dir
     # If True adds a UID to the checkpoint path, see
