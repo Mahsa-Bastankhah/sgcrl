@@ -17,7 +17,7 @@ from contrastive import make_networks
 from contrastive.utils import make_environment
 from contrastive import ContrastiveLearner
 from acme.jax import utils
-
+seed_num = 32
 # disable tensorflow_probability warning: The use of `check_types` is deprecated and does not have any effect.
 import logging
 logger = logging.getLogger("root")
@@ -45,13 +45,13 @@ def load_checkpoint(alpha, misc_params, env_name, base_log_dir, seed, fix_goals=
     state_entropy_coefficient = alpha
 
     # Here we override the ckpt_dir to be the folder provided.
-    ckpt_dir = '/home/mahsa/sgcrl/logs/contrastive_cpc_sawyer_bin_52/checkpoints/learner'
+    ckpt_dir = f'/home/mahsa/sgcrl/logs/contrastive_cpc_sawyer_bin_{seed_num}/checkpoints/learner'
     
     fixed_start_end = get_fixed_start_end(env_name) if fix_goals else None
 
     # Create the environment using your provided factory.
     env_factory = lambda seed: make_environment(env_name, config.start_index, 
-                                                config.end_index, seed=52, 
+                                                config.end_index, seed=seed_num, 
                                                 fixed_start_end=fixed_start_end)[0]
     dummy_seed = 1
     environment_spec = specs.make_environment_spec(env_factory(dummy_seed))
@@ -75,7 +75,7 @@ def load_checkpoint(alpha, misc_params, env_name, base_log_dir, seed, fix_goals=
         learning_rate=config.actor_learning_rate, eps=1e-7)
     q_optimizer = optax.adam(learning_rate=config.learning_rate, eps=1e-7)
 
-    key = jax.random.PRNGKey(52)
+    key = jax.random.PRNGKey(seed_num)
     learner_key, key = jax.random.split(key)
     actor_key, key = jax.random.split(key)
 
@@ -148,7 +148,7 @@ def list_all_checkpoints(ckpt_dir):
 
 
 def simulate_checkpoint(ckpt_num, num_episodes=100, alpha='0.1', misc_params='0.1_None',
-                        env_name='sawyer_bin', base_log_dir='/dummy/unused', seed=1):
+                        env_name='sawyer_bin', base_log_dir='/dummy/unused', seed=seed_num):
     """
     For the given checkpoint number, load the checkpoint,
     simulate `num_episodes` episodes, and record per-step Q value,
@@ -187,7 +187,7 @@ def simulate_checkpoint(ckpt_num, num_episodes=100, alpha='0.1', misc_params='0.
             # 0.02999509  0.12        0.7         0.05        0.4         0.12
             # 0.7         0.02      ]
 
-            print(obs)
+            #print(obs)
             obs_dim = obs.shape[0] // 2  # move outside the loop
             # dist = networks.policy_network.apply(trained_learner_state.policy_params, obs)
             # action = dist.mode()
@@ -234,16 +234,16 @@ def simulate_checkpoint(ckpt_num, num_episodes=100, alpha='0.1', misc_params='0.
 # Loop over all checkpoints in the folder and save simulation data.
 # ---------------------------
 def simulate_all_checkpoints(num_episodes=100, alpha='0.1', misc_params='0.1_None',
-                             env_name='sawyer_bin', seed=1):
-    ckpt_dir = '/home/mahsa/sgcrl/logs/contrastive_cpc_sawyer_bin_52/checkpoints/learner'
-    data_dir = "./data"
+                             env_name='sawyer_bin', seed=seed_num):
+    ckpt_dir = f'/home/mahsa/sgcrl/logs/contrastive_cpc_sawyer_bin_{seed_num}/checkpoints/learner'
+    data_dir = f"./data/{seed_num}"
     os.makedirs(data_dir, exist_ok=True)
 
     ckpt_nums = list_all_checkpoints(ckpt_dir)
     print("Found checkpoint numbers:", ckpt_nums)
 
     for ckpt in ckpt_nums:
-        if ckpt % 3 != 1:
+        if ckpt % 3 != 0:
             continue
 
         filename = f"checkpoint_{ckpt}_simulation_data.pkl"

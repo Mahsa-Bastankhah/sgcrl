@@ -3,10 +3,12 @@ import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 import re
+from numpy.linalg import norm
 
 # Paths
-DATA_DIR = "./data"
-PLOT_DIR = "./plots"
+seed_num = 52
+DATA_DIR = f"./data/{seed_num}"
+PLOT_DIR = f"./plots/{seed_num}"
 os.makedirs(PLOT_DIR, exist_ok=True)
 
 def load_simulation_data(filename):
@@ -508,11 +510,145 @@ def plot_avg_q_reward1_over_checkpoints(ckpt_nums, data_dir=DATA_DIR, save_dir=P
     plt.close()
     print(f"Plot saved to {save_path}")
 
+def compute_dot_reward1_mean_std(sim_data):
+    """
+    Computes the mean and std of dot(g_repr, g_repr_state) only on steps with reward == 1.
+    """
+    dot_products = []
+    for episode in sim_data["episodes"]:
+        for step in episode:
+            if step.get("reward", 0) == 1:
+                grepr = step["g_repr"]
+                gstate = step["g_repr_state"]
+                dot = np.dot(grepr, gstate)
+                dot_products.append(dot)
+
+    if dot_products:
+        dot_mean = np.mean(dot_products)
+        dot_std = np.std(dot_products)
+    else:
+        dot_mean, dot_std = np.nan, np.nan
+    return dot_mean, dot_std
+
+def plot_avg_dot_reward1_over_checkpoints(ckpt_nums, data_dir=DATA_DIR, save_dir=PLOT_DIR):
+    """
+    Plots the average dot(g_repr, g_repr_state) for reward==1 steps over checkpoints.
+    """
+    means = []
+    stds = []
+    valid_ckpts = []
+
+    for ckpt_num in ckpt_nums:
+        filename = f"checkpoint_{ckpt_num}_simulation_data.pkl"
+        filepath = os.path.join(data_dir, filename)
+        if not os.path.exists(filepath):
+            print(f"Checkpoint file '{filename}' not found in {data_dir}")
+            continue
+
+        sim_data = load_simulation_data(filepath)
+        dot_mean, dot_std = compute_dot_reward1_mean_std(sim_data)
+        valid_ckpts.append(ckpt_num)
+        means.append(dot_mean)
+        stds.append(dot_std)
+
+    if not valid_ckpts:
+        print("No valid checkpoints found to plot.")
+        return
+
+    plt.figure(figsize=(10, 5))
+    plt.errorbar(valid_ckpts, means, yerr=stds, fmt='-o', capsize=5, label="Dot(g_repr, g_state) | reward==1")
+    plt.xlabel("Checkpoint")
+    plt.ylabel("Dot Product (reward==1)")
+    plt.title("Dot Product of Goal vs State-as-Goal Representations\nfor Reward==1 Over Checkpoints")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+
+    save_path = os.path.join(save_dir, "dot_reward1_over_checkpoints.png")
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"✅ Plot saved to {save_path}")
+
+
+
+
+
+
+def compute_cosine_l2_stats(sim_data):
+    max_len = max(len(ep) for ep in sim_data["episodes"])
+    cosine_sims = [[] for _ in range(max_len)]
+    l2_dists = [[] for _ in range(max_len)]
+
+    for episode in sim_data["episodes"]:
+        for t, step in enumerate(episode):
+            g = np.array(step["g_repr"])
+            s = np.array(step["g_repr_state"])
+            if norm(g) > 0 and norm(s) > 0:
+                cosine = np.dot(g, s) / (norm(g) * norm(s))
+            else:
+                cosine = np.nan
+            l2 = norm(g - s)
+
+            cosine_sims[t].append(cosine)
+            l2_dists[t].append(l2)
+
+    cosine_means = np.array([np.mean(vals) if vals else np.nan for vals in cosine_sims])
+    cosine_stds = np.array([np.std(vals) if vals else np.nan for vals in cosine_sims])
+
+    l2_means = np.array([np.mean(vals) if vals else np.nan for vals in l2_dists])
+    l2_stds = np.array([np.std(vals) if vals else np.nan for vals in l2_dists])
+
+    return cosine_means, cosine_stds, l2_means, l2_stds
+
+
+def plot_cosine_l2_similarity(ckpt_num, data_dir=DATA_DIR, save_dir=PLOT_DIR):
+    filename = f"checkpoint_{ckpt_num}_simulation_data.pkl"
+    filepath = os.path.join(data_dir, filename)
+
+    if not os.path.exists(filepath):
+        print(f"Checkpoint file '{filename}' not found.")
+        return
+
+    sim_data = load_simulation_data(filepath)
+    cosine_means, cosine_stds, l2_means, l2_stds = compute_cosine_l2_stats(sim_data)
+
+    timesteps = np.arange(len(cosine_means))
+
+    plt.figure(figsize=(12, 5))
+
+    # Cosine similarity
+    plt.subplot(1, 2, 1)
+    plt.plot(timesteps, cosine_means, label="Cosine Similarity")
+    plt.fill_between(timesteps, cosine_means - cosine_stds, cosine_means + cosine_stds, alpha=0.3)
+    plt.ylim(0, 1.05)
+    plt.xlabel("Timestep")
+    plt.ylabel("Cosine Similarity")
+    plt.title(f"Cosine Similarity ψ(g), ψ(s) - Ckpt {ckpt_num}")
+    plt.grid(True)
+    plt.legend()
+
+    # L2 distance
+    plt.subplot(1, 2, 2)
+    plt.plot(timesteps, l2_means, label="L2 Distance", color='orange')
+    plt.fill_between(timesteps, l2_means - l2_stds, l2_means + l2_stds, alpha=0.3, color='orange')
+    plt.xlabel("Timestep")
+    plt.ylabel("L2 Distance")
+    plt.title(f"L2 Distance ψ(g), ψ(s) - Ckpt {ckpt_num}")
+    plt.grid(True)
+    plt.legend()
+
+    plt.tight_layout()
+    save_path = os.path.join(save_dir, f"cosine_l2_ckpt_{ckpt_num}.png")
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"✅ Cosine + L2 plot saved to {save_path}")
+
+
 
 if __name__ == "__main__":
     from pathlib import Path
 
-    DATA_DIR = "./data"
+    DATA_DIR = f"./data/{seed_num}"
     existing_files = [f.name for f in Path(DATA_DIR).glob("checkpoint_*.pkl")]
     existing_ckpts = {
         int(f.split("_")[1]) for f in existing_files if f.split("_")[1].isdigit()
@@ -526,18 +662,20 @@ if __name__ == "__main__":
             #plot_q_single_checkpoint(ckpt_num=ckpt_num)
             #plot_grepr_dot_product(ckpt_num=ckpt_num)
             #plot_reward_single_checkpoint(ckpt_num=ckpt_num)
-            #check_grepr_consistency(ckpt_num=3)
+
             #plot_observation_variance(ckpt_num=ckpt_num)
             #plot_state_goal_distance(ckpt_num=ckpt_num)
             #plot_state_repr_dimensions(ckpt_num=ckpt_num)
+            plot_cosine_l2_similarity(ckpt_num=ckpt_num)
             x = 1
 
         except Exception as e:
             print(f"Error in checkpoint {ckpt_num}: {e}")
 
-    #plot_goal_repr_evolution(data_dir="./data", 
-    #                         save_path="./plots/goal_repr_all_dims_over_checkpoints.png")
+    #plot_goal_repr_evolution(data_dir=f"./data/{seed_num}", 
+    #                         save_path=f"./plots/{seed_num}/goal_repr_all_dims_over_checkpoints.png")
     #plot_adjacent_goal_distance()
     # Example: plot for checkpoints that are multiples of 3
-    ckpt_nums = [ckpt for ckpt in range(1, 160) if ckpt % 3 == 0]
-    plot_avg_q_reward1_over_checkpoints(ckpt_nums)
+    #ckpt_nums = [ckpt for ckpt in range(1, 160) if ckpt % 3 == 0]
+    #plot_avg_q_reward1_over_checkpoints(ckpt_nums)
+    #plot_avg_dot_reward1_over_checkpoints(ckpt_nums)

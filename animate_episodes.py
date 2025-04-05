@@ -20,33 +20,37 @@ import os
 # import os
 # os.environ["MUJOCO_GL_VERBOSE"] = "1"
 
+# import os
+# os.environ["MUJOCO_GL"] = "osmesa"
+# os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.3"
+# # os.environ["EGL_VISIBLE_DEVICES"] = "2"
+
 import os
-os.environ["MUJOCO_GL"] = "egl"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.3"
-os.environ["EGL_VISIBLE_DEVICES"] = "2"
+# Disable hardware acceleration
+os.environ["MUJOCO_GL"] = "osmesa"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["EGL_DEVICE_ID"] = ""
 
-
-
-import mujoco
-print(mujoco.__version__)  # should be something like 2.3.7
 # import mujoco
-# print(mujoco.get_rendering_backend())
-import os
-os.environ["MUJOCO_GL"] = "egl"  # Try egl first
-import mujoco
-model = mujoco.MjModel.from_xml_string("""
-<mujoco>
-  <worldbody>
-    <geom type="sphere" size="0.1" rgba="1 0 0 1"/>
-  </worldbody>
-</mujoco>
-""")
-data = mujoco.MjData(model)
-renderer = mujoco.Renderer(model)
-renderer.update_scene(data)
-pixels = renderer.render()
-print("✅ Rendered an image with shape:", pixels.shape)
+# print(mujoco.__version__)  # should be something like 2.3.7
+# # import mujoco
+# # print(mujoco.get_rendering_backend())
+# import os
+# os.environ["MUJOCO_GL"] = "egl"  # Try egl first
+# import mujoco
+# model = mujoco.MjModel.from_xml_string("""
+# <mujoco>
+#   <worldbody>
+#     <geom type="sphere" size="0.1" rgba="1 0 0 1"/>
+#   </worldbody>
+# </mujoco>
+# """)
+# data = mujoco.MjData(model)
+# renderer = mujoco.Renderer(model)
+# renderer.update_scene(data)
+# pixels = renderer.render()
+# print("✅ Rendered an image with shape:", pixels.shape)
 
 
 
@@ -91,11 +95,14 @@ def create_episode_video(ckpt_num, num_episodes=1, image_height=480, image_width
         while not timestep.last():
             # Render an image from the environment using "gripperPOV" mode.
             # Adjust mode parameters if needed.
-            img = env.render("gripperPOV")
+            os.environ["MUJOCO_GL"] = "osmesa"
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            os.environ["EGL_DEVICE_ID"] = ""
+            #img = env.render()
             print("Available cameras:", env.sim.model.camera_names)
 
             print("hi i am here")
-            #img = env.sim.render(width=640, height=480, camera_name="topview")
+            img = env.sim.render(width=640, height=480, camera_name="topview")
             #img = env.render(mode="rgb_array", width=640, height=480)
             #img = env.sim.render(width=320, height=240, camera_name="topview")
             
