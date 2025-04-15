@@ -115,6 +115,7 @@ class PointEnv(gym.Env):
       resize_factor: (int) Scale the map by this factor.
     """
     if resize_factor > 1:
+      print("resize_factor", resize_factor)
       self._walls = resize_walls(WALLS[walls], resize_factor)
     else:
       self._walls = WALLS[walls]
@@ -150,9 +151,13 @@ class PointEnv(gym.Env):
     return state
 
   def _get_obs(self):
+    
     return np.concatenate([self.state, self.goal]).astype(np.float32)
 
   def reset(self):
+    # wall_positions = np.argwhere(self._walls == 1)
+    # for pos in wall_positions:
+    #     print(tuple(pos))
     self._timestep = 0
     
     if self._fixed_start_end is not None:
