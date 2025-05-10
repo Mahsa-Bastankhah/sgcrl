@@ -14,6 +14,7 @@ from absl import flags
 import contrastive
 from contrastive import utils as contrastive_utils
 import launchpad as lp
+from point_env import StochasticDepthPointEnv
 import numpy as np
 import os
 
@@ -21,7 +22,7 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string('log_dir_path', 'logs/', 'Where to log metrics')
 flags.DEFINE_integer('time_delta_minutes', 1, 'how often to save checkpoints')
-flags.DEFINE_integer('seed', 32, 'Specify seed, only used if use_slurm_array is false')
+flags.DEFINE_integer('seed', 72, 'Specify seed, only used if use_slurm_array is false')
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
 flags.DEFINE_string('alg', 'contrastive_cpc', 'Algorithm type, e.g. default is contrastive_cpc with no entropy or KL losses')
 flags.DEFINE_string('env', 'sawyer_bin', 'Environment type, e.g. default is sawyer bin')
@@ -30,8 +31,9 @@ flags.DEFINE_bool('sample_goals', False, 'sample the goal position uniformly acc
 
 # fixed goal coordinates for supported environments
 fixed_goal_dict={'point_Spiral11x11': [np.array([5,5], dtype=float), np.array([10,10], dtype=float)],
-                 'point_FourRooms': [np.array([0,0], dtype=float), np.array([10,8], dtype=float)], #[10,8] #[0,10]
+                 'point_FourRooms': [np.array([0,0, 0], dtype=float), np.array([10,8,0], dtype=float)], #[10,8] #[0,10] [5,10]
                  'point_Maze11x11' : [np.array([0,0], dtype=float), np.array([2,0], dtype=float)],
+                 'stochastic_point_FourRooms' : [np.array([0,0, 0], dtype=float), np.array([10,8,0], dtype=float)], #[8 , 10]  easiest: [5,10] hardest:[10, 8]
                      #note: sawyer fixed goal positions vary slightly with each episode
                       'sawyer_bin': np.array([0.12, 0.7, 0.02]),
                       'sawyer_box': np.array([0.0, 0.75, 0.133]),
@@ -150,6 +152,7 @@ def main(_):
   # Set terminal='tmux' if you want different components in different windows.
   
   print(params)
+  print("goal:", fixed_goal_dict[env_name])
   
   lp.launch(program, terminal='current_terminal')
 

@@ -9,6 +9,7 @@ import gym
 import metaworld
 import numpy as np
 import point_env
+from point_env import StochasticDepthPointEnv
 
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 
@@ -56,6 +57,14 @@ def load(env_name, fixed_start_end=None):
       max_episode_steps = 100
     else:
       max_episode_steps = 50
+  elif env_name.startswith('stochastic_point'):
+    CLASS = point_env.StochasticDepthPointEnv
+    kwargs['walls'] = env_name.split('_')[-1]
+    kwargs['fixed_start_end'] = fixed_start_end
+    if '11x11' in env_name:
+      max_episode_steps = 100
+    else:
+      max_episode_steps = 50
   else:
     raise NotImplementedError('Unsupported environment: %s' % env_name)
 
@@ -77,13 +86,17 @@ class SawyerBin(
     self._freeze_rand_vec = False
     self._set_task_called = True
     self._fixed_start_end=fixed_start_end
+    action_low  = self.action_space.low
+    action_high = self.action_space.high
     self.reset()
 
   def reset(self):
     super(SawyerBin, self).reset()
     body_id = self.model.body_name2id('bin_goal')
+    ## the position of the goal bin
     pos1 = self.sim.data.body_xpos[body_id].copy()
     pos1 += np.random.uniform(-0.05, 0.05, 3)
+    ## the position of the object
     pos2 = self._get_pos_objects().copy()
     
     if self._fixed_start_end is not None:
@@ -93,6 +106,9 @@ class SawyerBin(
         t = np.random.random()
         # Set the goal to be a uniformly sampled location
         # between the starting and end point
+        ## x , y will be somewhere between the initial 
+        # position of the object and the position of the goal
+        # and z will be somewhere between the table and the max height. 
         self._goal = t * pos1 + (1 - t) * pos2
         self._goal[2] = np.random.uniform(0.03, 0.12)
     self._target_pos = self._goal

@@ -77,7 +77,9 @@ class ContrastiveBuilder(builders.ActorLearnerBuilder):
     assert variable_source is not None
     actor_core = actor_core_lib.batched_feed_forward_to_actor_core(
         policy_network)
-    variable_client = variable_utils.VariableClient(variable_source, 'policy',
+    #variable_client = variable_utils.VariableClient(variable_source, 'policy',
+    #                                                device='cpu')
+    variable_client = variable_utils.VariableClient(variable_source, ['policy', 'critic'],
                                                     device='cpu')
     
     if self._config.use_random_actor:

@@ -194,8 +194,9 @@ class InitiallyRandomActor(actors.GenericActor):
 
   def select_action(self,
                     observation):
-    if (self._params['mlp/~/linear_0']['b'] == 0).all():
-      shape = self._params['Normal/~/linear']['b'].shape
+    policy_params, q_params = self._params
+    if (policy_params['mlp/~/linear_0']['b'] == 0).all():
+      shape = policy_params['Normal/~/linear']['b'].shape
       rng, self._state = jax.random.split(self._state)
       action = jax.random.uniform(key=rng, shape=shape,
                                   minval=-1.0, maxval=1.0)
@@ -203,3 +204,24 @@ class InitiallyRandomActor(actors.GenericActor):
       action, self._state = self._policy(self._params, observation,
                                          self._state)
     return utils.to_numpy(action)
+  
+
+
+
+
+# class InitiallyRandomActor(actors.GenericActor):
+#   """Actor that takes actions uniformly at random until the actor is updated.
+#   """
+
+#   def select_action(self,
+#                     observation):
+    
+#     if (self._params['mlp/~/linear_0']['b'] == 0).all():
+#       shape = self._params['Normal/~/linear']['b'].shape
+#       rng, self._state = jax.random.split(self._state)
+#       action = jax.random.uniform(key=rng, shape=shape,
+#                                   minval=-1.0, maxval=1.0)
+#     else:
+#       action, self._state = self._policy(self._params, observation,
+#                                          self._state)
+#     return utils.to_numpy(action)

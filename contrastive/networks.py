@@ -1,7 +1,7 @@
 """Contrastive RL networks definition."""
 import dataclasses
 from typing import Optional, Tuple, Callable
-
+from jax import debug
 from acme import specs
 from acme.agents.jax import actor_core as actor_core_lib
 from acme.jax import networks as networks_lib
@@ -12,8 +12,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax import random
 from itertools import product
-
-
+import itertools
+Q_max = True
 # modified Tanh mean to be mapped to tanh(mean) to keep within [-1, 1]
 from distributional import NormalTanhDistribution
 
@@ -30,15 +30,73 @@ class ContrastiveNetworks:
 
 def apply_policy_and_sample(
     networks,
+    Q_max = Q_max,
     eval_mode = False):
-  """Returns a function that computes actions."""
-  sample_fn = networks.sample if not eval_mode else networks.sample_eval
-  if not sample_fn:
-    raise ValueError('sample function is not provided')
+  
+  if Q_max is False:
+      """Returns a function that computes actions."""
+      sample_fn = networks.sample if not eval_mode else networks.sample_eval
+      if not sample_fn:
+        raise ValueError('sample function is not provided')
 
-  def apply_and_sample(params, key, obs):
-    return sample_fn(networks.policy_network.apply(params, obs), key)
-  return apply_and_sample
+      def apply_and_sample(params, key, obs):
+        policy_params, q_params = params 
+        return sample_fn(networks.policy_network.apply(policy_params, obs), key)
+      return apply_and_sample
+  
+  else:
+      def select_action(params, key, obs):
+          policy_params, q_params = params      # unpack
+          return maximize_q_action(networks.q_network, q_params, obs)
+      return select_action
+
+
+# def apply_policy_and_sample(networks, eval_mode=False):
+    
+
+
+
+def maximize_q_action(q_network, q_params, obs, grid_size=10):
+    # 1) Build candidate actions
+    # 1) Infer dimensions
+    obs = obs.reshape(-1)  # flatten in case it's shape (1, obs_dim)
+    obs_dim = obs.shape[0] // 2
+
+    input_dim = q_params['sa_encoder/~/linear_0']['w'].shape[0]
+    action_dim = input_dim - obs_dim
+    #debug.print("obs_dim: {}, action_dim: {}", obs_dim, action_dim)
+
+    grid = jnp.linspace(-1.0, 1.0, num=grid_size)        # 10 points per axis
+    action_grid = jnp.array(list(itertools.product(grid, repeat=action_dim)))
+    #    → (1000, 3)
+
+    # 2) Tile obs into shape (1000, obs_dim*2)
+    #    If obs is (6,) or (1,6), this yields (1000,6).
+    repeated_obs = jnp.tile(obs.reshape(-1), (action_grid.shape[0], 1))
+
+    # —— Debug prints ——
+    # debug.print("obs shape:         ", obs.shape)
+    # debug.print("repeated_obs shape:", repeated_obs.shape)
+    # debug.print("action_grid shape: ", action_grid.shape)
+
+    # 3) Call the critic: returns (critic_val, sa_repr, g_repr)
+    critic_val, sa_repr, g_repr = q_network.apply(q_params,
+                                                  repeated_obs,
+                                                  action_grid)
+    # Now sa_repr, g_repr are both (1000, repr_dim)
+
+    # 4) Compute per-action Q: elementwise dot → (1000,)
+    q_values = jnp.sum(sa_repr * g_repr, axis=-1)
+    #debug.print("q_values shape:    ", q_values.shape)
+
+    # 5) Pick the best index (a JAX scalar) and slice
+    best_idx    = jnp.argmax(q_values)          # shape=(), dtype=int32
+    best_action = action_grid[best_idx]         # shape=(3,)
+    #debug.print("best_idx:", best_idx, "→ best_action shape:", best_action.shape)
+
+    return jnp.expand_dims(best_action, axis=0)
+
+
 
 
 def make_networks(
