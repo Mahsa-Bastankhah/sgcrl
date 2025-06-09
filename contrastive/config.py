@@ -31,7 +31,7 @@ class ContrastiveConfig:
   n_step: int = 1
   # Target smoothing coefficient.
   tau: float = 0.005
-  hidden_layer_sizes: Tuple[int, Ellipsis] = (256, 256)
+  
   
   # Loss options - entropy
   # Coefficient applied to the entropy bonus. If None, an adaptative
@@ -56,7 +56,7 @@ class ContrastiveConfig:
   no_repr: bool = False
   repr_dim: Union[int, str] = 64  # Size of representation.
   use_random_actor: bool = True  # Initial with uniform random policy.
-  repr_norm: bool = False
+  
   use_cpc: bool = False
   local: bool = False  # Whether running locally. Disables eval.
   use_td: bool = False
@@ -72,6 +72,11 @@ class ContrastiveConfig:
   max_episode_steps: int = -1
   start_index: int = 0
   end_index: int = -1
+
+  repr_norm: bool = False
+  mid_goal_selector_actor = False
+  hidden_layer_sizes: Tuple[int, Ellipsis] = (256, 256)
+  #hidden_layer_sizes: Tuple[int, Ellipsis] = (1024, 1024)
 
 
 def target_entropy_from_env_spec(

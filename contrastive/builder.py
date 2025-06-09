@@ -1,4 +1,5 @@
-"""Contrastive RL builder."""
+
+
 import functools
 from typing import Callable, Iterator, List, Optional
 
@@ -24,7 +25,7 @@ import reverb
 from reverb import rate_limiters
 import tensorflow as tf
 import tree
-
+from goal_selector import MidpointGoalSelector
 
 class ContrastiveBuilder(builders.ActorLearnerBuilder):
   """Contrastive RL builder."""
@@ -77,15 +78,56 @@ class ContrastiveBuilder(builders.ActorLearnerBuilder):
     assert variable_source is not None
     actor_core = actor_core_lib.batched_feed_forward_to_actor_core(
         policy_network)
-    variable_client = variable_utils.VariableClient(variable_source, 'policy',
-                                                    device='cpu')
-    
+    variable_client = variable_utils.VariableClient(
+        variable_source, ['policy', 'critic'], device='cpu')
+    # variable_client = variable_utils.VariableClient(variable_source, ['policy', 'critic'],
+    #                                                 device='cpu')
     if self._config.use_random_actor:
       ACTOR = contrastive_utils.InitiallyRandomActor  # pylint: disable=invalid-name
     else:
       ACTOR = actors.GenericActor  # pylint: disable=invalid-name
     return ACTOR(
         actor_core, random_key, variable_client, adder, backend='cpu')
+
+
+  # ---------------------------------------------------------------------------
+  # New factory: use ONLY for the training actors (not the evaluators)
+  # ---------------------------------------------------------------------------
+  # def make_midpoint_actor(
+  #     self,               # keep mypy happy
+  #     random_key,
+  #     policy_network,
+  #     env,
+  #     networks,
+  #     adder = None,
+  #     variable_source= None,
+  #     ):
+  #   assert variable_source is not None, "variable_source must be supplied"
+
+  #   # Wrap policy into an ActorCore (handles batched obs/actions automatically).
+  #   actor_core = actor_core_lib.batched_feed_forward_to_actor_core(
+  #       policy_network)
+
+
+  #   # We need both policy **and** critic weights for MidpointGoalSelector.
+  #   variable_client = variable_utils.VariableClient(
+  #       variable_source, ['policy', 'critic'], device='cpu')
+
+  #   # Construct the goal‑selector that uses ψ from the Q‑network.
+  #   goal_selector = MidpointGoalSelector(env, networks, variable_client)
+
+  #   # Finally build the MidpointActor.
+  #   ## This actor automattically handles initial random actions
+  #   return MidpointActor(
+  #       actor_core=actor_core,
+  #       rng=random_key,
+  #       variable_client=variable_client,
+  #       adder=adder,
+  #       env=env,
+  #       goal_selector=goal_selector)
+    
+
+
 
   def make_replay_tables(
       self,

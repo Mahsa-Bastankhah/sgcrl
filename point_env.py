@@ -138,6 +138,14 @@ class PointEnv(gym.Env):
       self._max_episode_steps = 50
     self.reset()
 
+
+  # point_env.py   ── add anywhere inside the PointEnv class, e.g. just after reset()
+  def set_goal(self, new_goal: np.ndarray):
+      """Replace the current goal at run‑time."""
+      new_goal = np.asarray(new_goal, dtype=np.float32)
+      assert new_goal.shape == (2,)
+      self.goal = new_goal
+
   def _sample_empty_state(self):
     candidate_states = np.where(self._walls == 0)
     num_candidate_states = len(candidate_states[0])
@@ -152,9 +160,8 @@ class PointEnv(gym.Env):
   def _get_obs(self):
     return np.concatenate([self.state, self.goal]).astype(np.float32)
 
-  def reset(self):
+  def reset(self, random = True):
     self._timestep = 0
-    
     if self._fixed_start_end is not None:
         # fix the starting and ending position of the agent
         self.state = self._fixed_start_end[0]
@@ -162,6 +169,14 @@ class PointEnv(gym.Env):
     else:
         self.goal = self._sample_empty_state()
         self.state = self._sample_empty_state()
+    if random:
+        max_shift = 1.0  # Max amount to move in any direction
+        for _ in range(10):  # Try multiple random moves in case some are blocked
+            shift = np.random.uniform(low=-max_shift, high=max_shift, size=self.state.shape)
+            new_state = self.state + shift
+            if not self._is_blocked(new_state):
+                self.state = new_state
+                break
     return self._get_obs()
 
   def _discretize_state(self, state, resolution=1.0):

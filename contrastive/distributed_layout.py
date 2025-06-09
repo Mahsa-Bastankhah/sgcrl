@@ -3,7 +3,7 @@
 import dataclasses
 import logging
 from typing import Any, Callable, Optional, Sequence
-
+from goal_selector import MidpointGoalSelector, MidpointEnvWrapper
 from acme import core
 from acme import environment_loop
 from acme import specs
@@ -17,12 +17,14 @@ from acme.utils import loggers
 from acme.utils import lp_utils
 from acme.utils import observers as observers_lib
 from default import make_default_logger
+from contrastive import utils as contrastive_utils
 import dm_env
 import jax
 import launchpad as lp
 import numpy as np
 import reverb
 import tqdm
+from acme.jax import variable_utils
 
 
 ActorId = int
@@ -110,7 +112,7 @@ class CheckpointingConfig:
     
     """Configuration options for learner checkpointer."""
     # The maximum number of checkpoints to keep.
-    self.max_to_keep: int = 10
+    self.max_to_keep: int = 1000
     # Which directory to put the checkpoint in.
     self.directory: str = save_dir
     # If True adds a UID to the checkpoint path, see
@@ -230,31 +232,97 @@ class DistributedLayout:
         time_delta_minutes=self._config.time_delta_minutes,
         **kwargs)
 
+  # def actor(self, random_key, replay,
+  #           variable_source, counter,
+  #           actor_id):
+  #   """The actor process."""
+  #   adder = self._builder.make_adder(replay)
+
+  #   environment_key, actor_key = jax.random.split(random_key)
+  #   # Create environment and policy core.
+
+  #   # Environments normally require uint32 as a seed.
+  #   if self._config.mid_goal_selector_actor: 
+  #     print('Using MidpointGoalSelector actor', flush=True)
+  #     raw = self._environment_factory_fixed_goals(
+  #       utils.sample_uint32(environment_key))
+  #     environment = MidpointEnvWrapper(raw, networks, variable_client)
+  #   else:
+  #     environment = self._environment_factory(
+  #       utils.sample_uint32(environment_key))
+
+  #   networks = self._network_factory(specs.make_environment_spec(environment))
+  #   policy_network = self._policy_network(networks)
+
+    
+
+
+  #   # Create logger and counter.
+  #   counter = counting.Counter(counter, 'actor')
+  #   # Only actor #0 will write to bigtable in order not to spam it too much.
+  #   logger = self._actor_logger_fn(actor_id)
+
+
+  #   ## if you need to use the default actor uncommnent this and comment the next line
+  #   # if self._config.mid_goal_selector_actor: 
+  #   #   print('Using MidpointGoalSelector actor', flush=True)
+  #   #   actor = self._builder.make_midpoint_actor(
+  #   #         actor_key, policy_network,
+  #   #         env=environment,          
+  #   #         networks=networks,        
+  #   #         adder=adder,
+  #   #         variable_source=variable_source)
+  #   # else:
+  #   actor = self._builder.make_actor(actor_key, policy_network, adder,
+  #                                    variable_source)
+
+
+    
+    
+  #   # Create the loop to connect environment and agent.
+  #   return environment_loop.EnvironmentLoop(environment, actor, counter,
+  #                                           logger, observers=self._observers)
+  
+
+  ## Actor that supports the mid-goal environemnt warpper
   def actor(self, random_key, replay,
-            variable_source, counter,
-            actor_id):
-    """The actor process."""
+          variable_source, counter,
+          actor_id):
     adder = self._builder.make_adder(replay)
+    env_key, actor_key = jax.random.split(random_key)
 
-    environment_key, actor_key = jax.random.split(random_key)
-    # Create environment and policy core.
+    # 1) sample from the *regular* factory, not fixed_goals
+    raw_env = self._environment_factory(utils.sample_uint32(env_key))
 
-    # Environments normally require uint32 as a seed.
-    environment = self._environment_factory(
-        utils.sample_uint32(environment_key))
+    # 2) build networks & variable_client off raw_env
+    env_spec = specs.make_environment_spec(raw_env)
+    networks = self._network_factory(env_spec)
+    variable_client = variable_utils.VariableClient(
+        variable_source, ['policy','critic'], device='cpu')
 
-    networks = self._network_factory(specs.make_environment_spec(environment))
+    # 3) wrap it only for the actor
+    if self._config.mid_goal_selector_actor:
+      print('Using MidpointEnvWrapper for actor', flush=True)
+      environment = MidpointEnvWrapper(raw_env, networks, variable_client)
+    else:
+      environment = raw_env
+
+    # 4) now build the policy, actor, and loop as before
     policy_network = self._policy_network(networks)
-    actor = self._builder.make_actor(actor_key, policy_network, adder,
-                                     variable_source)
-
-    # Create logger and counter.
     counter = counting.Counter(counter, 'actor')
-    # Only actor #0 will write to bigtable in order not to spam it too much.
     logger = self._actor_logger_fn(actor_id)
-    # Create the loop to connect environment and agent.
-    return environment_loop.EnvironmentLoop(environment, actor, counter,
-                                            logger, observers=self._observers)
+    actor = self._builder.make_actor(
+        actor_key, policy_network, adder, variable_source)
+
+    # **pass the wrapped actor‐env into your EnvironmentLoop** 
+    return environment_loop.EnvironmentLoop(
+        environment,
+        actor,
+        counter,
+        logger,
+        observers=self._observers
+    )
+
 
   def coordinator(self, counter, max_actor_steps):
     steps_key = 'actor_steps'

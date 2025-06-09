@@ -21,7 +21,7 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string('log_dir_path', 'logs/', 'Where to log metrics')
 flags.DEFINE_integer('time_delta_minutes', 5, 'how often to save checkpoints')
-flags.DEFINE_integer('seed', 42, 'Specify seed, only used if use_slurm_array is false')
+flags.DEFINE_integer('seed', 6, 'Specify seed, only used if use_slurm_array is false')
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
 flags.DEFINE_string('alg', 'contrastive_cpc', 'Algorithm type, e.g. default is contrastive_cpc with no entropy or KL losses')
 flags.DEFINE_string('env', 'sawyer_bin', 'Environment type, e.g. default is sawyer bin')
@@ -30,6 +30,10 @@ flags.DEFINE_bool('sample_goals', False, 'sample the goal position uniformly acc
 
 # fixed goal coordinates for supported environments
 fixed_goal_dict={'point_Spiral11x11': [np.array([5,5], dtype=float), np.array([10,10], dtype=float)],
+                 'point_FourRooms': [np.array([0,0], dtype=float), np.array([10,8], dtype=float)], #[10,8] #[0,10] [5,10]
+                 'point_Impossible' :  [np.array([9,0], dtype=float), np.array([0,9], dtype=float)], # hardest right before the final wall [7,8], [2,6] is too easy
+                 'point_Maze11x11' : [np.array([0,0], dtype=float), np.array([5,4], dtype=float)], # hardest [11,11] , [5,4] doable using 1024 network
+                 'point_Wall11x11' : [np.array([2,8], dtype=float), np.array([0,10], dtype=float)], # hardest [11,11] , [5,4] doable using 1024 network
                      #note: sawyer fixed goal positions vary slightly with each episode
                       'sawyer_bin': np.array([0.12, 0.7, 0.02]),
                       'sawyer_box': np.array([0.0, 0.75, 0.133]),
@@ -54,11 +58,14 @@ def get_program(params):
   config = contrastive.ContrastiveConfig(**params)
   
   fix_goals = params['fix_goals']
+  print('Using fixed goals: {}...'.format(fix_goals))
 
   if fix_goals:
     fixed_start_end = fixed_goal_dict[env_name]
   else:
     fixed_start_end = None
+
+  print('Using fixed start and end: {}...'.format(fixed_start_end))
     
   env_factory = lambda seed: contrastive_utils.make_environment(  # pylint: disable=g-long-lambda
       env_name, config.start_index, config.end_index, seed, fixed_start_end = fixed_start_end)

@@ -39,6 +39,7 @@ class SuccessObserver(observers_base.EnvLoopObserver):
   def __init__(self):
     self._rewards = []
     self._success = []
+    
 
   def observe_first(self, env, timestep
                     ):
@@ -53,6 +54,7 @@ class SuccessObserver(observers_base.EnvLoopObserver):
     """Records one environment step."""
     assert timestep.reward in [0, 1]
     self._rewards.append(timestep.reward)
+    
 
   def get_metrics(self):
     """Returns metrics collected for the current episode."""
@@ -73,6 +75,7 @@ class DistanceObserver(observers_base.EnvLoopObserver):
         obs_to_goal_1d, start_index=start_index, end_index=end_index)
     self._smooth = smooth
     self._history = {}
+    self._subgoal = None
 
   def _get_distance(self, env,
                     timestep):
@@ -94,6 +97,7 @@ class DistanceObserver(observers_base.EnvLoopObserver):
       for key, value in self._get_current_metrics().items():
         self._history[key] = self._history.get(key, []) + [value]
     self._distances = [self._get_distance(env, timestep)]
+    self._subgoal = timestep.observation[self._obs_dim:]
 
   def observe(self, env, timestep,
               action):
@@ -106,6 +110,7 @@ class DistanceObserver(observers_base.EnvLoopObserver):
         'final_dist': self._distances[-1],
         'delta_dist': self._distances[0] - self._distances[-1],
         'min_dist': min(self._distances),
+        "commanded_goal": self._subgoal,
     }
     return metrics
 
@@ -114,6 +119,8 @@ class DistanceObserver(observers_base.EnvLoopObserver):
     metrics = self._get_current_metrics()
     if self._smooth:
       for key, vec in self._history.items():
+        if key == 'commanded_goal':
+          continue
         for size in [10, 100, 1000]:
           metrics['%s_%d' % (key, size)] = np.nanmean(vec[-size:])
     return metrics
@@ -194,12 +201,12 @@ class InitiallyRandomActor(actors.GenericActor):
 
   def select_action(self,
                     observation):
-    if (self._params['mlp/~/linear_0']['b'] == 0).all():
-      shape = self._params['Normal/~/linear']['b'].shape
+    if (self._params[0]['mlp/~/linear_0']['b'] == 0).all():
+      shape = self._params[0]['Normal/~/linear']['b'].shape
       rng, self._state = jax.random.split(self._state)
       action = jax.random.uniform(key=rng, shape=shape,
                                   minval=-1.0, maxval=1.0)
     else:
-      action, self._state = self._policy(self._params, observation,
+      action, self._state = self._policy(self._params[0], observation,
                                          self._state)
     return utils.to_numpy(action)
