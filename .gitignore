@@ -11,4 +11,7 @@ archived/
 data/
 logs/
 *.log
+*.png
+**/*.png
+
 

@@ -73,10 +73,20 @@ class ContrastiveConfig:
   start_index: int = 0
   end_index: int = -1
 
+
+  ## config added or changed by Mahsa
   repr_norm: bool = False
   mid_goal_selector_actor = False
   hidden_layer_sizes: Tuple[int, Ellipsis] = (256, 256)
+  #hidden_layer_sizes: Tuple[int, Ellipsis] = (256, 256)
   #hidden_layer_sizes: Tuple[int, Ellipsis] = (1024, 1024)
+
+
+  init_weight: Optional[str] = None
+  Q_max: Optional[bool] = False
+  save_init_weight = False
+
+
 
 
 def target_entropy_from_env_spec(

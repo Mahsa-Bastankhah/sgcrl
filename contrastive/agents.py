@@ -52,7 +52,8 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
     contrastive_builder = builder.ContrastiveBuilder(config, logger_fn=logger_fn)
     if evaluator_factories is None:
       eval_policy_factory = (
-          lambda n: networks.apply_policy_and_sample(n, True))
+           lambda n: networks.apply_policy_and_sample(n, Q_max=config.Q_max, eval_mode=True))
+        #lambda n: networks.apply_policy_and_sample(n, True))
       eval_observers = [
           contrastive_utils.SuccessObserver(),
           contrastive_utils.DistanceObserver(
@@ -78,13 +79,19 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
         contrastive_utils.DistanceObserver(obs_dim=config.obs_dim,
                                            start_index=config.start_index,
                                            end_index=config.end_index)]
+    # 2) actor policy (the one inherited by DistributedLayout)
+    policy_net_factory = lambda n: networks.apply_policy_and_sample(
+        n,
+        Q_max=config.Q_max          # ← same flag, no eval_mode
+    )
     super().__init__(
         seed=seed,
         environment_factory=environment_factory,
         environment_factory_fixed_goals=environment_factory_fixed_goals,
         network_factory=network_factory,
         builder=contrastive_builder,
-        policy_network=networks.apply_policy_and_sample,
+        policy_network=policy_net_factory,
+        #policy_network= networks.apply_policy_and_sample,
         evaluator_factories=evaluator_factories,
         num_actors=num_actors,
         max_number_of_steps=max_number_of_steps,

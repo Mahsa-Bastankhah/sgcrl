@@ -1,124 +1,134 @@
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
+#!/usr/bin/env python
+"""
+Plot evaluator success_1000 vs actor_steps
+for two groups (Q-max = blue, Actor = red).
+"""
 
-import pandas as pd
-import matplotlib.pyplot as plt
-import os
+import argparse, pathlib, warnings
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from pandas.errors import EmptyDataError
+#python plot_eval.py     --env point_Wall11x11     --q_seeds 400 401 402 404 405 406 407     --actor_seeds 110 111 112 114 115 116 117     --log_root ./logs
+# python plot_eval.py     --env point_Wall11x11     --q_seeds 400    --actor_seeds 34 800 801 802 803 804 805 806 807     --log_root ./logs
+
+# ------------------------------------------------------------------ #
+# 1. Load a single run, return (steps, success) or None if unusable. #
+# ------------------------------------------------------------------ #
+def load_run(env: str, seed: int, root: str):
+    csv = (
+        pathlib.Path(root)
+        / f"contrastive_cpc_{env}_{seed}"
+        / "logs/evaluator/logs.csv"
+    )
+    if not csv.exists() or csv.stat().st_size == 0:
+        print(f"[skip] {csv} is missing or empty")
+        return None
+
+    try:
+        df = pd.read_csv(csv)
+    except EmptyDataError:
+        print(f"[skip] {csv} has no header/rows yet")
+        return None
+
+    # ── always use actor_steps ───────────────────────────────────
+    df.columns = df.columns.str.strip()        # trim stray spaces/tabs
+    if "actor_steps" not in df.columns:
+        print(f"[skip] {csv}: 'actor_steps' column not found")
+        return None
+
+    steps = pd.to_numeric(df["actor_steps"], errors="coerce").values
+    succ  = pd.to_numeric(df["success_1000"], errors="coerce").values
+    return steps, succ
 
 
-def _last_non_nan_column(df, max_nan=100):
-    """Return the right‑most column that has **≤ max_nan** NaNs after coercion."""
-    for col in reversed(df.columns):
-        series = pd.to_numeric(df[col], errors="coerce")
-        nan_count = series.isna().sum()
-        if nan_count <= max_nan:
-            return col
-    raise ValueError("No column with acceptable NaN count found in evaluator log.")
+
+# ------------------------------------------------------------------ #
+# 2. Plot helper for one colour group                                #
+# ------------------------------------------------------------------ #
+def plot_group(ax, runs, color, label, alpha=.25):
+    if not runs:
+        print(f"[warn] group '{label}' has 0 usable runs – skipped")
+        return
+
+    # 2-a individual faint lines
+    for s, v in runs:
+        ax.plot(s, v, color=color, alpha=alpha, linewidth=1)
+
+    # 2-b mean ± std on common interval
+    max_common = min(s.max() for s, _ in runs)
+    x = np.linspace(0, max_common, 200)
+    mat = np.vstack([np.interp(x, s, v) for s, v in runs])
+
+    if np.isnan(mat).all():
+        print(f"[warn] group '{label}' only NaNs – skipped")
+        return
+
+    mean, std = np.nanmean(mat, 0), np.nanstd(mat, 0)
+    ax.plot(x, mean, color=color, linewidth=2.5, label=f"{label} (mean)")
+    ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.18)
 
 
-def plot_eval_compare(
-    seed_list,
-    env_name,
-    labels,
-    mode="separate",
-    success_col=None,
-):
-    """
-    Plot success curves for multiple seeds, either separately or averaged by group.
+# ------------------------------------------------------------------ #
+# 3. CLI                                                             #
+# ------------------------------------------------------------------ #
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--env", required=True)
+    p.add_argument("--q_seeds",     nargs="+", type=int, default=[])
+    p.add_argument("--actor_seeds", nargs="+", type=int, default=[])
+    p.add_argument("--log_root",    default="./logs")
+    p.add_argument("--label_qmax",  default="Q-max")
+    p.add_argument("--label_actor", default="Actor")
+    args = p.parse_args()
 
-    When *success_col* is None, the last column that is **not all NaN** (after
-    numeric coercion) is chosen automatically.
-    """
+    # ────────────────────────── PLOTTING ──────────────────────────
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.set_title(f"success_1000 vs actor_steps • {args.env}")
+    ax.set_xlabel("actor_steps")
+    ax.set_ylabel("success_1000")
 
-    data = []  # {seed, label, eps, vals}
-    for seed, label in zip(seed_list, labels):
-        folder = f"./logs/contrastive_cpc_point_{env_name}_{seed}/logs/evaluator"
-        eval_path = os.path.join(folder, "logs.csv")
-        df = pd.read_csv(eval_path)
+    def lines_plus_mean(runs, color, label,
+                        lw_seed=1.0, lw_mean=3.0, alpha_seed=0.65,
+                        mean_style="--"):
+        """Plot every seed (thin) and the group mean (thick, dashed)."""
+        if not runs:        # nothing to draw
+            return
 
-        # pick success column
-        col = success_col or _last_non_nan_column(df)
-        print(seed, label)
-        print("Using column", col)
-        print(df[col])
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        # individual curves
+        for s, v in runs:
+            ax.plot(s, v, color=color, linewidth=lw_seed, alpha=alpha_seed)
 
-        # episodes
-        if "actor_episodes" in df:
-            eps = pd.to_numeric(df["actor_episodes"], errors="coerce").values
-        else:
-            actor_path = os.path.join(folder.replace("evaluator", "actor"), "logs.csv")
-            actor_df = pd.read_csv(actor_path)
-            eps = pd.to_numeric(actor_df["actor_episodes"], errors="coerce").values
+        # interpolate to common x-axis and compute mean
+        max_common = min(s.max() for s, _ in runs)
+        x = np.linspace(0, max_common, 200)
+        y = np.vstack([np.interp(x, s, v) for s, v in runs])
+        mean = np.nanmean(y, axis=0)
 
-        vals = df[col].values
-        # align lengths if mismatch
-        if len(eps) != len(vals):
-            eps = np.interp(np.linspace(0, 1, len(vals)), np.linspace(0, 1, len(eps)), eps)
+        ax.plot(x, mean, color=color, linewidth=lw_mean,
+                linestyle=mean_style, label=f"{label} (mean)")
 
-        data.append({"seed": seed, "label": label, "eps": eps, "vals": vals})
-
-    plt.figure(figsize=(10, 6))
-
-    if mode == "separate":
-        for d in data:
-            plt.plot(d["eps"], d["vals"], label=f"Seed {d['seed']}, {d['label']}")
-    elif mode == "average":
-        groups = {}
-        for d in data:
-            groups.setdefault(d["label"], []).append(d)
-
-        for label, runs in groups.items():
-            common_max = min(r["eps"].max() for r in runs)
-            common_eps = np.linspace(0, common_max, 100)
-            aligned = [np.interp(common_eps, r["eps"], r["vals"]) for r in runs]
-            mat = np.vstack(aligned)
-            mean, std = np.nanmean(mat, 0), np.nanstd(mat, 0)
-            plt.plot(common_eps, mean, label=f"{label} (mean±std)")
-            plt.fill_between(common_eps, mean - std, mean + std, alpha=0.3)
+    # ─── Blue: Q-max ───────────────────────────────────────────────
+    if args.q_seeds == []:
+        print("[warn] no Q-max seeds provided, skipping this group")
     else:
-        raise ValueError("Mode must be 'separate' or 'average'")
+        q_runs = [r for s in args.q_seeds
+                if (r := load_run(args.env, s, args.log_root)) is not None]
+        lines_plus_mean(q_runs, color="tab:blue", label=args.label_qmax)
 
-    plt.xlabel("Actor Episodes")
-    plt.ylabel(success_col or "Success")
-    plt.title(f"{success_col or 'Success'} vs Actor Episodes ({env_name})")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
+    # ─── Red: Actor ────────────────────────────────────────────────
+    a_runs = [r for s in args.actor_seeds
+            if (r := load_run(args.env, s, args.log_root)) is not None]
+    lines_plus_mean(a_runs, color="tab:red", label=args.label_actor)
 
-    fname = f"eval_compare_{mode}_{env_name}_{'_'.join(map(str, seed_list))}.png"
-    plt.savefig(fname)
-    print("Saved plot to", fname)
+    ax.grid(alpha=.3)
+    ax.legend()
+    fig.tight_layout()
 
-env_name = "Maze11x11"
-env_name = "Impossible"
-seed_list = [13, 12 ,42,  20 , 21, 30, 31, 40, 41]
-seed_list = [13, 12 ,  20 , 21, 30, 31, 40, 41]
-labels = ["max Q, sgcrl", "max Q, sgcrl","actor, sgcrl", "actor, subgoal", "actor, sgcrl", "actor, subgoal", "actor, sgcrl", "actor, subgoal"]
-#seed_list = [13, 12 , 20 , 21, 30, 31]
-#labels = ["max Q, sgcrl",  "max Q, sgcrl","actor, sgcrl", "actor, subgoal", "actor, sgcrl", "actor, subgoal"]
-plot_eval_compare(seed_list, env_name, labels, mode = 'average')
+    out = f"success_1000_{args.env}_{args.actor_seeds}.png"
+    fig.savefig(out, dpi=120)
+    print("saved →", out)
 
 
-
-
-
-# import pandas as pd
-# import os
-
-# import pandas as pd
-
-# seed  = 31
-# env   = "Impossible"
-# path  = f"./logs/contrastive_cpc_point_{env}_{seed}/logs/evaluator/logs.csv"
-
-# df = pd.read_csv(path)
-
-# # show dtypes first (optional)
-# print("Column dtypes:\n", df.dtypes, "\n")
-
-# # print the first 30 rows of every column
-# print("First 30 rows:\n")
-# print(df.head(100).to_string(index=False))
-
+if __name__ == "__main__":
+    # Silence NumPy “mean of empty slice” if they ever sneak through
+    warnings.filterwarnings("ignore", category=RuntimeWarning)
+    main()

@@ -8,7 +8,9 @@ Run using multi-threading
 """
 import functools
 from typing import Any, Dict
-
+import json
+import pathlib  # ← add near the other imports
+import json, pathlib, uuid
 from absl import app
 from absl import flags
 import contrastive
@@ -21,12 +23,25 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string('log_dir_path', 'logs/', 'Where to log metrics')
 flags.DEFINE_integer('time_delta_minutes', 5, 'how often to save checkpoints')
-flags.DEFINE_integer('seed', 6, 'Specify seed, only used if use_slurm_array is false')
+flags.DEFINE_integer('seed', 12, 'Specify seed, only used if use_slurm_array is false')
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
 flags.DEFINE_string('alg', 'contrastive_cpc', 'Algorithm type, e.g. default is contrastive_cpc with no entropy or KL losses')
 flags.DEFINE_string('env', 'sawyer_bin', 'Environment type, e.g. default is sawyer bin')
-flags.DEFINE_integer('num_steps', 8_000_000, 'Number of steps to run', lower_bound=0)
+flags.DEFINE_integer('num_steps', 2_000_000, 'Number of steps to run', lower_bound=0)
 flags.DEFINE_bool('sample_goals', False, 'sample the goal position uniformly according to the environment (corresponds to the original contrastive_rl algorithm)')
+flags.DEFINE_string(
+    'init_weight',          # flag name
+    None,                 # default → no warm-start
+    'Path to a pickled/npz checkpoint containing "policy_params" and '
+    '"q_params" to use as initial weights.')
+flags.DEFINE_bool('Q_max',  False, 'Wether using the actor or the arg max Q policy ')
+# e.g. --hidden_layer_sizes=512 --hidden_layer_sizes=512 --hidden_layer_sizes=256
+flags.DEFINE_multi_integer(
+    'hidden_layer_sizes',
+    [256, 256],                # default
+    'Sizes of each hidden layer in the policy/Q MLP. '
+    'Repeat the flag for each layer, e.g. '
+    '"--hidden_layer_sizes=512 --hidden_layer_sizes=256".')
 
 # fixed goal coordinates for supported environments
 fixed_goal_dict={'point_Spiral11x11': [np.array([5,5], dtype=float), np.array([10,10], dtype=float)],
@@ -131,8 +146,12 @@ def main(_):
   print('Using alg {}...'.format(alg))
   params['alg_name'] = alg
   params['fix_goals'] = not FLAGS.sample_goals
+  params['hidden_layer_sizes'] = tuple(FLAGS.hidden_layer_sizes)
+
   add_uid = FLAGS.add_uid
   params['add_uid'] = add_uid
+  params['Q_max'] = FLAGS.Q_max
+  params['init_weight'] = FLAGS.init_weight
   print('Adding uid: {}...'.format(params['add_uid']))
   
   params['log_dir'] = FLAGS.log_dir_path
@@ -149,6 +168,25 @@ def main(_):
     params['add_mc_to_td'] = True
   else:
     raise NotImplementedError('Unknown method: %s' % alg)
+
+  # === NEW BLOCK: persist the run configuration =============
+  run_dir = pathlib.Path(params['log_dir']) / f"{params['alg_name']}_{params['env_name']}_{params['seed']}"
+
+  # If you add a UID elsewhere, replicate it here:
+  if params.get('add_uid'):               # True/False in FLAGS
+      run_dir = run_dir.with_name(run_dir.name + f"_{uuid.uuid4().hex[:6]}")
+
+  run_dir.mkdir(parents=True, exist_ok=True)
+
+  # --------------------------------------------------------------
+  # Persist the configuration *inside* that run folder.
+  config_file = run_dir / 'config.json'
+  with config_file.open('w') as f:
+      json.dump(params, f, indent=2, sort_keys=True)
+
+  print(f"Saved run config to {config_file}")
+    # ==========================================================
+
 
 
   program = get_program(params)

@@ -1,7 +1,7 @@
 """Contrastive RL learner implementation."""
 import time
 from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Tuple, Callable
-
+import pickle
 import acme
 from acme import types
 from acme.jax import networks as networks_lib
@@ -22,6 +22,68 @@ from jax import random
 import os
 from default import make_default_logger
 from pathlib import Path
+import tensorflow as tf
+from acme.jax import savers        # for SaveableAdapter
+from contrastive import utils as contrastive_utils     # obs_to_goal helpers
+import functools
+from acme.tf.savers import SaveableAdapter
+from acme import core
+import glob, re, os, tensorflow as tf
+import os, functools, tensorflow as tf, jax
+import os, pickle
+from pathlib import Path
+def load_ckpt(path: str, *, first: bool = True):
+    # --------------------------------------------------------
+    # 1) Resolve prefix  (dir → ckpt-0  …  or latest)
+    # --------------------------------------------------------
+    if os.path.isdir(path):
+        if first:
+            idx_files = sorted(
+                glob.glob(os.path.join(path, "ckpt-*.index")),
+                key=lambda p: int(re.search(r"ckpt-(\d+)\.index", p).group(1)),
+            )
+            if not idx_files:
+                raise FileNotFoundError(f"No ckpt-*.index files inside {path}")
+            ckpt_prefix = idx_files[0][:-6]  # strip ".index"
+        else:
+            ckpt_prefix = tf.train.latest_checkpoint(path)
+            if ckpt_prefix is None:
+                raise FileNotFoundError(f"No checkpoints inside {path}")
+    else:
+        ckpt_prefix = path
+
+    print(f"[warm-start] reading weights from {ckpt_prefix}", flush=True)
+
+    # --------------------------------------------------------
+    # 2) Grab the PythonState blob & extract the two param trees
+    # --------------------------------------------------------
+    reader = tf.train.load_checkpoint(ckpt_prefix)
+    blob   = reader.get_tensor("learner/.ATTRIBUTES/py_state")
+    state  = pickle.loads(blob)
+
+    policy_params = state.policy_params
+    q_params      = state.q_params
+    return policy_params, q_params
+
+
+def save_params(params: Dict[str, Any], save_dir: str, name: str = "initial_params.pkl"):
+    """
+    params: dict, e.g. {"policy_params": ..., "q_params": ...}
+    save_dir: the directory where you want to write the pickle
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    path = Path(save_dir) / name
+    with open(path, "wb") as f:
+        pickle.dump(params, f)
+    print(f"[init] saved params to {path}", flush = True)
+
+def load_saved_params(save_dir: str, name: str = "initial_params.pkl"):
+    """
+    Returns the dict you originally saved.
+    """
+    path = Path(save_dir) / name
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 class TrainingState(NamedTuple):
   """Contains training state for the learner."""
@@ -352,14 +414,43 @@ class ContrastiveLearner(acme.Learner):
       self._update_step = update_step
 
     def make_initial_state(key):
-      """Initialises the training state (parameters and optimiser state)."""
-      key_policy, key_q, key = jax.random.split(key, 3)
+      log_subdir = os.path.join(config.log_dir,
+                              f"{config.alg_name}_{config.env_name}_{config.seed}")
+      ckpt_dir   = os.path.join(log_subdir, "checkpoints", "learner")
 
-      policy_params = networks.policy_network.init(key_policy)
-      policy_optimizer_state = policy_optimizer.init(policy_params)
 
-      q_params = networks.q_network.init(key_q)
-      q_optimizer_state = q_optimizer.init(q_params)
+      if config.init_weight is not None:
+          # policy_params, q_params = load_ckpt(config.init_ckpt)
+          try:
+            saved = load_saved_params(config.init_weight)
+            policy_params = saved["policy_params"]
+            q_params      = saved["q_params"]
+            print(policy_params, flush= True)
+            print(q_params, flush= True)  
+            print(f"[warm-start] loaded initial weights from pickle in {config.init_weight}", flush=True)
+          except FileNotFoundError:
+            # Fallback: grab them from the very first TF checkpoint
+            print(f"[warm-start] No pickel was found", flush=True)
+          # Fresh optimiser slots
+          policy_optimizer_state = policy_optimizer.init(policy_params)
+          q_optimizer_state      = q_optimizer.init(q_params)
+          _, _, key = jax.random.split(key, 3)
+
+
+      else:
+        print(f"[Init] random initialisation of weights {config.init_weight}", flush=True)
+        key_policy, key_q, key = jax.random.split(key, 3)
+
+        policy_params = networks.policy_network.init(key_policy)
+        policy_optimizer_state = policy_optimizer.init(policy_params)
+        q_params = networks.q_network.init(key_q)
+        q_optimizer_state = q_optimizer.init(q_params)
+        if config.save_init_weight:
+          # save them for future reuse
+          save_params({
+              "policy_params": policy_params,
+              "q_params":      q_params
+          }, save_dir=ckpt_dir)
 
       state = TrainingState(
           policy_optimizer_state=policy_optimizer_state,
@@ -372,7 +463,7 @@ class ContrastiveLearner(acme.Learner):
 
       if adaptive_entropy_coefficient:
         state = state._replace(alpha_optimizer_state=alpha_optimizer_state,
-                               alpha_params=log_alpha)
+                              alpha_params=log_alpha)
         
       return state
 

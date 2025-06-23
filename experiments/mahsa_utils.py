@@ -12,6 +12,9 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from IPython.display import HTML
 from tqdm import tqdm
 import os
+from itertools import product
+import numpy as np
+import jax.numpy as jnp
 from contrastive.config import ContrastiveConfig
 from contrastive import utils as contrastive_utils
 from contrastive import make_networks
@@ -51,11 +54,62 @@ action_list = [[1,0], [1,1], [0,1], [0,0], [-1,0], [-1,-1], [0,-1], [-1,1], [1,-
 logger.addFilter(CheckTypesFilter())
 
 axes_names = ['x', 'y']
+def get_point_map(env_name):
+    """Return the 0/1 occupancy grid (point_map) for each point-nav env."""
+    if env_name == "point_Spiral11x11":
+        return np.array([
+            [1,1,1,1,1,1,1,1,1,1,1],
+            [1,0,0,0,0,0,0,0,0,0,0],
+            [1,0,1,1,1,1,1,1,1,1,0],
+            [1,0,1,0,0,0,0,0,0,1,0],
+            [1,0,1,0,1,1,1,1,0,1,0],
+            [1,0,1,0,1,0,0,1,0,1,0],
+            [1,0,1,0,1,1,0,1,0,1,0],
+            [1,0,1,0,0,0,0,1,0,1,0],
+            [1,0,1,1,1,1,1,1,0,1,0],
+            [1,0,0,0,0,0,0,0,0,1,0],
+            [1,1,1,1,1,1,1,1,1,1,0],
+        ], dtype=int)
 
-def load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = False, ckpt_num = None, NUM_EPISODES = 10, alg = 'contrastive_cpc'):
+    elif env_name == "point_Impossible":
+        return np.array([
+            [0,1,0,0,0,0,0,0,0],
+            [0,1,0,1,1,1,1,1,0],
+            [0,1,0,0,0,0,1,0,0],
+            [0,1,1,1,1,0,1,0,1],
+            [0,1,0,0,0,0,1,0,0],
+            [0,1,0,1,1,1,1,1,0],
+            [0,0,0,1,0,0,0,1,0],
+            [0,1,0,1,0,1,0,1,1],
+            [0,1,0,0,0,1,0,1,0],
+        ], dtype=int)
+
+    elif env_name == "point_Wall11x11":
+        return np.array([
+            [0,0,0,0,0,0,0,0,0,0,0],
+            [1,1,1,1,1,1,1,1,1,1,0],
+            [0,0,0,0,0,0,0,0,0,1,0],
+            [0,0,0,0,0,0,0,0,0,1,0],
+            [0,0,0,0,0,0,0,0,0,1,0],
+            [0,0,0,0,0,0,0,0,0,1,0],
+            [0,0,0,0,0,0,0,0,0,1,0],
+            [0,0,0,0,0,0,0,0,0,1,0],
+            [0,0,0,0,0,0,0,0,0,1,0],
+            [0,0,0,0,0,0,0,0,0,1,0],
+            [0,0,0,0,0,0,0,0,0,0,0],
+        ], dtype=int)
+
+    else:
+        raise ValueError(f"No point_map defined for env '{env_name}'")
+# ----------------------------------------------------------
+
+
+def load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = False, ckpt_num = None, NUM_EPISODES = 10, alg = 'contrastive_cpc', uid = None):
     state_entropy_coefficient = alpha
     
     ckpt_dir = '{}/{}_{}_{}/checkpoints/learner'.format(log_dir, alg, env_name,seed)
+    if uid is not None:
+        ckpt_dir = '{}/{}_{}_{}/{}/checkpoints/learner'.format(log_dir, alg, env_name, seed, uid)
     #ckpt_dir = '{}/{}_{}_{}_{}/checkpoints/learner'.format(log_dir, alg, env_name, misc_params, seed)
     
     fixed_start_end = None
@@ -68,6 +122,9 @@ def load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = Fal
             fixed_start_end = [np.array([0.5,0.5], dtype=float), np.array([8.5,8.5], dtype=float)]
         elif env_name == 'point_Impossible':
             fixed_start_end = [np.array([9,0], dtype=float), np.array([0,9], dtype=float)]
+        elif env_name == 'point_Wall11x11':
+            fixed_start_end = [np.array([2,8], dtype=float), np.array([0,10], dtype=float)]
+            #fixed_start_end = [np.array([5,5], dtype=float), np.array([0,10], dtype=float)]
     else:
         fixed_start_end = None
     
@@ -127,15 +184,15 @@ def load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = Fal
     print("Model loaded from: {}".format(ckpt_dir))
     return trained_learner_state, env, networks
 
-def eval_fixed_goal_exploration(alpha, misc_params, env_name, log_dir, seeds_list, ckpt_num, NUM_EPISODES=10):
+def eval_fixed_goal_exploration(alpha, misc_params, env_name, log_dir, seeds_list, ckpt_num, NUM_EPISODES=10, action_mode="actor_max", uid = None):
     success_rates_dict = {}
     returns_dict = {}
     goals_dict = {}
     
     positions_dict = {}
     for seed in seeds_list:
-        trained_learner_state, env, networks = load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = True, ckpt_num = ckpt_num)
-        
+        trained_learner_state, env, networks = load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = True, ckpt_num = ckpt_num, uid = uid)
+        print("I am evaluating inside the eval fixed goal function and my action mode is: ", action_mode)
         episode_returns = np.zeros(NUM_EPISODES)
         positions_dict[seed] = []
         goals_dict[seed] = []
@@ -147,11 +204,97 @@ def eval_fixed_goal_exploration(alpha, misc_params, env_name, log_dir, seeds_lis
             positions_dict[seed].append([])
 
             while not timestep.last():
-                dist = networks.policy_network.apply(
+                obs = timestep.observation
+
+                if action_mode == "q_max":
+                    # Discretize action space: 10 values per dimension between -1 and 1
+                    action_dim = env.action_spec().shape[0]
+                    action_vals = np.linspace(-1, 1, 10)
+                    grid = np.meshgrid(*([action_vals] * action_dim))
+                    actions = np.stack([g.ravel() for g in grid], axis=1)  # shape: (num_actions, action_dim)
+
+                    obs_batch = np.tile(obs, (actions.shape[0], 1))
+                    
+                    # Evaluate Q-values
+                    q_values, _, _ = networks.q_network.apply(
+                        trained_learner_state.q_params,
+                        obs_batch,
+                        actions
+                    )
+                    q_values = np.asarray(q_values)
+                    q_values = np.diag(q_values)  # shape: (100,)
+                    # print("q_values shape: ", q_values.shape)
+                    q_values = np.asarray(q_values).flatten()
+                    q_values = np.asarray(q_values).squeeze()
+                    # print("q_values shape: ", q_values.shape)
+
+                    best_action = actions[np.argmax(q_values)]
+                    action = best_action
+                    action = best_action.astype(np.float32)
+                    # print("Best action shape: ", action)
+
+                    
+                if action_mode == "actor_max":
+                    dist = networks.policy_network.apply(
                     trained_learner_state.policy_params,
-                    timestep.observation
-                )
-                action = np.array(dist.mode())
+                    obs
+                    )
+                    action = np.array(dist.mode())
+                elif action_mode == "actor_sample":
+                    print("obs", obs)
+                    # 1. Create or update a PRNG key
+                    rng_key = jax.random.PRNGKey(seed)  # or split from an existing key
+
+                    # 2. Apply the policy to get the distribution
+                    rng_key, subkey1, subkey2 = jax.random.split(rng_key, 3)
+                    dist = networks.policy_network.apply(
+                        trained_learner_state.policy_params,
+                        # subkey1,  # Pass PRNGKey to .apply() if randomness is used inside
+                        obs
+                    )
+
+                    # 3. Sample from the distribution
+                    action = np.array(dist.sample(seed=subkey2))
+
+
+                    import inspect
+
+                    def unwrap_normal(d):
+                        """
+                        Follow the .distribution chain until we reach something that
+                        *has* a loc / scale (or mean / stddev) attribute.
+                        Works for TFP-JAX, Distrax, or Haiku convenience wrappers.
+                        """
+                        while hasattr(d, "distribution"):
+                            # Stop if the next layer is identical (safety against infinite loops)
+                            nxt = d.distribution
+                            if nxt is d or nxt is None:
+                                break
+                            d = nxt
+                        return d
+                    # ------------------------------------------------------------
+                    # unwrap until we land on the Normal
+                    base = unwrap_normal(dist)
+
+                    # access parameters robustly
+                    if hasattr(base, "loc") and hasattr(base, "scale"):    # TFP / Distrax Normal
+                        mean = np.asarray(base.loc)
+                        std  = np.asarray(base.scale)
+                    else:                                                  # fall back on methods
+                        mean = np.asarray(base.mean())
+                        std  = np.asarray(base.stddev())
+
+                    var   = std ** 2
+
+                    print(f"[policy] mean={mean}, std={std}, var={var}")
+                    # === Already have `mean` and `std` from the base Normal ===
+                    low  = np.tanh(mean - std)   # lower edge (mean − 1 σ)
+                    high = np.tanh(mean + std)   # upper edge (mean + 1 σ)
+
+                    print(f"[tanh-range] 1σ band maps to ≈ [{high-low}] in tanh space")
+
+
+
                 timestep = env.step(action)
                 positions_dict[seed][-1].append(deepcopy(env.state))
 
@@ -170,7 +313,7 @@ def eval_fixed_goal_exploration(alpha, misc_params, env_name, log_dir, seeds_lis
 
     return returns_dict, success_rates_dict, positions_dict, goals_dict
   
-def get_cells_visited(positions, grid_width=0.005, grid_min=0, grid_max=11, num_dims=2):
+def get_cells_visited(positions, grid_width=0.005, grid_min=0, grid_max=11, num_dims=2, uid = None):
     '''
     positions: agent (x,y,z)-positions per episode per batch; (batch_size, episodes_length, num_dims=2)
     returns average unique gridcells visited per episode, at grid_width resolution
@@ -190,16 +333,16 @@ def get_cells_visited(positions, grid_width=0.005, grid_min=0, grid_max=11, num_
     return cells_visited
 
 def eval_and_get_cells_visited(env_name, log_dir, seed, ckpt_num=None, grid_width=0.01,
-                               alpha='0.1', render_images=False, **kwargs):
+                               alpha='0.1', render_images=False,uid=None, **kwargs):
     misc_params = '{}_None'.format(alpha)
 
-    returns_dict, success_rates_dict, positions_dict, goals_dict = eval_fixed_goal_exploration(alpha, misc_params, env_name, log_dir, [seed], ckpt_num, **kwargs)
+    returns_dict, success_rates_dict, positions_dict, goals_dict = eval_fixed_goal_exploration(alpha, misc_params, env_name=env_name, log_dir=log_dir, seeds_list=[seed], ckpt_num=ckpt_num, uid=uid, **kwargs)
     positions = np.array(positions_dict[seed])
-    return returns_dict, success_rates_dict, positions_dict, goals_dict, get_cells_visited(positions, grid_width=grid_width)
+    return returns_dict, success_rates_dict, positions_dict, goals_dict, get_cells_visited(positions, grid_width=grid_width, uid=uid)
       
       
 def get_psi_norms(env_name, log_dir,  seed, ckpt_num=None, alg = 'contrastive_cpc', alpha = '0.1',
-                  state_repr_shape=2, N_SAMPLES = 10_000, axes_lims=None, beta = 0.1, project = False):
+                  state_repr_shape=2, N_SAMPLES = 10_000, axes_lims=None, beta = 0.1, project = False, uid= None):
     '''
     Assumes axes are 0, 1, 2. Only supports sawyer bin and box.
     '''
@@ -216,21 +359,30 @@ def get_psi_norms(env_name, log_dir,  seed, ckpt_num=None, alg = 'contrastive_cp
     obs_dim = 2
 
     # load weights + init environment
-    trained_learner_state, env, networks = load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = True, ckpt_num = ckpt_num)
+    trained_learner_state, env, networks = load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = True, ckpt_num = ckpt_num, uid=uid)
 
     timestep = env.reset()
     initial_state = np.zeros((state_repr_shape))
 
     # init dummy obs + action
     obs = timestep.observation
-    
     obs_dim = obs.shape[0] // 2
-    dist = networks.policy_network.apply(
-      trained_learner_state.policy_params,
-      obs
-    )
-    action = np.array(dist.mode())
-    action_batch = np.broadcast_to(action, (N_SAMPLES, action.shape[0]))
+
+    dist0 = networks.policy_network.apply(trained_learner_state.policy_params, obs)
+    a0 = np.array(dist0.mode())      
+    obs0 = obs[None, :]         # shape (1, 2*obs_dim)
+    a0   = a0[None, :]          # shape (1, action_dim)                      # a₀
+    _, phi_s0_a0, _ = networks.q_network.apply(
+            trained_learner_state.q_params, obs0, a0)
+    phi_s0_a0 = phi_s0_a0.squeeze(0)      # shape (repr_dim,)
+    
+    
+    # dist = networks.policy_network.apply(
+    #   trained_learner_state.policy_params,
+    #   obs
+    # )
+    # action = np.array(dist.mode())
+    # action_batch = np.broadcast_to(action, (N_SAMPLES, action.shape[0]))
     
     # uniformly sample states within axes_lims
     random_goals = np.random.rand(N_SAMPLES, 2*obs_dim)
@@ -242,9 +394,22 @@ def get_psi_norms(env_name, log_dir,  seed, ckpt_num=None, alg = 'contrastive_cp
         random_goals[:, obs_dim+axis] += axis_min
 
     goal_locations = random_goals[:, obs_dim:].copy()
-    obs_batch = np.broadcast_to(obs, (N_SAMPLES, 2*obs_dim)).copy()
-    obs_batch[:, obs_dim:] = 0
-    obs_batch = obs_batch + random_goals
+    # obs_batch = np.broadcast_to(obs, (N_SAMPLES, 2*obs_dim)).copy()
+    # obs_batch[:, obs_dim:] = 0
+    # obs_batch = obs_batch + random_goals
+    # Set both state and goal parts to the same random goal
+
+    ## both parts are random states we just sampld, we wanna calculate both their psi similarity with the goal and their phi psi similarity
+    obs_batch = np.zeros((N_SAMPLES, 2 * obs_dim), dtype=np.float32)
+    obs_batch[:, :obs_dim] = goal_locations 
+    obs_batch[:, obs_dim:] = goal_locations 
+
+    # INSERT NEW CODE HERE
+    dist = networks.policy_network.apply(
+        trained_learner_state.policy_params,
+        obs_batch
+    )
+    action_batch = np.array(dist.mode())
 
 
     # compute psi norms and critic_sf
@@ -301,9 +466,42 @@ def get_psi_norms(env_name, log_dir,  seed, ckpt_num=None, alg = 'contrastive_cp
         g_repr_sa / np.linalg.norm(g_repr_sa, axis=1, keepdims=True),
         g_repr_g / np.linalg.norm(g_repr_g, axis=1, keepdims=True)
     ))
+    psi_inner_product = np.diag(np.einsum(
+        'ik,jk->ij',
+        g_repr_sa,
+        g_repr_g
+    ))
+
+    if (g_repr_sa < 0).any() or (g_repr_g < 0).any():
+        print("❌ Error: There are negative values in g_repr_sa or g_repr_g")
+
+
+    phi_psi_similarity = np.diag(np.einsum(
+        'ik,jk->ij',
+        sa_repr / np.linalg.norm(sa_repr, axis=1, keepdims=True),
+        g_repr_g / np.linalg.norm(g_repr_g, axis=1, keepdims=True)
+    ))
+    phi_psi_inner_product = np.diag(np.einsum(
+        'ik,jk->ij',
+        sa_repr ,
+        g_repr_g 
+    ))
+
+    local_phi_psi_similarity = np.diag(np.einsum(
+        'ik,jk->ij',
+        sa_repr / np.linalg.norm(sa_repr, axis=1, keepdims=True),
+        g_repr_sa / np.linalg.norm(g_repr_sa, axis=1, keepdims=True)
+    ))
     waypoint_similarity = np.diag(np.einsum('ik,jk->ij', g_repr_sa / np.linalg.norm(g_repr_sa, axis=1, keepdims=True), waypoint_repr / np.linalg.norm(waypoint_repr, axis=1, keepdims=True)))
 
+    # 2. φ(s₀,a₀)·ψ(s)   (vector length N_SAMPLES)
+    phi_s0_dot_psi_s = np.einsum('i,ji->j', phi_s0_a0, g_repr_sa)
 
+    # 3. φ(s,a)·ψ(g)     (vector length N_SAMPLES)
+    phi_s_dot_psi_g = np.einsum('ij,ij->i', sa_repr, g_repr_g)
+
+    # 4. Combined metric
+    posterior = phi_s0_dot_psi_s + phi_s_dot_psi_g
 
     ### getting the optimal actions at random locations but using the fixed goal 
     # --- Use fixed goal positions from before
@@ -314,14 +512,14 @@ def get_psi_norms(env_name, log_dir,  seed, ckpt_num=None, alg = 'contrastive_cp
     # --- Query policy at these states
     dist = networks.policy_network.apply(trained_learner_state.policy_params, cross_obs_batch)
     actions_at_random_states_fixed_goal = np.array(dist.mode())
-    return goal_locations, psi_norms, critic_sf, critic_g, psi_similarity, waypoint_similarity, actions_at_random_states_fixed_goal, env, trained_learner_state, networks
+    return goal_locations, psi_norms, critic_sf, critic_g, psi_similarity, waypoint_similarity, actions_at_random_states_fixed_goal, env, trained_learner_state, networks, phi_psi_similarity, local_phi_psi_similarity, posterior, phi_s0_dot_psi_s, phi_s_dot_psi_g, psi_inner_product, phi_psi_inner_product
 
 
 
 
 
 def get_cell_projected_psi_norms(env_name, log_dir,  seed, ckpt_num=None, alg = 'contrastive_cpc', alpha = '0.1',
-                  state_repr_shape=2, N_SAMPLES = 10_000, axes_lims=None, beta = 0.1, project = False, point_map=None):
+                  state_repr_shape=2, N_SAMPLES = 10_000, axes_lims=None, beta = 0.1, project = False, point_map=None, cell_size=1, uid=None):
     '''
     Assumes axes are 0, 1, 2. Only supports sawyer bin and box.
     '''
@@ -338,7 +536,7 @@ def get_cell_projected_psi_norms(env_name, log_dir,  seed, ckpt_num=None, alg = 
     obs_dim = 2
 
     # load weights + init environment
-    trained_learner_state, env, networks = load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = True, ckpt_num = ckpt_num)
+    trained_learner_state, env, networks = load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = True, ckpt_num = ckpt_num, uid=uid)
 
     timestep = env.reset()
     initial_state = np.zeros((state_repr_shape))
@@ -354,10 +552,10 @@ def get_cell_projected_psi_norms(env_name, log_dir,  seed, ckpt_num=None, alg = 
     action = np.array(dist.mode())
     action_batch = np.broadcast_to(action, (N_SAMPLES, action.shape[0]))
 
-    fit_scores, cells , proj_matrixes = subspace_transferability(env, trained_learner_state, networks, point_map=point_map)
+    fit_scores, cells , proj_matrixes = subspace_transferability(env, trained_learner_state, networks, point_map=point_map, env_name=env_name, seed =seed, ckpt_num=ckpt_num, cell_size=cell_size)
     
 
-    def goal_to_cell(goal, cell_size=1.0):
+    def goal_to_cell(goal, cell_size=1):
         """Given a goal (x,y), return its corresponding cell as (row,col)."""
         row, col = (goal // cell_size).astype(int)
         return (row, col)
@@ -479,7 +677,7 @@ def get_sa_repr_subspace_basis(env, trained_learner_state, networks, goal_locati
     # Compute basis via SVD
     # Compute rank directly
     rank = np.linalg.matrix_rank(sa_repr_matrix)
-    print(f"True rank from data span = {rank}")
+    #print(f"True rank from data span = {rank}")
 
     # SVD of the stacked matrix  (M × d)
     # full‑matrices=False is fine
@@ -511,12 +709,12 @@ def subspace_transferability(env,
                              start_cell=(5, 5),         # grid (row, col)
                              goal_cell=(10, 10),
                              path_cells=None,
-                             n_samples=1024,
-                             cell_size=1.0,
-                             verbose=True,
+                             cell_size=1,
+                             verbose=False,
                              env_name="point_Spiral11x11",
                              seed=5,
-                             ckpt_num=None):
+                             ckpt_num=None, 
+                             use_all_free_cells=True):
     """
     Follow the true walkable corridor in point_Spiral11x11 (or any binary map)
     and measure how well each square’s ϕ(s,a) vectors fit the previous square’s
@@ -537,60 +735,109 @@ def subspace_transferability(env,
             raise ValueError("Either path_cells or point_map must be provided.")
 
         R, C = point_map.shape
-        free = lambda r, c: 0 <= r < R and 0 <= c < C and point_map[r, c] == 0
+        # assume `cell_size` is an int defined in the outer scope
+        if use_all_free_cells:
+            path_cells = [
+                (r, c)
+                for r in range(0, R, cell_size)      # ← step by cell_size
+                for c in range(0, C, cell_size)      # ← step by cell_size
+                # if point_map[r, c] == 0            # keep commented or restore
+            ]
 
-        # ---------- BFS ------------------------------------------------------
-        q       = deque([start_cell])
-        parent  = {start_cell: None}
-        found   = False
-        while q and not found:
-            r, c = q.popleft()
-            for dr, dc in [(-1,0), (1,0), (0,-1), (0,1)]:       # 4‑connected
-                nr, nc = r + dr, c + dc
-                nxt = (nr, nc)
-                if free(nr, nc) and nxt not in parent:
-                    parent[nxt] = (r, c)
-                    q.append(nxt)
-                    if nxt == goal_cell:
-                        found = True
-                        break
-        if not found:
-            raise RuntimeError("No path found from start_cell to goal_cell.")
-
-        # reconstruct
-        path_cells = []
-        cur = goal_cell
-        while cur:
-            path_cells.append(cur)
-            cur = parent[cur]
-        path_cells.reverse()                                   # start→goal
 
     # -------------------------------------------------------------------------
     # 2. Helpers to sample and compute ϕ(s,a)
     # -------------------------------------------------------------------------
-    def _sa_repr(states, actions):
-        _, phi, _ = networks.q_network.apply(
-            trained_learner_state.q_params, states, actions
-        )
-        return np.asarray(phi)
+    # def _sa_repr(states, actions):
+    #     _, phi, _ = networks.q_network.apply(
+    #         trained_learner_state.q_params, states, actions
+    #     )
+    #     return np.asarray(phi)
 
-    def _sample_in_cell(cell_xy):
-        low  = np.asarray(cell_xy, dtype=np.float32)
-        high = low + cell_size
-        r, c = cell_xy
-        if point_map is not None and point_map[r, c] == 1:
-            raise ValueError(f"Cell {cell_xy} is a wall; cannot sample here.")
+    def _sa_repr(states, actions, *, batch_size: int = 1024):
+        """
+        Return ϕ(s,a) for a (possibly large) batch of (states, actions),
+        processing in smaller chunks to avoid OOM.
+
+        Args:
+            states:  np.ndarray / jnp.ndarray with shape (N, …)
+            actions: np.ndarray / jnp.ndarray with shape (N, …)
+            batch_size: maximum #pairs to feed into the network at once
+        """
+        num = states.shape[0]
+        chunks = []
+        for start in range(0, num, batch_size):
+            stop = start + batch_size
+            # slice the current mini-batch
+            s_batch = states[start:stop]
+            a_batch = actions[start:stop]
+            _, phi_batch, _ = networks.q_network.apply(
+                trained_learner_state.q_params, s_batch, a_batch
+            )
+            chunks.append(phi_batch)
+
+        # jnp.concatenate keeps everything on device; np.asarray() pulls to host
+        phi_full = jnp.concatenate(chunks, axis=0)
+        return np.asarray(phi_full)          # keep original return type
 
 
-        xs = np.random.uniform(low=low, high=high, size=(n_samples, 2))
-        obs_tpl = env.reset().observation
-        obs     = np.tile(obs_tpl, (n_samples, 1)).astype(np.float32)
-        obs[:, :2] = xs                                 # assumes obs[:2] = (row,col)
+    # def _sample_in_cell(cell_xy):
+    #     low  = np.asarray(cell_xy, dtype=np.float32)
+    #     high = low + cell_size
+    #     r, c = cell_xy
+    #     # if point_map is not None and point_map[r, c] == 1:
+    #     #     raise ValueError(f"Cell {cell_xy} is a wall; cannot sample here.")
 
+
+    #     xs = np.random.uniform(low=low, high=high, size=(n_samples, 2))
+    #     obs_tpl = env.reset().observation
+    #     obs     = np.tile(obs_tpl, (n_samples, 1)).astype(np.float32)
+    #     obs[:, :2] = xs                                 # assumes obs[:2] = (row,col)
+
+    #     act_dim = env.action_spec().shape[0]
+    #     acts = np.random.uniform(-1., 1., size=(n_samples, act_dim)).astype(np.float32)
+
+
+
+    #     return obs, acts
+
+
+    def _sample_in_cell(cell_xy, *, grid_res=0.1):
+        """Return exhaustive (state, action) pairs for one cell.
+
+        - States:  (row,col) grid inside the cell with spacing = grid_res.
+        - Actions: all Cartesian products of (-1,0,1) per action dim
+                (currently drops the all-zero vector).
+
+        Returns
+        -------
+        obs  : (n_states * n_actions, obs_dim) float32
+        acts : (n_states * n_actions, act_dim) float32
+        """
+        low   = np.asarray(cell_xy, dtype=np.float32)
+        high  = low + cell_size              # cell_size defined elsewhere
+        r, c  = cell_xy
+
+        # ----- 1. deterministic state grid inside the cell -----------------
+        rows = np.arange(low[0], high[0], grid_res, dtype=np.float32)
+        cols = np.arange(low[1], high[1], grid_res, dtype=np.float32)
+        xs   = np.stack(np.meshgrid(rows, cols, indexing="ij"), axis=-1).reshape(-1, 2)
+        n_states = xs.shape[0]
+
+        # ----- 2. exhaustive discrete actions ------------------------------
         act_dim = env.action_spec().shape[0]
-        acts = np.random.uniform(-1., 1., size=(n_samples, act_dim)).astype(np.float32)
+        action_list = list(product([-1., 0., 1.], repeat=act_dim))
+        # optionally drop the zero-action
+        action_list = [a for a in action_list if any(v != 0. for v in a)]
+        acts_grid   = np.asarray(action_list, dtype=np.float32)            # (n_act, act_dim)
+        n_actions   = acts_grid.shape[0]
 
+        # ----- 3. tile / repeat to pair every state with every action ------
+        obs_tpl = env.reset().observation
+        obs = np.tile(obs_tpl, (n_states * n_actions, 1)).astype(np.float32)
+        obs[:, :2] = np.repeat(xs, n_actions, axis=0)
 
+        acts = np.tile(acts_grid, (n_states, 1))
 
         return obs, acts
 
@@ -600,11 +847,29 @@ def subspace_transferability(env,
 
 
         U, S, Vt = np.linalg.svd(vecs, full_matrices=False)
+        
         tol  = S.max() * max(vecs.shape) * np.finfo(S.dtype).eps
         rank = int(np.sum(S > tol))
         basis = Vt[:rank, :]                           # (rank, d)
         proj  = basis.T @ basis                         # (d, d)
         return proj, true_rank, basis.T
+    
+    def diagnose_rank(X, pca_cut=0.99, eps=None):
+        U,S,Vt = np.linalg.svd(X, full_matrices=False)
+        
+        print("all σ:", S[:10], "…")
+        # (i) algebraic rank
+        print("exact rank:", np.linalg.matrix_rank(X, tol=0.0))
+        # (ii) relative-tol rank
+        if eps is None:
+            eps = np.finfo(S.dtype).eps
+        tol = eps * S[0] * max(X.shape)
+        print(f"rank tol={tol:.1e} :", (S>tol).sum())
+        # (iii) PCA variance rank
+        r = np.searchsorted(np.cumsum(S**2)/S.sum()**2, pca_cut) + 1
+        print(f"components for {pca_cut*100:.1f}% variance:", r)
+        return S
+
 
     def _avg_residual(vecs, proj, relative=True, eps=1e-12):
         """
@@ -637,10 +902,11 @@ def subspace_transferability(env,
 
 
     for cell in path_cells:
-        print(f"\nSampling cell {cell}", end=' ')
+        #print(f"\nSampling cell {cell}", end=' ')
         obs, acts = _sample_in_cell(cell)
         phi       = _sa_repr(obs, acts)
-
+        #diagnose_rank(phi, pca_cut=0.99)  # print the rank diagnostics
+        #diagnose_rank(phi, pca_cut=0.99, eps=None)  # print the rank diagnostics
         if prev_proj is not None:
             r1 = _avg_residual(phi, prev_proj)              # ← parent
             r2 = (_avg_residual(phi, prev_prev_proj)
@@ -651,11 +917,12 @@ def subspace_transferability(env,
                 msg = f"res→prev={r1:.4f}"
                 if r2 is not None:
                     msg += f",  res→prevprev={r2:.4f}"
-                print(msg)
+                #print(msg)
 
         # slide the window: current basis becomes 'prev', old 'prev' → 'prev_prev'
         prev_prev_proj = prev_proj
         prev_proj, rank , basis     = _svd_basis(phi)
+        
         proj_by_cell[cell] = prev_proj     
         basis_by_cell[cell] = basis
         ranks_along_path.append((cell, rank))
@@ -726,8 +993,8 @@ def subspace_transferability(env,
     os.makedirs(plot_dir, exist_ok=True)
     fname = f"rank_{ckpt_num}.png" if ckpt_num is not None else "rank.png"
     path = os.path.join(plot_dir, fname)
-
-    plt.savefig(path, dpi=200)
+    ## uncomment it if you wanna save the rank plot
+    #plt.savefig(path, dpi=200)
     plt.close(fig)
 
     if verbose:
