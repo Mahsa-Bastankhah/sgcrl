@@ -30,11 +30,11 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 ## spiral 30-37 default sgcrl but with 6 layers
 
 
-seeds=(1106)
-devices=(0)
+# seeds=(4000)
+# devices=(7)
 
-
-
+seeds=(5500 5501 5502 5503 5504 5505 5506 5507)
+devices=(0 1 2 3 4 5 6 7)
 
 for idx in "${!seeds[@]}"; do
   SEED=${seeds[$idx]}
@@ -46,13 +46,16 @@ for idx in "${!seeds[@]}"; do
     nohup python lp_contrastive.py \
       --env point_Wall11x11 \
       --seed "$SEED" \
-      --num_steps 4000000 \
+      --goal_neg_actor_steps 700000 \
       > "$LOG" 2>&1 &
 done
 
 
-
+      # --init_weight "logs/contrastive_cpc_point_Wall11x11_26/checkpoints/learner" \
 
 wait
 echo "✅ All jobs launched (logs in lp_contrastive_seed*.out)"
 
+      # --goal_neg_actor_steps 50000 \
+            # --cold_q_init \
+            # --cold_q_scale 1e-12 \

@@ -138,7 +138,7 @@ def apply_policy_and_sample(
 
 
 
-def maximize_q_action(q_network, q_params, obs, grid_size=10):
+def maximize_q_action(q_network, q_params, obs, grid_size=20, epsilon = 0.01):
     # 1) Build candidate actions
     # 1) Infer dimensions
     obs = obs.reshape(-1)  # flatten in case it's shape (1, obs_dim)
@@ -175,6 +175,17 @@ def maximize_q_action(q_network, q_params, obs, grid_size=10):
     best_idx    = jnp.argmax(q_values)          # shape=(), dtype=int32
     best_action = action_grid[best_idx]         # shape=(3,)
     #debug.print("best_idx:", best_idx, "→ best_action shape:", best_action.shape)
+    # Add small Gaussian noise to the best action
+    # key = jax.random.PRNGKey(0)  # Initialize once
+    # key, noise_key, eps_key = jax.random.split(key, 3)
+
+    # rand_idx = jax.random.randint(jax.random.PRNGKey(0), shape=(), minval=0, maxval=action_grid.shape[0])
+    # random_action = action_grid[rand_idx]
+
+    # # 8) Epsilon-greedy selection
+    # choose_random = jax.random.uniform(eps_key) < epsilon
+    # selected_action = jax.lax.cond(choose_random, lambda: random_action, lambda: best_action)
+
 
     return jnp.expand_dims(best_action, axis=0)
 
@@ -188,7 +199,8 @@ def make_networks(
     hidden_layer_sizes = (256, 256),
     actor_min_std = 1e-6,
     twin_q = False,
-    use_image_obs = False,):
+    use_image_obs = False,
+    config = None):
   """Creates networks used by the agent."""
 
   num_dimensions = np.prod(spec.actions.shape, dtype=int)
@@ -256,6 +268,9 @@ def make_networks(
         log_scale = hk.get_parameter('repr_log_scale', [], dtype=sa_repr.dtype,
                                      init=jnp.zeros)
         sa_repr = sa_repr / jnp.exp(log_scale)
+    if config.softmax_repr:
+      sa_repr = jax.nn.softmax(sa_repr , axis=1)
+      g_repr = jax.nn.softmax(g_repr , axis=1)
     return sa_repr, g_repr, (state, goal)
 
     

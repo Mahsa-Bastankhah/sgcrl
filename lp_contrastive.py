@@ -27,7 +27,7 @@ flags.DEFINE_integer('seed', 12, 'Specify seed, only used if use_slurm_array is 
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
 flags.DEFINE_string('alg', 'contrastive_cpc', 'Algorithm type, e.g. default is contrastive_cpc with no entropy or KL losses')
 flags.DEFINE_string('env', 'sawyer_bin', 'Environment type, e.g. default is sawyer bin')
-flags.DEFINE_integer('num_steps', 2_000_000, 'Number of steps to run', lower_bound=0)
+flags.DEFINE_integer('num_steps', 1_000_000, 'Number of steps to run', lower_bound=0)
 flags.DEFINE_bool('sample_goals', False, 'sample the goal position uniformly according to the environment (corresponds to the original contrastive_rl algorithm)')
 flags.DEFINE_string(
     'init_weight',          # flag name
@@ -42,6 +42,12 @@ flags.DEFINE_multi_integer(
     'Sizes of each hidden layer in the policy/Q MLP. '
     'Repeat the flag for each layer, e.g. '
     '"--hidden_layer_sizes=512 --hidden_layer_sizes=256".')
+flags.DEFINE_integer('goal_neg_actor_steps', 0, 'Number of actor steps to use goal as a negative example', lower_bound=0)
+flags.DEFINE_bool('softmax_repr', False, 'Whether to do softmax normalization on the representation. ')
+flags.DEFINE_bool('cold_q_init', False, 'Whether to do cold initialization for the Q network. ')
+flags.DEFINE_float('cold_q_scale', 1e-12 , 'Cold initialization scale for the Q network. ')
+
+
 
 # fixed goal coordinates for supported environments
 fixed_goal_dict={'point_Spiral11x11': [np.array([5,5], dtype=float), np.array([10,10], dtype=float)],
@@ -98,7 +104,7 @@ def get_program(params):
       contrastive.make_networks, obs_dim=obs_dim, repr_dim=config.repr_dim,
       repr_norm=config.repr_norm, twin_q=config.twin_q,
       use_image_obs=config.use_image_obs,
-      hidden_layer_sizes=config.hidden_layer_sizes)
+      hidden_layer_sizes=config.hidden_layer_sizes, config=config)
     
   env_factory_fixed_goals = lambda seed: contrastive_utils.make_environment(  # pylint: disable=g-long-lambda
       env_name, config.start_index, config.end_index, seed, fixed_start_end = fixed_goal_dict[env_name])
@@ -147,8 +153,14 @@ def main(_):
   params['alg_name'] = alg
   params['fix_goals'] = not FLAGS.sample_goals
   params['hidden_layer_sizes'] = tuple(FLAGS.hidden_layer_sizes)
-
+  params['goal_neg_actor_steps'] = FLAGS.goal_neg_actor_steps
   add_uid = FLAGS.add_uid
+  params['softmax_repr'] = FLAGS.softmax_repr
+  params['cold_q_init'] = FLAGS.cold_q_init
+  params['cold_q_scale'] = FLAGS.cold_q_scale
+  goal_entry = fixed_goal_dict[env_name][1]
+  params['fixed_goal'] = tuple(goal_entry.astype(float))
+  print('Using fixed goal: {}...'.format(params['fixed_goal']))
   params['add_uid'] = add_uid
   params['Q_max'] = FLAGS.Q_max
   params['init_weight'] = FLAGS.init_weight

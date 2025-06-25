@@ -5,6 +5,7 @@ from typing import Any, Optional, Union, Tuple
 from acme import specs
 from acme.adders import reverb as adders_reverb
 import numpy as onp
+from typing import Optional, List
 
 
 @dataclasses.dataclass
@@ -84,7 +85,14 @@ class ContrastiveConfig:
 
   init_weight: Optional[str] = None
   Q_max: Optional[bool] = False
-  save_init_weight = False
+  save_init_weight: Optional[bool] = False
+  # Number of actor episodes until which the final goal is used as negative example 
+  # if 0, it is deactivated
+  goal_neg_actor_steps: Optional[int] = 0
+  fixed_goal: Optional[Tuple[float, ...]] = None
+  softmax_repr : Optional[bool] = False
+  cold_q_init: Optional[bool]  = False           # initialise last Q layer near-zero?
+  cold_q_scale: Optional[float] = 1e-12          # magnitude to use when cold-starting
 
 
 

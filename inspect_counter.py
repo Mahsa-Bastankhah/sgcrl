@@ -137,13 +137,13 @@ def load_saved_params(save_dir: str, name: str = "initial_params.pkl"):
         print(q_params, flush= True)  
 
 
-seed = 400
+seed = 4000
 #34, 36
-ckpts = [2]
+ckpts = [1 , 2]
 for ckpt in ckpts:
     show_counter_state(f"logs/contrastive_cpc_point_Wall11x11_{seed}/checkpoints/counter/ckpt-{ckpt}")
 
 #show_counter_state("logs/contrastive_cpc_point_Impossible_42/checkpoints/counter/ckpt-240")
 
-load_saved_params("logs/contrastive_cpc_point_Wall11x11_4/checkpoints/learner", "initial_params.pkl")
-load_saved_params("logs/contrastive_cpc_point_Wall11x11_4/checkpoints/learner", "initial_params_old.pkl")
+# load_saved_params("logs/contrastive_cpc_point_Wall11x11_4/checkpoints/learner", "initial_params.pkl")
+# load_saved_params("logs/contrastive_cpc_point_Wall11x11_4/checkpoints/learner", "initial_params_old.pkl")

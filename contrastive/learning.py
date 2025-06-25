@@ -32,6 +32,10 @@ import glob, re, os, tensorflow as tf
 import os, functools, tensorflow as tf, jax
 import os, pickle
 from pathlib import Path
+import haiku as hk, jax, jax.numpy as jnp
+from typing import Mapping
+
+goal_neg_sample = True
 def load_ckpt(path: str, *, first: bool = True):
     # --------------------------------------------------------
     # 1) Resolve prefix  (dir → ckpt-0  …  or latest)
@@ -133,6 +137,8 @@ class ContrastiveLearner(acme.Learner):
     self._num_sgd_steps_per_step = config.num_sgd_steps_per_step
     self._obs_dim = config.obs_dim
     self._use_td = config.use_td
+    self.config = config
+    self.actor_steps = 0
     
     if adaptive_entropy_coefficient:
       # alpha is the temperature parameter that determines the relative
@@ -164,8 +170,10 @@ class ContrastiveLearner(acme.Learner):
                     policy_params,
                     target_q_params,
                     transitions,
-                    key):
+                    key,
+                    use_goal_neg: bool = False):
       batch_size = transitions.observation.shape[0]
+      
       # Note: We might be able to speed up the computation for some of the
       # baselines to making a single network that returns all the values. This
       # avoids computing some of the underlying representations multiple times.
@@ -243,7 +251,49 @@ class ContrastiveLearner(acme.Learner):
       else:  # For the MC losses.
         def loss_fn(_logits):  # pylint: disable=invalid-name
           if config.use_cpc:
-            return (optax.softmax_cross_entropy(logits=_logits, labels=I)
+            fixed_goal = self.config.fixed_goal
+            fixed_goal = jnp.asarray(fixed_goal, dtype=jnp.float32)   # shape (d,)
+            
+            # ## Adding goal as a negative example
+            labels = I
+            if (fixed_goal is not None) and use_goal_neg:
+              # ensure fixed_goal is a JAX array, not a Python list
+              # debug.print("[DBG] fixed_goal is not None, using it as a negative example")
+              B = _logits.shape[0]
+              
+
+
+              # split current states  s  |  g
+              s, _ = jnp.split(transitions.observation,
+                              [config.obs_dim], axis=1)
+              
+
+      
+
+              # replicate the fixed goal so we have B copies
+              g_fixed = jnp.broadcast_to(fixed_goal, (B, fixed_goal.shape[-1]))
+
+              obs_fixed = jnp.concatenate([s, g_fixed], axis=1)        # (B , 2*obs_dim)
+              fixed_logits, _, _ = networks.q_network.apply(
+                  q_params, obs_fixed, transitions.action)             # (B [,2])
+              fixed_logits = fixed_logits[:, 0]    
+
+              # ensure shape is (B ,1)  or  (B ,1 ,2) in twin-Q case
+              if fixed_logits.ndim == 1:
+                  fixed_logits = fixed_logits[:, None]
+              else:
+                  fixed_logits = fixed_logits[:, None, :]
+
+              # append as a new column on the right
+              _logits = jnp.concatenate([_logits, fixed_logits], axis=1)
+              #debug.print("[DBG] logits shape after concat {}", _logits.shape)
+
+              # extend the label matrix (all zeros → still a negative)
+              labels = jnp.concatenate(
+                      [I, jnp.zeros((B, 1), I.dtype)],
+                      axis=1)
+              #debug.print("[DBG] labels shape after concat {}", labels.shape)
+            return (optax.softmax_cross_entropy(logits=_logits, labels=labels)
                     + 0.01 * jax.nn.logsumexp(_logits, axis=1)**2)
           else:
             return optax.sigmoid_binary_cross_entropy(logits=_logits, labels=I)
@@ -327,8 +377,10 @@ class ContrastiveLearner(acme.Learner):
     actor_grad = jax.value_and_grad(actor_loss, has_aux=True)
 
     def update_step(
-        state,
-        transitions
+            state,
+            transitions,
+            *,                       # keep it a keyword-only arg
+            use_goal_neg: bool,
     ):
   
       key, key_alpha, key_critic, key_actor = jax.random.split(state.key, 4)
@@ -340,10 +392,12 @@ class ContrastiveLearner(acme.Learner):
       else:
         alpha = config.entropy_coefficient
 
-                       
+      # (critic_loss, critic_metrics), critic_grads = critic_grad(
+      #     state.q_params, state.policy_params, state.target_q_params,
+      #     transitions, key_critic)
       (critic_loss, critic_metrics), critic_grads = critic_grad(
           state.q_params, state.policy_params, state.target_q_params,
-          transitions, key_critic)
+          transitions, key_critic, use_goal_neg=use_goal_neg)
 
       # Apply critic gradients
       critic_update, q_optimizer_state = q_optimizer.update(critic_grads, state.q_optimizer_state)
@@ -406,12 +460,25 @@ class ContrastiveLearner(acme.Learner):
     # Iterator on demonstration transitions.
     self._iterator = iterator
 
-    update_step = utils.process_multiple_batches(update_step,config.num_sgd_steps_per_step)
-    # Use the JIT compiler.
-    if config.jit:
-      self._update_step = jax.jit(update_step)
-    else:
-      self._update_step = update_step
+    # update_step = utils.process_multiple_batches(update_step,config.num_sgd_steps_per_step)
+    # #Use the JIT compiler.
+    # if config.jit:
+    #   self._update_step = jax.jit(update_step)
+    # else:
+    #   self._update_step = update_step
+
+    def make_update(use_goal_neg: bool):
+      # 1. freeze the flag so the inner fn now has *only* (state, trans)
+      step_fn = functools.partial(update_step, use_goal_neg=use_goal_neg)
+      # 2. let Acme split big batches if requested
+      step_fn = utils.process_multiple_batches(
+          step_fn, config.num_sgd_steps_per_step
+      )
+      # 3. JIT if desired (no extra static args now)
+      return jax.jit(step_fn) if config.jit else step_fn
+
+    self._update_step_true  = make_update(True)   # goal is a negative
+    self._update_step_false = make_update(False)  # stop using it
 
     def make_initial_state(key):
       log_subdir = os.path.join(config.log_dir,
@@ -423,27 +490,87 @@ class ContrastiveLearner(acme.Learner):
           # policy_params, q_params = load_ckpt(config.init_ckpt)
           try:
             saved = load_saved_params(config.init_weight)
-            policy_params = saved["policy_params"]
+            
+            #policy_params = saved["policy_params"]
             q_params      = saved["q_params"]
-            print(policy_params, flush= True)
             print(q_params, flush= True)  
             print(f"[warm-start] loaded initial weights from pickle in {config.init_weight}", flush=True)
           except FileNotFoundError:
             # Fallback: grab them from the very first TF checkpoint
             print(f"[warm-start] No pickel was found", flush=True)
           # Fresh optimiser slots
-          policy_optimizer_state = policy_optimizer.init(policy_params)
+          
           q_optimizer_state      = q_optimizer.init(q_params)
-          _, _, key = jax.random.split(key, 3)
+          key_policy, key_q, key = jax.random.split(key, 3)
+          policy_params = networks.policy_network.init(key_policy)
+          policy_optimizer_state = policy_optimizer.init(policy_params)
+
 
 
       else:
         print(f"[Init] random initialisation of weights {config.init_weight}", flush=True)
         key_policy, key_q, key = jax.random.split(key, 3)
+        
+        ### cold initialization helper function
+        def uniform_coldify_last_linear(params: hk.Params, rng_key,
+                                scale: float = 1e-12) -> hk.Params:
+          mut = hk.data_structures.to_mutable_dict(params)
+
+          for prefix in ("sa_encoder", "g_encoder"):
+              # collect all leaves that belong to a linear_* module under this prefix
+              linear_items = [
+                  (k, v)
+                  for k, v in mut.items()
+                  if re.search(rf"^{prefix}.*?/linear_(\d+)(/w|/b)?$", k)
+              ]
+              if not linear_items:
+                  print(f"[ColdInit] WARNING: no Linear layer found in {prefix}", flush=True)
+                  continue
+
+              # pick the highest index
+              last_idx = max(int(re.search(r"linear_(\d+)", k).group(1))
+                            for k, _ in linear_items)
+              print(f"[ColdInit] Found {len(linear_items)} linear layers in {prefix}, ", flush=True)
+              print(f"[ColdInit] last index is {last_idx}", flush=True) 
+              print(f"[ColdInit] linear_items: {linear_items}", flush=True)
+              # re-initialise every leaf that belongs to that index
+              # --- after you computed `last_idx` ---------------------------------
+              for k, block in linear_items:          # block is {'w': array, 'b': array}
+                  if f"linear_{last_idx}" not in k:  # skip earlier linear layers
+                      continue
+
+                  # re-seed the weight matrix only
+                  rng_key, sub = jax.random.split(rng_key)
+                  w_arr = block["w"]                 # current weights
+                  block["w"] = jax.random.uniform(
+                      sub,
+                      w_arr.shape,
+                      minval=-scale,
+                      maxval=scale,
+                      dtype=w_arr.dtype,
+                  )
+
+                  mut[k] = block   
+                                  # write the updated block back
+          print(mut, flush=True)
+          return hk.data_structures.to_immutable_dict(mut)
 
         policy_params = networks.policy_network.init(key_policy)
         policy_optimizer_state = policy_optimizer.init(policy_params)
         q_params = networks.q_network.init(key_q)
+
+        q_params = networks.q_network.init(key_q)
+
+        # NEW: cold-start the final layer if requested
+        if config.cold_q_init:
+            print(f"[ColdInit] Initialising last Q layer with U[-{config.cold_q_scale}, {config.cold_q_scale}]", flush=True)
+            q_params = uniform_coldify_last_linear(
+                q_params,
+                rng_key=key_q,                 # reuse the same sub-key is fine
+                scale=config.cold_q_scale      # 1e-12 by default
+            )
+
+
         q_optimizer_state = q_optimizer.init(q_params)
         if config.save_init_weight:
           # save them for future reuse
@@ -479,8 +606,20 @@ class ContrastiveLearner(acme.Learner):
     with jax.profiler.StepTraceAnnotation('step', step_num=self._counter):
       sample = next(self._iterator)
       transitions = types.Transition(*sample.data)
-      self._state, metrics = self._update_step(self._state, transitions) 
-    
+
+      ## Added logic to support adding fixed goal as negative example
+      counts = self._counter.get_counts()          # Python dict
+      actor_steps = counts.get('actor_steps', 0)
+      # If the number of actor steps is less than goal_neg_actor_steps then use the goal as a negative example
+      use_goal_neg  = actor_steps < self.config.goal_neg_actor_steps
+
+      update_fn = (self._update_step_true
+                 if use_goal_neg
+                 else self._update_step_false)
+
+      
+      self._state, metrics = update_fn(self._state, transitions)
+      #self._state, metrics = self._update_step(self._state, transitions) 
     # Compute elapsed time.
     timestamp = time.time()
     elapsed_time = timestamp - self._timestamp if self._timestamp else 0

@@ -16,9 +16,9 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 #devices=(0 1 2 3 4 5 6 7)   
 
 #seeds=(2 3 4 5) # List of seeds to run
-seeds=(1106)
+seeds=(5500 5501 5502 5503 5504 5505 5506 5507)
 ###### 0  0  1  1  0  0  0  0  0  1  0  0  0  0  0  0  0  1  0  1
-devices=(0)        # GPU index for each run
+devices=(7)        # GPU index for each run
 
 for idx in "${!seeds[@]}"; do
   SEED=${seeds[$idx]}
@@ -31,7 +31,7 @@ for idx in "${!seeds[@]}"; do
     --seed $SEED \
     --log_dir logs \
     --alg contrastive_cpc \
-    --ckpt_list 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 \
+    --ckpt_list 1 2 3 4 5 6 7 8 9 10 11 12 14 \
     --NUM_AXES 2 \
     --NUM_EPISODES 5 \
     --plot_psi \

@@ -26,6 +26,9 @@ from sklearn.metrics import silhouette_score
 from sklearn.cluster import AgglomerativeClustering
 import numpy as np
 from scipy.linalg import subspace_angles
+import json, os
+from types import SimpleNamespace
+
 
 # disable tensorflow_probability warning: The use of `check_types` is deprecated and does not have any effect.
 import logging
@@ -39,11 +42,8 @@ class CheckTypesFilter(logging.Filter):
 
 # NOTE: uses cpc and L2 critic
 config = ContrastiveConfig()
-# config.use_cpc_symm = True
-config.use_goal_action = True
-config.use_quasimetric_logit = True
-config.use_goal_potential = True
-config.twin_q = True
+
+
 
 obs_repr_shape = 4
 state_repr_shape = 2
@@ -106,7 +106,7 @@ def get_point_map(env_name):
 
 def load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = False, ckpt_num = None, NUM_EPISODES = 10, alg = 'contrastive_cpc', uid = None):
     state_entropy_coefficient = alpha
-    
+    config = ContrastiveConfig()
     ckpt_dir = '{}/{}_{}_{}/checkpoints/learner'.format(log_dir, alg, env_name,seed)
     if uid is not None:
         ckpt_dir = '{}/{}_{}_{}/{}/checkpoints/learner'.format(log_dir, alg, env_name, seed, uid)
@@ -128,6 +128,25 @@ def load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = Fal
     else:
         fixed_start_end = None
     
+
+
+    run_root = os.path.dirname(os.path.dirname(ckpt_dir))      # “…/ALG_ENV_SEED[/uid]”
+    cfg_path = os.path.join(run_root, "config.json")
+
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "r") as f:
+            override = json.load(f)
+        print(f"[config] overriding from {cfg_path}", flush=True)
+
+        # ensure dot-access even for new keys
+        if not isinstance(config, SimpleNamespace):
+            config = SimpleNamespace(**vars(config))
+
+        # overwrite only the keys present in the JSON
+        for k, v in override.items():
+            setattr(config, k, v)
+    else:
+        print(f"[config] {cfg_path} not found – using code defaults", flush=True)
     
     env_factory = lambda seed: make_environment(env_name, config.start_index, 
                                                 config.end_index, seed=np.random.randint(1e6), fixed_start_end=fixed_start_end)[0] 
@@ -140,7 +159,7 @@ def load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = Fal
         make_networks, obs_dim=obs_dim, repr_dim=config.repr_dim,
         repr_norm=config.repr_norm, twin_q=False,
         use_image_obs=config.use_image_obs,
-        hidden_layer_sizes=config.hidden_layer_sizes,
+        hidden_layer_sizes=config.hidden_layer_sizes, config=config
     )
 
     random_key = jax.random.PRNGKey(np.random.choice(int(1e6)))
@@ -148,6 +167,7 @@ def load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = Fal
     policy_optimizer = optax.adam(
         learning_rate=config.actor_learning_rate)
     q_optimizer = optax.adam(.001)#learning_rate=config.critic_learning_rate
+    print(config)
 
     trained_learner = ContrastiveLearner(
         networks=networks,
