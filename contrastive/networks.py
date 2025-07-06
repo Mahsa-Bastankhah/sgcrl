@@ -65,6 +65,10 @@ class ResidualMLP(hk.Module):
 
             # Residual: add skip when dims match and it's a skip point
             if self._skip_every and (i + 1) % self._skip_every == 0:
+                print("Checking for skip connection skip every", self._skip_every, flush=True)
+                print("i:", i, flush=True)
+                print("h shape:", h.shape[-1], flush=True)
+                print("skip shape:", skip.shape[-1] if skip is not None else None, flush=True)
                 if skip is not None and skip.shape[-1] == h.shape[-1]:
                     print("Adding skip connection at layer", i, flush=True)
                     h = skip + h
@@ -227,37 +231,41 @@ def make_networks(
     else:
       state, goal = hidden
 
-    sa_encoder = hk.nets.MLP(
+
+    if config.use_residual_mlp is False:
+      sa_encoder = hk.nets.MLP(
+          list(hidden_layer_sizes) + [repr_dim],
+          w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+          activation=jax.nn.relu,
+          name='sa_encoder')
+      sa_repr = sa_encoder(jnp.concatenate([state, action], axis=-1))
+
+      g_encoder = hk.nets.MLP(
+          list(hidden_layer_sizes) + [repr_dim],
+          w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+          activation=jax.nn.relu,
+          name='g_encoder')
+      g_repr = g_encoder(goal)
+
+
+    if config.use_residual_mlp:
+      sa_encoder = ResidualMLP(
         list(hidden_layer_sizes) + [repr_dim],
-        w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
-        activation=jax.nn.relu,
+        skip_every=4,              # <- every 2 layers get a skip; tune as you like
+        activation=jax.nn.swish,
+        use_layer_norm=True,
         name='sa_encoder')
-    sa_repr = sa_encoder(jnp.concatenate([state, action], axis=-1))
+      sa_repr = sa_encoder(jnp.concatenate([state, action], axis=-1))
 
-    g_encoder = hk.nets.MLP(
-        list(hidden_layer_sizes) + [repr_dim],
-        w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
-        activation=jax.nn.relu,
-        name='g_encoder')
-    g_repr = g_encoder(goal)
+      g_encoder = ResidualMLP(
+          list(hidden_layer_sizes) + [repr_dim],
+          skip_every=4,
+          activation=jax.nn.swish,
+          use_layer_norm=True,
+          name='g_encoder')
+      g_repr = g_encoder(goal)
 
-    # sa_encoder = ResidualMLP(
-    #   list(hidden_layer_sizes) + [repr_dim],
-    #   skip_every=2,              # <- every 2 layers get a skip; tune as you like
-    #   activation=jax.nn.relu,
-    #   use_layer_norm=True,
-    #   name='sa_encoder')
-    # sa_repr = sa_encoder(jnp.concatenate([state, action], axis=-1))
-
-    # g_encoder = ResidualMLP(
-    #     list(hidden_layer_sizes) + [repr_dim],
-    #     skip_every=2,
-    #     activation=jax.nn.relu,
-    #     use_layer_norm=True,
-    #     name='g_encoder')
-    #g_repr = g_encoder(goal)
-
-      ## adding relu to make all the elements of the psi vector positive
+      # adding relu to make all the elements of the psi vector positive
       #g_repr = jax.nn.relu(g_repr)
 
     if repr_norm:
@@ -297,16 +305,37 @@ def make_networks(
       state, goal = _unflatten_obs(obs)
       obs = jnp.concatenate([state, goal], axis=-1)
       obs = TORSO()(obs)
-    network = hk.Sequential([
-        hk.nets.MLP(
-            list(hidden_layer_sizes),
-            w_init=hk.initializers.VarianceScaling(1.0, 'fan_in', 'uniform'),
-            activation=jax.nn.relu,
-            activate_final=True),
-        NormalTanhDistribution(num_dimensions, min_scale=actor_min_std),
-    ])
+    # network = hk.Sequential([
+    #     hk.nets.MLP(
+    #         list(hidden_layer_sizes),
+    #         w_init=hk.initializers.VarianceScaling(1.0, 'fan_in', 'uniform'),
+    #         activation=jax.nn.relu,
+    #         activate_final=True),
+    #     NormalTanhDistribution(num_dimensions, min_scale=actor_min_std),
+    # ])
+
+      # ── 1. choose trunk (MLP vs ResidualMLP) in-place ─────────────────────────
+    trunk = ResidualMLP(                            # your critic style
+        list(hidden_layer_sizes),
+        skip_every=4,
+        activation=jax.nn.swish,
+        use_layer_norm=True,
+        name="policy_trunk",
+    ) if config.use_residual_mlp else hk.nets.MLP(  # fallback to plain MLP
+        list(hidden_layer_sizes),
+        w_init=hk.initializers.VarianceScaling(1.0, "fan_in", "uniform"),
+        activation=jax.nn.relu,
+        name="policy_trunk",
+    )
+    seq_layers = [trunk]
+    # ― final distribution head
+    seq_layers.append(NormalTanhDistribution(num_dimensions, min_scale=actor_min_std))
+
+    # ── 3. assemble and call ──────────────────────────────────────────────────
+    network = hk.Sequential(seq_layers)
 
 
+  
     return network(obs)
 
   policy = hk.without_apply_rng(hk.transform(_actor_fn))

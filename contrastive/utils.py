@@ -2,7 +2,8 @@
 import functools
 from typing import Dict
 from typing import Optional, Sequence
-
+import re
+import jax
 from acme import types
 from acme.agents.jax import actors
 from acme.jax import networks as network_lib
@@ -189,15 +190,34 @@ def make_environment(env_name, start_index, end_index,
   return env, obs_dim
 
 
+
+
 class InitiallyRandomActor(actors.GenericActor):
   """Actor that takes actions uniformly at random until the actor is updated.
   """
 
   def select_action(self,
                     observation):
-    # print("param tree structure: {}", jax.tree_util.tree_structure(self._params), flush=True)
-    if (self._params[0]['mlp/~/linear_0']['b'] == 0).all():
+      # ── helper ---------------------------------------------------------
+    def _first_linear0_bias_is_zero(param_tree) -> bool:
+      """Return True iff the first bias tensor of a *linear_0 module* is all-zeros.
+      Works for both MLP and ResidualMLP trunks because it searches by regex."""
+      for name, subdict in param_tree.items():
+        if re.search(r'/linear_0$', name) and isinstance(subdict, dict) and 'b' in subdict:
+          return (subdict['b'] == 0).all()
+      # Fallback: if we didn’t find such a module, assume weights are *not* zeros.
+      return False
+      # print("param tree structure: {}", jax.tree_util.tree_structure(self._params), flush=True)
+      # if (self._params[0]['mlp/~/linear_0']['b'] == 0).all():
+    
+    
+    params_root = self._params[0]               # same as before
+
+    if _first_linear0_bias_is_zero(params_root):
+      print("Using random actions because first linear_0 bias is zero.",
+            flush=True)
       shape = self._params[0]['Normal/~/linear']['b'].shape
+      print("Action shape: {}".format(shape), flush=True)
       rng, self._state = jax.random.split(self._state)
       action = jax.random.uniform(key=rng, shape=shape,
                                   minval=-1.0, maxval=1.0)

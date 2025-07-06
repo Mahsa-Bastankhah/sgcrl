@@ -27,7 +27,7 @@ flags.DEFINE_integer('seed', 12, 'Specify seed, only used if use_slurm_array is 
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
 flags.DEFINE_string('alg', 'contrastive_cpc', 'Algorithm type, e.g. default is contrastive_cpc with no entropy or KL losses')
 flags.DEFINE_string('env', 'sawyer_bin', 'Environment type, e.g. default is sawyer bin')
-flags.DEFINE_integer('num_steps', 1_000_000, 'Number of steps to run', lower_bound=0)
+flags.DEFINE_integer('num_steps', 2_000_000, 'Number of steps to run', lower_bound=0)
 flags.DEFINE_bool('sample_goals', False, 'sample the goal position uniformly according to the environment (corresponds to the original contrastive_rl algorithm)')
 flags.DEFINE_string(
     'init_weight',          # flag name
@@ -43,18 +43,27 @@ flags.DEFINE_multi_integer(
     'Repeat the flag for each layer, e.g. '
     '"--hidden_layer_sizes=512 --hidden_layer_sizes=256".')
 flags.DEFINE_integer('goal_neg_actor_steps', 0, 'Number of actor steps to use goal as a negative example', lower_bound=0)
+flags.DEFINE_integer('goal_pos_actor_steps', 0, 'Number of actor steps to use goal as a positive example', lower_bound=0)
 flags.DEFINE_bool('softmax_repr', False, 'Whether to do softmax normalization on the representation. ')
 flags.DEFINE_bool('cold_q_init', False, 'Whether to do cold initialization for the Q network. ')
 flags.DEFINE_float('cold_q_scale', 1e-12 , 'Cold initialization scale for the Q network. ')
+flags.DEFINE_integer('perturbed_negatives_num', 0, 'Number of purturbed negatives to sample. If 0, no perturbation is done.')
+flags.DEFINE_integer('perturbed_negatives_goal_num', 0, 'Number of purturbed negatives to sample for the goal. If 0, no perturbation is done.')
+flags.DEFINE_string('fixed_goal', None, 'Override the fixed goal with a custom goal coordinate as a comma-separated string, e.g., "0.1,0.2,0.3"')
+flags.DEFINE_bool('use_residual_mlp', False, 'whether to use residual MLP for representation learning')
+
+
+
+
 
 
 
 # fixed goal coordinates for supported environments
 fixed_goal_dict={'point_Spiral11x11': [np.array([5,5], dtype=float), np.array([10,10], dtype=float)],
                  'point_FourRooms': [np.array([0,0], dtype=float), np.array([10,8], dtype=float)], #[10,8] #[0,10] [5,10]
-                 'point_Impossible' :  [np.array([9,0], dtype=float), np.array([0,9], dtype=float)], # hardest right before the final wall [7,8], [2,6] is too easy
+                 'point_Impossible' :  [np.array([9,0], dtype=float), np.array([7 , 9], dtype=float)], # hardest right before the final wall [7,9]
                  'point_Maze11x11' : [np.array([0,0], dtype=float), np.array([5,4], dtype=float)], # hardest [11,11] , [5,4] doable using 1024 network
-                 'point_Wall11x11' : [np.array([2,8], dtype=float), np.array([0,10], dtype=float)], # hardest [11,11] , [5,4] doable using 1024 network
+                 'point_Wall11x11' : [np.array([2,0], dtype=float), np.array([0,0], dtype=float)], # hardest [2,0] [0,0] easier [2,8] [0,10]
                      #note: sawyer fixed goal positions vary slightly with each episode
                       'sawyer_bin': np.array([0.12, 0.7, 0.02]),
                       'sawyer_box': np.array([0.0, 0.75, 0.133]),
@@ -66,6 +75,15 @@ def get_env(env_name, start_index, end_index, seed, fix_goals = False, fix_goals
     fixed_start_end = fixed_goal_dict[env_name]
   else:
     fixed_start_end = None
+  
+  if FLAGS.fixed_goal:
+    try:
+        # Parse string input like "0.1,0.2,0.3"
+        goal_coords = np.array([float(x) for x in FLAGS.fixed_goal.split(',')])
+        fixed_start_end[1] = goal_coords
+        print(f"Overriding fixed goal with custom input: {fixed_start_end}")
+    except Exception as e:
+        raise ValueError(f"Invalid format for --fixed_goal: {FLAGS.fixed_goal}") from e
     
   return contrastive_utils.make_environment(env_name, start_index, end_index, seed=seed, fixed_start_end = fixed_start_end)
 
@@ -85,6 +103,17 @@ def get_program(params):
     fixed_start_end = fixed_goal_dict[env_name]
   else:
     fixed_start_end = None
+
+
+  if FLAGS.fixed_goal:
+    try:
+        # Parse string input like "0.1,0.2,0.3"
+        goal_coords = np.array([float(x) for x in FLAGS.fixed_goal.split(',')])
+        fixed_start_end[1] = goal_coords
+        print(f"Overriding fixed goal with custom input: {fixed_start_end}")
+    except Exception as e:
+        raise ValueError(f"Invalid format for --fixed_goal: {FLAGS.fixed_goal}") from e
+
 
   print('Using fixed start and end: {}...'.format(fixed_start_end))
     
@@ -131,6 +160,17 @@ def main(_):
   #   2D nav: point_{Spiral11x11}
   env_name = FLAGS.env
   print('Using env {}...'.format(env_name))
+  goal_coords = fixed_goal_dict.get(env_name, None)[1]
+
+
+  if FLAGS.fixed_goal:
+    print(f"Overriding fixed goal with custom input: {FLAGS.fixed_goal}")
+    try:
+        # Parse string input like "0.1,0.2,0.3"
+        goal_coords = np.array([float(x) for x in FLAGS.fixed_goal.split(',')])
+        print(f"Overriding fixed goal with custom input: {goal_coords}")
+    except Exception as e:
+        raise ValueError(f"Invalid format for --fixed_goal: {FLAGS.fixed_goal}") from e
   
   seed_idx = FLAGS.seed
   print('Using random seed {}...'.format(seed_idx))
@@ -154,13 +194,19 @@ def main(_):
   params['fix_goals'] = not FLAGS.sample_goals
   params['hidden_layer_sizes'] = tuple(FLAGS.hidden_layer_sizes)
   params['goal_neg_actor_steps'] = FLAGS.goal_neg_actor_steps
+  params['use_residual_mlp'] = FLAGS.use_residual_mlp
+  params['goal_pos_actor_steps'] = FLAGS.goal_pos_actor_steps
   add_uid = FLAGS.add_uid
   params['softmax_repr'] = FLAGS.softmax_repr
   params['cold_q_init'] = FLAGS.cold_q_init
+  params['perturbed_negatives_num'] = FLAGS.perturbed_negatives_num
+  params['perturbed_negatives_goal_num'] = FLAGS.perturbed_negatives_goal_num
   params['cold_q_scale'] = FLAGS.cold_q_scale
-  goal_entry = fixed_goal_dict[env_name][1]
-  params['fixed_goal'] = tuple(goal_entry.astype(float))
-  print('Using fixed goal: {}...'.format(params['fixed_goal']))
+  if FLAGS.sample_goals:
+    params['fixed_goal'] = None
+  else:
+    params['fixed_goal'] = tuple(goal_coords.astype(float))
+    print('Using fixed goal: {}...'.format(params['fixed_goal']))
   params['add_uid'] = add_uid
   params['Q_max'] = FLAGS.Q_max
   params['init_weight'] = FLAGS.init_weight

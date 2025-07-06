@@ -35,7 +35,7 @@ from pathlib import Path
 import haiku as hk, jax, jax.numpy as jnp
 from typing import Mapping
 
-goal_neg_sample = True
+
 def load_ckpt(path: str, *, first: bool = True):
     # --------------------------------------------------------
     # 1) Resolve prefix  (dir → ckpt-0  …  or latest)
@@ -253,13 +253,14 @@ class ContrastiveLearner(acme.Learner):
           if config.use_cpc:
             fixed_goal = self.config.fixed_goal
             fixed_goal = jnp.asarray(fixed_goal, dtype=jnp.float32)   # shape (d,)
+            B = _logits.shape[0]
             
             # ## Adding goal as a negative example
             labels = I
             if (fixed_goal is not None) and use_goal_neg:
               # ensure fixed_goal is a JAX array, not a Python list
               # debug.print("[DBG] fixed_goal is not None, using it as a negative example")
-              B = _logits.shape[0]
+              
               
 
 
@@ -293,6 +294,103 @@ class ContrastiveLearner(acme.Learner):
                       [I, jnp.zeros((B, 1), I.dtype)],
                       axis=1)
               #debug.print("[DBG] labels shape after concat {}", labels.shape)
+            if self.config.perturbed_negatives_num > 0:
+              obs_dim = config.obs_dim
+              s, _ = jnp.split(transitions.observation, [obs_dim], axis=1)
+              num_negatives = self.config.perturbed_negatives_num
+              
+
+              # ---- 1. draw uniform noise in [-2 , 2]  ----
+              scale  = 2.0
+              noise  = jax.random.uniform(
+                  key,
+                  shape=(B, num_negatives, obs_dim),
+                  minval=-scale,
+                  maxval= scale
+              )
+              s_perturbed = s[:, None, :] + noise          # (B , 5 , obs_dim)
+
+              # ---- 2. build [s , s′] pairs  ----
+              s_rep             = jnp.repeat(s, num_negatives, axis=0)              # (B*5 , obs_dim)
+              s_perturbed_flat  = s_perturbed.reshape(B * num_negatives, obs_dim)   # (B*5 , obs_dim)
+              obs_neg           = jnp.concatenate([s_rep, s_perturbed_flat], axis=1)  # (B*5 , 2*obs_dim)
+
+              action_rep        = jnp.repeat(transitions.action, num_negatives, axis=0)
+
+
+
+              neg_logits, _, _  = networks.q_network.apply(q_params, obs_neg, action_rep)
+              neg_logits        = neg_logits[:, 0]
+              neg_logits        = neg_logits[:, None] if neg_logits.ndim == 1 else neg_logits[:, None, :]
+              neg_logits        = neg_logits.reshape(B, num_negatives, -1)          # (B , 5 , 1) or (B , 5 , 2)
+              neg_logits = jnp.squeeze(neg_logits, axis=-1)      # (B*K,)  ← get rid of last dim
+              neg_logits = neg_logits.reshape(B, num_negatives)  # (B , K)  rank-2 matrix
+              # ---- 3. concatenate & label  ----
+              _logits = jnp.concatenate([_logits, neg_logits], axis=1)
+              labels  = jnp.concatenate([labels, jnp.zeros((B, num_negatives), I.dtype)], axis=1)                        
+            
+
+            # ------------------------------------------------------------------
+            # (2-alt)  Perturbed-state w/ fixed-goal negatives  q(s′ , g_fixed)
+            # ------------------------------------------------------------------
+            if (self.config.perturbed_negatives_goal_num > 0) and (fixed_goal is not None):
+                obs_dim       = config.obs_dim
+                num_negatives = self.config.perturbed_negatives_goal_num
+
+                # ── split observation into state s | g_original (unused here) ──
+                s, _ = jnp.split(transitions.observation, [obs_dim], axis=1)  # s: (B , obs_dim)
+                B    = s.shape[0]
+
+                # ── 1. draw uniform noise in [-scale , +scale] and perturb s ──
+                
+                scale = 2.0
+                noise = jax.random.uniform(
+                    key,
+                    shape=(B, num_negatives, obs_dim),
+                    minval=-scale,
+                    maxval= scale
+                )
+                s_perturbed = s[:, None, :] + noise                             # (B , K , obs_dim)
+
+                # ── 2. build observations [s′ , g_fixed]  ──
+                s_perturbed_flat = s_perturbed.reshape(B * num_negatives, obs_dim)  # (B*K , obs_dim)
+                g_fixed          = jnp.asarray(self.config.fixed_goal, dtype=jnp.float32)
+                g_fixed_rep      = jnp.broadcast_to(g_fixed, (B * num_negatives, g_fixed.shape[-1]))
+                obs_neg          = jnp.concatenate([s_perturbed_flat, g_fixed_rep], axis=1)  # (B*K , 2*obs_dim)
+
+                action_rep = jnp.repeat(transitions.action, num_negatives, axis=0)  # (B*K , act_dim)
+
+                # ── 3. critic forward: q(s′ , g_fixed) ──
+                # ---- 3. critic forward: full similarity matrix (N × N) ----
+                neg_logits_full, _, _ = networks.q_network.apply(q_params, obs_neg, action_rep)
+
+                # ---- 4. grab just the diagonal  ----------------------------
+                neg_logits_vec = jnp.diag(neg_logits_full)          # (B*K,)
+
+                # If you have twin-Q (rank-3, N × N × 2), use:
+                # neg_logits_vec = jax.vmap(jnp.diag, in_axes=2, out_axes=-1)(neg_logits_full)
+                # neg_logits_vec = jnp.min(neg_logits_vec, axis=-1)  # twin-Q trick
+
+                # ---- 5. reshape to (B , K) so rank = 2 ---------------------
+                neg_logits = neg_logits_vec.reshape(B, num_negatives)   # (B , K)
+
+                # ---- 6. concatenate & label -------------------------------
+                _logits = jnp.concatenate([_logits, neg_logits], axis=1)        # both rank-2
+                labels  = jnp.concatenate(
+                    [labels, jnp.zeros((B, num_negatives), I.dtype)],
+                    axis=1
+                )
+
+
+                # ── 5. sanity prints (work in JIT via jax.debug.print) ──
+                # jax.debug.print("\n[DBG-PG] ----- perturbed+fixed-goal branch -----")
+                # jax.debug.print("[DBG-PG] s.shape              = {}", s.shape)
+                # jax.debug.print("[DBG-PG] s_perturbed.shape     = {}", s_perturbed.shape)
+                # jax.debug.print("[DBG-PG] obs_neg.shape         = {}", obs_neg.shape)
+                # jax.debug.print("[DBG-PG] neg_logits.shape      = {}", neg_logits.shape)
+                # jax.debug.print("[DBG-PG] _logits final shape   = {}", _logits.shape)
+                # jax.debug.print("[DBG-PG] labels  final shape   = {}", labels.shape)
+
             return (optax.softmax_cross_entropy(logits=_logits, labels=labels)
                     + 0.01 * jax.nn.logsumexp(_logits, axis=1)**2)
           else:
@@ -559,7 +657,6 @@ class ContrastiveLearner(acme.Learner):
         policy_optimizer_state = policy_optimizer.init(policy_params)
         q_params = networks.q_network.init(key_q)
 
-        q_params = networks.q_network.init(key_q)
 
         # NEW: cold-start the final layer if requested
         if config.cold_q_init:
@@ -612,6 +709,33 @@ class ContrastiveLearner(acme.Learner):
       actor_steps = counts.get('actor_steps', 0)
       # If the number of actor steps is less than goal_neg_actor_steps then use the goal as a negative example
       use_goal_neg  = actor_steps < self.config.goal_neg_actor_steps
+
+
+      # ──────────────────────────────────────────────────────────────
+      # NEW -- randomly replace 20 % of future states with the fixed goal
+      # ──────────────────────────────────────────────────────────────
+      if self.config.fixed_goal is not None and actor_steps < self.config.goal_pos_actor_steps:
+        obs        = transitions.observation           # (B, 2*obs_dim)
+        B          = obs.shape[0]
+        obs_dim    = self.config.obs_dim               # e.g. 2
+        frac       = 0.2                              # 10 %
+        k1, k2     = jax.random.split(self._state.key) # reuse learner RNG
+        idx        = jax.random.choice(                # (⌈0.1 B⌉,)
+                       k1, B,
+                       (max(1, int(B * frac)),),       # at least one row
+                       replace=False)
+        fixed_goal = jnp.asarray(
+                       self.config.fixed_goal,
+                       dtype=obs.dtype)                # (obs_dim,)
+
+        # broadcast & set the goal part (last obs_dim cols) at idx rows
+        obs  = obs.at[idx, obs_dim:].set(
+                 jnp.broadcast_to(fixed_goal, (idx.size, obs_dim)))
+        #print(f"[DBG] using fixed goal {fixed_goal} as a posuitve example for {idx.size} rows", flush=True)
+        
+        transitions = transitions._replace(observation=obs)
+        # keep the new RNG key in learner state so next step differs
+        self._state = self._state._replace(key=k2)
 
       update_fn = (self._update_step_true
                  if use_goal_neg

@@ -101,3 +101,7 @@ for cluster in "${spiral_clusters[@]}"; do
 done
 
 echo "✅  All jobs submitted.  Tail with:  tail -F logs/*/*.out"
+
+
+##SBATCH --array=0-4              # job array with index values 0, 1, 2, 3, 4
+#SBATCH --partition=mig          

@@ -13,5 +13,8 @@ logs/
 *.log
 *.png
 **/*.png
+**/**/**/**/*.png
+logs/**               # ignore logs anywhere, any depth
+logs
 
 

@@ -8,8 +8,8 @@
 # ------------------------------------------------------------------
 # (Replace ~/miniconda3 with your own Miniconda/Anaconda path if needed)
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate contrastive_rl_nn            # ➜ env: contrastive_rl_nn
-
+conda activate contrastive_rl            # ➜ env: contrastive_rl_nn
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
 # ------------------------------------------------------------------
 # 2) Show CONDA_PREFIX and update LD_LIBRARY_PATH
 # ------------------------------------------------------------------
@@ -33,8 +33,14 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 # seeds=(4000)
 # devices=(7)
 
-seeds=(5500 5501 5502 5503 5504 5505 5506 5507)
+seeds=(6786588)
 devices=(0 1 2 3 4 5 6 7)
+# ➊  Add this block just after you define the seeds / devices
+hidden_sizes=(256 256 256 256 256 256)  # 12 layers
+hidden_flags=()
+for h in "${hidden_sizes[@]}"; do
+  hidden_flags+=(--hidden_layer_sizes "$h")
+done
 
 for idx in "${!seeds[@]}"; do
   SEED=${seeds[$idx]}
@@ -42,12 +48,13 @@ for idx in "${!seeds[@]}"; do
   LOG="lp_contrastive_seed${SEED}.out"
 
   echo "▶ Launching seed $SEED on GPU $DEV  →  $LOG"
-  CUDA_VISIBLE_DEVICES=$DEV \
-    nohup python lp_contrastive.py \
+    CUDA_VISIBLE_DEVICES=$DEV \
+    nohup python -u lp_contrastive.py \
       --env point_Wall11x11 \
       --seed "$SEED" \
-      --goal_neg_actor_steps 700000 \
-      > "$LOG" 2>&1 &
+      --num_steps 1000000 \
+      "${hidden_flags[@]}" \
+      > "$LOG" 2>&1 &   # redirection now belongs to the nohup command
 done
 
 
@@ -59,3 +66,4 @@ echo "✅ All jobs launched (logs in lp_contrastive_seed*.out)"
       # --goal_neg_actor_steps 50000 \
             # --cold_q_init \
             # --cold_q_scale 1e-12 \
+                  # --perturbed_negatives_goal_num 5 \

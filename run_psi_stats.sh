@@ -16,19 +16,21 @@ SUCCESS=(0  0  1  1  0  0  0  0  0  1  0  0  0  0  0  0  0  1  0  1)
 # list of seeds and matching success flags (1 = success, 0 = fail)
 # SEEDS=(2 )
 # SUCCESS=(0)
+SEEDS=(440 441 442 443 444 445 446 447 448 449 450 451 452 453 454 455)
+SUCCESS=(0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  0  )
 
 ## 6 layers exp: 110 , 111, 112, 113, 114, 115, 116, 117, 118
 
 
 ######################################### SPIRAL #########################################
-SEEDS=(2  3  4  5  21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36)
-###### 0  0  1  1  0  0  0  0  0  1  0  0  0  0  0  0  0  1  0  1
-SUCCESS=(0  0  1  1  0  0  0  0  0  1  0  0  0  0  0  0  0  1  0  1)
-# checkpoints you want to analyse
+# SEEDS=(2  3  4  5  21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36)
+# ###### 0  0  1  1  0  0  0  0  0  1  0  0  0  0  0  0  0  1  0  1
+# SUCCESS=(0  0  1  1  0  0  0  0  0  1  0  0  0  0  0  0  0  1  0  1)
+# # checkpoints you want to analyse
 CKPTS=(1 2 3 4 5 8 10)
 
-SEEDS=(26 1100 1101 1102 1103 1104 1105 1106)
-SUCCESS=(1 1     1   1    1    1    1    0  )
+# SEEDS=(26 1100 1101 1102 1103 1104 1105 1106)
+# SUCCESS=(1 1     1   1    1    1    1    0  )
 
 
 # SEEDS=(36 800 801 802 803 804 805 806 807)
@@ -40,7 +42,7 @@ PROJECTED=false
 
 # --- conda env setup (adjust path if needed) ---
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate contrastive_rl_nn
+conda activate contrastive_rl
 echo "CONDA_PREFIX = $CONDA_PREFIX"
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 
@@ -53,7 +55,7 @@ export JAX_PLATFORM_NAME="cpu"
 # flag for psi_stats
 PROJECT_FLAG=""
 $PROJECTED && PROJECT_FLAG="--projected"
-
+echo "Using projected ψ: $PROJECTED"
 # iterate over checkpoints
 for CKPT in "${CKPTS[@]}"; do
   echo "▶ analysing ckpt $CKPT  (projected = $PROJECTED)"

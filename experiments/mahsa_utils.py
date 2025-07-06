@@ -28,6 +28,11 @@ import numpy as np
 from scipy.linalg import subspace_angles
 import json, os
 from types import SimpleNamespace
+from sklearn.manifold import TSNE
+
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 # disable tensorflow_probability warning: The use of `check_types` is deprecated and does not have any effect.
@@ -121,9 +126,9 @@ def load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = Fal
         elif env_name == 'point_FourRooms':
             fixed_start_end = [np.array([0.5,0.5], dtype=float), np.array([8.5,8.5], dtype=float)]
         elif env_name == 'point_Impossible':
-            fixed_start_end = [np.array([9,0], dtype=float), np.array([0,9], dtype=float)]
+            fixed_start_end = [np.array([9,0], dtype=float), np.array([7 , 9], dtype=float)] # [7,9]
         elif env_name == 'point_Wall11x11':
-            fixed_start_end = [np.array([2,8], dtype=float), np.array([0,10], dtype=float)]
+            fixed_start_end = [np.array([2,0], dtype=float), np.array([0,0], dtype=float)]
             #fixed_start_end = [np.array([5,5], dtype=float), np.array([0,10], dtype=float)]
     else:
         fixed_start_end = None
@@ -167,7 +172,7 @@ def load_checkpoint(alpha, misc_params, env_name, log_dir, seed, fix_goals = Fal
     policy_optimizer = optax.adam(
         learning_rate=config.actor_learning_rate)
     q_optimizer = optax.adam(.001)#learning_rate=config.critic_learning_rate
-    print(config)
+    #print(config)
 
     trained_learner = ContrastiveLearner(
         networks=networks,
@@ -671,7 +676,134 @@ def get_cell_projected_psi_norms(env_name, log_dir,  seed, ckpt_num=None, alg = 
 
 
 
+def run_pca_on_visited_cells(
+        env_name: str,
+        log_dir: str,
+        seed: int,
+        ckpt_num: int,
+        alpha: str = "0.1",
+        action_mode: str = "actor_max",
+        grid_width: float = 0.01,
+        num_episodes: int = 10,
+        uid: str = None ,
+    ):
 
+    
+        """
+        • Runs `eval_and_get_cells_visited` to collect visited states.
+        • Extracts φ(s,a) and ψ(s) for those states, plus ψ(g) of the fixed goal.
+        • Projects all vectors to 2-D with PCA and shows a scatter plot.
+        """
+        # ----- 1. collect visited positions & goal -----------------------------
+        (
+            _,
+            _,
+            positions_dict,
+            goals_dict,
+            _,
+        ) = eval_and_get_cells_visited(
+            env_name,
+            log_dir,
+            seed,
+            ckpt_num=ckpt_num,
+            grid_width=grid_width,
+            alpha=alpha,
+            uid=uid,
+            action_mode=action_mode,
+            NUM_EPISODES=num_episodes,
+        )
+        positions = np.concatenate(positions_dict[seed], axis=0)          # (T,2)
+        goal_pos  = goals_dict[seed][0]                                   # (2,)
+        print("goal position", goal_pos)
+
+        # ----- 2. re-load learner & networks -----------------------------------
+        misc_params = f"{alpha}_None"
+        learner_state, env, networks = load_checkpoint(
+            alpha,
+            misc_params,
+            env_name,
+            log_dir,
+            seed,
+            fix_goals=True,
+            ckpt_num=ckpt_num,
+            uid=uid,
+        )
+        obs_dim = env.observation_spec().shape[0] // 2
+
+        # ----- 3. build (obs, action) batch for visited states -----------------
+        obs_batch = np.zeros((positions.shape[0], 2 * obs_dim), dtype=np.float32)
+        
+        obs_batch[:, :obs_dim]  = positions
+        obs_batch[:, obs_dim:]  = positions
+        dist       = networks.policy_network.apply(learner_state.policy_params, obs_batch)
+        act_batch  = np.asarray(dist.mode())
+
+        q_vals, phi_sa, psi_s = networks.q_network.apply(
+            learner_state.q_params, obs_batch, act_batch
+        )
+
+        # ----- 4. get ψ(g) for the fixed goal ----------------------------------
+        goal_obs  = np.zeros((1, 2 * obs_dim), dtype=np.float32)
+        goal_obs[:, obs_dim:] = goal_pos
+        dist_g    = networks.policy_network.apply(learner_state.policy_params, goal_obs)
+        act_g     = np.asarray(dist_g.mode())
+        _, _, psi_g = networks.q_network.apply(learner_state.q_params, goal_obs, act_g)
+
+
+        # ----- 5b. ψ(s_rand) of uniformly-sampled states -----------------
+        num_rand = 500                       # how many random states to show
+        rand_states = np.random.uniform(0, 11, size=(num_rand, obs_dim))  # U[0,11)²
+        rand_obs = np.zeros((num_rand, 2 * obs_dim), dtype=np.float32)
+        rand_obs[:, :obs_dim] = rand_states       # agent at random (x,y)
+        rand_obs[:, obs_dim:] = rand_states       # goal = same (doesn’t matter for ψ(s))
+
+        # policy & critic
+        dist_r = networks.policy_network.apply(learner_state.policy_params, rand_obs)
+        act_r  = np.asarray(dist_r.mode())
+        _, phi_rand, psi_rand = networks.q_network.apply(learner_state.q_params, rand_obs, act_r)
+
+        
+        # ----- 5. t-SNE & plotting ---------------------------------------------
+        # stack _all_ points you want to visualize at once:
+        all_vecs = np.concatenate([
+            phi_sa,           # φ(s,a)
+            psi_s,            # ψ(s)
+            psi_g,   # ψ(g)
+            psi_rand,         # random ψ(s)
+            phi_rand          # random φ(s,a)
+        ], axis=0)
+
+        tsne = TSNE(n_components=2, perplexity=30, random_state=seed)
+        all_2d = tsne.fit_transform(all_vecs)
+
+        # now split them back out
+        Nφ = phi_sa.shape[0]
+        Nψ = psi_s.shape[0]
+        Ng = 1
+        Nr = psi_rand.shape[0]
+
+        φ_2d   = all_2d[           :   Nφ]
+        ψ_2d   = all_2d[Nφ         : Nφ+Nψ]
+        g2d    = all_2d[Nφ+Nψ      : Nφ+Nψ+Ng]
+        ψr_2d  = all_2d[Nφ+Nψ+Ng   : Nφ+Nψ+Ng+Nr]
+        φr_2d  = all_2d[Nφ+Nψ+Ng+Nr:             ]
+
+        fig, ax = plt.subplots(figsize=(6,6))
+        ax.scatter(ψr_2d[:,0], ψr_2d[:,1], s=10, alpha=0.4, c="purple", marker="^", label="ψ(s_random)")
+        ax.scatter(φr_2d[:,0], φr_2d[:,1], s=10, alpha=0.4, c="pink", marker=".", label="φ(s_random)")
+        ax.scatter(φ_2d[:,0],  φ_2d[:,1],  s=8,  alpha=0.4, label="φ(s,a)")
+        ax.scatter(ψ_2d[:,0],  ψ_2d[:,1],  s=8,  alpha=0.4, label="ψ(s)")
+        ax.scatter(g2d[0,0],    g2d[0,1],  marker="*", s=120, c="red", label="ψ(g)")
+
+        ax.set_title("t-SNE of φ/ψ representations")
+        ax.legend()
+        plt.show()
+
+
+
+
+
+    
 
 
 def get_sa_repr_subspace_basis(env, trained_learner_state, networks, goal_locations):
@@ -1038,5 +1170,9 @@ def subspace_transferability(env,
 
 
     return fit_scores, cells , proj_by_cell
+
+
+
+
 
 

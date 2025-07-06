@@ -93,8 +93,10 @@ class ContrastiveConfig:
   softmax_repr : Optional[bool] = False
   cold_q_init: Optional[bool]  = False           # initialise last Q layer near-zero?
   cold_q_scale: Optional[float] = 1e-12          # magnitude to use when cold-starting
-
-
+  goal_pos_actor_steps: Optional[int] = 0  # Number of actor episodes until which the final goal is used as positive example
+  perturbed_negatives_num: Optional[int] = 0  # Whether to sample perturbed negatives
+  perturbed_negatives_goal_num : Optional[int] = 0  # Whether to sample perturbed negatives for goal
+  use_residual_mlp : Optional[bool] = False  # Whether to use residual MLP for representation
 
 
 def target_entropy_from_env_spec(
