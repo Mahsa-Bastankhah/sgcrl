@@ -276,11 +276,48 @@ def make_networks(
       g_repr = g_encoder(goal)
 
 
-    # ❶ Add these two helpers – place them near _repr_fn for clarity
-    def _in_region(x: jnp.ndarray, lower: jnp.ndarray, upper: jnp.ndarray) -> jnp.ndarray:
-        """Returns a (batch,) boolean mask: True if each state lies inside [lower, upper] box."""
-        # jax.debug.print("x {x}", x=x)
-        return jnp.all((x >= lower) & (x <= upper), axis=-1)
+    # # ❶ Add these two helpers – place them near _repr_fn for clarity
+    # def _in_region(x: jnp.ndarray, lower: jnp.ndarray, upper: jnp.ndarray) -> jnp.ndarray:
+    #     """Returns a (batch,) boolean mask: True if each state lies inside [lower, upper] box."""
+    #     # jax.debug.print("x {x}", x=x)
+    #     mask = jnp.all((x >= lower) & (x <= upper), axis=-1)
+    #     # jax.debug.print(mask)
+    #     return mask
+    
+
+    def _in_region(x: jnp.ndarray,
+               lower: jnp.ndarray,
+               upper: jnp.ndarray) -> jnp.ndarray:
+        """
+        Returns a (batch,) mask that is True when each state in `x` lies in
+        *at least one* axis-aligned box defined by `lower, upper`.
+
+        Parameters
+        ----------
+        x      : (B, D)  batch of states
+        lower  : (D,) or (R, D)  lower corner(s) of region box(es)
+        upper  : (D,) or (R, D)  upper corner(s) of region box(es)
+        """
+        # Ensure JAX arrays with matching dtype
+        lower = jnp.asarray(lower, dtype=x.dtype)
+        upper = jnp.asarray(upper, dtype=x.dtype)
+
+        if lower.ndim == 1:
+            # ---- single region --------------------------------------------------
+            return jnp.all((x >= lower) & (x <= upper), axis=-1)   # (B,)
+        else:
+            # ---- multiple regions ----------------------------------------------
+            # lower/upper shape  (R, D)
+            # Build a (R, B, D) boolean tensor: True if inside that coord
+            in_each_region = (x[None, :, :] >= lower[:, None, :]) & \
+                            (x[None, :, :] <= upper[:, None, :])      # (R,B,D)
+
+            # Collapse the D dimension ⇒ (R, B)  then OR across regions ⇒ (B,)
+            return jnp.any(jnp.all(in_each_region, axis=-1), axis=0)
+
+    
+
+
 
     def _replace_with_goal(mask: jnp.ndarray,
                           g_repr: jnp.ndarray,
@@ -295,8 +332,8 @@ def make_networks(
     
         # jax.debug.print(
         #     "⏩ replace_with_goal: masked {m}/{b}  stop_grad={sg}, goal {goal}",
-        #     m=mask.sum(), b=mask.size, sg=stop_grad_to_goal, goal=config.fixed_goal)
-        # small peek at first 3 dims of the first vector
+        #     m=mask.sum(), b=mask.size, sg=stop_grad_to_goal, goal=goal)
+        #small peek at first 3 dims of the first vector
 
       # -----------------------------------------------------------------
         return out
@@ -308,7 +345,9 @@ def make_networks(
         # NEW: ensure they are JAX arrays (works for list / tuple / array)
         lower = jnp.asarray(lower, dtype=state.dtype)
         upper = jnp.asarray(upper, dtype=state.dtype)
-        #jax.debug.print("region_bounds {lower} {upper}", lower=lower, upper=upper)
+        # jax.debug.print("region_bounds {lower} {upper}", lower=lower, upper=upper)
+        # jax.debug.print("goal {goal}", goal=goal)
+        # jax.debug.print("fixed goal {fixed_goal}", fixed_goal =config.fixed_goal)
         mask = _in_region(goal, lower, upper)     # (batch,)
 
         # ▸ 1.  Convert whatever the user put in `config.fixed_goal`

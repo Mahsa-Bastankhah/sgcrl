@@ -36,7 +36,7 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 seeds=(456789)
 devices=(0 1 2 3 4 5 6 7)
 # ➊  Add this block just after you define the seeds / devices
-hidden_sizes=(256 256)  # 12 layers
+hidden_sizes=(256 256 256 256 256 256)  # 12 layers
 hidden_flags=()
 for h in "${hidden_sizes[@]}"; do
   hidden_flags+=(--hidden_layer_sizes "$h")
@@ -52,9 +52,9 @@ for idx in "${!seeds[@]}"; do
     nohup python -u lp_contrastive.py \
       --time_delta_minutes 15 \
       --env point_FourRooms \
+      --region_bounds="0,6:8,11;  0,1:4,6; 7,0:11,4" \
       --seed "$SEED" \
       --num_steps 100000 \
-      --Q_max \
       "${hidden_flags[@]}" \
       > "$LOG" 2>&1 &   # redirection now belongs to the nohup command
 done

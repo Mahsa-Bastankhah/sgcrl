@@ -32,7 +32,7 @@ echo "CUDA_HOME: $CUDA_HOME"
 nvidia-smi
 
 #seeds=(316 317 318 319 320 321 322 323)
-seeds=(1)
+seeds=(99998 99999)
 #seeds=(330 331 332 333 334 335 336 337 338 339 340 341 342 343 344 345)
 #seeds=(10008 10009 10010 10011 10012 10013 10014 10015)
 # seeds=(20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35)
@@ -42,7 +42,7 @@ SEED=${seeds[$SLURM_ARRAY_TASK_ID]}
 #hidden_sizes=(256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256)
 #hidden_sizes=(256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256)
 #hidden_sizes=(256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256 256)
-hidden_sizes=(256 256)
+hidden_sizes=(256 256 256 256 256 256)
 hidden_flags=()
 for h in "${hidden_sizes[@]}"; do
   hidden_flags+=(--hidden_layer_sizes "$h")
@@ -70,20 +70,11 @@ done
       # --region_bounds=7,0:11,4 \ narroew  line in fourrooms
       ## x >> 9 - 10 , y >> 5, 7 >>>>  --region_bounds=9,5:10,7 \ --region_bounds=low_x,low_y:high_x,high_y \
 
-# python -u lp_contrastive.py \
-#       --time_delta_minutes 15 \
-#       --env point_Impossible \
-#       --nonegative_goal_repr \
-#       --seed "$SEED" \
-#       --Q_max \
-#       --region_bounds=4,2:6,4 \
-#       --num_steps 8000000 \
-#       "${hidden_flags[@]}" \
 
 
 python -u lp_contrastive.py \
       --time_delta_minutes 15 \
-      --env sawyer_bin \
+      --env point_Impossible \
       --seed "$SEED" \
       --num_steps 8000000 \
 

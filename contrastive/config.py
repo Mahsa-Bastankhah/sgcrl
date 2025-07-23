@@ -60,7 +60,7 @@ class ContrastiveConfig:
   no_repr: bool = False
   repr_dim: Union[int, str] = 64  # Size of representation.
   use_random_actor: bool = True  # Initial with uniform random policy.
-  repr_norm: bool = False
+  repr_norm: bool = True
   use_cpc: bool = False
   local: bool = False  # Whether running locally. Disables eval.
   use_td: bool = False

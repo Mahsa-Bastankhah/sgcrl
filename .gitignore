@@ -12,4 +12,5 @@ archived/
 logs
 **/**/*.png
 *.log
+runs_final/
 

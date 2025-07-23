@@ -184,7 +184,13 @@ def main(_):
   #   2D nav: point_{Spiral11x11}
   env_name = FLAGS.env
   print('Using env {}...'.format(env_name))
-  goal_coords = fixed_goal_dict.get(env_name, None)[1]
+  print(" fixed goal being an instance of ", type(fixed_goal_dict.get(env_name, None)))
+  if isinstance(fixed_goal_dict.get(env_name, None), (list, tuple, dict)):
+    goal_coords = fixed_goal_dict.get(env_name, None)[1]
+  else:
+    obj_coords = fixed_goal_dict.get(env_name, None)
+    goal_coords = np.concatenate([obj_coords + np.array([0.0, 0.0, 0.03]),
+                           [0.4], obj_coords])
 
 
   if FLAGS.fixed_goal:
@@ -245,28 +251,40 @@ def main(_):
   if FLAGS.region_bounds is None:
     params['region_bounds'] = None
   else:
-    try:
-        lower_str, upper_str = FLAGS.region_bounds.split(':')
-        lower = jnp.array(list(map(float, lower_str.split(','))),
-                          dtype=jnp.float32)
-        upper = jnp.array(list(map(float, upper_str.split(','))),
-                          dtype=jnp.float32)
-        params['region_bounds'] = (lower.tolist(), upper.tolist())
-    except Exception as e:
-        raise ValueError(
-            f"Bad --region_bounds '{FLAGS.region_bounds}'. "
-            "Use 'x_lo,y_lo:x_hi,y_hi' with no spaces."
-        ) from e
+      try:
+          # 1. split on ';'  → list of "lo:hi" strings
+          boxes = [b.strip() for b in FLAGS.region_bounds.split(';') if b.strip()]
+          lowers, uppers = [], []
+
+          for box in boxes:
+              lower_str, upper_str = box.split(':')
+              lower = list(map(float, lower_str.split(',')))
+              upper = list(map(float, upper_str.split(',')))
+              if len(lower) != len(upper):
+                  raise ValueError(f"Mismatched dims in '{box}'")
+              lowers.append(lower)
+              uppers.append(upper)
+
+          # 2. store as list-of-lists so JAX helper can broadcast
+          params['region_bounds'] = (lowers, uppers)
+
+      except Exception as e:
+          raise ValueError(
+              f"Bad --region_bounds '{FLAGS.region_bounds}'. "
+              "Use 'x_lo,y_lo:x_hi,y_hi' -- or multiple boxes separated by ';'."
+          ) from e
+
   params['stop_grad_fixed'] = FLAGS.stop_grad_fixed
   params['negative_goal_repr'] = FLAGS.negative_goal_repr
   # ---- sanity-check ----------------------------------------------------
-  if params.get('region_bounds') is None:
+  rb = params.get('region_bounds')
+  if rb is None:
       print("[mask] region_bounds = None  → masking DISABLED")
   else:
-      lo, hi = params['region_bounds']
-      print(f"[mask] region_bounds:"
-            f"  lower = {lo}   upper = {hi}   "
-            f"stop_grad_fixed = {params['stop_grad_fixed']}")
+      lowers, uppers = rb
+      for i, (lo, hi) in enumerate(zip(lowers, uppers)):
+          print(f"[mask] box {i}: lower={lo}  upper={hi}")
+      print(f"stop_grad_fixed = {params['stop_grad_fixed']}")
 # stop-grad flag
   
   if alg == 'contrastive_cpc':
