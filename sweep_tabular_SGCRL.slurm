@@ -31,9 +31,9 @@ REPLAY_CAPS=(1000)      # new
 MAX_STEPS_LIST=(100)    # new
 ## I think 64 is too small, 128 is better
 BATCH_SIZES=(128)       # new
-NUM_EPISODES_LIST=(200000)  # new
+NUM_EPISODES_LIST=(100000)  # new
 GAMMAS=(0.99)           # new
-SEEDS=(100 101 102 103)
+SEEDS=(112 113 114)
 entropy_coeff=(0.1)
 # -------------------------------------------------------------------
 
@@ -120,4 +120,5 @@ python -u tabular_SGCRL.py \
   --gamma "$GAM" \
   --seed "$SEED" \
   --entropy_coeff "$ECO" \
-  --random_exploration True \
+  --random_exploration False \
+  --two_goals True \
