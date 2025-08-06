@@ -14,11 +14,11 @@ NEAR_VARS=(0.2)
 FAR_VARS=(5.0)
 ALPHAS=(100)
 REPLAY_CAPS=(1000)
-MAX_STEPS_LIST=(100)
+MAX_STEPS_LIST=(30)
 BATCH_SIZES=(128)
-NUM_EPISODES_LIST=(50000)
+NUM_EPISODES_LIST=(100000)
 GAMMAS=(0.99)
-SEEDS=(118)
+SEEDS=(211)
 entropy_coeff=(0.1)
 # -------------------------------------------------------
 
@@ -41,7 +41,7 @@ for REP in "${REP_DIMS[@]}"; do
                           echo "replay_cap=$RCAP max_steps=$MSTEP batch_size=$BS num_episodes=$NEPI gamma=$GAM entropy_coeff=$ECO seed=$SEED"
                           echo "------------------------------------------------------------"
 
-                          python -u tabular_SGCRL.py \
+                          nohup python -u tabular_SGCRL.py \
                             --rep-dim "$REP" \
                             --episodes-per-upd "$UPD" \
                             --lr-phi-psi "$LR" \
@@ -55,8 +55,9 @@ for REP in "${REP_DIMS[@]}"; do
                             --gamma "$GAM" \
                             --seed "$SEED" \
                             --entropy_coeff "$ECO" \
+                            --loss_mode "backward" \
+                            --env "fourRooms10" \
                             --verbose True \
-                            --random_exploration True \
 
                         done
                       done

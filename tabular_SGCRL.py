@@ -17,7 +17,7 @@ import argparse, json, time, os
 from pathlib import Path
 import hashlib
 
-
+import re
                # lightweight optimiser library for JAX
 # -------- Imports ------------------------------------------------------------
 import numpy as np
@@ -25,102 +25,7 @@ import matplotlib.pyplot as plt
 from tqdm import trange, tqdm
 from collections import deque 
 
-# -------- Maze construction --------------------------------------------------
-HEIGHT, WIDTH = 10, 10
-GOAL_COORD = (9, 9)                           # row 29, col 29 (zero-indexed)
-walls = np.zeros((HEIGHT, WIDTH), dtype=int)
-DOOR_LEN = 2   
-# horizontal wall
-walls[HEIGHT // 2, :] = 1
-doors_h = np.concatenate([
-    WIDTH // 4 + np.arange(DOOR_LEN),
-    WIDTH * 3 // 4 + np.arange(DOOR_LEN)
-])
-walls[HEIGHT // 2, doors_h] = 0
 
-# vertical wall
-walls[:, WIDTH // 2] = 1
-doors_v = np.concatenate([
-    HEIGHT // 4 + np.arange(DOOR_LEN),
-    HEIGHT * 3 // 4 + np.arange(DOOR_LEN)
-])
-walls[doors_v, WIDTH // 2] = 0
-
-empty_states = np.where(walls.flatten() == 0)[0]
-
-
-# HEIGHT, WIDTH = 5, 5
-# GOAL_COORD = (4, 4)  # zero-indexed bottom-right corner
-# walls = np.zeros((HEIGHT, WIDTH), dtype=int)  # no walls
-
-# empty_states = np.where(walls.flatten() == 0)[0]
-
-NUM_STATES     = HEIGHT * WIDTH
-NUM_ACTIONS    = 5           # stay, down, up, right, left
-A_TO_DELTA     = np.array([[0, 0],
-                           [1, 0], [-1, 0],
-                           [0, 1], [0, -1]])
-# NUM_ACTIONS    = 4           # stay, down, up, right, left
-# A_TO_DELTA     = np.array([[1, 0], [-1, 0],
-#                            [0, 1], [0, -1]])
-START_STATE = np.ravel_multi_index((0, 0), walls.shape) 
-
-#### spiral
-# -------- Maze construction: spiral pattern -------------------------------
-# HEIGHT = WIDTH = 11
-# GOAL_COORD = (10, 10)               # bottom-right (zero-indexed)
-
-# # 1 = wall, 0 = free space
-# walls = np.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-#                   [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-#                   [1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0],
-#                   [1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0],
-#                   [1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0],
-#                   [1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0],
-#                   [1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0],
-#                   [1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0],
-#                   [1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0],
-#                   [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
-#                   [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]])
-
-# # ---------------------------------------------------------------------------
-# empty_states = np.where(walls.flatten() == 0)[0]
-# NUM_STATES   = HEIGHT * WIDTH
-# NUM_ACTIONS  = 5                     # stay, down, up, right, left
-# A_TO_DELTA   = np.array([[0, 0],
-#                          [1, 0], [-1, 0],
-#                          [0, 1], [0, -1]])
-# START_STATE = np.ravel_multi_index((5, 5), walls.shape) 
-
-
-
-
-
-
-### impossible goal
-# walls = np.array([[0, 1, 0, 0, 0, 0, 0, 0, 0],
-#                   [0, 1, 0, 1, 1, 1, 1, 1, 0],
-#                   [0, 1, 0, 0, 0, 0, 1, 0, 0],
-#                   [0, 1, 1, 1, 1, 0, 1, 0, 1],
-#                   [0, 1, 0, 0, 0, 0, 1, 0, 0],
-#                   [0, 1, 0, 1, 1, 1, 1, 1, 0],
-#                   [0, 0, 0, 1, 0, 0, 0, 1, 0],
-#                   [0, 1, 0, 1, 0, 1, 0, 1, 1],
-#                   [0, 1, 0, 0, 0, 1, 0, 1, 0]])
-
-# HEIGHT = WIDTH = 9
-# GOAL_COORD = (6, 8)               # bottom-right (zero-indexed)
-
-
-
-# # ---------------------------------------------------------------------------
-# empty_states = np.where(walls.flatten() == 0)[0]
-# NUM_STATES   = HEIGHT * WIDTH
-# NUM_ACTIONS  = 5                     # stay, down, up, right, left
-# A_TO_DELTA   = np.array([[0, 0],
-#                          [1, 0], [-1, 0],
-#                          [0, 1], [0, -1]])
-# START_STATE = np.ravel_multi_index((0, 0), walls.shape) 
 
 
 # -------- Environment helpers ------------------------------------------------
@@ -134,15 +39,6 @@ def step(state: int, action: int) -> int:
     return state  # blocked: stay in place
 
 
-# -------- Environment helpers ------------------------------------------------
-def step(state: int, action: int) -> int:
-    """Deterministic step function for the maze."""
-    di, dj = A_TO_DELTA[action]
-    i, j   = np.unravel_index(state, walls.shape)
-    ni, nj = i + di, j + dj
-    if 0 <= ni < HEIGHT and 0 <= nj < WIDTH and walls[ni, nj] == 0:
-        return np.ravel_multi_index((ni, nj), walls.shape)
-    return state  # blocked: stay in place
 
 
 
@@ -166,10 +62,11 @@ def parse_args():
     p.add_argument("--entropy_coeff",            type=float, default=0.1)
     p.add_argument("--random_exploration",         type=bool, default=False)
     p.add_argument("--two_goals",         type=bool, default=False)
-    p.add_argument("--distance_aware_init",         type=bool, default=False)
     p.add_argument("--verbose",         type=bool, default=False)
-    p.add_argument("--fully_random_init",         type=bool, default=False)
-    p.add_argument("--loss",         type=str, default="backward")
+    p.add_argument("--init_mode",         type=str, default="uniform_around_goal" , choices=["distance_aware", "uniform_around_goal", "fully_random"])
+    p.add_argument("--loss_mode",         type=str, default="backward")
+    p.add_argument("--env",         type=str, default="fourRooms10", choices=["fourRooms10", "spiral", "impossible_maze", "fourRooms20", "box"])
+    p.add_argument("--relative_sim_factor",       type=bool,   default=False, help="whether to use relative similarity factor in the softmax action selection")
     return p.parse_args()
 
 args = parse_args()
@@ -187,7 +84,7 @@ seed             = args.seed
 replay_capacity  = args.replay_capacity
 near_var         = args.near_var
 far_var          = args.far_var
-fully_random_init = args.fully_random_init
+init_mode        = args.init_mode
 verbose = args.verbose
 alpha            = args.alpha
 # plot_mult        = args.plot_mult
@@ -199,7 +96,11 @@ norm = True
 random_exploration = args.random_exploration
 two_goals = args.two_goals
 plain_goal = False
-distance_aware_init = args.distance_aware_init
+env = args.env
+relavce_sim_factor = args.relative_sim_factor
+rer_order_exp = False
+
+loss_mode = args.loss_mode
 
 np.random.seed(seed)
 
@@ -223,10 +124,171 @@ config = {
     "random_exploration": random_exploration,
     "norm": norm,
     "two_goals": two_goals,
-    "distance_aware_init": distance_aware_init,
-    "fully_random_init": fully_random_init,
-    "loss": args.loss,
+    "loss_mode": loss_mode,
+    "init_mode": init_mode,
+    "env" : env,
+    "relative_sim_factor" : relavce_sim_factor,
+    "rer_order_exp" : rer_order_exp,
 }
+
+
+if "fourRooms" in env:
+    match = re.search(r"fourRooms(\d+)", env)
+    if match:
+        size = int(match.group(1))  # e.g. 10 or 20
+    else:
+        raise ValueError(f"Could not determine size from env name: {env}")
+    
+    
+    # -------- Maze construction --------------------------------------------------
+    HEIGHT, WIDTH = size , size
+    GOAL_COORD = (size - 1, size - 1)                           # row 29, col 29 (zero-indexed)
+    walls = np.zeros((HEIGHT, WIDTH), dtype=int)
+    DOOR_LEN = 2   
+    # horizontal wall
+    walls[HEIGHT // 2, :] = 1
+    doors_h = np.concatenate([
+        WIDTH // 4 + np.arange(DOOR_LEN),
+        WIDTH * 3 // 4 + np.arange(DOOR_LEN)
+    ])
+    walls[HEIGHT // 2, doors_h] = 0
+
+    # vertical wall
+    walls[:, WIDTH // 2] = 1
+    doors_v = np.concatenate([
+        HEIGHT // 4 + np.arange(DOOR_LEN),
+        HEIGHT * 3 // 4 + np.arange(DOOR_LEN)
+    ])
+    walls[doors_v, WIDTH // 2] = 0
+
+    empty_states = np.where(walls.flatten() == 0)[0]
+
+
+    # HEIGHT, WIDTH = 5, 5
+    # GOAL_COORD = (4, 4)  # zero-indexed bottom-right corner
+    # walls = np.zeros((HEIGHT, WIDTH), dtype=int)  # no walls
+
+    # empty_states = np.where(walls.flatten() == 0)[0]
+
+    NUM_STATES     = HEIGHT * WIDTH
+    NUM_ACTIONS    = 5           # stay, down, up, right, left
+    A_TO_DELTA     = np.array([[0, 0],
+                            [1, 0], [-1, 0],
+                            [0, 1], [0, -1]])
+    # NUM_ACTIONS    = 4           # stay, down, up, right, left
+    # A_TO_DELTA     = np.array([[1, 0], [-1, 0],
+    #                            [0, 1], [0, -1]])
+    START_STATE = np.ravel_multi_index((0, 0), walls.shape) 
+
+elif env == "box":
+    HEIGHT, WIDTH = 5, 5
+    GOAL_COORD = (4, 4)  # zero-indexed bottom-right corner
+    walls = np.zeros((HEIGHT, WIDTH), dtype=int)  # no walls
+
+    empty_states = np.where(walls.flatten() == 0)[0]
+
+    NUM_STATES     = HEIGHT * WIDTH
+    NUM_ACTIONS    = 5           # stay, down, up, right, left
+    A_TO_DELTA     = np.array([[0, 0],
+                            [1, 0], [-1, 0],
+                            [0, 1], [0, -1]])
+    # NUM_ACTIONS    = 4           # stay, down, up, right, left
+    # A_TO_DELTA     = np.array([[1, 0], [-1, 0],
+    #                            [0, 1], [0, -1]])
+    START_STATE = np.ravel_multi_index((0, 0), walls.shape) 
+
+elif env == "spiral":
+    # -------- Maze construction: spiral pattern -------------------------------
+    HEIGHT = WIDTH = 11
+    GOAL_COORD = (10, 10)               # bottom-right (zero-indexed)
+
+    # 1 = wall, 0 = free space
+    walls = np.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                      [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                      [1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0],
+                      [1, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0],
+                      [1, 0, 1, 0, 1, 1, 1, 1, 0, 1, 0],
+                      [1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0],
+                      [1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0],
+                      [1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0],
+                      [1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 0],
+                      [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
+                      [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]])
+
+    # ---------------------------------------------------------------------------
+    empty_states = np.where(walls.flatten() == 0)[0]
+    NUM_STATES   = HEIGHT * WIDTH
+    NUM_ACTIONS  = 5                     # stay, down, up, right, left
+    A_TO_DELTA   = np.array([[0, 0],
+                             [1, 0], [-1, 0],
+                             [0, 1], [0, -1]])
+    START_STATE = np.ravel_multi_index((5, 5), walls.shape) 
+
+elif env == "impossible_maze":
+    walls = np.array([
+    [0,1,0,0,0,0,0,0,0],
+    [0,1,0,1,1,1,1,1,0],
+    [0,1,0,0,0,0,1,0,0],
+    [0,1,1,1,1,0,1,0,1],
+    [0,1,0,0,0,0,1,0,0],
+    [0,1,0,1,1,1,1,1,0],
+    [0,0,0,1,0,0,0,1,0],
+    [0,1,0,1,0,1,0,1,1],
+    [0,1,0,0,0,1,0,1,0]
+    ], dtype=np.int8)
+
+    HEIGHT = WIDTH = 9
+    GOAL_COORD = (6, 8)  # (row, col)
+
+    k = 4  # scale factor
+
+    # Option: uniformly scale both hallways and walls by 3×
+    # (keeps a proper rectangular numpy array)
+    wide_walls = np.repeat(np.repeat(walls, k, axis=0), k, axis=1)
+
+    # If you prefer, this does the same:
+    # wide_walls = np.kron(walls, np.ones((k, k), dtype=np.int8))
+
+    # Update goal to the center of the expanded block corresponding to the old goal
+    GOAL_COORD = (GOAL_COORD[0]*k + k//2, GOAL_COORD[1]*k + k//2)
+    walls = wide_walls
+    HEIGHT, WIDTH = walls.shape
+
+
+
+    # ---------------------------------------------------------------------------
+    empty_states = np.where(walls.flatten() == 0)[0]
+    NUM_STATES   = HEIGHT * WIDTH
+    NUM_ACTIONS  = 5                     # stay, down, up, right, left
+    A_TO_DELTA   = np.array([[0,0],
+                             [1, 0], [-1, 0],
+                             [0, 1], [0, -1]])
+    START_STATE = np.ravel_multi_index((0, 0), walls.shape) 
+
+else:
+    raise ValueError(f"Unknown environment: {env}. Choose from fourRooms10, spiral, impossible_maze, fourRooms20, box.")
+
+
+
+# NEW: helper to make a unit vector orthogonal to a given vector
+def orthogonal_unit(vec, rng=np.random):
+    v = vec.astype(float)
+    n2 = float(v @ v)
+    if n2 < 1e-12:
+        u = np.zeros_like(v); u[0] = 1.0
+        return u
+    for _ in range(8):
+        r = rng.randn(v.size)
+        u = r - (r @ v) / n2 * v
+        nu = np.linalg.norm(u)
+        if nu > 1e-8:
+            return u / nu
+    # deterministic fallback
+    i = int(np.argmax(np.abs(v)))
+    e = np.zeros_like(v); e[(i + 1) % v.size] = 1.0
+    u = e - (e @ v) / n2 * v
+    return u / (np.linalg.norm(u) + 1e-12)
+
 
 # 2. Create a stable UID *excluding the seed* so same hyperparams with different seeds
 #    land in parallel subfolders under their own seed directory.
@@ -291,36 +353,11 @@ if two_goals:
 
 
 
-# def plane_projector(v1: np.ndarray, v2: np.ndarray):
-#     """Return orthogonal projector P onto span{v1, v2}."""
-#     eps = 1e-8
-#     u1 = v1 / (np.linalg.norm(v1) + eps)
-
-#     v2_orth = v2 - (u1 @ v2) * u1
-#     if np.linalg.norm(v2_orth) < eps:
-#         # fall back to any orthogonal direction
-#         e = np.zeros_like(u1); e[0] = 1.0
-#         if abs(e @ u1) > 0.9:
-#             e = np.zeros_like(u1); e[1] = 1.0
-#         v2_orth = e - (e @ u1) * u1
-
-#     u2 = v2_orth / (np.linalg.norm(v2_orth) + eps)
-#     U  = np.stack([u1, u2], axis=1)   # (d x 2)
-#     P  = U @ U.T                      # (d x d)
-#     return P
-
-# P_plane = None
-# if plain_goal:
-#     psi_goal2 = np.random.randn(rep_dim) * 0.1             # anchor embedding for second goal
-#     psi[goal2] = psi_goal2
-#     P_plane = plane_projector(psi_goal, psi_goal2)
-
-
 
                                  # set goal’s ψ once
 initialization_for_other_states = np.random.randn(rep_dim) * 0.1             # anchor embedding
 ## initialize representations in a distance-aware manner
-if two_goals is False and distance_aware_init:
+if two_goals is False and init_mode == "distance_aware":
     print("[INFO] Initializing ψ(s) distance-aware...")
     for s, c in enumerate(coords):
         if s == goal:
@@ -328,20 +365,56 @@ if two_goals is False and distance_aware_init:
         d         = np.linalg.norm(c - goal_coord)          # L2 to goal
         frac      = (d / max_dist) ** alpha                # 0 near goal → 1 far away
         var_scale = near_var + (far_var - near_var) * frac # extreme scaling
-        print(f"State {s} at {c}: dist={d:.2f}, frac={frac:.2f}, var_scale={var_scale:.2f}")
+        #print(f"State {s} at {c}: dist={d:.2f}, frac={frac:.2f}, var_scale={var_scale:.2f}")
         psi[s]    = psi_goal + np.random.randn(rep_dim) * 0.1 * var_scale
 
 
 
-elif two_goals is False and not distance_aware_init:
+elif two_goals is False and init_mode == "uniform_around_goal":
     print("[INFO] Initializing ψ(s) uniformly around ψ(goal)...")
     for s, c in enumerate(coords):
         if s == goal:
             continue
         psi[s]    =  psi_goal + np.random.randn(rep_dim) * 0.1 *  near_var
+    
+
+    # --- SPECIAL OVERRIDE: 2x2 room centers orthogonal to ψ(goal) ---
+    if rer_order_exp and env == "fourRooms10":
+        # centers of the four rooms for size=10:
+        # rooms are split by row=5 and col=5 (0-indexed). Quarter centers near (2,2), (2,7), (7,2), (7,7).
+        centers = [(2, 2), (2, 7), (7, 2), (7, 7)]
+        # build 2x2 squares starting at each center (i,j) -> cells {(i,j),(i+1,j),(i,j+1),(i+1,j+1)}
+        squares = []
+        for (ci, cj) in centers:
+            cells = [(ci, cj), (ci+1, cj), (ci, cj+1), (ci+1, cj+1)]
+            # keep only free cells inside the maze
+            cells = [(i, j) for (i, j) in cells
+                     if 0 <= i < HEIGHT and 0 <= j < WIDTH and walls[i, j] == 0]
+            squares.extend(cells)
+
+        # a unit vector orthogonal to ψ(goal)
+        u_perp = orthogonal_unit(psi_goal)
+
+        # override those states with u_perp + small noise
+        for (i, j) in squares:
+            s = np.ravel_multi_index((i, j), walls.shape)
+            if s == goal:
+                continue
+            vec = -1 * psi_goal + np.random.randn(rep_dim) * 0.1 * near_var
+            if norm:
+                vec = vec / (np.linalg.norm(vec) + 1e-8)
+            psi[s] = vec
 
 
-elif two_goals is True and distance_aware_init:
+elif two_goals is False and init_mode == "fully_random":
+    print("[INFO] Initializing ψ(s) uniformly at random...")
+    for s, c in enumerate(coords):
+        if s == goal:
+            continue
+        psi[s] = np.random.randn(rep_dim) * 0.1
+
+
+elif two_goals is True and init_mode == "distance_aware":
     print("[INFO] Initializing ψ(s) distance-aware with two goals...")
     for s, c in enumerate(coords):
         if s == goal or s == goal2:
@@ -365,20 +438,41 @@ if norm :
     psi_norms = np.linalg.norm(psi, axis=1, keepdims=True) + 1e-8
     psi /= psi_norms
     
-#### if random exploration is True, initialization is done from scratch 
+
+
+
+# NEW: room split and orthogonal anchor
+mid_r, mid_c = HEIGHT // 2, WIDTH // 2
+
+
 if random_exploration:
     random_goal_psi = np.random.randn(rep_dim) * 0.1
     random_goal_psi /= np.linalg.norm(random_goal_psi) + 1e-8
+    perp_anchor = orthogonal_unit(random_goal_psi) 
     print(f"[INFO] Using random exploration with ψ(goal) = {random_goal_psi[:5]}...")
-    if fully_random_init:
+    if init_mode == "fully_random":
         print("[INFO] Initializing ψ(s) uniformly at random...")
         for s, c in enumerate(coords):
             psi[s] = np.random.randn(rep_dim) * 0.1 
-    else:
+            
+    elif init_mode == "uniform_around_goal" and env!="fourRooms20":
         for s, c in enumerate(coords):
             var_scale = near_var 
             print(f"State {s} var_scale={var_scale:.2f}")
-            psi[s]    = random_goal_psi + np.random.randn(rep_dim) * 0.1 * var_scale
+            psi[s]    =  random_goal_psi + np.random.randn(rep_dim) * 0.1 * var_scale
+    ## the experiment where I initialize some states to not be orthogonal to the goal
+    elif init_mode == "uniform_around_goal" and env == "fourRooms30":
+        for s, (r, c) in enumerate(coords):
+            var_scale = near_var
+            in_top_left     = (r < mid_r)  and (c < mid_c)
+            in_bottom_right = (r >= mid_r) and (c >= mid_c)
+
+            base = random_goal_psi if (in_top_left or in_bottom_right) else perp_anchor
+            psi[s] = base + np.random.randn(rep_dim) * 0.1 * var_scale
+
+            
+    else:
+        raise ValueError("Unsupported combination of random_exploration and initialization mode")
 
 
 
@@ -399,14 +493,18 @@ def select_action(s: int, g: int) -> int:
     for a in range(NUM_ACTIONS):
         ns = step(s, a)
         sim = psi[ns] @ goal_vec  # dot similarity (or cosine if normalized)
-        if plain_goal:
-            proj = P_plane @ psi[ns]
-            sim = proj @ proj  # squared norm in the plane
+        #sim = psi[ns] @ np.random.randn(rep_dim) * 0.1
+        # if plain_goal:
+        #     proj = P_plane @ psi[ns]
+        #     sim = proj @ proj  # squared norm in the plane
         similarities.append(sim)
 
     # Apply entropy regularization (inverse temperature)
     logits = np.array(similarities)
-    inverse_temp = 1.0 / entropy_coeff
+    ## the smaller the max(similarity), the larger the inverse temperature, the more uniform
+    inverse_temp = 1.0 / entropy_coeff  
+    if relavce_sim_factor:
+        inverse_temp *= (max(similarities) + 1) / 2
     logits *= inverse_temp
 
     # Softmax over scaled logits
@@ -525,9 +623,6 @@ def update_representations(verbose: bool = False) -> float:
             continue
         i = np.random.randint(0, len(traj) - 1)
         remaining = len(traj) - i
-        # w = gamma ** np.arange(remaining)
-        # w /= w.sum()
-        # j = i + np.random.choice(remaining, p=w)
 
         w = gamma ** np.arange(1, remaining)
         w /= w.sum()
@@ -543,48 +638,98 @@ def update_representations(verbose: bool = False) -> float:
     sp_batch = np.asarray(sp_list, dtype=np.int32)   # positives (B,)
     B        = len(s_batch)
 
-    # if verbose:
-    #     from collections import Counter
 
-    #     pair_counter = Counter(zip(s_batch, sp_batch))
+    # ----- 2. Gather current embeddings -------------------------------------
+    # psi_s = psi[s_batch]                  # ψ(s_j)      – shape (B,d)
+    # psi_p = psi[sp_batch]                 # ψ(sp_k)     – shape (B,d)
 
-    #     print("\n=== [Anchor–Positive Pair Histogram] ===")
-    #     for (s, sp), count in pair_counter.most_common():
-    #         print(f"(s={s:4d}, sp={sp:4d})  | Count: {count:2d}")
+    # # ----- 3. Column-wise soft-max probabilities P --------------------------
+    # dots        = psi_s @ psi_p.T                         # (B,B)
+    # dots       -= dots.max(axis=0, keepdims=True)         # stabilise
+    # exp_logits  = np.exp(dots)
+    # P           = exp_logits / exp_logits.sum(axis=0, keepdims=True)
 
-    #     print(f"\nTotal unique pairs: {len(pair_counter)}")
-    #     top_pair = pair_counter.most_common(1)[0]
-    #     print(f"Most common pair: (s={top_pair[0][0]}, sp={top_pair[0][1]})  | Count: {top_pair[1]}")
+    # diag_P = np.diag(P)                                   # p_k(k)
+    # nll    = -np.mean(np.log(diag_P + 1e-12))             # mean-NLL
+
+    # # ----- 4. Anchor-state updates  Δψ(s_j) -------------------------------
+    # coeff         = np.eye(B) - P                         # (B,B)
+    # anchor_update = lr_phi_psi * (coeff @ psi_p)          # (B,d)
+    # np.add.at(psi, s_batch, anchor_update)                # scatter-add
+
+
+    # # ----- 5. Positive-state updates  Δψ(sp_k) ----------------------------
+    # expected_anchor = (P.T @ psi_s)                       # (B,d)
+    # pos_update      = lr_phi_psi * (psi_s - expected_anchor)
+    # np.add.at(psi, sp_batch, pos_update)                  # scatter-add
 
 
     # ----- 2. Gather current embeddings -------------------------------------
     psi_s = psi[s_batch]                  # ψ(s_j)      – shape (B,d)
     psi_p = psi[sp_batch]                 # ψ(sp_k)     – shape (B,d)
 
-    # ----- 3. Column-wise soft-max probabilities P --------------------------
-    dots        = psi_s @ psi_p.T                         # (B,B)
-    dots       -= dots.max(axis=0, keepdims=True)         # stabilise
-    exp_logits  = np.exp(dots)
-    P           = exp_logits / exp_logits.sum(axis=0, keepdims=True)
+    # ----- 3. Similarities ---------------------------------------------------
+    D = psi_s @ psi_p.T                   # (B,B), rows=j (anchors), cols=k (positives)
 
-    diag_P = np.diag(P)                                   # p_k(k)
-    nll    = -np.mean(np.log(diag_P + 1e-12))             # mean-NLL
+    # Backward (columns) softmax: P = softmax_j D[:,k]
+    D_col = D - D.max(axis=0, keepdims=True)       # numerically stable per column
+    exp_col = np.exp(D_col)
+    P = exp_col / (exp_col.sum(axis=0, keepdims=True) + 1e-12)   # (B,B), sum over rows per column = 1
 
-    # ----- 4. Anchor-state updates  Δψ(s_j) -------------------------------
-    coeff         = np.eye(B) - P                         # (B,B)
-    anchor_update = lr_phi_psi * (coeff @ psi_p)          # (B,d)
-    np.add.at(psi, s_batch, anchor_update)                # scatter-add
+    # Forward (rows) softmax: Q = softmax_k D[j,:]
+    D_row = D - D.max(axis=1, keepdims=True)       # numerically stable per row
+    exp_row = np.exp(D_row)
+    Q = exp_row / (exp_row.sum(axis=1, keepdims=True) + 1e-12)   # (B,B), sum over cols per row = 1
 
-    # if verbose and goal is not None:
-    #     psi_goal = psi[goal]
-    #     for idx, s in enumerate(s_batch):
-    #         ip = np.dot(anchor_update[idx], psi_goal)
-    #         print(f"[Anchor] s={s}, ⟨Δψ(s), ψ(goal)⟩ = {ip:.10f}")
+    # Diagonal probs and losses
+    diag_P = np.diag(P)                             # backward: p_k(k)
+    diag_Q = np.diag(Q)                             # forward:  q_j(j)
+    nll_bwd = -np.mean(np.log(diag_P + 1e-12))      # column-CE
+    nll_fwd = -np.mean(np.log(diag_Q + 1e-12))      # row-CE
 
-    # ----- 5. Positive-state updates  Δψ(sp_k) ----------------------------
-    expected_anchor = (P.T @ psi_s)                       # (B,d)
-    pos_update      = lr_phi_psi * (psi_s - expected_anchor)
-    np.add.at(psi, sp_batch, pos_update)                  # scatter-add
+    # Choose which loss to optimize
+    #   "backward" -> only columns (your current behavior)
+    #   "forward"  -> only rows
+    #   "both"     -> symmetric (CLIP-style)
+
+
+    if loss_mode == "backward":
+        nll = nll_bwd
+    elif loss_mode == "forward":
+        nll = nll_fwd
+    else:  # "both"
+        nll = 0.5 * (nll_bwd + nll_fwd)
+
+    # ----- 4/5. Vectorized updates ------------------------------------------
+    # Backward (column) updates (your existing formulas):
+    #   Δψ(s_j)     = η * (I - P) @ ψ(sp)                    (B,d)
+    #   Δψ(sp_k)    = η * (ψ(s_k) - P^T @ ψ(s))              (B,d)
+    I_B = np.eye(B, dtype=psi.dtype)
+    coeff_col = I_B - P
+    anchor_update_b = lr_phi_psi * (coeff_col @ psi_p)          # (B,d)
+    pos_update_b    = lr_phi_psi * (psi_s - (P.T @ psi_s))      # (B,d)
+
+    # Forward (row) updates (symmetric):
+    #   Δψ(s_j)     = η * (I - Q) @ ψ(sp)
+    #   Δψ(sp_k)    = η * (ψ(s_k) - Q^T @ ψ(s))
+    coeff_row = I_B - Q
+    anchor_update_f = lr_phi_psi * (coeff_row @ psi_p)          # (B,d)
+    pos_update_f    = lr_phi_psi * (psi_s - (Q.T @ psi_s))      # (B,d)
+
+    # Combine according to loss_mode
+    if loss_mode == "backward":
+        anchor_update = anchor_update_b
+        pos_update    = pos_update_b
+    elif loss_mode == "forward":
+        anchor_update = anchor_update_f
+        pos_update    = pos_update_f
+    else:  # "both" -> average to keep effective step size comparable
+        anchor_update = 0.5 * (anchor_update_b + anchor_update_f)
+        pos_update    = 0.5 * (pos_update_b    + pos_update_f)
+
+    # Scatter-add into the table
+    np.add.at(psi, s_batch,  anchor_update)        # anchors s_j
+    np.add.at(psi, sp_batch, pos_update)           # positives sp_k
 
     
      # After applying the updates (anchor and positive)
@@ -794,40 +939,239 @@ for ep in trange(1, num_episodes + 1, desc="episodes"):
         plt.close(fig)
 
 
-        sim1        = (psi @ goal_vec) 
-        sim1_map = sim1.reshape(walls.shape)
+        # sim1        = (psi @ goal_vec) 
+        # sim1_map = sim1.reshape(walls.shape)
 
-        fig, ax = plt.subplots(figsize=(6, 6))
+        # fig, ax = plt.subplots(figsize=(6, 6))
 
-        # background: similarity heat-map
-        im1 = ax.imshow(sim1_map,
-                    cmap="viridis",          # pick any perceptual colormap
-                    origin="lower")
-        fig.colorbar(im1, ax=ax, fraction=0.046, pad=0.04,
-                    label=r"$\psi(s)\!\cdot\!\psi(g)$")
+        # # background: similarity heat-map
+        # im1 = ax.imshow(sim1_map,
+        #             cmap="viridis",          # pick any perceptual colormap
+        #             origin="lower")
+        # fig.colorbar(im1, ax=ax, fraction=0.046, pad=0.04,
+        #             label=r"$\psi(s)\!\cdot\!\psi(g)$")
 
-        # optional: overlay walls in light gray
-        ax.imshow(walls,
-                cmap=plt.cm.binary,
-                alpha=0.5, origin="lower")
+        # # optional: overlay walls in light gray
+        # ax.imshow(walls,
+        #         cmap=plt.cm.binary,
+        #         alpha=0.5, origin="lower")
 
-        # 2. draw the most-recent trajectories
-        for t in latest_trajs:
-            coords = np.array([np.unravel_index(s, walls.shape) for s in t])
-            ax.plot(coords[:, 1], coords[:, 0], color="black", linewidth=1.0)
+        # # 2. draw the most-recent trajectories
+        # for t in latest_trajs:
+        #     coords = np.array([np.unravel_index(s, walls.shape) for s in t])
+        #     ax.plot(coords[:, 1], coords[:, 0], color="black", linewidth=1.0)
 
-        # 3. highlight the fixed start and goal
-        ax.scatter(*np.unravel_index(START_STATE, walls.shape)[::-1],
-                marker="o", s=60, c="lime", label="start")
-        ax.scatter(*np.unravel_index(goal, walls.shape)[::-1],
-                marker="*", s=90, c="red",  label="goal")
-        ax.legend(loc="upper left", frameon=False)
+        # # 3. highlight the fixed start and goal
+        # ax.scatter(*np.unravel_index(START_STATE, walls.shape)[::-1],
+        #         marker="o", s=60, c="lime", label="start")
+        # ax.scatter(*np.unravel_index(goal, walls.shape)[::-1],
+        #         marker="*", s=90, c="red",  label="goal")
+        # ax.legend(loc="upper left", frameon=False)
 
-        ax.set_title(f"Episodes {ep - episodes_per_upd + 1}–{ep}, inner product")
-        ax.axis("off")
-        fig.tight_layout()
-        fig.savefig(f"{run_dir}/trajs_ep{ep:05d}.png", dpi=150)
-        plt.close(fig)
+        # ax.set_title(f"Episodes {ep - episodes_per_upd + 1}–{ep}, inner product")
+        # ax.axis("off")
+        # fig.tight_layout()
+        # fig.savefig(f"{run_dir}/trajs_ep{ep:05d}.png", dpi=150)
+        # plt.close(fig)
+
+
+
+
+
+
+        # def spherical_stats(psi, eps=1e-8):
+        #     psi_unit = psi / (np.linalg.norm(psi, axis=1, keepdims=True) + eps)
+        #     N, d = psi_unit.shape
+        #     mean_dir = psi_unit.mean(axis=0)
+        #     R = np.linalg.norm(mean_dir)               # mean resultant length ∈ [0,1]
+        #     mean_dir = mean_dir / (R + eps) if R > eps else np.zeros_like(mean_dir)
+
+        #     # rough vMF κ estimate (valid for d>=3 and not too small/large R)
+        #     # κ ≈ R*(d - R**2) / (1 - R**2)
+        #     if R < 1 - 1e-6:
+        #         kappa = R * (d - R**2) / (1 - R**2)
+        #     else:
+        #         kappa = np.inf
+
+        #     return R, kappa, mean_dir
+
+        # R, kappa, mean_dir = spherical_stats(psi)
+        # print(f"[spherical] mean resultant length R = {R:.4f}  (0≈uniform, 1≈perfectly aligned)")
+        # print(f"[spherical] vMF κ (rough) = {kappa:.3f}")
+        # print(f"[spherical] angle(mean_dir, goal) = "
+        #     f"{np.degrees(np.arccos(np.clip((mean_dir @ (psi[goal]/(np.linalg.norm(psi[goal])+1e-8))), -1, 1))):.2f}°")
+        
+        def plot_goal_aligned_3d(psi_mat, goal_vec, out_path, state_indices=None):
+            """
+            3D scatter of ψ in a goal-aligned basis, using different markers
+            for each of the four rooms. If state_indices is provided, it must
+            be a 1D array of flattened grid indices aligned with rows of psi_mat.
+            """
+            eps = 1e-12
+            N, d = psi_mat.shape
+            if d < 2:
+                print("[viz] rep_dim < 2; skipping goal-aligned 3D.")
+                return
+
+            # ----- map rows of psi_mat to grid (i, j) -----
+            # If user passed only non-wall states, provide their flat indices here.
+            if state_indices is None:
+                # assume psi_mat corresponds to ALL states in row-major order
+                flat_idx = np.arange(walls.size)
+            else:
+                flat_idx = np.asarray(state_indices)
+
+            ij = np.column_stack(np.unravel_index(flat_idx, walls.shape))
+            ii, jj = ij[:, 0], ij[:, 1]
+
+            # If any wall cells slipped in, mask them out to stay safe.
+            mask_nonwall = (walls.flatten()[flat_idx] == 0)
+            psi_use = psi_mat[mask_nonwall]
+            ii = ii[mask_nonwall]
+            jj = jj[mask_nonwall]
+            N = psi_use.shape[0]
+
+            # ----- normalize and build goal-aligned basis -----
+            U  = psi_use / (np.linalg.norm(psi_use, axis=1, keepdims=True) + eps)
+            u1 = goal_vec / (np.linalg.norm(goal_vec) + eps)
+
+            R = U - (U @ u1)[:, None] * u1
+            try:
+                _, _, Vt = np.linalg.svd(R, full_matrices=False)
+            except np.linalg.LinAlgError:
+                print("[viz] SVD failed; skipping goal-aligned 3D.")
+                return
+
+            u2 = Vt[0]
+            u2 = u2 - (u1 @ u2) * u1; u2 /= (np.linalg.norm(u2) + eps)
+
+            if d >= 3:
+                u3 = Vt[1]
+                u3 = u3 - (u1 @ u3) * u1 - (u2 @ u3) * u2
+                if np.linalg.norm(u3) < eps:
+                    e = np.zeros_like(u1); e[0] = 1.0
+                    u3 = e - (u1 @ e) * u1 - (u2 @ e) * u2
+                u3 /= (np.linalg.norm(u3) + eps)
+            else:
+                e = np.zeros_like(u1); e[0] = 1.0
+                u3 = e - (u1 @ e) * u1 - (u2 @ e) * u2
+                u3 /= (np.linalg.norm(u3) + eps)
+
+            X = U @ u2
+            Y = U @ u3
+            Z = U @ u1
+            c = np.clip(Z, -1, 1)  # color by cos(ψ(s), ψ(goal))
+
+            # ----- room masks (four quadrants) -----
+            mid_i = walls.shape[0] // 2
+            mid_j = walls.shape[1] // 2
+            m_TL = (ii <  mid_i) & (jj <  mid_j)
+            m_TR = (ii <  mid_i) & (jj >= mid_j)
+            m_BL = (ii >= mid_i) & (jj <  mid_j)
+            m_BR = (ii >= mid_i) & (jj >= mid_j)
+
+            # ----- figure & shared colormap -----
+            fig = plt.figure(figsize=(6, 6))
+            ax  = fig.add_subplot(111, projection='3d')
+
+            # Use a single ScalarMappable to keep one colorbar across groups
+            import matplotlib as mpl
+            norm = mpl.colors.Normalize(vmin=c.min() if N else 0.0, vmax=c.max() if N else 1.0)
+            cmap = plt.get_cmap("viridis")
+            sm   = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+            sm.set_array([])
+
+            # (marker, label, mask) for the four rooms
+            groups = [
+                ('o', 'Bottom-Left',     m_TL),
+                ('^', 'Bottom-Right',    m_TR),
+                ('s', 'Top-Left',  m_BL),
+                ('D', 'Top-Right', m_BR),
+            ]
+
+            # plot each room with a different marker (color still encodes cos angle)
+            for marker, label, m in groups:
+                if np.any(m):
+                    ax.scatter(X[m], Y[m], Z[m],
+                            c=c[m], cmap=cmap, norm=norm,
+                            s=12, alpha=0.9, marker=marker, label=label)
+
+            cb = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
+            cb.set_label("cos(ψ(s), ψ(goal))")
+
+            # unit sphere wireframe (reference)
+            u = np.linspace(0, 2*np.pi, 60)
+            v = np.linspace(0, np.pi, 30)
+            xs = np.outer(np.cos(u), np.sin(v))
+            ys = np.outer(np.sin(u), np.sin(v))
+            zs = np.outer(np.ones_like(u), np.cos(v))
+            ax.plot_wireframe(xs, ys, zs, color='lightgray', linewidth=0.3, alpha=0.5)
+
+            # mark goal at (0,0,1)
+            ax.scatter([0], [0], [1], c='red', s=80, marker='*', label='goal (u1)')
+
+            ax.set_xlabel("u2 (orthogonal to goal)")
+            ax.set_ylabel("u3 (orthogonal to goal)")
+            ax.set_zlabel("u1 (along goal)")
+            ax.set_title("ψ projected to goal-aligned 3D frame\n(markers = rooms)")
+
+            # equal aspect ratio
+            max_range = np.array([X.max()-X.min(), Y.max()-Y.min(), Z.max()-Z.min()]).max() if N else 1.0
+            cx, cy, cz = (X.mean() if N else 0.0), (Y.mean() if N else 0.0), (Z.mean() if N else 0.0)
+            ax.set_xlim(cx - max_range/2, cx + max_range/2)
+            ax.set_ylim(cy - max_range/2, cy + max_range/2)
+            ax.set_zlim(cz - max_range/2, cz + max_range/2)
+
+            ax.legend(loc="upper left")
+            fig.tight_layout()
+            fig.savefig(out_path, dpi=200)
+            plt.close(fig)
+
+        def plot_pca_3d(psi_mat, out_path):
+            eps = 1e-12
+            N, d = psi_mat.shape
+            if d < 3:
+                print("[viz] rep_dim < 3; skipping PCA-3D.")
+                return
+            U = psi_mat / (np.linalg.norm(psi_mat, axis=1, keepdims=True) + eps)
+            X = U - U.mean(axis=0, keepdims=True)
+            try:
+                U_svd, S, Vt = np.linalg.svd(X, full_matrices=False)
+            except np.linalg.LinAlgError:
+                print("[viz] SVD failed; skipping PCA-3D.")
+                return
+            PCs = Vt[:3].T
+            Z = X @ PCs
+            var_ratio = (S[:3]**2) / (S**2).sum()
+
+            r = np.linalg.norm(Z, axis=1)
+            fig = plt.figure(figsize=(6, 6))
+            ax = fig.add_subplot(111, projection='3d')
+            sc = ax.scatter(Z[:, 0], Z[:, 1], Z[:, 2], c=r, cmap="viridis", s=12, alpha=0.9)
+            fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.02, label="‖PC coords‖")
+
+            ax.set_xlabel(f"PC1 ({var_ratio[0]*100:.1f}%)")
+            ax.set_ylabel(f"PC2 ({var_ratio[1]*100:.1f}%)")
+            ax.set_zlabel(f"PC3 ({var_ratio[2]*100:.1f}%)")
+            ax.set_title("PCA 3D of ψ (unit-normalized)")
+
+            max_range = np.array([Z[:,0].ptp(), Z[:,1].ptp(), Z[:,2].ptp()]).max()
+            cx, cy, cz = Z[:,0].mean(), Z[:,1].mean(), Z[:,2].mean()
+            ax.set_xlim(cx - max_range/2, cx + max_range/2)
+            ax.set_ylim(cy - max_range/2, cy + max_range/2)
+            ax.set_zlim(cz - max_range/2, cz + max_range/2)
+
+            fig.tight_layout()
+            fig.savefig(out_path, dpi=200)
+            plt.close(fig)
+
+        # Build abstract goal vector exactly like in your selectors
+        
+
+        # Save figures
+        plot_goal_aligned_3d(psi, goal_vec, os.path.join(run_dir, f"psi_goal_frame_3d_{ep:05d}.png"))
+        # optional:
+        #plot_pca_3d(psi, os.path.join(run_dir, f"psi_pca_3d_{ep:05d}.png"))
 
              # ---------- NEW: save loss curve up to this episode --------------
 if loss_history:                                     # nothing to plot on very first call
@@ -988,150 +1332,5 @@ if verbose:
 
 
 
-        def spherical_stats(psi, eps=1e-8):
-            psi_unit = psi / (np.linalg.norm(psi, axis=1, keepdims=True) + eps)
-            N, d = psi_unit.shape
-            mean_dir = psi_unit.mean(axis=0)
-            R = np.linalg.norm(mean_dir)               # mean resultant length ∈ [0,1]
-            mean_dir = mean_dir / (R + eps) if R > eps else np.zeros_like(mean_dir)
-
-            # rough vMF κ estimate (valid for d>=3 and not too small/large R)
-            # κ ≈ R*(d - R**2) / (1 - R**2)
-            if R < 1 - 1e-6:
-                kappa = R * (d - R**2) / (1 - R**2)
-            else:
-                kappa = np.inf
-
-            return R, kappa, mean_dir
-
-        R, kappa, mean_dir = spherical_stats(psi)
-        print(f"[spherical] mean resultant length R = {R:.4f}  (0≈uniform, 1≈perfectly aligned)")
-        print(f"[spherical] vMF κ (rough) = {kappa:.3f}")
-        print(f"[spherical] angle(mean_dir, goal) = "
-            f"{np.degrees(np.arccos(np.clip((mean_dir @ (psi[goal]/(np.linalg.norm(psi[goal])+1e-8))), -1, 1))):.2f}°")
-        
-        def plot_goal_aligned_3d(psi_mat, goal_vec, out_path):
-            eps = 1e-12
-            N, d = psi_mat.shape
-            if d < 2:
-                print("[viz] rep_dim < 2; skipping goal-aligned 3D.")
-                return
-            # unit-normalize all
-            U = psi_mat / (np.linalg.norm(psi_mat, axis=1, keepdims=True) + eps)
-
-            # u1 = goal direction (unit)
-            u1 = goal_vec / (np.linalg.norm(goal_vec) + eps)
-
-            # remove along-goal part to find dominant orth directions
-            R = U - (U @ u1)[:, None] * u1
-            # SVD to get top orth directions
-            try:
-                _, _, Vt = np.linalg.svd(R, full_matrices=False)
-            except np.linalg.LinAlgError:
-                print("[viz] SVD failed; skipping goal-aligned 3D.")
-                return
-
-            u2 = Vt[0]
-            u2 = u2 - (u1 @ u2) * u1; u2 /= (np.linalg.norm(u2) + eps)
-
-            # third axis (if d>=3), else fabricate an orthonormal axis
-            if d >= 3:
-                u3 = Vt[1]
-                u3 = u3 - (u1 @ u3) * u1 - (u2 @ u3) * u2
-                if np.linalg.norm(u3) < eps:
-                    # fabricate a perpendicular axis
-                    e = np.zeros_like(u1); e[0] = 1.0
-                    u3 = e - (u1 @ e) * u1 - (u2 @ e) * u2
-                u3 /= (np.linalg.norm(u3) + eps)
-            else:
-                # fabricate u3 in the plane orthogonal to u1, u2
-                e = np.zeros_like(u1); e[0] = 1.0
-                u3 = e - (u1 @ e) * u1 - (u2 @ e) * u2
-                u3 /= (np.linalg.norm(u3) + eps)
-
-            # coordinates: X=u2·ψ, Y=u3·ψ, Z=u1·ψ (Z is cos to goal since U is unit)
-            X = U @ u2
-            Y = U @ u3
-            Z = U @ u1
-            c = np.clip(Z, -1, 1)
-
-            fig = plt.figure(figsize=(6, 6))
-            ax = fig.add_subplot(111, projection='3d')
-            sc = ax.scatter(X, Y, Z, c=c, cmap="viridis", s=12, alpha=0.9)
-            cb = fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.02)
-            cb.set_label("cos(ψ(s), ψ(goal))")
-
-            # unit sphere wireframe for reference
-            u = np.linspace(0, 2*np.pi, 60)
-            v = np.linspace(0, np.pi, 30)
-            xs = np.outer(np.cos(u), np.sin(v))
-            ys = np.outer(np.sin(u), np.sin(v))
-            zs = np.outer(np.ones_like(u), np.cos(v))
-            ax.plot_wireframe(xs, ys, zs, color='lightgray', linewidth=0.3, alpha=0.5)
-
-            # mark goal at (0,0,1)
-            ax.scatter([0], [0], [1], c='red', s=80, marker='*', label='goal (u1)')
-
-            ax.set_xlabel("u2 (orthogonal to goal)")
-            ax.set_ylabel("u3 (orthogonal to goal)")
-            ax.set_zlabel("u1 (along goal)")
-            ax.set_title("ψ projected to goal-aligned 3D frame")
-
-            # equal aspect ratio
-            max_range = np.array([X.max()-X.min(), Y.max()-Y.min(), Z.max()-Z.min()]).max()
-            cx, cy, cz = X.mean(), Y.mean(), Z.mean()
-            ax.set_xlim(cx - max_range/2, cx + max_range/2)
-            ax.set_ylim(cy - max_range/2, cy + max_range/2)
-            ax.set_zlim(cz - max_range/2, cz + max_range/2)
-
-            ax.legend(loc="upper left")
-            fig.tight_layout()
-            fig.savefig(out_path, dpi=200)
-            plt.close(fig)
-
-        def plot_pca_3d(psi_mat, out_path):
-            eps = 1e-12
-            N, d = psi_mat.shape
-            if d < 3:
-                print("[viz] rep_dim < 3; skipping PCA-3D.")
-                return
-            U = psi_mat / (np.linalg.norm(psi_mat, axis=1, keepdims=True) + eps)
-            X = U - U.mean(axis=0, keepdims=True)
-            try:
-                U_svd, S, Vt = np.linalg.svd(X, full_matrices=False)
-            except np.linalg.LinAlgError:
-                print("[viz] SVD failed; skipping PCA-3D.")
-                return
-            PCs = Vt[:3].T
-            Z = X @ PCs
-            var_ratio = (S[:3]**2) / (S**2).sum()
-
-            r = np.linalg.norm(Z, axis=1)
-            fig = plt.figure(figsize=(6, 6))
-            ax = fig.add_subplot(111, projection='3d')
-            sc = ax.scatter(Z[:, 0], Z[:, 1], Z[:, 2], c=r, cmap="viridis", s=12, alpha=0.9)
-            fig.colorbar(sc, ax=ax, fraction=0.03, pad=0.02, label="‖PC coords‖")
-
-            ax.set_xlabel(f"PC1 ({var_ratio[0]*100:.1f}%)")
-            ax.set_ylabel(f"PC2 ({var_ratio[1]*100:.1f}%)")
-            ax.set_zlabel(f"PC3 ({var_ratio[2]*100:.1f}%)")
-            ax.set_title("PCA 3D of ψ (unit-normalized)")
-
-            max_range = np.array([Z[:,0].ptp(), Z[:,1].ptp(), Z[:,2].ptp()]).max()
-            cx, cy, cz = Z[:,0].mean(), Z[:,1].mean(), Z[:,2].mean()
-            ax.set_xlim(cx - max_range/2, cx + max_range/2)
-            ax.set_ylim(cy - max_range/2, cy + max_range/2)
-            ax.set_zlim(cz - max_range/2, cz + max_range/2)
-
-            fig.tight_layout()
-            fig.savefig(out_path, dpi=200)
-            plt.close(fig)
-
-        # Build abstract goal vector exactly like in your selectors
-        
-
-        # Save figures
-        plot_goal_aligned_3d(psi, goal_vec, os.path.join(run_dir, "psi_goal_frame_3d.png"))
-        # optional:
-        plot_pca_3d(psi, os.path.join(run_dir, "psi_pca_3d.png"))
+    
 

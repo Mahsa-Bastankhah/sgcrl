@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=maze_ms
-#SBATCH --array=0-3%4             # (NUM_CONFIGS * NUM_SEEDS) - 1
-#SBATCH --time=01:30:00
+#SBATCH --array=0-0%1             # (NUM_CONFIGS * NUM_SEEDS) - 1
+#SBATCH --time=03:30:00
 #SBATCH --account=eysenbach
 #SBATCH --cpus-per-task=1
 #SBATCH --mem-per-cpu=2G
@@ -28,12 +28,11 @@ ALPHAS=(100)
 ## should I try larger? probably too small right now?
 ## it seems increasing the replay buffer size never helps, 10k is probably too high, keeping the last 100 episodes in the buffer
 REPLAY_CAPS=(1000)      # new
-MAX_STEPS_LIST=(100)    # new
-## I think 64 is too small, 128 is better
+MAX_STEPS_LIST=(350)    # new
 BATCH_SIZES=(128)       # new
-NUM_EPISODES_LIST=(100000)  # new
+NUM_EPISODES_LIST=(1000000)  # new
 GAMMAS=(0.99)           # new
-SEEDS=(112 113 114)
+SEEDS=(128)
 entropy_coeff=(0.1)
 # -------------------------------------------------------------------
 
@@ -107,18 +106,19 @@ echo "replay_cap=$RCAP max_steps=$MSTEP batch_size=$BS num_episodes=$NEPI gamma=
 echo "------------------------------------------------------------"
 
 python -u tabular_SGCRL.py \
-  --rep-dim "$REP" \
-  --episodes-per-upd "$UPD" \
-  --lr-phi-psi "$LR" \
-  --near-var "$NVAR" \
-  --far-var "$FVAR" \
-  --alpha "$ALPHA" \
-  --replay-capacity "$RCAP" \
-  --max-steps "$MSTEP" \
-  --batch-size "$BS" \
-  --num-episodes "$NEPI" \
-  --gamma "$GAM" \
-  --seed "$SEED" \
-  --entropy_coeff "$ECO" \
-  --random_exploration False \
-  --two_goals True \
+                        --rep-dim "$REP" \
+                        --episodes-per-upd "$UPD" \
+                        --lr-phi-psi "$LR" \
+                        --near-var "$NVAR" \
+                        --far-var "$FVAR" \
+                        --alpha "$ALPHA" \
+                        --replay-capacity "$RCAP" \
+                        --max-steps "$MSTEP" \
+                        --batch-size "$BS" \
+                        --num-episodes "$NEPI" \
+                        --gamma "$GAM" \
+                        --seed "$SEED" \
+                        --entropy_coeff "$ECO" \
+                        --loss_mode "backward" \
+                        --env "impossible_maze" \
+                        --relative_sim_factor True \
