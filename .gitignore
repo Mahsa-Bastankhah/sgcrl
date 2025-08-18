@@ -8,4 +8,9 @@ contrastive/__pycache__/
 tensorboard/
 joblog/
 archived/
+*.png
+logs
+runs_final/
+**/*.png
+
 

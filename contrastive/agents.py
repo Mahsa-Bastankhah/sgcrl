@@ -11,7 +11,7 @@ from contrastive import config as contrastive_config
 from contrastive import distributed_layout
 from contrastive import networks
 from contrastive import utils as contrastive_utils
-
+from contrastive import visit_entropy_observer as visit_entropy_observer
 from default import make_default_logger
 
 import dm_env
@@ -77,7 +77,9 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
         contrastive_utils.SuccessObserver(),
         contrastive_utils.DistanceObserver(obs_dim=config.obs_dim,
                                            start_index=config.start_index,
-                                           end_index=config.end_index)]
+                                           end_index=config.end_index),
+                                           visit_entropy_observer.VisitEntropyObserver(config= config),]
+
     super().__init__(
         seed=seed,
         environment_factory=environment_factory,

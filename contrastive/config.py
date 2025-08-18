@@ -31,7 +31,7 @@ class ContrastiveConfig:
   n_step: int = 1
   # Target smoothing coefficient.
   tau: float = 0.005
-  hidden_layer_sizes: Tuple[int, Ellipsis] = (256, 256)
+  hidden_layer_sizes: Tuple[int, Ellipsis] = (256, 256, 256, 256, 256, 256)
   
   # Loss options - entropy
   # Coefficient applied to the entropy bonus. If None, an adaptative
@@ -66,6 +66,8 @@ class ContrastiveConfig:
   jit: bool = True
   add_mc_to_td: bool = False
   resample_neg_actions: bool = False
+
+  add_noise_z : bool = False  # Whether to add noise to the z representation.
   
   # Parameters that should be overwritten, based on each environment.
   obs_dim: int = -1

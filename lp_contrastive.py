@@ -20,7 +20,7 @@ import os
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string('log_dir_path', 'logs/', 'Where to log metrics')
-flags.DEFINE_integer('time_delta_minutes', 5, 'how often to save checkpoints')
+flags.DEFINE_integer('time_delta_minutes', 15, 'how often to save checkpoints')
 flags.DEFINE_integer('seed', 42, 'Specify seed, only used if use_slurm_array is false')
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
 flags.DEFINE_string('alg', 'contrastive_cpc', 'Algorithm type, e.g. default is contrastive_cpc with no entropy or KL losses')
@@ -30,6 +30,7 @@ flags.DEFINE_bool('sample_goals', False, 'sample the goal position uniformly acc
 
 # fixed goal coordinates for supported environments
 fixed_goal_dict={'point_Spiral11x11': [np.array([5,5], dtype=float), np.array([10,10], dtype=float)],
+                 'point_FourRooms': [np.array([0,0], dtype=float), np.array([10,8], dtype=float)],
                      #note: sawyer fixed goal positions vary slightly with each episode
                       'sawyer_bin': np.array([0.12, 0.7, 0.02]),
                       'sawyer_box': np.array([0.0, 0.75, 0.133]),
@@ -143,6 +144,7 @@ def main(_):
   else:
     raise NotImplementedError('Unknown method: %s' % alg)
 
+  params["add_noise_z"] = False  # Whether to add noise to the z representation.
 
   program = get_program(params)
   # Set terminal='tmux' if you want different components in different windows.
