@@ -465,7 +465,7 @@ def get_psi_norms(env_name, log_dir,  seed, ckpt_num=None, alg = 'contrastive_cp
         random_goals[:, obs_dim+axis] += axis_min
 
     # ── 1. after you set N_SAMPLES ─────────────────────────────────────
-    EXTRA_AROUND_GOAL = 3000          # how many focused samples
+    EXTRA_AROUND_GOAL = 0         # how many focused samples
     SIGMA_GOAL        = 0.30          # std-dev (in grid units) around the goal
 
         # ── 3. NEW: concentrated cloud around the fixed goal ───────────────
@@ -574,8 +574,8 @@ def get_psi_norms(env_name, log_dir,  seed, ckpt_num=None, alg = 'contrastive_cp
         g_repr_g
     ))
 
-    if (g_repr_sa < 0).any() or (g_repr_g < 0).any():
-        print("❌ Error: There are negative values in g_repr_sa or g_repr_g")
+    # if (g_repr_sa < 0).any() or (g_repr_g < 0).any():
+    #     print("❌ Error: There are negative values in g_repr_sa or g_repr_g")
 
 
     phi_psi_similarity = np.diag(np.einsum(

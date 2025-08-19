@@ -24,6 +24,26 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import trange, tqdm
 from collections import deque 
+import os
+import numpy as np
+import pandas as pd
+import matplotlib as mpl
+
+# ---------------- Global style (no LaTeX) ----------------
+mpl.rcParams.update({
+    "text.usetex": False,                      # DO NOT use LaTeX
+    # "font.family": "serif",
+    # "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
+    "axes.labelsize": 24,
+    "axes.titlesize": 18,
+    "legend.fontsize": 24,
+    "xtick.labelsize": 18,
+    "ytick.labelsize": 18,
+    "figure.dpi": 200,
+    # embed TrueType fonts in PDFs (good for journals)
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
 
 
 
@@ -67,6 +87,8 @@ def parse_args():
     p.add_argument("--loss_mode",         type=str, default="backward")
     p.add_argument("--env",         type=str, default="fourRooms10", choices=["fourRooms10", "spiral", "impossible_maze", "fourRooms20", "box"])
     p.add_argument("--relative_sim_factor",       type=bool,   default=False, help="whether to use relative similarity factor in the softmax action selection")
+    p.add_argument("--optimality_exp_mode",       type=str,  default="deactive", choices=["sgcrl", "random_goal"])
+    
     return p.parse_args()
 
 args = parse_args()
@@ -99,6 +121,7 @@ plain_goal = False
 env = args.env
 relavce_sim_factor = args.relative_sim_factor
 rer_order_exp = False
+optimality_exp_mode = args.optimality_exp_mode
 
 loss_mode = args.loss_mode
 
@@ -129,6 +152,7 @@ config = {
     "env" : env,
     "relative_sim_factor" : relavce_sim_factor,
     "rer_order_exp" : rer_order_exp,
+    "optimality_exp_mode" : optimality_exp_mode,
 }
 
 
@@ -455,20 +479,29 @@ if random_exploration:
         for s, c in enumerate(coords):
             psi[s] = np.random.randn(rep_dim) * 0.1 
             
-    elif init_mode == "uniform_around_goal" and env!="fourRooms20":
-        for s, c in enumerate(coords):
+    elif init_mode == "uniform_around_goal":
+        for s, (r ,c) in enumerate(coords):
             var_scale = near_var 
             print(f"State {s} var_scale={var_scale:.2f}")
             psi[s]    =  random_goal_psi + np.random.randn(rep_dim) * 0.1 * var_scale
-    ## the experiment where I initialize some states to not be orthogonal to the goal
-    elif init_mode == "uniform_around_goal" and env == "fourRooms30":
-        for s, (r, c) in enumerate(coords):
-            var_scale = near_var
-            in_top_left     = (r < mid_r)  and (c < mid_c)
-            in_bottom_right = (r >= mid_r) and (c >= mid_c)
+            if optimality_exp_mode is not "deactive" and env == "fourRooms10":
+                # special case for the fourRooms10 experiment where I initialize some states to not be orthogonal to the goal
+                in_top_left = (7 <= r <= 9) and (0 <= c <= 3)
+                in_bottom_right = (0 <= r <= 2) and (6 <= c <= 9)
 
-            base = random_goal_psi if (in_top_left or in_bottom_right) else perp_anchor
-            psi[s] = base + np.random.randn(rep_dim) * 0.1 * var_scale
+
+                base = perp_anchor if (in_top_left or in_bottom_right) else random_goal_psi
+                psi[s] = base + np.random.randn(rep_dim) * 0.1 * var_scale
+
+    ## the experiment where I initialize some states to not be orthogonal to the goal
+    # elif init_mode == "uniform_around_goal" and env == "fourRooms30":
+    #     for s, (r, c) in enumerate(coords):
+    #         var_scale = near_var
+    #         in_top_left     = (r < mid_r)  and (c < mid_c)
+    #         in_bottom_right = (r >= mid_r) and (c >= mid_c)
+
+    #         base = random_goal_psi if (in_top_left or in_bottom_right) else perp_anchor
+    #         psi[s] = base + np.random.randn(rep_dim) * 0.1 * var_scale
 
             
     else:
@@ -493,7 +526,8 @@ def select_action(s: int, g: int) -> int:
     for a in range(NUM_ACTIONS):
         ns = step(s, a)
         sim = psi[ns] @ goal_vec  # dot similarity (or cosine if normalized)
-        #sim = psi[ns] @ np.random.randn(rep_dim) * 0.1
+        if optimality_exp_mode == "random_goal":
+            sim = psi[ns] @ np.random.randn(rep_dim) * 0.1
         # if plain_goal:
         #     proj = P_plane @ psi[ns]
         #     sim = proj @ proj  # squared norm in the plane
@@ -825,14 +859,14 @@ for ep in trange(1, num_episodes + 1, desc="episodes"):
                                     # shape (NUM_STATES,)
         sim_map = sim.reshape(walls.shape)
 
-        fig, ax = plt.subplots(figsize=(6, 6))
+        fig, ax = plt.subplots(figsize=(8, 8))
 
         # background: similarity heat-map
         im = ax.imshow(sim_map,
                     cmap="viridis",          # pick any perceptual colormap
                     origin="lower")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
-                    label=r"$cos \psi(s)\!,\!\psi(g)$")
+                    label=r"$\psi$-similarity")
 
         # optional: overlay walls in light gray
         ax.imshow(walls,
@@ -841,7 +875,7 @@ for ep in trange(1, num_episodes + 1, desc="episodes"):
 
         ax.legend(loc="upper left", frameon=False)
 
-        ax.set_title(f"Episodes {ep - episodes_per_upd + 1}–{ep}, cos similarity")
+        ax.set_title(f"Episodes {episodes_per_upd + 1}–{ep}")
         ax.axis("off")
         if psi.shape[1] == 2:
             X, Y = np.meshgrid(np.arange(WIDTH), np.arange(HEIGHT))
@@ -855,7 +889,9 @@ for ep in trange(1, num_episodes + 1, desc="episodes"):
 
             ax.quiver(X, Y, U, V, color="white", scale=1.5, scale_units="xy", angles='xy', width=0.005)
         fig.tight_layout()
-        fig.savefig(f"{run_dir}/trajs_ep{ep:05d}_cos.png", dpi=150)
+        #fig.savefig(f"{run_dir}/trajs_ep{ep:05d}_cos.png", dpi=150)
+        fig.savefig(f"{run_dir}/trajs_ep{ep:05d}_cos.pdf", dpi=300, bbox_inches="tight")
+
         plt.close(fig)
 
 
@@ -895,14 +931,14 @@ for ep in trange(1, num_episodes + 1, desc="episodes"):
                                     # shape (NUM_STATES,)
         sim_map = sim.reshape(walls.shape)
 
-        fig, ax = plt.subplots(figsize=(6, 6))
+        fig, ax = plt.subplots(figsize=(8, 8))
 
         # background: similarity heat-map
         im = ax.imshow(sim_map,
                     cmap="viridis",          # pick any perceptual colormap
                     origin="lower")
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04,
-                    label=r"$cos \psi(s)\!,\!\psi(g)$")
+                    label=r"$\psi$-similarity")
 
         # optional: overlay walls in light gray
         ax.imshow(walls,
@@ -917,11 +953,20 @@ for ep in trange(1, num_episodes + 1, desc="episodes"):
         # 3. highlight the fixed start and goal
         ax.scatter(*np.unravel_index(START_STATE, walls.shape)[::-1],
                 marker="o", s=60, c="lime", label="start")
-        ax.scatter(*np.unravel_index(goal, walls.shape)[::-1],
-                marker="*", s=90, c="red",  label="goal")
-        ax.legend(loc="upper left", frameon=False)
+        # ax.scatter(*np.unravel_index(goal, walls.shape)[::-1],
+        #         marker="*", s=90, c="red",  label="goal")
+        #ax.legend(loc="upper left", frameon=False)
+        # ax.legend(
+        #     loc="upper left",
+        #     bbox_to_anchor=(-0.05, 1.05),   # adjust position
+        #     frameon=True,                   # show box around legend
+        #     fancybox=True,                  # rounded corners
+        #     framealpha=1.0,                 # transparency (1 = solid)
+        #     edgecolor="black",              # border color
+        #     facecolor="white"               # background color
+        # )
 
-        ax.set_title(f"Episodes {ep - episodes_per_upd + 1}–{ep}, cos similarity")
+        ax.set_title(f"Episode {ep}")
         ax.axis("off")
         if psi.shape[1] == 2:
             X, Y = np.meshgrid(np.arange(WIDTH), np.arange(HEIGHT))
@@ -935,7 +980,7 @@ for ep in trange(1, num_episodes + 1, desc="episodes"):
 
             ax.quiver(X, Y, U, V, color="white", scale=1.5, scale_units="xy", angles='xy', width=0.005)
         fig.tight_layout()
-        fig.savefig(f"{run_dir}/trajs_ep{ep:05d}_cos.png", dpi=150)
+        fig.savefig(f"{run_dir}/trajs_ep{ep:05d}_cos.pdf", dpi=300, bbox_inches="tight")
         plt.close(fig)
 
 
@@ -1071,7 +1116,7 @@ for ep in trange(1, num_episodes + 1, desc="episodes"):
             m_BR = (ii >= mid_i) & (jj >= mid_j)
 
             # ----- figure & shared colormap -----
-            fig = plt.figure(figsize=(6, 6))
+            fig = plt.figure(figsize=(12, 10))
             ax  = fig.add_subplot(111, projection='3d')
 
             # Use a single ScalarMappable to keep one colorbar across groups
@@ -1088,15 +1133,22 @@ for ep in trange(1, num_episodes + 1, desc="episodes"):
                 ('s', 'Top-Left',  m_BL),
                 ('D', 'Top-Right', m_BR),
             ]
-
+            dot_size = 60        # try 36, 60, 100; larger = bigger dots
+            rasterize_flag = (N >= 30000)   # keep rasterization for very large clouds
             # plot each room with a different marker (color still encodes cos angle)
             for marker, label, m in groups:
                 if np.any(m):
-                    ax.scatter(X[m], Y[m], Z[m],
-                            c=c[m], cmap=cmap, norm=norm,
-                            s=12, alpha=0.9, marker=marker, label=label)
-
-            cb = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
+                    ax.scatter(
+                    X[m], Y[m], Z[m],
+                    c=c[m], cmap=cmap, norm=norm,
+                    s=dot_size,
+                    alpha=0.95,
+                    marker=marker,
+                    label=label,
+                    edgecolor='k', linewidth=0.18,
+                    rasterized=rasterize_flag
+                )
+            cb = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.03)
             cb.set_label("cos(ψ(s), ψ(goal))")
 
             # unit sphere wireframe (reference)
@@ -1108,24 +1160,88 @@ for ep in trange(1, num_episodes + 1, desc="episodes"):
             ax.plot_wireframe(xs, ys, zs, color='lightgray', linewidth=0.3, alpha=0.5)
 
             # mark goal at (0,0,1)
-            ax.scatter([0], [0], [1], c='red', s=80, marker='*', label='goal (u1)')
+            ax.scatter([0], [0], [1], c='red', s=100, marker='*', label='Goal (z)')
 
-            ax.set_xlabel("u2 (orthogonal to goal)")
-            ax.set_ylabel("u3 (orthogonal to goal)")
-            ax.set_zlabel("u1 (along goal)")
-            ax.set_title("ψ projected to goal-aligned 3D frame\n(markers = rooms)")
+            #ax.set_xlabel("u2 (orthogonal to goal)",  fontsize=24)
+            #ax.set_ylabel("u3 (orthogonal to goal)")
+            #ax.set_zlabel("u1 (along goal)")
+            ax.set_title("3D PCA plot of ψ - FourRooms", fontsize=24)
 
             # equal aspect ratio
             max_range = np.array([X.max()-X.min(), Y.max()-Y.min(), Z.max()-Z.min()]).max() if N else 1.0
             cx, cy, cz = (X.mean() if N else 0.0), (Y.mean() if N else 0.0), (Z.mean() if N else 0.0)
-            ax.set_xlim(cx - max_range/2, cx + max_range/2)
-            ax.set_ylim(cy - max_range/2, cy + max_range/2)
-            ax.set_zlim(cz - max_range/2, cz + max_range/2)
+            # ax.set_xlim(cx - max_range/2, cx + max_range/2)
+            # ax.set_ylim(cy - max_range/2, cy + max_range/2)
+            # ax.set_zlim(cz - max_range/2, cz + max_range/2)
+            # instead of computing max_range from data:
+            ax.set_xlim(-1.1, 1.1)
+            ax.set_ylim(-1.1, 1.1)
+            ax.set_zlim(-0.15, 1.1)   # <-- focus on the top half of the unit sphere
 
-            ax.legend(loc="upper left")
+            leg = ax.legend(loc="upper left",
+                markerscale=2.5, # multiplies the marker size shown in legend
+                handletextpad=0.6,
+                labelspacing=0.4,
+                borderpad=0.4)
+
             fig.tight_layout()
-            fig.savefig(out_path, dpi=200)
+            #fig.savefig(out_path, dpi=200)
+            fig.savefig(out_path, format="pdf", bbox_inches="tight")
+
+
             plt.close(fig)
+
+            # --- choose base path from out_path ---
+            base, _ = os.path.splitext(out_path)
+            npz_path = base + "_goal_aligned.npz"
+            csv_path = base + "_goal_aligned.csv"
+
+            # --- build per-point room label array (string) ---
+            room_labels = np.full(X.shape[0], "None", dtype=object)
+            room_labels[m_TL] = "Bottom-Left"
+            room_labels[m_TR] = "Bottom-Right"
+            room_labels[m_BL] = "Top-Left"
+            room_labels[m_BR] = "Top-Right"
+
+            # --- compute the flat indices corresponding to the rows saved (only when you masked nonwalls) ---
+            # If you used `flat_idx` and `mask_nonwall` above, save the actual flat indices for each saved point:
+            if 'flat_idx' in locals() and 'mask_nonwall' in locals():
+                saved_flat_idx = flat_idx[mask_nonwall]
+            else:
+                # fallback: use a simple 0..N-1 index when no walls mapping
+                saved_flat_idx = np.arange(X.shape[0])
+
+            # --- Save a compact binary .npz with full fidelity (recommended) ---
+            np.savez(
+                npz_path,
+                flat_idx=saved_flat_idx,
+                i=ii,
+                j=jj,
+                X=X,
+                Y=Y,
+                Z=Z,
+                c=c,
+                room=room_labels,
+                u1=u1,
+                u2=u2,
+                u3=u3,
+                psi_use=psi_use
+            )
+
+            # --- Save a CSV for easy inspection / sharing ---
+            df = pd.DataFrame({
+                "flat_idx": saved_flat_idx,
+                "i": ii,
+                "j": jj,
+                "X": X,
+                "Y": Y,
+                "Z": Z,
+                "c": c,
+                "room": room_labels
+            })
+            df.to_csv(csv_path, index=False)
+
+            print(f"[viz] saved projection data: {npz_path} (binary), {csv_path} (csv)")
 
         def plot_pca_3d(psi_mat, out_path):
             eps = 1e-12
@@ -1169,7 +1285,7 @@ for ep in trange(1, num_episodes + 1, desc="episodes"):
         
 
         # Save figures
-        plot_goal_aligned_3d(psi, goal_vec, os.path.join(run_dir, f"psi_goal_frame_3d_{ep:05d}.png"))
+        plot_goal_aligned_3d(psi, goal_vec, os.path.join(run_dir, f"psi_goal_frame_3d_{ep:05d}.pdf"))
         # optional:
         #plot_pca_3d(psi, os.path.join(run_dir, f"psi_pca_3d_{ep:05d}.png"))
 

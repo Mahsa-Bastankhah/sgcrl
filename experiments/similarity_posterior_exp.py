@@ -114,6 +114,9 @@ uid = args.uid
 #     plot_posterior = False
 
 
+
+
+
 if env_name == 'point_Spiral11x11':
     point_map = np.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
                         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -189,6 +192,73 @@ elif env_name == 'point_FourRooms':
 
 
 
+
+
+def save_psi_similarity(goal_locations, psi_similarity, max_y, env_name, seed, ckpt_num,
+                        action_mode, project, uid,
+                        pos_arr, pos_id_arr, starts_arr, goals_arr,
+                        episode_length, num_episodes):
+    """
+    Saves per-point psi similarity with coordinates, and also the agent trajectories.
+
+    goal_locations[:, 0] -> row (y on the grid)
+    goal_locations[:, 1] -> col (x on the grid)
+    y_plot = max_y - row  (the y you use for plotting)
+
+    Trajectory fields saved:
+      - pos_arr:        shape (NUM_EPISODES*EPISODE_LENGTH, 2), raw (row, col) per step
+      - pos_id_arr:     shape (NUM_EPISODES*EPISODE_LENGTH,), episode id for each step
+      - starts_arr:     shape (NUM_EPISODES, 2), start (row, col) per episode
+      - goals_arr:      shape (NUM_EPISODES, 2), goal (row, col) per episode
+      - episode_length: int
+      - num_episodes:   int
+    """
+    data_dir = os.path.join("experiments/psi_data", f"{env_name}_{seed}")
+    if uid is not None:
+        data_dir = os.path.join(data_dir, uid)
+    os.makedirs(data_dir, exist_ok=True)
+
+    x_col = goal_locations[:, 1]
+    y_row = goal_locations[:, 0]
+    y_plot = max_y - y_row
+
+    out_arr = np.column_stack([x_col, y_row, y_plot, psi_similarity])
+    header = "x_col,y_row,y_plot,psi_similarity"
+
+    base = "psi_projected" if project else f"psi_{action_mode}"
+    csv_path = os.path.join(data_dir, f"{base}_{ckpt_num}.csv")
+    npz_path = os.path.join(data_dir, f"{base}_{ckpt_num}.npz")
+
+    # human-friendly
+    np.savetxt(csv_path, out_arr, delimiter=",", header=header, comments="")
+
+    # programmatic (now includes trajectory info)
+    np.savez_compressed(
+        npz_path,
+        # grid / psi
+        x_col=x_col, y_row=y_row, y_plot=y_plot,
+        psi_similarity=psi_similarity,
+        goal_locations=goal_locations,
+        # trajectories
+        pos_arr=pos_arr,
+        pos_id_arr=pos_id_arr,
+        starts_arr=starts_arr,
+        goals_arr=goals_arr,
+        episode_length=np.int32(episode_length),
+        num_episodes=np.int32(num_episodes),
+        # light metadata
+        env_name=np.array(env_name),
+        seed=np.int32(seed),
+        ckpt_num=np.int32(ckpt_num),
+        action_mode=np.array(action_mode),
+        projected=np.bool_(project),
+    )
+
+    print(f"Saved psi-similarity CSV to: {csv_path}")
+    print(f"Saved psi-similarity + trajectories NPZ to: {npz_path}")
+
+
+
 for ckpt_num in tqdm(ckpt_list):
     print("-----------------------------------------------------------")
     axes_names = ['x', 'y']
@@ -225,6 +295,29 @@ for ckpt_num in tqdm(ckpt_list):
     #     (waypoint_similarity, "Waypoint Similarity"),
     #     (critic_sf, "Value of S_f"),
     # ]
+
+
+
+    # NEW: persist coordinates + psi similarity for this checkpoint
+    save_psi_similarity(
+        goal_locations=goal_locations,
+        psi_similarity=psi_similarity,
+        max_y=max_y,
+        env_name=env_name,
+        seed=seed,
+        ckpt_num=ckpt_num,
+        action_mode=action_mode,
+        project=project,
+        uid=uid,
+        # NEW:
+        pos_arr=pos_arr,
+        pos_id_arr=pos_id_arr,
+        starts_arr=starts_arr,
+        goals_arr=goals_arr,
+        episode_length=EPISODE_LENGTH,
+        num_episodes=NUM_EPISODES,
+    )
+
 
     if plot_psi is True:
         print("===============checkpoint===============", ckpt_num)

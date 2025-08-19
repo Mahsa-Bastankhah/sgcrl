@@ -14,11 +14,11 @@ NEAR_VARS=(0.2)
 FAR_VARS=(5.0)
 ALPHAS=(100)
 REPLAY_CAPS=(1000)
-MAX_STEPS_LIST=(30)
+MAX_STEPS_LIST=(100)
 BATCH_SIZES=(128)
-NUM_EPISODES_LIST=(100000)
+NUM_EPISODES_LIST=(50001)
 GAMMAS=(0.99)
-SEEDS=(211)
+SEEDS=(205)
 entropy_coeff=(0.1)
 # -------------------------------------------------------
 
@@ -58,6 +58,8 @@ for REP in "${REP_DIMS[@]}"; do
                             --loss_mode "backward" \
                             --env "fourRooms10" \
                             --verbose True \
+                            --random_exploration True \
+                            --optimality_exp_mode "sgcrl" \
 
                         done
                       done

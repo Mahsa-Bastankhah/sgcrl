@@ -13,4 +13,6 @@ logs
 **/**/*.png
 *.log
 runs_final/
+experiments/plots/
+experiments/psi_data
 

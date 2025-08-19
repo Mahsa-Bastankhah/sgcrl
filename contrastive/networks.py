@@ -348,6 +348,7 @@ def make_networks(
         # jax.debug.print("region_bounds {lower} {upper}", lower=lower, upper=upper)
         # jax.debug.print("goal {goal}", goal=goal)
         # jax.debug.print("fixed goal {fixed_goal}", fixed_goal =config.fixed_goal)
+        # jax.debug.print("stop grad fixed {stop_grad}", stop_grad = config.stop_grad_fixed)
         mask = _in_region(goal, lower, upper)     # (batch,)
 
         # ▸ 1.  Convert whatever the user put in `config.fixed_goal`
