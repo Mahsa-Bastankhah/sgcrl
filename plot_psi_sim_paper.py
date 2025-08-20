@@ -91,81 +91,52 @@ def main():
     parser.add_argument("--out_dir", type=str, default=None)
     args = parser.parse_args()
 
+
     env_name = "point_FourRooms"
     point_map, axes_lims, _ = fourrooms_map()
+    out_dir = args.out_dir or os.path.join("experiments/plots", f"{env_name}_multi") 
+    os.makedirs(out_dir, exist_ok=True)
+    # --- replace the figure setup with a single axis ---
+    fig, ax = plt.subplots(figsize=(6, 6))
 
-    # Figure with 1x2 panels
-    #fig, axes = plt.subplots(1, 2, figsize=(13, 6))
-    # OLD
-    # fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+    # --- remove these now-unused initializations ---
+    # all_handles = None
+    # heats = []
+    # vmins, vmaxs = [], []
 
-    # NEW — reserve a 3rd, skinny column for the colorbar
-    fig = plt.figure(figsize=(13, 6))
-    gs = fig.add_gridspec(1, 3, width_ratios=[1, 1, 0.04], wspace=0.00)
-    ax0 = fig.add_subplot(gs[0, 0])
-    ax1 = fig.add_subplot(gs[0, 1])
-    cax = fig.add_subplot(gs[0, 2])  # dedicated colorbar axis
-    axes = [ax0, ax1]
+    # --- keep just the first seed and plot once (you already did this) ---
+    seed = args.seeds[0]
+    npz_path, base = build_npz_path(env_name, seed, args.ckpt,
+                                    args.action_mode, args.project, args.uid)
+    if not os.path.exists(npz_path):
+        raise FileNotFoundError(f"Could not find NPZ at {npz_path}")
 
+    data = np.load(npz_path, allow_pickle=True)
+    handles, heat, vmin, vmax = plot_one(ax, data, point_map, axes_lims)
 
-    all_handles = None
+    # --- DELETE the shared-scale section below (vmins/vmaxs/heats/shared_norm) ---
+    # vmin_global, vmax_global = float(np.min(vmins)), float(np.max(vmaxs))
+    # shared_norm = plt.Normalize(vmin_global, vmax_global)
+    # for h in heats:
+    #     h.set_norm(shared_norm)
 
-    heats = []
-    vmins, vmaxs = [], []
-
-    # Plot each seed in its own panel (no local colorbars, no local titles)
-    for i, seed in enumerate(args.seeds[:2]):  # ensure two panels
-        npz_path, base = build_npz_path(env_name, seed, args.ckpt,
-                                        args.action_mode, args.project, args.uid)
-        if not os.path.exists(npz_path):
-            raise FileNotFoundError(f"Could not find NPZ at {npz_path}")
-
-        data = np.load(npz_path, allow_pickle=True)
-        handles, heat, vmin, vmax = plot_one(axes[i], data, point_map, axes_lims)
-        heats.append(heat)
-        vmins.append(vmin); vmaxs.append(vmax)
-        if all_handles is None:
-            all_handles = handles  # use handles from first panel
-
-    # Shared color scale + ONE shared colorbar
-    vmin_global, vmax_global = float(np.min(vmins)), float(np.max(vmaxs))
-    shared_norm = plt.Normalize(vmin_global, vmax_global)
-    for h in heats:
-        h.set_norm(shared_norm)
-
-    # cbar = fig.colorbar(heats[0], ax=axes, orientation="vertical",
-    #                     fraction=0.046, pad=1)
-    # cbar.ax.tick_params(labelsize=18)
-    # cbar.set_label(r"$\psi$ Similarity", fontsize=24, labelpad=15)
-
-    # OLD
-    # cbar = fig.colorbar(heats[0], ax=axes, orientation="vertical", fraction=0.046, pad=0.04)
-
-    # NEW — draw into the reserved axis so it never overlaps
-    cbar = fig.colorbar(heats[0], cax=cax, orientation="vertical")
+    # --- add a regular colorbar tied to the single plot ---
+    cbar = fig.colorbar(heat, ax=ax, orientation="vertical", fraction=0.046, pad=0.04)
     cbar.ax.tick_params(labelsize=18)
     cbar.set_label(r"$\psi$ Similarity", fontsize=24, labelpad=15)
 
+    # --- keep a bottom legend; ensure space for it ---
+    fig.subplots_adjust(bottom=0.18)
+    fig.legend(handles=handles, labels=['Goal', 'Start'],
+            loc='lower center', ncol=2, fontsize=18)
 
-    # (Removed suptitle to avoid duplicate "psi similarity" text)
-    # fig.suptitle(r"$\psi$ Similarity (shared scale)", fontsize=20)
-
-    # Legend at bottom center (unchanged)
-    fig.subplots_adjust(bottom=0.18, wspace=0.00)
-    fig.legend(
-        handles=all_handles,
-        labels=['Goal', 'Start'],
-        loc='lower center', ncol=2, fontsize=18
-    )
-
-    # Save one PDF
-    out_dir = args.out_dir or os.path.join("experiments/plots", f"{env_name}_multi")
-    os.makedirs(out_dir, exist_ok=True)
-
+    # --- fix the output filename to not reference a second seed ---
     mode_tag = "psi_projected" if args.project else f"psi_{args.action_mode}"
-    out_path = os.path.join(out_dir, f"{mode_tag}_seeds_{args.seeds[0]}_{args.seeds[1]}_ckpt_{args.ckpt}.pdf")
+    out_path = os.path.join(out_dir, f"{mode_tag}_seed_{args.seeds[0]}_ckpt_{args.ckpt}.pdf")
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    print(f"Saved combined PDF to: {out_path}")
+    print(f"Saved PDF to: {out_path}")
+
+
 
 if __name__ == "__main__":
     main()

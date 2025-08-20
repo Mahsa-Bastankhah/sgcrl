@@ -15,4 +15,6 @@ logs
 runs_final/
 experiments/plots/
 experiments/psi_data
+*.pdf
+experiments/safety_region_visits/
 
