@@ -12,5 +12,12 @@ archived/
 logs
 runs_final/
 **/*.png
+experiments/old_plots
+experiments/plots
+*.pdf
+**/*.pdf
+**/*.json
+**/*.csv
+**/*.npz
 
 

@@ -9,6 +9,7 @@ import gym
 import metaworld
 import numpy as np
 import point_env
+from point_env_3d import PointEnv3D
 
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 
@@ -49,8 +50,12 @@ def load(env_name, fixed_start_end=None):
     max_episode_steps = 150
     kwargs['fixed_start_end'] = fixed_start_end
   elif env_name.startswith('point_'):
-    CLASS = point_env.PointEnv
-    kwargs['walls'] = env_name.split('_')[-1]
+    if "3d" in env_name.lower():
+      CLASS = PointEnv3D
+      kwargs['walls'] = env_name.split('_')[-2]
+    else:
+      CLASS = point_env.PointEnv
+      kwargs['walls'] = env_name.split('_')[-1]
     kwargs['fixed_start_end'] = fixed_start_end
     if '11x11' in env_name:
       max_episode_steps = 100

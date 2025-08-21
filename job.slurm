@@ -31,7 +31,7 @@ echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 echo "CUDA_HOME: $CUDA_HOME"
 nvidia-smi
 
-seeds=(4433 4434 4435 4436 4437 4438 4439 4440)
+seeds=(0 1 2 3 4 5 6 7)
 SEED=${seeds[$SLURM_ARRAY_TASK_ID]}
 
 hidden_sizes=(256 256 256 256 256 256)
@@ -44,8 +44,9 @@ done
 
 
 python -u lp_contrastive.py \
-      --env point_FourRooms \
+      --time_delta_minutes 30 \
+      --env point_FourRooms_3d \
       --seed "$SEED" \
-      --num_steps 5000000 \
+      --num_steps 8000000 \
 
 exit 0  
