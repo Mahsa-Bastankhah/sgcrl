@@ -118,7 +118,9 @@ class PointEnv3D(gym.Env):
                  resize_factor: int = 1,
                  fixed_start_end: Optional[tuple] = None,
                  z_max: float = 10.0,
-                 action_noise: float = 0.01):
+                 action_noise: float = 0.01,
+                 noisy_tv: bool = True,
+                 noisy_tv_sigma: float = 1.0):
         """
         Args:
           walls: name of a map in WALLS or a binary HxW array; used for (x,y) only.
@@ -143,12 +145,33 @@ class PointEnv3D(gym.Env):
         self._action_noise = float(action_noise)
         self._fixed_start_end = fixed_start_end
 
+        self._noisy_tv = bool(noisy_tv)
+        self._noisy_tv_sigma = float(noisy_tv_sigma)
+        if self._noisy_tv:
+            print(f"[INIT] Noisy-TV mode enabled (σ={self._noisy_tv_sigma}). Actions are 2D only.")
+        else:
+            print("[INIT] Standard 3D mode enabled.")
+
         # 3D continuous actions
-        self.action_space = gym.spaces.Box(
-            low=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
-            dtype=np.float32
-        )
+        # self.action_space = gym.spaces.Box(
+        #     low=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
+        #     high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+        #     dtype=np.float32
+        # )
+                # 3D or 2D continuous actions depending on noisy_tv
+        if self._noisy_tv:
+            self.action_space = gym.spaces.Box(
+                low=np.array([-1.0, -1.0], dtype=np.float32),
+                high=np.array([ 1.0,  1.0], dtype=np.float32),
+                dtype=np.float32
+            )
+        else:
+            self.action_space = gym.spaces.Box(
+                low=np.array([-1.0, -1.0, -1.0], dtype=np.float32),
+                high=np.array([ 1.0,  1.0,  1.0], dtype=np.float32),
+                dtype=np.float32
+            )
+
 
         # Observations: [x, y, z, gx, gy, gz]
         self.observation_space = gym.spaces.Box(
@@ -163,6 +186,26 @@ class PointEnv3D(gym.Env):
         self.reset()
 
     # --- helpers (x,y use 2D walls; z is free but bounded) ---
+    def _in_bottom_left_room(self, xy):
+        # Generic "bottom-left room" as the bottom-left quadrant.
+        # x ~ rows (downwards), y ~ cols (rightwards)
+        return (xy[0] >= self._height / 2.0) and (xy[1] < self._width / 2.0)
+
+    def _apply_noisy_tv_z(self):
+        if not self._noisy_tv:
+            return
+        prev_z = self.state[2]
+        if self._in_bottom_left_room(self.state[:2]):
+            z = np.random.normal(0.0, self._noisy_tv_sigma)
+            self.state[2] = float(np.clip(z, self._z_min, self._z_max))
+            #print(f"[NOISY_TV] In bottom-left room → sampled z={self.state[2]:.3f} (prev {prev_z:.3f})")
+        else:
+            self.state[2] = 0.0
+            #print(f"[NOISY_TV] Outside bottom-left room → forced z=0 (prev {prev_z:.3f})")
+
+        # Always force goal z=0
+        self.goal[2] = 0.0
+
 
     def _sample_empty_xy(self):
         """Sample a free (x,y) cell and add uniform sub-cell jitter."""
@@ -175,6 +218,7 @@ class PointEnv3D(gym.Env):
         return xy
 
     def _get_obs(self):
+        #print(f"[OBS] pos=({self.state[0]:.3f}, {self.state[1]:.3f}, {self.state[2]:.3f}) ")
         return np.concatenate([self.state, self.goal]).astype(np.float32)
 
     def reset(self):
@@ -196,6 +240,8 @@ class PointEnv3D(gym.Env):
         # Ensure within bounds
         self.state = self._clip_state(self.state)
         self.goal  = self._clip_state(self.goal)
+        # Enforce noisy TV behavior on z at the start
+        self._apply_noisy_tv_z()
         return self._get_obs()
 
     def _discretize_xy(self, xy, resolution=1.0):
@@ -220,14 +266,24 @@ class PointEnv3D(gym.Env):
 
     def step(self, action):
         action = np.array(action, dtype=np.float32).copy()
-        if not self.action_space.contains(action):
-            print('WARNING: clipping invalid action:', action)
-        if self._action_noise > 0.0:
-            action += np.random.normal(0.0, self._action_noise, size=(3,))
-        action = np.clip(action, self.action_space.low, self.action_space.high)
-        assert self.action_space.contains(action)
 
-        # Same substep Euler integration as your 2D env
+        # Validate/clip action with appropriate dimensionality
+        if self._noisy_tv:
+            if action.shape != (2,):
+                # If someone passes a 3D action by mistake, ignore the z component
+                action = action[:2]
+            if self._action_noise > 0.0:
+                action += np.random.normal(0.0, self._action_noise, size=(2,))
+            action = np.clip(action, self.action_space.low, self.action_space.high)
+            assert self.action_space.contains(action)
+        else:
+            if not self.action_space.contains(action):
+                print('WARNING: clipping invalid action:', action)
+            if self._action_noise > 0.0:
+                action += np.random.normal(0.0, self._action_noise, size=(3,))
+            action = np.clip(action, self.action_space.low, self.action_space.high)
+            assert self.action_space.contains(action)
+
         num_substeps = 10
         dt = 1.0 / num_substeps
 
@@ -244,21 +300,31 @@ class PointEnv3D(gym.Env):
             if not self._is_blocked_xy(new_state[:2]):
                 self.state[1] = new_state[1]
 
-            # z axis (no walls, just bounds)
-            new_state = self.state.copy()
-            new_state[2] += dt * action[2]
-            self.state[2] = np.clip(new_state[2], self._z_min, self._z_max)
+            # z axis
+            if not self._noisy_tv:
+                new_state = self.state.copy()
+                new_state[2] += dt * action[2]
+                self.state[2] = np.clip(new_state[2], self._z_min, self._z_max)
 
+        # Clip and enforce noisy-tv z after the dynamics
         self.state = self._clip_state(self.state)
+        self._apply_noisy_tv_z()
 
-        done = False  # mirrors your 2D env
+        done = False
         obs = self._get_obs()
-        dist = np.linalg.norm(self.goal - self.state)  # full 3D distance
+
+        if self._noisy_tv:
+            # Reward ignores z because agent can't control it
+            dist = np.linalg.norm(self.goal[:2] - self.state[:2])
+        else:
+            dist = np.linalg.norm(self.goal - self.state)
+
         self._last_end_pos = self.state.copy()
         self._timestep += 1
         rew = float(dist < 1.0)
 
         return obs, rew, done, {}
+
 
     @property
     def walls(self):

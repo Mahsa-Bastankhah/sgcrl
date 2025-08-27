@@ -30,8 +30,8 @@ echo "CONDA_PREFIX: $CONDA_PREFIX"
 echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 echo "CUDA_HOME: $CUDA_HOME"
 nvidia-smi
-
-seeds=(0 1 2 3 4 5 6 7)
+#seeds=(0 1 2 3 4 5 6 7)
+seeds=(8 9 10 11 12 13 14 15)
 SEED=${seeds[$SLURM_ARRAY_TASK_ID]}
 
 hidden_sizes=(256 256 256 256 256 256)

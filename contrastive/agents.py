@@ -58,8 +58,9 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
           contrastive_utils.DistanceObserver(
               obs_dim=config.obs_dim,
               start_index=config.start_index,
-              end_index=config.end_index)
-      ]
+              end_index=config.end_index), 
+              visit_entropy_observer.VisitEntropyObserver(config= config)]
+      
       evaluator_factories = [
           distributed_layout.default_evaluator_factory(
               environment_factory=environment_factory_fixed_goals,
@@ -77,8 +78,7 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
         contrastive_utils.SuccessObserver(),
         contrastive_utils.DistanceObserver(obs_dim=config.obs_dim,
                                            start_index=config.start_index,
-                                           end_index=config.end_index),
-                                           visit_entropy_observer.VisitEntropyObserver(config= config),]
+                                           end_index=config.end_index)]
 
     super().__init__(
         seed=seed,

@@ -48,7 +48,7 @@ for idx in "${!seeds[@]}"; do
       --time_delta_minutes 15 \
       --env point_FourRooms_3d \
       --seed "$SEED" \
-      --num_steps 8000000 \
+      --num_steps 10000 \
       > "$LOG" 2>&1 &   # redirection now belongs to the nohup command
 done
 

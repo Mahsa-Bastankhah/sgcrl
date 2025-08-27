@@ -28,6 +28,7 @@ flags.DEFINE_string('env', 'sawyer_bin', 'Environment type, e.g. default is sawy
 flags.DEFINE_integer('num_steps', 8_000_000, 'Number of steps to run', lower_bound=0)
 flags.DEFINE_bool('sample_goals', False, 'sample the goal position uniformly according to the environment (corresponds to the original contrastive_rl algorithm)')
 
+
 # fixed goal coordinates for supported environments
 fixed_goal_dict={'point_Spiral11x11': [np.array([5,5], dtype=float), np.array([10,10], dtype=float)],
                  'point_FourRooms': [np.array([0,0], dtype=float), np.array([10,8], dtype=float)],

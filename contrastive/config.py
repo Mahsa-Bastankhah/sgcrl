@@ -74,6 +74,7 @@ class ContrastiveConfig:
   max_episode_steps: int = -1
   start_index: int = 0
   end_index: int = -1
+  noisy_tv: bool = False  # Whether the environment is noisy TV.
 
 
 def target_entropy_from_env_spec(
