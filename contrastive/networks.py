@@ -50,8 +50,13 @@ def make_networks(
     hidden_layer_sizes = (256, 256),
     actor_min_std = 1e-6,
     twin_q = False,
-    use_image_obs = False):
+  use_image_obs = False,
+  config=None):
   """Creates networks used by the agent."""
+
+  if config is not None:
+    # Config is currently unused; kept to stay compatible with legacy API.
+    _ = config
 
   num_dimensions = np.prod(spec.actions.shape, dtype=int)
   TORSO = networks_lib.AtariTorso  # pylint: disable=invalid-name

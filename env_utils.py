@@ -77,25 +77,36 @@ class SawyerBin(
     self._freeze_rand_vec = False
     self._set_task_called = True
     self._fixed_start_end=fixed_start_end
+    self._goal_set_once = False  # Flag to set goal only once
+    # Allow arbitrarily long trajectories by relaxing MetaWorld path length limits
+    huge_path_len = 10**9
+    self.max_path_length = huge_path_len
+    if hasattr(self, '_max_path_length'):
+      self._max_path_length = huge_path_len
     self.reset()
 
   def reset(self):
     super(SawyerBin, self).reset()
-    body_id = self.model.body_name2id('bin_goal')
-    pos1 = self.sim.data.body_xpos[body_id].copy()
-    pos1 += np.random.uniform(-0.05, 0.05, 3)
-    pos2 = self._get_pos_objects().copy()
     
-    if self._fixed_start_end is not None:
-        # Set the goal to be a fixed location
-        self._goal = self._fixed_start_end 
-    else:
-        t = np.random.random()
-        # Set the goal to be a uniformly sampled location
-        # between the starting and end point
-        self._goal = t * pos1 + (1 - t) * pos2
-        self._goal[2] = np.random.uniform(0.03, 0.12)
-    self._target_pos = self._goal
+    # Only set goal once at the first reset (for continuous episode)
+    if not self._goal_set_once:
+      body_id = self.model.body_name2id('bin_goal')
+      pos1 = self.sim.data.body_xpos[body_id].copy()
+      pos1 += np.random.uniform(-0.05, 0.05, 3)
+      pos2 = self._get_pos_objects().copy()
+      
+      if self._fixed_start_end is not None:
+          # Set the goal to be a fixed location
+          self._goal = self._fixed_start_end 
+      else:
+          t = np.random.random()
+          # Set the goal to be a uniformly sampled location
+          # between the starting and end point
+          self._goal = t * pos1 + (1 - t) * pos2
+          self._goal[2] = np.random.uniform(0.03, 0.12)
+      self._target_pos = self._goal
+      self._goal_set_once = True
+    
     return self._get_obs()
 
   def step(self, action):
@@ -146,24 +157,34 @@ class SawyerBox(
     self._set_task_called = True
     self._partially_observable = False
     self._freeze_rand_vec = False
+    self._goal_set_once = False  # Flag to set goal only once
+    huge_path_len = 10**9
+    self.max_path_length = huge_path_len
+    if hasattr(self, '_max_path_length'):
+      self._max_path_length = huge_path_len
     self.reset()
 
   def reset(self):
     super(SawyerBox, self).reset()
-    pos1 = self._target_pos.copy()
-    pos2 = self._get_pos_objects().copy()
     
-    if self._fixed_start_end is not None:
-        # Set the goal to be a fixed location
-        self._goal_pos = pos1 
-    else:
-        # Set the goal to be a uniformly sampled location
-        # between the starting and end point
-        t = np.random.random()
-        self._goal_pos = t * pos1 + (1 - t) * pos2
-        
-    self._goal_quat = np.array([0.707, 0, 0, 0.707]) # ideal orientation of lid
-    self._target_pos = self._goal_pos    
+    # Only set goal once at the first reset (for continuous episode)
+    if not self._goal_set_once:
+      pos1 = self._target_pos.copy()
+      pos2 = self._get_pos_objects().copy()
+      
+      if self._fixed_start_end is not None:
+          # Set the goal to be a fixed location
+          self._goal_pos = pos1 
+      else:
+          # Set the goal to be a uniformly sampled location
+          # between the starting and end point
+          t = np.random.random()
+          self._goal_pos = t * pos1 + (1 - t) * pos2
+          
+      self._goal_quat = np.array([0.707, 0, 0, 0.707]) # ideal orientation of lid
+      self._target_pos = self._goal_pos
+      self._goal_set_once = True
+    
     return self._get_obs()
 
   def step(self, action):
@@ -219,22 +240,32 @@ class SawyerPeg(
     self._set_task_called = True
     self._partially_observable = False
     self._freeze_rand_vec = False
+    self._goal_set_once = False  # Flag to set goal only once
+    huge_path_len = 10**9
+    self.max_path_length = huge_path_len
+    if hasattr(self, '_max_path_length'):
+      self._max_path_length = huge_path_len
     self.reset()
 
   def reset(self):
     super(SawyerPeg, self).reset()
-    pos1 = self._target_pos.copy()
-    pos2 = self._get_site_pos("pegHead")
     
-    if self._fixed_start_end is not None:
-        # Set the goal to be a fixed location
-        self._goal_pos = pos1 
-    else:
-        # Set the goal to be a uniformly sampled location
-        # between the starting and end point
-        t = np.random.random()
-        self._goal_pos = t * pos1 + (1 - t) * pos2
-    self._target_pos = self._goal_pos    
+    # Only set goal once at the first reset (for continuous episode)
+    if not self._goal_set_once:
+      pos1 = self._target_pos.copy()
+      pos2 = self._get_site_pos("pegHead")
+      
+      if self._fixed_start_end is not None:
+          # Set the goal to be a fixed location
+          self._goal_pos = pos1 
+      else:
+          # Set the goal to be a uniformly sampled location
+          # between the starting and end point
+          t = np.random.random()
+          self._goal_pos = t * pos1 + (1 - t) * pos2
+      self._target_pos = self._goal_pos
+      self._goal_set_once = True
+    
     return self._get_obs()
 
   def step(self, action):

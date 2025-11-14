@@ -159,8 +159,59 @@ class ObservationFilterWrapper(base.EnvironmentWrapper):
     return self._observation_spec
 
 
+class FakeEpisodeBoundaryWrapper(base.EnvironmentWrapper):
+  """Wrapper that creates fake episode boundaries for continuous episodes.
+  
+  This allows us to have one long continuous episode but still chunk the data
+  into fixed-length trajectories for the replay buffer by inserting LAST 
+  timesteps periodically without actually resetting the environment.
+  """
+
+  def __init__(self, environment, steps_per_chunk):
+    """Initializes the wrapper.
+    
+    Args:
+      environment: Environment to wrap.
+      steps_per_chunk: Number of steps before creating a fake episode boundary.
+    """
+    super().__init__(environment)
+    self._steps_per_chunk = steps_per_chunk
+    self._step_count = 0
+    self._needs_reset = True
+    self._last_observation = None
+
+  def reset(self):
+    # Only do actual reset on first call or when explicitly needed
+    if self._needs_reset:
+      timestep = self._environment.reset()
+      self._needs_reset = False
+      self._last_observation = timestep.observation
+    else:
+      # Fake reset - just get current observation without resetting
+      timestep = dm_env.TimeStep(
+          step_type=dm_env.StepType.FIRST,
+          reward=0.0,
+          discount=1.0,
+          observation=self._last_observation
+      )
+    self._step_count = 0
+    return timestep
+
+  def step(self, action):
+    timestep = self._environment.step(action)
+    self._last_observation = timestep.observation
+    self._step_count += 1
+    
+    # Create fake episode boundary after steps_per_chunk steps
+    if self._step_count >= self._steps_per_chunk:
+      # Return LAST timestep to trigger episode boundary in replay buffer
+      timestep = timestep._replace(step_type=dm_env.StepType.LAST)
+    
+    return timestep
+
+
 def make_environment(env_name, start_index, end_index,
-                     seed, fixed_start_end = None):
+                     seed, fixed_start_end = None, extra_dim: int = 0):
   """Creates the environment.
 
   Args:
@@ -169,6 +220,9 @@ def make_environment(env_name, start_index, end_index,
     end_index: final index of the observation to use in the goal. The goal
       is then obs[start_index:goal_index].
     seed: random seed.
+    extra_dim: backwards-compatibility hook; legacy callers may request
+      additional observation features. The current environments do not
+      expose these extra features, so the parameter is ignored.
   Returns:
     env: the environment
     obs_dim: integer specifying the size of the observations, before
@@ -176,6 +230,9 @@ def make_environment(env_name, start_index, end_index,
   """
   np.random.seed(seed)
   gym_env, obs_dim, max_episode_steps = env_utils.load(env_name, fixed_start_end)
+  if extra_dim:
+    print(f"[make_environment] Requested extra_dim={extra_dim}, but the current"
+          " environment does not expose additional coordinates; ignoring.")
   goal_indices = obs_dim + obs_to_goal_1d(np.arange(obs_dim), start_index,
                                           end_index)
   indices = np.concatenate([
@@ -183,7 +240,12 @@ def make_environment(env_name, start_index, end_index,
       goal_indices
   ])
   env = gym_wrapper.GymWrapper(gym_env)
-  env = step_limit.StepLimitWrapper(env, step_limit=max_episode_steps)
+  # Use very large step limit for continuous episode (no actual resets during training)
+  env = step_limit.StepLimitWrapper(env, step_limit=12_000_000)
+  # Add fake episode boundaries to chunk continuous episode into trajectories
+  env = FakeEpisodeBoundaryWrapper(env, steps_per_chunk=max_episode_steps)
+  # Preserve the original episode length for config, not the large step limit
+  env._step_limit = max_episode_steps
   env = ObservationFilterWrapper(env, indices)
   return env, obs_dim
 
