@@ -3,7 +3,7 @@
 #SBATCH --cpus-per-task=4         
 #SBATCH --mem-per-cpu=8G               
 #SBATCH --gres=gpu:1         
-#SBATCH --time=1:00:00                                   
+#SBATCH --time=5:00:00                                   
 #SBATCH --mail-user=mb6458@princeton.edu
 #SBATCH --account=eysenbach
 
@@ -30,9 +30,10 @@ echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
 echo "CUDA_HOME: $CUDA_HOME"
 nvidia-smi
 
+cd /home/mb6458/new-sgcrl/sgcrl || exit 1
 
 
-python -u lp_contrastive.py --seed 60 --env point_Spiral11x11
+python -u lp_contrastive.py --seed 99887766 --env sawyer_box
 
 
 exit 0  

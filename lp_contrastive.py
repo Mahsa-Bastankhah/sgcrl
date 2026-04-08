@@ -27,9 +27,22 @@ flags.DEFINE_string('alg', 'contrastive_cpc', 'Algorithm type, e.g. default is c
 flags.DEFINE_string('env', 'sawyer_bin', 'Environment type, e.g. default is sawyer bin')
 flags.DEFINE_integer('num_steps', 8_000_000, 'Number of steps to run', lower_bound=0)
 flags.DEFINE_bool('sample_goals', False, 'sample the goal position uniformly according to the environment (corresponds to the original contrastive_rl algorithm)')
+flags.DEFINE_integer(
+    'maze_traj_snapshot_every',
+    1000,
+    'Point/maze envs only: save a maze PNG with the last --maze_traj_snapshot_history '
+    'agent positions every N environment steps. Use 1000 for dense diagnostics; '
+    '5000 is lighter on disk. 0 disables.')
+flags.DEFINE_integer(
+    'maze_traj_snapshot_history',
+    50,
+    'Point/maze envs only: number of recent positions drawn on each snapshot.')
 
 # fixed goal coordinates for supported environments
 fixed_goal_dict={'point_Spiral11x11': [np.array([5,5], dtype=float), np.array([10,10], dtype=float)],
+                    'point_Impossible' :  [np.array([9,0], dtype=float), np.array([7 , 9], dtype=float)], # hardest right before the final wall [7,9]
+                 'point_Maze11x11' : [np.array([0,0], dtype=float), np.array([11,11], dtype=float)], # hardest [11,11] , [5,4] doable using 1024 network
+                 'point_Wall11x11' : [np.array([2,0], dtype=float), np.array([0,0], dtype=float)], # hardest [2,0] [0,0] easier [2,8] [0,10]
                      #note: sawyer fixed goal positions vary slightly with each episode
                       'sawyer_bin': np.array([0.12, 0.7, 0.02]),
                       'sawyer_box': np.array([0.0, 0.75, 0.133]),
@@ -103,6 +116,11 @@ def main(_):
   #   2D nav: point_{Spiral11x11}
   env_name = FLAGS.env
   print('Using env {}...'.format(env_name))
+  print(
+      'Non-episodic physics: environments are built with '
+      'FakeEpisodeBoundaryWrapper (see actor/worker stdout for '
+      '[sgcrl continuous-episode] lines).',
+      flush=True)
   
   seed_idx = FLAGS.seed
   print('Using random seed {}...'.format(seed_idx))
@@ -130,6 +148,13 @@ def main(_):
   
   params['log_dir'] = FLAGS.log_dir_path
   params['time_delta_minutes'] = FLAGS.time_delta_minutes
+
+  if FLAGS.maze_traj_snapshot_every > 0:
+    os.environ['SGCRL_MAZE_TRAJ_EVERY'] = str(FLAGS.maze_traj_snapshot_every)
+    os.environ['SGCRL_MAZE_TRAJ_HISTORY'] = str(FLAGS.maze_traj_snapshot_history)
+    os.environ['SGCRL_MAZE_TRAJ'] = '1'
+  else:
+    os.environ['SGCRL_MAZE_TRAJ'] = '0'
   
   if alg == 'contrastive_cpc':
     params['use_cpc'] = True
