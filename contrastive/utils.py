@@ -1,6 +1,6 @@
 """Utilities for the contrastive RL agent."""
 import functools
-from typing import Dict
+from typing import Dict, List
 from typing import Optional, Sequence
 
 from acme import types
@@ -203,3 +203,128 @@ class InitiallyRandomActor(actors.GenericActor):
       action, self._state = self._policy(self._params, observation,
                                          self._state)
     return utils.to_numpy(action)
+
+
+def _unwrap_to_point_env(env):
+  """Walk through acme/gym wrappers until we reach the raw PointEnv."""
+  e = env
+  while hasattr(e, '_environment'):
+    e = e._environment
+  return e
+
+
+class MazeTrajWandbObserver(observers_base.EnvLoopObserver):
+  """Logs evaluator trajectories on the maze grid to Weights & Biases.
+
+  Works for any point_env (FourRooms, Spiral11x11, …).  Trajectories are
+  rendered as matplotlib figures (colour-coded start→end) overlaid on the
+  maze walls, then uploaded as wandb images every ``log_every_n`` episodes.
+
+  The observer logs directly to wandb (not through the Acme logger), so
+  ``get_metrics()`` always returns an empty dict.
+  """
+
+  def __init__(self, obs_dim: int, log_every_n: int = 20):
+    self._obs_dim = obs_dim
+    self._log_every_n = log_every_n
+    self._positions: List[np.ndarray] = []
+    self._goal: Optional[np.ndarray] = None
+    self._walls: Optional[np.ndarray] = None
+    self._episode_count = 0
+
+  # ------------------------------------------------------------------
+  # Observer interface
+  # ------------------------------------------------------------------
+
+  def observe_first(self, env, timestep) -> None:
+    # Render and log the episode that just finished (if any).
+    if self._positions and self._walls is not None:
+      self._episode_count += 1
+      if self._episode_count % self._log_every_n == 0:
+        self._render_and_log(self._episode_count)
+
+    # Cache walls once (unwrap all acme/gym layers to reach PointEnv).
+    if self._walls is None:
+      point_env = _unwrap_to_point_env(env)
+      if hasattr(point_env, '_walls'):
+        self._walls = point_env._walls  # pylint: disable=protected-access
+
+    obs = timestep.observation
+    self._positions = [obs[:self._obs_dim].copy()]
+    self._goal = obs[self._obs_dim:].copy()
+
+  def observe(self, env, timestep, action) -> None:
+    obs = timestep.observation
+    self._positions.append(obs[:self._obs_dim].copy())
+
+  def get_metrics(self):
+    return {}
+
+  # ------------------------------------------------------------------
+  # Rendering
+  # ------------------------------------------------------------------
+
+  def _render_and_log(self, episode: int) -> None:
+    try:
+      import wandb  # pylint: disable=import-outside-toplevel
+      import matplotlib  # pylint: disable=import-outside-toplevel
+      matplotlib.use('Agg')
+      import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
+      import matplotlib.patheffects as pe  # pylint: disable=import-outside-toplevel
+
+      if wandb.run is None:
+        return
+
+      positions = np.array(self._positions)  # (T, 2)  — [row, col]
+      goal = self._goal
+      walls = self._walls
+      H, W = walls.shape
+
+      fig, ax = plt.subplots(figsize=(5, 5), dpi=100)
+      fig.patch.set_facecolor('#1a1a2e')
+      ax.set_facecolor('#1a1a2e')
+
+      # Draw maze: walls dark, open cells light.
+      maze_rgb = np.where(walls[..., None], 0.15, 0.9) * np.ones((H, W, 3))
+      ax.imshow(maze_rgb, origin='upper', extent=[0, W, H, 0], zorder=0)
+
+      # Draw trajectory colour-ramped blue→yellow.
+      n = len(positions)
+      if n > 1:
+        colors = plt.cm.plasma(np.linspace(0.1, 0.9, n - 1))
+        for i in range(n - 1):
+          ax.plot(
+              positions[i:i+2, 1], positions[i:i+2, 0],
+              color=colors[i], linewidth=1.8, alpha=0.85, zorder=2,
+          )
+
+      # Start marker (green circle).
+      ax.scatter(
+          positions[0, 1], positions[0, 0],
+          c='#00ff88', s=120, zorder=5, edgecolors='white', linewidths=0.8,
+          label='start',
+      )
+      # Goal marker (red star).
+      ax.scatter(
+          goal[1], goal[0],
+          c='#ff4466', s=180, marker='*', zorder=5,
+          edgecolors='white', linewidths=0.8, label='goal',
+      )
+
+      ax.set_xlim(0, W)
+      ax.set_ylim(H, 0)
+      ax.set_xticks([])
+      ax.set_yticks([])
+      ax.legend(
+          loc='lower right', fontsize=7, framealpha=0.4,
+          labelcolor='white', facecolor='#1a1a2e',
+      )
+      ax.set_title(f'eval trajectory — episode {episode}',
+                   color='white', fontsize=9, pad=4)
+      plt.tight_layout(pad=0.5)
+
+      wandb.log({'eval/maze_traj': wandb.Image(fig)})
+      plt.close(fig)
+
+    except Exception as exc:  # pylint: disable=broad-except
+      print(f'[MazeTrajWandbObserver] render failed: {exc}')

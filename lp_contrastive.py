@@ -23,14 +23,20 @@ flags.DEFINE_string('log_dir_path', 'logs/', 'Where to log metrics')
 flags.DEFINE_integer('time_delta_minutes', 5, 'how often to save checkpoints')
 flags.DEFINE_integer('seed', 42, 'Specify seed, only used if use_slurm_array is false')
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
-flags.DEFINE_string('alg', 'contrastive_cpc', 'Algorithm type, e.g. default is contrastive_cpc with no entropy or KL losses')
+flags.DEFINE_string('alg', 'contrastive_cpc', 'Algorithm type: contrastive_cpc | c_learning | nce+c_learning | kappa_sac')
 flags.DEFINE_string('env', 'sawyer_bin', 'Environment type, e.g. default is sawyer bin')
 flags.DEFINE_integer('num_steps', 8_000_000, 'Number of steps to run', lower_bound=0)
 flags.DEFINE_bool('sample_goals', False, 'sample the goal position uniformly according to the environment (corresponds to the original contrastive_rl algorithm)')
+# Weights & Biases
+flags.DEFINE_bool('use_wandb', False, 'Log metrics to Weights & Biases')
+flags.DEFINE_string('wandb_project', 'sgcrl', 'wandb project name')
+flags.DEFINE_string('wandb_entity', '', 'wandb entity (username or team); leave empty for default')
+flags.DEFINE_string('wandb_group', '', 'wandb run group, useful for grouping sweeps')
 
 # fixed goal coordinates for supported environments
 fixed_goal_dict={'point_Spiral11x11': [np.array([5,5], dtype=float), np.array([10,10], dtype=float)],
                      #note: sawyer fixed goal positions vary slightly with each episode
+                      'point_FourRooms': [np.array([0,0], dtype=float), np.array([10,8], dtype=float)],
                       'sawyer_bin': np.array([0.12, 0.7, 0.02]),
                       'sawyer_box': np.array([0.0, 0.75, 0.133]),
                       'sawyer_peg': np.array([-0.3, 0.6, 0.0])}
@@ -140,8 +146,21 @@ def main(_):
     params['use_td'] = True
     params['twin_q'] = True
     params['add_mc_to_td'] = True
+  elif alg == 'kappa_sac':
+    # Contrastive CPC critic + twin-κ Bellman network + SAC actor on κ·ψ.
+    params['use_cpc'] = True
+    params['use_kappa'] = True
+    params['twin_kappa'] = True
+    params['repr_reward_actor'] = 'sac'
+    params['repr_reward_target_entropy'] = -2.   # -action_dim for 2-D envs
   else:
     raise NotImplementedError('Unknown method: %s' % alg)
+
+  # Weights & Biases
+  params['use_wandb'] = FLAGS.use_wandb
+  params['wandb_project'] = FLAGS.wandb_project
+  params['wandb_entity'] = FLAGS.wandb_entity
+  params['wandb_group'] = FLAGS.wandb_group or f'{alg}_{env_name}'
 
 
   program = get_program(params)

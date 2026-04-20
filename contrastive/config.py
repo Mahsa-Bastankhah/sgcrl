@@ -61,12 +61,28 @@ class ContrastiveConfig:
   local: bool = False  # Whether running locally. Disables eval.
   use_td: bool = False
   twin_q: bool = False
+  use_kappa: bool = False   # Train κ(s,a): discounted-sum-of-φ value network.
+  twin_kappa: bool = False  # Two independent κ networks + targets; actor uses min(κ1,κ2)·ψ.
+  # Repr-based reward maximization: '' = disabled; 'sac' = SAC-style actor on κ·ψ.
+  # Other algorithms can be added later (e.g. 'ppo').
+  repr_reward_actor: str = ''
+  # Target entropy for the repr-based SAC actor.  Standard choice: -action_dim
+  # (e.g. -2 for a 2-D action space).  The learned α rescales automatically so
+  # this mainly controls the *shape* of the entropy trade-off.
+  repr_reward_target_entropy: float = 0.
   use_image_obs: bool = False
   random_goals: float = 0.5
   jit: bool = True
   add_mc_to_td: bool = False
   resample_neg_actions: bool = False
   
+  # Weights & Biases logging.
+  use_wandb: bool = False
+  wandb_project: str = 'sgcrl'
+  wandb_entity: str = ''   # leave empty to use your default wandb entity
+  wandb_run_name: str = '' # leave empty for wandb auto-generated names
+  wandb_group: str = ''    # useful for grouping sweep runs together
+
   # Parameters that should be overwritten, based on each environment.
   obs_dim: int = -1
   max_episode_steps: int = -1

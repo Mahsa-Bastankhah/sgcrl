@@ -34,6 +34,16 @@ class TrainingState(NamedTuple):
   key: networks_lib.PRNGKey
   alpha_optimizer_state: Optional[optax.OptState] = None
   alpha_params: Optional[networks_lib.Params] = None
+  # κ networks (use_kappa=True only; _2 fields also used when twin_kappa=True)
+  kappa_params: Optional[networks_lib.Params] = None
+  target_kappa_params: Optional[networks_lib.Params] = None
+  kappa_optimizer_state: Optional[optax.OptState] = None
+  kappa_params_2: Optional[networks_lib.Params] = None
+  target_kappa_params_2: Optional[networks_lib.Params] = None
+  kappa_optimizer_state_2: Optional[optax.OptState] = None
+  # repr_reward_actor='sac': separate temperature for the κ·ψ actor objective.
+  log_alpha_repr: Optional[networks_lib.Params] = None
+  alpha_repr_optimizer_state: Optional[optax.OptState] = None
 
 
 class ContrastiveLearner(acme.Learner):
@@ -82,6 +92,13 @@ class ContrastiveLearner(acme.Learner):
       if config.target_entropy:
         raise ValueError('target_entropy should not be set when '
                          'entropy_coefficient is provided')
+
+    if config.use_kappa:
+      kappa_optimizer = optax.adam(learning_rate=config.learning_rate)
+
+    if config.repr_reward_actor == 'sac':
+      log_alpha_repr_init = jnp.asarray(0., dtype=jnp.float32)
+      alpha_repr_optimizer = optax.adam(learning_rate=3e-4)
 
     def alpha_loss(log_alpha,
                    policy_params,
@@ -260,16 +277,113 @@ class ContrastiveLearner(acme.Learner):
       
       return jnp.mean(actor_loss), metrics
 
+    def _make_kappa_loss(kappa_net, name_prefix):
+      """Factory returning a Bellman loss for one κ network.
+
+      κ(s,a) ∈ R^repr_dim: discounted sum of φ(s_t,a_t) along on-policy
+      trajectories.  Loss: mean‖κ(s,a) − sg[φ(s,a) + γ·κ_target(s',a')]‖².
+      φ and the policy are stop-gradiented so only κ's own params are trained.
+      """
+      def kappa_loss(kappa_params, target_kappa_params, q_params, policy_params,
+                     transitions, key):
+        obs = transitions.observation
+        action = transitions.action
+        g = obs[:, config.obs_dim:]
+
+        # φ(s,a) from frozen critic — stop-gradient so critic is unaffected.
+        _, phi_sa, _ = networks.q_network.apply(
+            jax.lax.stop_gradient(q_params), obs, action)
+        phi_sa = jax.lax.stop_gradient(phi_sa)  # (B, repr_dim)
+
+        kappa_sa = kappa_net.apply(kappa_params, obs, action)
+
+        next_s = transitions.next_observation[:, :config.obs_dim]
+        next_obs = jnp.concatenate([next_s, g], axis=1)
+        next_dist = networks.policy_network.apply(
+            jax.lax.stop_gradient(policy_params), next_obs)
+        next_action = networks.sample(next_dist, key)
+
+        kappa_next = kappa_net.apply(target_kappa_params, next_obs, next_action)
+        target = jax.lax.stop_gradient(phi_sa + config.discount * kappa_next)
+
+        loss = jnp.mean(jnp.sum((kappa_sa - target) ** 2, axis=-1))
+        return loss, {
+            f'{name_prefix}_loss': loss,
+            f'{name_prefix}_norm_mean': jnp.mean(jnp.linalg.norm(kappa_sa, axis=-1)),
+        }
+      return kappa_loss
+
+    if config.repr_reward_actor == 'sac':
+      def alpha_repr_loss(log_alpha_repr, policy_params, transitions, key):
+        """SAC temperature loss for the repr-based actor (same form as alpha_loss)."""
+        dist_params = networks.policy_network.apply(
+            policy_params, transitions.observation)
+        action = networks.sample(dist_params, key)
+        log_prob = networks.log_prob(dist_params, action)
+        alpha_val = jnp.exp(log_alpha_repr)
+        return jnp.mean(
+            alpha_val * jax.lax.stop_gradient(
+                -log_prob - config.repr_reward_target_entropy))
+
+      def actor_loss_repr(policy_params, kappa_params, kappa_params_2,
+                          q_params, log_alpha_repr, transitions, key):
+        """SAC actor loss: maximise min(κ1·ψ, κ2·ψ) subject to entropy >= H0.
+
+        Gradients flow policy_params → action → κ networks (κ params frozen).
+        Both ψ and κ params are stop-gradiented so only the policy is trained.
+        """
+        obs = transitions.observation
+        dist_params = networks.policy_network.apply(policy_params, obs)
+        action = networks.sample(dist_params, key)
+        log_prob = networks.log_prob(dist_params, action)
+
+        # ψ(g) from the frozen critic; action-independent but we must pass one.
+        _, _, psi_g = networks.q_network.apply(
+            jax.lax.stop_gradient(q_params), obs, action)
+        psi_g = jax.lax.stop_gradient(psi_g)  # (B, repr_dim)
+
+        # κ1(s,a)·ψ(g) — gradients flow through action → policy_params.
+        kappa1 = networks.kappa_network.apply(
+            jax.lax.stop_gradient(kappa_params), obs, action)  # (B, repr_dim)
+        q1 = jnp.sum(kappa1 * psi_g, axis=-1)  # (B,)
+
+        if config.twin_kappa:
+          kappa2 = networks.kappa_network_2.apply(
+              jax.lax.stop_gradient(kappa_params_2), obs, action)
+          q2 = jnp.sum(kappa2 * psi_g, axis=-1)
+          q_min = jnp.minimum(q1, q2)
+        else:
+          q_min = q1
+
+        alpha_repr = jnp.exp(log_alpha_repr)
+        loss = jnp.mean(alpha_repr * log_prob - q_min)
+        return loss, {
+            'repr_actor_loss': loss,
+            'repr_q_min_mean': jnp.mean(q_min),
+            'repr_log_prob_mean': jnp.mean(log_prob),
+            'repr_alpha': alpha_repr,
+        }
+
     alpha_grad = jax.value_and_grad(alpha_loss)
     critic_grad = jax.value_and_grad(critic_loss, has_aux=True)
     actor_grad = jax.value_and_grad(actor_loss, has_aux=True)
+    if config.repr_reward_actor == 'sac':
+      alpha_repr_grad = jax.value_and_grad(alpha_repr_loss)
+      actor_repr_grad = jax.value_and_grad(actor_loss_repr, argnums=0, has_aux=True)
+    if config.use_kappa:
+      kappa_grad_1 = jax.value_and_grad(
+          _make_kappa_loss(networks.kappa_network, 'kappa'), has_aux=True)
+      if config.twin_kappa:
+        kappa_grad_2 = jax.value_and_grad(
+            _make_kappa_loss(networks.kappa_network_2, 'kappa2'), has_aux=True)
 
     def update_step(
         state,
         transitions
     ):
   
-      key, key_alpha, key_critic, key_actor = jax.random.split(state.key, 4)
+      key, key_alpha, key_critic, key_actor, key_kappa, key_alpha_repr = (
+          jax.random.split(state.key, 6))
       if adaptive_entropy_coefficient:
         alpha_loss, alpha_grads = alpha_grad(state.alpha_params,
                                              state.policy_params, transitions,
@@ -277,6 +391,10 @@ class ContrastiveLearner(acme.Learner):
         alpha = jnp.exp(state.alpha_params)
       else:
         alpha = config.entropy_coefficient
+
+      if config.repr_reward_actor == 'sac':
+        alpha_repr_loss_val, alpha_repr_grads = alpha_repr_grad(
+            state.log_alpha_repr, state.policy_params, transitions, key_alpha_repr)
 
                        
       (critic_loss, critic_metrics), critic_grads = critic_grad(
@@ -292,21 +410,26 @@ class ContrastiveLearner(acme.Learner):
                                          state.target_q_params, q_params)
       metrics = critic_metrics
       
-      # compute actor loss                               
-      (actor_loss, actor_metrics), actor_grads = actor_grad(state.policy_params, state.q_params, 
-                                                            alpha, transitions, key_actor)
-                                     
+      # compute actor loss
+      if config.repr_reward_actor == 'sac':
+        (actor_loss_val, actor_metrics), actor_grads = actor_repr_grad(
+            state.policy_params, state.kappa_params, state.kappa_params_2,
+            state.q_params, state.log_alpha_repr, transitions, key_actor)
+      else:
+        (actor_loss_val, actor_metrics), actor_grads = actor_grad(
+            state.policy_params, state.q_params, alpha, transitions, key_actor)
+
       # Apply policy gradients
       policy_params_prev = state.policy_params
       actor_update, policy_optimizer_state = policy_optimizer.update(
           actor_grads, state.policy_optimizer_state)
       policy_params = optax.apply_updates(state.policy_params, actor_update)
-                                     
+
       metrics.update({
           'critic_loss': critic_loss,
-          'actor_loss': actor_loss,
+          'actor_loss': actor_loss_val,
       })
-      
+
       metrics.update(actor_metrics)
   
       new_state = TrainingState(
@@ -316,9 +439,57 @@ class ContrastiveLearner(acme.Learner):
           policy_params_prev=policy_params_prev,
           q_params=q_params,
           target_q_params=new_target_q_params,
-          key=key
+          key=key,
+          # κ fields — carried forward unchanged; overwritten below if use_kappa.
+          kappa_params=state.kappa_params,
+          target_kappa_params=state.target_kappa_params,
+          kappa_optimizer_state=state.kappa_optimizer_state,
+          kappa_params_2=state.kappa_params_2,
+          target_kappa_params_2=state.target_kappa_params_2,
+          kappa_optimizer_state_2=state.kappa_optimizer_state_2,
+          # repr SAC α — carried forward; overwritten below if repr_reward_actor='sac'.
+          log_alpha_repr=state.log_alpha_repr,
+          alpha_repr_optimizer_state=state.alpha_repr_optimizer_state,
       )
-    
+
+      if config.use_kappa:
+        key_kappa, key_kappa2 = jax.random.split(key_kappa)
+
+        # --- κ1 update ---
+        (_, k1_metrics), k1_grads = kappa_grad_1(
+            state.kappa_params, state.target_kappa_params, state.q_params,
+            state.policy_params, transitions, key_kappa)
+        k1_update, new_k1_opt_state = kappa_optimizer.update(
+            k1_grads, state.kappa_optimizer_state)
+        new_kappa_params = optax.apply_updates(state.kappa_params, k1_update)
+        new_target_kappa_params = jax.tree_map(
+            lambda x, y: x * (1 - config.tau) + y * config.tau,
+            state.target_kappa_params, new_kappa_params)
+        metrics.update(k1_metrics)
+        new_state = new_state._replace(
+            kappa_params=new_kappa_params,
+            target_kappa_params=new_target_kappa_params,
+            kappa_optimizer_state=new_k1_opt_state,
+        )
+
+        # --- κ2 update (twin_kappa only) ---
+        if config.twin_kappa:
+          (_, k2_metrics), k2_grads = kappa_grad_2(
+              state.kappa_params_2, state.target_kappa_params_2, state.q_params,
+              state.policy_params, transitions, key_kappa2)
+          k2_update, new_k2_opt_state = kappa_optimizer.update(
+              k2_grads, state.kappa_optimizer_state_2)
+          new_kappa_params_2 = optax.apply_updates(state.kappa_params_2, k2_update)
+          new_target_kappa_params_2 = jax.tree_map(
+              lambda x, y: x * (1 - config.tau) + y * config.tau,
+              state.target_kappa_params_2, new_kappa_params_2)
+          metrics.update(k2_metrics)
+          new_state = new_state._replace(
+              kappa_params_2=new_kappa_params_2,
+              target_kappa_params_2=new_target_kappa_params_2,
+              kappa_optimizer_state_2=new_k2_opt_state,
+          )
+
       if adaptive_entropy_coefficient:
         # Apply alpha gradients
         alpha_update, alpha_optimizer_state = alpha_optimizer.update(
@@ -331,7 +502,20 @@ class ContrastiveLearner(acme.Learner):
         new_state = new_state._replace(
             alpha_optimizer_state=alpha_optimizer_state,
             alpha_params=alpha_params)
-    
+
+      if config.repr_reward_actor == 'sac':
+        alpha_repr_update, new_alpha_repr_opt_state = alpha_repr_optimizer.update(
+            alpha_repr_grads, state.alpha_repr_optimizer_state)
+        new_log_alpha_repr = optax.apply_updates(state.log_alpha_repr, alpha_repr_update)
+        metrics.update({
+            'repr_alpha_loss': alpha_repr_loss_val,
+            'repr_alpha': jnp.exp(new_log_alpha_repr),
+        })
+        new_state = new_state._replace(
+            log_alpha_repr=new_log_alpha_repr,
+            alpha_repr_optimizer_state=new_alpha_repr_opt_state,
+        )
+
       return_state = new_state
       return return_state, metrics
 
@@ -353,7 +537,7 @@ class ContrastiveLearner(acme.Learner):
 
     def make_initial_state(key):
       """Initialises the training state (parameters and optimiser state)."""
-      key_policy, key_q, key = jax.random.split(key, 3)
+      key_policy, key_q, key_kappa, key_kappa_2, key = jax.random.split(key, 5)
 
       policy_params = networks.policy_network.init(key_policy)
       policy_optimizer_state = policy_optimizer.init(policy_params)
@@ -365,7 +549,7 @@ class ContrastiveLearner(acme.Learner):
           policy_optimizer_state=policy_optimizer_state,
           q_optimizer_state=q_optimizer_state,
           policy_params=policy_params,
-          policy_params_prev = policy_params,
+          policy_params_prev=policy_params,
           q_params=q_params,
           target_q_params=q_params,
           key=key)
@@ -373,7 +557,28 @@ class ContrastiveLearner(acme.Learner):
       if adaptive_entropy_coefficient:
         state = state._replace(alpha_optimizer_state=alpha_optimizer_state,
                                alpha_params=log_alpha)
-        
+
+      if config.use_kappa:
+        kappa_params = networks.kappa_network.init(key_kappa)
+        state = state._replace(
+            kappa_params=kappa_params,
+            target_kappa_params=kappa_params,
+            kappa_optimizer_state=kappa_optimizer.init(kappa_params),
+        )
+        if config.twin_kappa:
+          kappa_params_2 = networks.kappa_network_2.init(key_kappa_2)
+          state = state._replace(
+              kappa_params_2=kappa_params_2,
+              target_kappa_params_2=kappa_params_2,
+              kappa_optimizer_state_2=kappa_optimizer.init(kappa_params_2),
+          )
+
+      if config.repr_reward_actor == 'sac':
+        state = state._replace(
+            log_alpha_repr=log_alpha_repr_init,
+            alpha_repr_optimizer_state=alpha_repr_optimizer.init(log_alpha_repr_init),
+        )
+
       return state
 
     # Create initial state.
@@ -411,6 +616,10 @@ class ContrastiveLearner(acme.Learner):
         'policy': self._state.policy_params,
         'critic': self._state.q_params,
     }
+    if self._state.kappa_params is not None:
+      variables['kappa'] = self._state.kappa_params
+    if self._state.kappa_params_2 is not None:
+      variables['kappa_2'] = self._state.kappa_params_2
     return [variables[name] for name in names]
 
   def save(self):

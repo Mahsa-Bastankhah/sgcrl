@@ -26,6 +26,10 @@ class ContrastiveNetworks:
   repr_fn: Callable[Ellipsis, networks_lib.NetworkOutput]
   sample: networks_lib.SampleFn
   sample_eval: Optional[networks_lib.SampleFn] = None
+  # κ network: maps (obs, action) → R^repr_dim.
+  # κ(s,a) approximates E[Σ γ^t φ(s_t,a_t)] along on-policy trajectories.
+  kappa_network: Optional[networks_lib.FeedForwardNetwork] = None
+  kappa_network_2: Optional[networks_lib.FeedForwardNetwork] = None
 
 
 def apply_policy_and_sample(
@@ -132,9 +136,27 @@ def make_networks(
     ])
     return network(obs)
 
+  def _make_kappa_fn(net_name):
+    """Factory for a κ network with a given Haiku variable scope name.
+
+    Each call produces an independent set of parameters, enabling twin-κ.
+    Uses only the state slice of obs (goal-agnostic, matching φ(s,a)).
+    """
+    def _kappa_fn(obs, action):
+      state = obs[:, :obs_dim]
+      net = hk.nets.MLP(
+          list(hidden_layer_sizes) + [repr_dim],
+          w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+          activation=jax.nn.relu,
+          name=net_name)
+      return net(jnp.concatenate([state, action], axis=-1))
+    return _kappa_fn
+
   policy = hk.without_apply_rng(hk.transform(_actor_fn))
   critic = hk.without_apply_rng(hk.transform(_critic_fn))
   repr_fn = hk.without_apply_rng(hk.transform(_repr_fn))
+  kappa = hk.without_apply_rng(hk.transform(_make_kappa_fn('kappa_net')))
+  kappa2 = hk.without_apply_rng(hk.transform(_make_kappa_fn('kappa_net_2')))
 
   # Create dummy observations and actions to create network parameters.
   dummy_action = utils.zeros_like(spec.actions)
@@ -151,4 +173,8 @@ def make_networks(
       log_prob=lambda params, actions: params.log_prob(actions),
       sample=lambda params, key: params.sample(seed=key),
       sample_eval=lambda params, key: params.mode(),
+      kappa_network=networks_lib.FeedForwardNetwork(
+          lambda key: kappa.init(key, dummy_obs, dummy_action), kappa.apply),
+      kappa_network_2=networks_lib.FeedForwardNetwork(
+          lambda key: kappa2.init(key, dummy_obs, dummy_action), kappa2.apply),
       )

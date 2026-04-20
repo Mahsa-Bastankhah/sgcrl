@@ -1,5 +1,6 @@
 """Defines distributed contrastive RL agents, using JAX."""
 
+import dataclasses
 import functools
 from typing import Callable, Optional, Sequence
 
@@ -41,14 +42,28 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
     assert config.max_episode_steps > 0
     assert config.obs_dim > 0
 
+    run_dir = config.log_dir + config.alg_name + '_' + config.env_name + '_' + str(seed)
+
+    # Build wandb kwargs from config; passed to both learner and evaluator.
+    wandb_kwargs = None
+    if config.use_wandb:
+      wandb_kwargs = dict(
+          project=config.wandb_project,
+          entity=config.wandb_entity,
+          name=config.wandb_run_name or f'{config.alg_name}_{config.env_name}_seed{seed}',
+          group=config.wandb_group,
+          config=dataclasses.asdict(config),
+      )
+
     logger_fn = functools.partial(make_default_logger,
                                   'learner', log_to_bigtable,
                                   time_delta=log_every, asynchronous=True,
                                   serialize_fn=utils.fetch_devicearray,
-                                  save_dir = config.log_dir + config.alg_name + '_' 
-                                  + config.env_name + '_' + str(seed),
-                                  add_uid = config.add_uid,
-                                  steps_key='learner_steps')
+                                  save_dir=run_dir,
+                                  add_uid=config.add_uid,
+                                  steps_key='learner_steps',
+                                  use_wandb=config.use_wandb,
+                                  wandb_kwargs=wandb_kwargs)
     contrastive_builder = builder.ContrastiveBuilder(config, logger_fn=logger_fn)
     if evaluator_factories is None:
       eval_policy_factory = (
@@ -60,6 +75,11 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
               start_index=config.start_index,
               end_index=config.end_index)
       ]
+      # Maze trajectory images — only for 2-D point envs when wandb is on.
+      if config.use_wandb and config.env_name.startswith('point_'):
+        eval_observers.append(
+            contrastive_utils.MazeTrajWandbObserver(obs_dim=config.obs_dim)
+        )
       evaluator_factories = [
           distributed_layout.default_evaluator_factory(
               environment_factory=environment_factory_fixed_goals,
@@ -67,9 +87,10 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
               policy_factory=eval_policy_factory,
               log_to_bigtable=log_to_bigtable,
               observers=eval_observers,
-              save_dir = config.log_dir + config.alg_name + '_'
-              + config.env_name + '_' + str(seed),
-              add_uid = config.add_uid)
+              save_dir=run_dir,
+              add_uid=config.add_uid,
+              use_wandb=config.use_wandb,
+              wandb_kwargs=wandb_kwargs)
       ]
       if config.local:
         evaluator_factories = []
@@ -91,10 +112,8 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
         prefetch_size=config.prefetch_size,
         log_to_bigtable=log_to_bigtable,
         actor_logger_fn=distributed_layout.get_default_logger_fn(
-            log_to_bigtable, log_every, save_dir = config.log_dir + config.alg_name + '_'
-            + config.env_name + '_' + str(seed), add_uid = config.add_uid),
+            log_to_bigtable, log_every, save_dir=run_dir, add_uid=config.add_uid),
         observers=actor_observers,
         checkpointing_config=distributed_layout.CheckpointingConfig(
-            save_dir = config.log_dir + config.alg_name + '_'
-            + config.env_name + '_' + str(seed), add_uid = config.add_uid),
+            save_dir=run_dir, add_uid=config.add_uid),
         config=config)

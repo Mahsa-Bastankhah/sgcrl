@@ -70,7 +70,9 @@ def default_evaluator_factory(
     observers = (),
     log_to_bigtable = False,
     save_dir = "logs",
-    add_uid = True):
+    add_uid = True,
+    use_wandb = False,
+    wandb_kwargs = None):
   """Returns a default evaluator process."""
   def evaluator(
       random_key,
@@ -91,9 +93,11 @@ def default_evaluator_factory(
     # Create logger and counter.
     counter = counting.Counter(counter, 'evaluator')
     logger = make_default_logger('evaluator', log_to_bigtable,
-                                         save_dir=save_dir,
-                                         add_uid=add_uid,
-                                         steps_key='actor_steps')
+                                 save_dir=save_dir,
+                                 add_uid=add_uid,
+                                 steps_key='actor_steps',
+                                 use_wandb=use_wandb,
+                                 wandb_kwargs=wandb_kwargs)
 
     # Create the run loop and return it.
     return environment_loop.EnvironmentLoop(environment, actor, counter,
