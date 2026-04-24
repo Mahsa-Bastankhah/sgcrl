@@ -1,19 +1,19 @@
 #!/bin/bash
 #SBATCH --job-name=kappa_g
-#SBATCH --output=slurm/kappa_gamma_sweep_kl%A_%a.out
+#SBATCH --output=slurm/kappa_gamma_sweep_hard%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=7:00:00
+#SBATCH --time=15:00:00
 #SBATCH --account=seas
 # Edit: DISCOUNT_KAPPA, SEEDS, and --array=0-(n-1) for n=len(SEEDS)
-#SBATCH --array=0-2
+#SBATCH --array=0-4
 
-DISCOUNT_KAPPA="${DISCOUNT_KAPPA:-0.1}"
+DISCOUNT_KAPPA="${DISCOUNT_KAPPA:-0.5}"
 GAMMA="${DISCOUNT_KAPPA}"
-SEEDS=(100 101 102)
+SEEDS=(30 31 32 33 34)
 
 TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 if [ "${TASK_ID}" -lt 0 ] || [ "${TASK_ID}" -ge "${#SEEDS[@]}" ]; then
@@ -59,15 +59,15 @@ export MUJOCO_PY_MUJOCO_PATH="${HOME}/.mujoco/mujoco210"
 
 ENV=sawyer_bin
 ALG=kappa_sac
-NUM_STEPS=10000000
-LOG_DIR="logs/kappa_gamma_sweep_bin_kl/${SWEEP_TAG}/"
+NUM_STEPS=15000000
+LOG_DIR="logs/kappa_gamma_sweep_bin_hard/${SWEEP_TAG}/"
 
 # --- lp_contrastive knobs (edit here; sweep_config.json uses the same values) ---
 # Defaults: twin κ on, κ Adam LR 1e-4, κ grad clip 1.0, no hard-goal actor term, no repr_norm.
-KAPPA_ACTOR_HARD_GOAL_COEF="${KAPPA_ACTOR_HARD_GOAL_COEF:-0}"
+KAPPA_ACTOR_HARD_GOAL_COEF="${KAPPA_ACTOR_HARD_GOAL_COEF:-0.1}"
 LEARNING_RATE_KAPPA="${LEARNING_RATE_KAPPA:-1e-4}"
 KAPPA_MAX_GRAD_NORM="${KAPPA_MAX_GRAD_NORM:-1.0}"
-Q_ACTOR_KL_TO_PREV_COEF="${Q_ACTOR_KL_TO_PREV_COEF:-0.0001}"
+Q_ACTOR_KL_TO_PREV_COEF="${Q_ACTOR_KL_TO_PREV_COEF:-0}"
 TWIN_KAPPA="${TWIN_KAPPA:-1}"
 REPR_NORM="${REPR_NORM:-0}"
 
@@ -177,4 +177,5 @@ exec python -u lp_contrastive.py \
   --num_steps="${NUM_STEPS}" \
   --log_dir_path="${LOG_DIR}" \
   --discount_kappa="${GAMMA}" \
-  "${LP_EXTRA[@]}"
+  "${LP_EXTRA[@]}" \
+  # --hidden_layer_sizes=256,256,256,256,256,256

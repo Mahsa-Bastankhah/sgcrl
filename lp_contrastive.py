@@ -76,6 +76,12 @@ flags.DEFINE_float(
 # If True, L2-normalize φ/ψ in the critic (see ContrastiveConfig.repr_norm).
 flags.DEFINE_bool('repr_norm', False,
                   'If True, L2-normalize critic φ and ψ before the dot product.')
+# Comma-separated trunk widths for policy/critic/κ/etc. (see make_networks).
+# Example: --hidden_layer_sizes=256,256,256  or  --hidden_layer_sizes="(256, 256, 256)"
+# Empty string keeps ContrastiveConfig default (256, 256).
+flags.DEFINE_string(
+    'hidden_layer_sizes', '',
+    'Comma-separated hidden widths, e.g. 256,256,256. Empty = config default.')
 
 # fixed goal coordinates for supported environments
 fixed_goal_dict={'point_Spiral11x11': [np.array([5, 5], dtype=float),
@@ -296,6 +302,16 @@ def main(_):
   params['repr_norm'] = bool(FLAGS.repr_norm)
   if FLAGS.repr_norm:
     print('Using repr_norm=True...')
+
+  hls = FLAGS.hidden_layer_sizes.strip()
+  if hls:
+    hls = hls.strip('()[]')
+    parts = [int(x.strip()) for x in hls.split(',') if x.strip()]
+    if not parts:
+      raise ValueError(
+          f'--hidden_layer_sizes={FLAGS.hidden_layer_sizes!r} parsed to no integers')
+    params['hidden_layer_sizes'] = tuple(parts)
+    print('Using hidden_layer_sizes={}...'.format(params['hidden_layer_sizes']))
 
   program = get_program(params)
   # Set terminal='tmux' if you want different components in different windows.

@@ -1,6 +1,6 @@
 """Contrastive RL networks definition."""
 import dataclasses
-from typing import Optional, Tuple, Callable
+from typing import Callable, Optional, Sequence, Tuple
 
 from acme import specs
 from acme.agents.jax import actor_core as actor_core_lib
@@ -16,6 +16,108 @@ from itertools import product
 
 # modified Tanh mean to be mapped to tanh(mean) to keep within [-1, 1]
 from distributional import NormalTanhDistribution
+
+
+def _use_residual_mlp(hidden_layer_sizes: Sequence[int]) -> bool:
+  """Use ResidualMLP instead of hk.nets.MLP when there are more than two hidden layers."""
+  return len(tuple(hidden_layer_sizes)) > 2
+
+
+# When `_use_residual_mlp` is true, all such stacks share this layout (repr-style).
+_RESIDUAL_SKIP_EVERY = 4
+_RESIDUAL_ACTIVATION = jax.nn.swish
+_RESIDUAL_USE_LAYER_NORM = True
+
+
+class ResidualMLP(hk.Module):
+  """MLP with optional residual skips and LayerNorm.
+
+  Residual adds ``skip + h`` only when widths match and ``skip_every`` divides
+  the layer index. Final layer has no residual from prior blocks.
+  """
+
+  def __init__(
+      self,
+      widths: Sequence[int],
+      skip_every: int = 0,
+      activation: Callable[[jnp.ndarray], jnp.ndarray] = jax.nn.relu,
+      use_layer_norm: bool = False,
+      name: Optional[str] = None,
+      activate_final: bool = False,
+      w_init: Optional[hk.initializers.Initializer] = None,
+  ):
+    super().__init__(name=name)
+    self._widths = list(widths)
+    self._skip_every = skip_every
+    self._activation = activation
+    self._use_ln = use_layer_norm
+    self._activate_final = activate_final
+    if w_init is None:
+      self._w_init = hk.initializers.VarianceScaling(1.0, "fan_in", "uniform")
+    else:
+      self._w_init = w_init
+
+  def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    h = x
+    skip = None
+    for i, w in enumerate(self._widths[:-1]):
+      h = hk.Linear(w, name=f"linear_{i}", w_init=self._w_init)(h)
+      if self._use_ln:
+        h = hk.LayerNorm(
+            axis=-1,
+            create_scale=True,
+            create_offset=True,
+            name=f"ln_{i}",
+        )(h)
+      h = self._activation(h)
+      if self._skip_every and (i + 1) % self._skip_every == 0:
+        if skip is not None and skip.shape[-1] == h.shape[-1]:
+          h = skip + h
+        skip = h
+    final_w = self._widths[-1]
+    h = hk.Linear(
+        final_w,
+        w_init=self._w_init,
+        name=f"linear_{len(self._widths) - 1}",
+    )(h)
+    if self._activate_final:
+      h = self._activation(h)
+    return h
+
+
+def _mlp_or_residual(
+    x: jnp.ndarray,
+    widths: Sequence[int],
+    *,
+    hidden_layer_sizes: Sequence[int],
+    name: str,
+    activation: Callable[[jnp.ndarray], jnp.ndarray],
+    activate_final: bool,
+    w_init: hk.initializers.Initializer,
+) -> jnp.ndarray:
+  """hk.nets.MLP for shallow stacks; ResidualMLP when len(hidden_layer_sizes) > 2.
+
+  Deep (residual) stacks use a fixed layout: LayerNorm, Swish, skip_every=4, and
+  the caller's ``w_init`` (e.g. fan_avg uniform for encoders / κ / q-goal trunks).
+  """
+  if _use_residual_mlp(hidden_layer_sizes):
+    return ResidualMLP(
+        widths,
+        skip_every=_RESIDUAL_SKIP_EVERY,
+        activation=_RESIDUAL_ACTIVATION,
+        use_layer_norm=_RESIDUAL_USE_LAYER_NORM,
+        name=name,
+        activate_final=activate_final,
+        w_init=w_init,
+    )(x)
+  return hk.nets.MLP(
+      list(widths),
+      w_init=w_init,
+      activation=activation,
+      activate_final=activate_final,
+      name=name,
+  )(x)
+
 
 @dataclasses.dataclass
 class ContrastiveNetworks:
@@ -89,19 +191,25 @@ def make_networks(
     else:
       state, goal = hidden
 
-    sa_encoder = hk.nets.MLP(
+    sa_repr = _mlp_or_residual(
+        jnp.concatenate([state, action], axis=-1),
         list(hidden_layer_sizes) + [repr_dim],
-        w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+        hidden_layer_sizes=hidden_layer_sizes,
+        name='sa_encoder',
         activation=jax.nn.relu,
-        name='sa_encoder')
-    sa_repr = sa_encoder(jnp.concatenate([state, action], axis=-1))
+        activate_final=False,
+        w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+    )
 
-    g_encoder = hk.nets.MLP(
+    g_repr = _mlp_or_residual(
+        goal,
         list(hidden_layer_sizes) + [repr_dim],
-        w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+        hidden_layer_sizes=hidden_layer_sizes,
+        name='g_encoder',
         activation=jax.nn.relu,
-        name='g_encoder')
-    g_repr = g_encoder(goal)
+        activate_final=False,
+        w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+    )
 
     if repr_norm:
       sa_repr = sa_repr / jnp.linalg.norm(sa_repr, axis=1, keepdims=True)
@@ -124,7 +232,7 @@ def make_networks(
       sa_repr2, g_repr2, _ = _repr_fn(obs, action, hidden=hidden)
       product2 = _combine_repr(sa_repr2, g_repr2)
       # outer.shape = [batch_size, batch_size, 2]
-      critic_val = jnp.stack([product, product2], axis=-1)
+      critic_val = jnp.stack([critic_val, product2], axis=-1)
       sa_repr = sa_repr2
       g_repr = g_repr2
     return critic_val, sa_repr, g_repr
@@ -134,15 +242,16 @@ def make_networks(
       state, goal = _unflatten_obs(obs)
       obs = jnp.concatenate([state, goal], axis=-1)
       obs = TORSO()(obs)
-    network = hk.Sequential([
-        hk.nets.MLP(
-            list(hidden_layer_sizes),
-            w_init=hk.initializers.VarianceScaling(1.0, 'fan_in', 'uniform'),
-            activation=jax.nn.relu,
-            activate_final=True),
-        NormalTanhDistribution(num_dimensions, min_scale=actor_min_std),
-    ])
-    return network(obs)
+    h = _mlp_or_residual(
+        obs,
+        list(hidden_layer_sizes),
+        hidden_layer_sizes=hidden_layer_sizes,
+        name='policy_mlp',
+        activation=jax.nn.relu,
+        activate_final=True,
+        w_init=hk.initializers.VarianceScaling(1.0, 'fan_in', 'uniform'),
+    )
+    return NormalTanhDistribution(num_dimensions, min_scale=actor_min_std)(h)
 
   def _value_fn(obs):
     """V(s, g): scalar value network for PPO on r = φ·ψ.
@@ -151,6 +260,18 @@ def make_networks(
     CleanRL uses tanh activations + orthogonal init for PPO; we follow suit
     since it's notably more stable than relu+fan_avg for value learning.
     """
+    if _use_residual_mlp(hidden_layer_sizes):
+      h = _mlp_or_residual(
+          obs,
+          list(hidden_layer_sizes),
+          hidden_layer_sizes=hidden_layer_sizes,
+          name='value_mlp',
+          activation=jnp.tanh,
+          activate_final=True,
+          w_init=hk.initializers.Orthogonal(scale=np.sqrt(2.0)),
+      )
+      out = hk.Linear(1, w_init=hk.initializers.Orthogonal(scale=1.0))(h)
+      return jnp.squeeze(out, axis=-1)
     net = hk.Sequential([
         hk.nets.MLP(
             list(hidden_layer_sizes),
@@ -172,17 +293,20 @@ def make_networks(
     """
     def _q_goal_fn(obs, action):
       state = obs[:, :obs_dim]
-      trunk = hk.nets.MLP(
+      trunk_in = jnp.concatenate([state, action], axis=-1)
+      trunk = _mlp_or_residual(
+          trunk_in,
           list(hidden_layer_sizes),
-          w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+          hidden_layer_sizes=hidden_layer_sizes,
+          name=net_name,
           activation=jax.nn.relu,
           activate_final=True,
-          name=net_name)
+          w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+      )
       head = hk.Linear(
           1, w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
           name=net_name + '_head')
-      h = trunk(jnp.concatenate([state, action], axis=-1))
-      return jnp.squeeze(head(h), axis=-1)
+      return jnp.squeeze(head(trunk), axis=-1)
     return _q_goal_fn
 
   def _make_kappa_fn(net_name):
@@ -193,12 +317,15 @@ def make_networks(
     """
     def _kappa_fn(obs, action):
       state = obs[:, :obs_dim]
-      net = hk.nets.MLP(
+      return _mlp_or_residual(
+          jnp.concatenate([state, action], axis=-1),
           list(hidden_layer_sizes) + [repr_dim],
-          w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+          hidden_layer_sizes=hidden_layer_sizes,
+          name=net_name,
           activation=jax.nn.relu,
-          name=net_name)
-      return net(jnp.concatenate([state, action], axis=-1))
+          activate_final=False,
+          w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+      )
     return _kappa_fn
 
   policy = hk.without_apply_rng(hk.transform(_actor_fn))
