@@ -1,12 +1,12 @@
 """Utilities for the contrastive RL agent."""
 import functools
-from typing import Dict, List
-from typing import Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 from acme import types
 from acme.agents.jax import actors
 from acme.jax import networks as network_lib
 from acme.jax import utils
+from acme.jax import variable_utils
 from acme.utils.observers import base as observers_base
 from acme.wrappers import base
 from acme.wrappers import canonical_spec
@@ -119,6 +119,94 @@ class DistanceObserver(observers_base.EnvLoopObserver):
     return metrics
 
 
+class ReprCriticLogitObserver(observers_base.EnvLoopObserver):
+  """Logs average φ(s,a)·ψ(g) along the episode.
+
+  The contrastive critic's output for a single (s, a, g) triple is
+  `φ(s,a)·ψ(g)` — the same quantity used as the logit in CRL's InfoNCE
+  loss and (via `log σ(·)`) as the reward signal for the repr-reward
+  actors (Launchpad `kappa_sac` / `q_sac`, or standalone PPO).  Tracking it at eval time tells
+  us how the critic scores the trajectories the policy is actually
+  producing, without imposing any training cost — useful especially for
+  the "reward_shaping_mode disabled" case where the critic never feeds
+  back into the actor and we have no other direct signal of φ·ψ scale.
+
+  Wiring note: the critic params live on the learner, so this observer
+  cannot be fully constructed in `agents.py` (no variable source yet).
+  It is instantiated there as a bare shell and later "bound" by the
+  evaluator / actor factory via `bind(variable_source, networks)` once
+  the launchpad topology is stitched together.  Before binding it is a
+  no-op.
+  """
+
+  def __init__(self, twin_q = False, obs_dim = None, hard_goal = None):
+    self._twin_q = bool(twin_q)
+    self._obs_dim = obs_dim
+    self._hard_goal = None if hard_goal is None else np.asarray(hard_goal, dtype=np.float32)
+    self._apply = None
+    self._variable_client = None
+    self._prev_obs = None
+    self._logits = []          # current episode
+    self._episode_means = []   # one entry per completed episode
+
+  def _obs_with_hard_goal(self, obs):
+    if self._hard_goal is None or self._obs_dim is None:
+      return obs
+    obs = np.asarray(obs).copy()
+    obs[self._obs_dim:] = self._hard_goal
+    return obs
+
+  def bind(self, variable_source, networks):
+    """Attach a variable client + network.  Called by the factory."""
+    self._apply = jax.jit(networks.q_network.apply)
+    self._variable_client = variable_utils.VariableClient(
+        variable_source, 'critic', device='cpu')
+    # Block once so we're ready for the very first episode.
+    self._variable_client.update_and_wait()
+
+  def observe_first(self, env, timestep):
+    """Called with the initial timestep of a new episode."""
+    del env
+    if self._logits:
+      self._episode_means.append(float(np.mean(self._logits)))
+    self._logits = []
+    self._prev_obs = np.asarray(timestep.observation)
+    # Fire-and-forget refresh; params used in observe() are whatever the
+    # client currently holds (cheap on an inter-process pipe).
+    if self._variable_client is not None:
+      self._variable_client.update(wait=False)
+
+  def observe(self, env, timestep, action):
+    """Called after each env step with the *post-step* timestep."""
+    del env
+    if self._apply is None or self._prev_obs is None:
+      self._prev_obs = np.asarray(timestep.observation)
+      return
+    # q_network.apply returns (critic_val, sa_repr, g_repr) where
+    # critic_val has shape [B, B] (no-twin) or [B, B, 2] (twin).  For a
+    # single-sample query, B=1 and we want the diagonal entry, i.e.
+    # critic_val[0, 0] averaged across the twin axis.
+    obs_for_critic = self._obs_with_hard_goal(self._prev_obs)
+    out = self._apply(self._variable_client.params,
+                      obs_for_critic[None], np.asarray(action)[None])
+    critic_val = np.asarray(out[0]).reshape(-1)
+    self._logits.append(float(np.mean(critic_val)))
+    self._prev_obs = np.asarray(timestep.observation)
+
+  def get_metrics(self):
+    """Per-episode metrics consumed by the environment loop logger."""
+    if not self._logits:
+      return {}
+    cur = float(np.mean(self._logits))
+    return {
+        'repr_critic_logit_mean': cur,
+        'repr_critic_logit_final': float(self._logits[-1]),
+        'repr_critic_logit_max': float(np.max(self._logits)),
+        'repr_critic_logit_mean_100':
+            float(np.mean((self._episode_means + [cur])[-100:])),
+    }
+
+
 class ObservationFilterWrapper(base.EnvironmentWrapper):
   """Wrapper that exposes just the desired goal coordinates."""
 
@@ -204,127 +292,3 @@ class InitiallyRandomActor(actors.GenericActor):
                                          self._state)
     return utils.to_numpy(action)
 
-
-def _unwrap_to_point_env(env):
-  """Walk through acme/gym wrappers until we reach the raw PointEnv."""
-  e = env
-  while hasattr(e, '_environment'):
-    e = e._environment
-  return e
-
-
-class MazeTrajWandbObserver(observers_base.EnvLoopObserver):
-  """Logs evaluator trajectories on the maze grid to Weights & Biases.
-
-  Works for any point_env (FourRooms, Spiral11x11, …).  Trajectories are
-  rendered as matplotlib figures (colour-coded start→end) overlaid on the
-  maze walls, then uploaded as wandb images every ``log_every_n`` episodes.
-
-  The observer logs directly to wandb (not through the Acme logger), so
-  ``get_metrics()`` always returns an empty dict.
-  """
-
-  def __init__(self, obs_dim: int, log_every_n: int = 20):
-    self._obs_dim = obs_dim
-    self._log_every_n = log_every_n
-    self._positions: List[np.ndarray] = []
-    self._goal: Optional[np.ndarray] = None
-    self._walls: Optional[np.ndarray] = None
-    self._episode_count = 0
-
-  # ------------------------------------------------------------------
-  # Observer interface
-  # ------------------------------------------------------------------
-
-  def observe_first(self, env, timestep) -> None:
-    # Render and log the episode that just finished (if any).
-    if self._positions and self._walls is not None:
-      self._episode_count += 1
-      if self._episode_count % self._log_every_n == 0:
-        self._render_and_log(self._episode_count)
-
-    # Cache walls once (unwrap all acme/gym layers to reach PointEnv).
-    if self._walls is None:
-      point_env = _unwrap_to_point_env(env)
-      if hasattr(point_env, '_walls'):
-        self._walls = point_env._walls  # pylint: disable=protected-access
-
-    obs = timestep.observation
-    self._positions = [obs[:self._obs_dim].copy()]
-    self._goal = obs[self._obs_dim:].copy()
-
-  def observe(self, env, timestep, action) -> None:
-    obs = timestep.observation
-    self._positions.append(obs[:self._obs_dim].copy())
-
-  def get_metrics(self):
-    return {}
-
-  # ------------------------------------------------------------------
-  # Rendering
-  # ------------------------------------------------------------------
-
-  def _render_and_log(self, episode: int) -> None:
-    try:
-      import wandb  # pylint: disable=import-outside-toplevel
-      import matplotlib  # pylint: disable=import-outside-toplevel
-      matplotlib.use('Agg')
-      import matplotlib.pyplot as plt  # pylint: disable=import-outside-toplevel
-      import matplotlib.patheffects as pe  # pylint: disable=import-outside-toplevel
-
-      if wandb.run is None:
-        return
-
-      positions = np.array(self._positions)  # (T, 2)  — [row, col]
-      goal = self._goal
-      walls = self._walls
-      H, W = walls.shape
-
-      fig, ax = plt.subplots(figsize=(5, 5), dpi=100)
-      fig.patch.set_facecolor('#1a1a2e')
-      ax.set_facecolor('#1a1a2e')
-
-      # Draw maze: walls dark, open cells light.
-      maze_rgb = np.where(walls[..., None], 0.15, 0.9) * np.ones((H, W, 3))
-      ax.imshow(maze_rgb, origin='upper', extent=[0, W, H, 0], zorder=0)
-
-      # Draw trajectory colour-ramped blue→yellow.
-      n = len(positions)
-      if n > 1:
-        colors = plt.cm.plasma(np.linspace(0.1, 0.9, n - 1))
-        for i in range(n - 1):
-          ax.plot(
-              positions[i:i+2, 1], positions[i:i+2, 0],
-              color=colors[i], linewidth=1.8, alpha=0.85, zorder=2,
-          )
-
-      # Start marker (green circle).
-      ax.scatter(
-          positions[0, 1], positions[0, 0],
-          c='#00ff88', s=120, zorder=5, edgecolors='white', linewidths=0.8,
-          label='start',
-      )
-      # Goal marker (red star).
-      ax.scatter(
-          goal[1], goal[0],
-          c='#ff4466', s=180, marker='*', zorder=5,
-          edgecolors='white', linewidths=0.8, label='goal',
-      )
-
-      ax.set_xlim(0, W)
-      ax.set_ylim(H, 0)
-      ax.set_xticks([])
-      ax.set_yticks([])
-      ax.legend(
-          loc='lower right', fontsize=7, framealpha=0.4,
-          labelcolor='white', facecolor='#1a1a2e',
-      )
-      ax.set_title(f'eval trajectory — episode {episode}',
-                   color='white', fontsize=9, pad=4)
-      plt.tight_layout(pad=0.5)
-
-      wandb.log({'eval/maze_traj': wandb.Image(fig)})
-      plt.close(fig)
-
-    except Exception as exc:  # pylint: disable=broad-except
-      print(f'[MazeTrajWandbObserver] render failed: {exc}')

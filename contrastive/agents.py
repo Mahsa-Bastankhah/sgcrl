@@ -1,6 +1,5 @@
 """Defines distributed contrastive RL agents, using JAX."""
 
-import dataclasses
 import functools
 from typing import Callable, Optional, Sequence
 
@@ -44,26 +43,13 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
 
     run_dir = config.log_dir + config.alg_name + '_' + config.env_name + '_' + str(seed)
 
-    # Build wandb kwargs from config; passed to both learner and evaluator.
-    wandb_kwargs = None
-    if config.use_wandb:
-      wandb_kwargs = dict(
-          project=config.wandb_project,
-          entity=config.wandb_entity,
-          name=config.wandb_run_name or f'{config.alg_name}_{config.env_name}_seed{seed}',
-          group=config.wandb_group,
-          config=dataclasses.asdict(config),
-      )
-
     logger_fn = functools.partial(make_default_logger,
                                   'learner', log_to_bigtable,
                                   time_delta=log_every, asynchronous=True,
                                   serialize_fn=utils.fetch_devicearray,
                                   save_dir=run_dir,
                                   add_uid=config.add_uid,
-                                  steps_key='learner_steps',
-                                  use_wandb=config.use_wandb,
-                                  wandb_kwargs=wandb_kwargs)
+                                  steps_key='learner_steps')
     contrastive_builder = builder.ContrastiveBuilder(config, logger_fn=logger_fn)
     if evaluator_factories is None:
       eval_policy_factory = (
@@ -75,11 +61,13 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
               start_index=config.start_index,
               end_index=config.end_index)
       ]
-      # Maze trajectory images — only for 2-D point envs when wandb is on.
-      if config.use_wandb and config.env_name.startswith('point_'):
-        eval_observers.append(
-            contrastive_utils.MazeTrajWandbObserver(obs_dim=config.obs_dim)
-        )
+      # Always log episode-level φ(s,a)·ψ(g) via the passive critic observer.
+      # With `hard_goal` set, this becomes φ(s,a)·ψ(hard_goal).
+      eval_observers.append(
+          contrastive_utils.ReprCriticLogitObserver(
+              twin_q=config.twin_q,
+              obs_dim=config.obs_dim,
+              hard_goal=config.hard_goal))
       evaluator_factories = [
           distributed_layout.default_evaluator_factory(
               environment_factory=environment_factory_fixed_goals,
@@ -88,9 +76,7 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
               log_to_bigtable=log_to_bigtable,
               observers=eval_observers,
               save_dir=run_dir,
-              add_uid=config.add_uid,
-              use_wandb=config.use_wandb,
-              wandb_kwargs=wandb_kwargs)
+              add_uid=config.add_uid)
       ]
       if config.local:
         evaluator_factories = []
@@ -99,6 +85,11 @@ class DistributedContrastive(distributed_layout.DistributedLayout):
         contrastive_utils.DistanceObserver(obs_dim=config.obs_dim,
                                            start_index=config.start_index,
                                            end_index=config.end_index)]
+    actor_observers.append(
+        contrastive_utils.ReprCriticLogitObserver(
+            twin_q=config.twin_q,
+            obs_dim=config.obs_dim,
+            hard_goal=config.hard_goal))
     super().__init__(
         seed=seed,
         environment_factory=environment_factory,

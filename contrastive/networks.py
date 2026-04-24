@@ -30,6 +30,14 @@ class ContrastiveNetworks:
   # κ(s,a) approximates E[Σ γ^t φ(s_t,a_t)] along on-policy trajectories.
   kappa_network: Optional[networks_lib.FeedForwardNetwork] = None
   kappa_network_2: Optional[networks_lib.FeedForwardNetwork] = None
+  # V network used by the PPO-on-φ·ψ actor (reward_shaping_mode='ppo').
+  # Maps full obs=[state;goal] → scalar V(s,g).
+  value_network: Optional[networks_lib.FeedForwardNetwork] = None
+  # Scalar Q networks when reward_shaping_mode='q'.  Input is obs=[s;g] but the
+  # MLP only uses the state slice (see _make_q_goal_fn).  Trained TD3-style on
+  # r = sg(φ(s,a)·ψ(g)) with clipped-double-Q target.
+  q_goal_network: Optional[networks_lib.FeedForwardNetwork] = None
+  q_goal_network_2: Optional[networks_lib.FeedForwardNetwork] = None
 
 
 def apply_policy_and_sample(
@@ -136,6 +144,47 @@ def make_networks(
     ])
     return network(obs)
 
+  def _value_fn(obs):
+    """V(s, g): scalar value network for PPO on r = φ·ψ.
+
+    Takes the full obs = [state; goal] (same format the policy consumes).
+    CleanRL uses tanh activations + orthogonal init for PPO; we follow suit
+    since it's notably more stable than relu+fan_avg for value learning.
+    """
+    net = hk.Sequential([
+        hk.nets.MLP(
+            list(hidden_layer_sizes),
+            w_init=hk.initializers.Orthogonal(scale=np.sqrt(2.0)),
+            activation=jnp.tanh,
+            activate_final=True),
+        hk.Linear(1, w_init=hk.initializers.Orthogonal(scale=1.0)),
+    ])
+    return jnp.squeeze(net(obs), axis=-1)
+
+  def _make_q_goal_fn(net_name):
+    """Factory for a state-action scalar Q network.
+
+    Takes obs=[state;goal] and action, but only uses the state slice
+    `obs[:, :obs_dim]` (goal slice is ignored). Used when reward_shaping_mode='q' and
+    trained on
+    r = sg(φ(s,a)·ψ(g)) with TD(0) + clipped-double-Q.  Each call creates
+    an independent Haiku scope so Q1 and Q2 have independent parameters.
+    """
+    def _q_goal_fn(obs, action):
+      state = obs[:, :obs_dim]
+      trunk = hk.nets.MLP(
+          list(hidden_layer_sizes),
+          w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+          activation=jax.nn.relu,
+          activate_final=True,
+          name=net_name)
+      head = hk.Linear(
+          1, w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+          name=net_name + '_head')
+      h = trunk(jnp.concatenate([state, action], axis=-1))
+      return jnp.squeeze(head(h), axis=-1)
+    return _q_goal_fn
+
   def _make_kappa_fn(net_name):
     """Factory for a κ network with a given Haiku variable scope name.
 
@@ -157,6 +206,9 @@ def make_networks(
   repr_fn = hk.without_apply_rng(hk.transform(_repr_fn))
   kappa = hk.without_apply_rng(hk.transform(_make_kappa_fn('kappa_net')))
   kappa2 = hk.without_apply_rng(hk.transform(_make_kappa_fn('kappa_net_2')))
+  value = hk.without_apply_rng(hk.transform(_value_fn))
+  q_goal = hk.without_apply_rng(hk.transform(_make_q_goal_fn('q_goal_net')))
+  q_goal2 = hk.without_apply_rng(hk.transform(_make_q_goal_fn('q_goal_net_2')))
 
   # Create dummy observations and actions to create network parameters.
   dummy_action = utils.zeros_like(spec.actions)
@@ -177,4 +229,10 @@ def make_networks(
           lambda key: kappa.init(key, dummy_obs, dummy_action), kappa.apply),
       kappa_network_2=networks_lib.FeedForwardNetwork(
           lambda key: kappa2.init(key, dummy_obs, dummy_action), kappa2.apply),
+      value_network=networks_lib.FeedForwardNetwork(
+          lambda key: value.init(key, dummy_obs), value.apply),
+      q_goal_network=networks_lib.FeedForwardNetwork(
+          lambda key: q_goal.init(key, dummy_obs, dummy_action), q_goal.apply),
+      q_goal_network_2=networks_lib.FeedForwardNetwork(
+          lambda key: q_goal2.init(key, dummy_obs, dummy_action), q_goal2.apply),
       )

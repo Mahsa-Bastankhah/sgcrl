@@ -11,4 +11,7 @@ archived/
 .venv/
 experiments/
 logs/
+training_videos/
+plots/
+videos/
 

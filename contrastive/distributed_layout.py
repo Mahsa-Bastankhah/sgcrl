@@ -70,9 +70,7 @@ def default_evaluator_factory(
     observers = (),
     log_to_bigtable = False,
     save_dir = "logs",
-    add_uid = True,
-    use_wandb = False,
-    wandb_kwargs = None):
+    add_uid = True):
   """Returns a default evaluator process."""
   def evaluator(
       random_key,
@@ -90,14 +88,23 @@ def default_evaluator_factory(
 
     actor = make_actor(actor_key, policy_factory(networks), variable_source)
 
+    # Late-bind any observers that need the critic params.  Must happen
+    # before EnvironmentLoop starts, since the first call into the
+    # observer's `observe_first` will already want a fetched params
+    # snapshot.  Doing it here (inside the launchpad process, with
+    # `variable_source` in scope) avoids threading a new factory
+    # signature through DistributedLayout just for this hook.
+    from contrastive import utils as _cu
+    for _obs in observers:
+      if isinstance(_obs, _cu.ReprCriticLogitObserver):
+        _obs.bind(variable_source, networks)
+
     # Create logger and counter.
     counter = counting.Counter(counter, 'evaluator')
     logger = make_default_logger('evaluator', log_to_bigtable,
                                  save_dir=save_dir,
                                  add_uid=add_uid,
-                                 steps_key='actor_steps',
-                                 use_wandb=use_wandb,
-                                 wandb_kwargs=wandb_kwargs)
+                                 steps_key='actor_steps')
 
     # Create the run loop and return it.
     return environment_loop.EnvironmentLoop(environment, actor, counter,
@@ -251,6 +258,13 @@ class DistributedLayout:
     policy_network = self._policy_network(networks)
     actor = self._builder.make_actor(actor_key, policy_network, adder,
                                      variable_source)
+
+    # Late-bind per-actor observers that need the critic (see the
+    # matching block in `default_evaluator_factory` above for rationale).
+    from contrastive import utils as _cu
+    for _obs in self._observers:
+      if isinstance(_obs, _cu.ReprCriticLogitObserver):
+        _obs.bind(variable_source, networks)
 
     # Create logger and counter.
     counter = counting.Counter(counter, 'actor')

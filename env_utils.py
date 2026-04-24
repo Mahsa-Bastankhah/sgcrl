@@ -6,8 +6,42 @@ from __future__ import print_function
 import os
 
 import gym
-import metaworld
 import numpy as np
+
+_METAWORLD_IMPORT_ERROR = None
+try:
+  import metaworld as _metaworld
+  _MW_BIN = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['bin-picking-v2']
+  _MW_BOX = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['box-close-v2']
+  _MW_PEG = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['peg-insert-side-v2']
+except Exception as _e:  # noqa: BLE001  ImportError, OR mujoco_py's env-var
+  # checks, OR any other metaworld/mujoco_py load-time failure.  We
+  # deliberately cast a wide net so that point-only workflows (e.g.
+  # ppo_rollout_maze.py) can run on hosts that don't have MuJoCo
+  # installed/configured.  The sawyer_* envs below still reference these
+  # class stubs; we re-raise the cached import error in SawyerBin/Box/Peg
+  # `__init__` so users instantiating them get a clear message instead of
+  # a downstream `super().reset()` AttributeError.
+  _metaworld = None
+  _MW_BIN = object
+  _MW_BOX = object
+  _MW_PEG = object
+  _METAWORLD_IMPORT_ERROR = _e
+
+
+def _require_metaworld(env_name: str):
+  if _METAWORLD_IMPORT_ERROR is not None:
+    raise RuntimeError(
+        f'Cannot build {env_name}: metaworld/mujoco_py failed to import at '
+        f'env_utils load time.  Original error:\n    '
+        f'{type(_METAWORLD_IMPORT_ERROR).__name__}: '
+        f'{_METAWORLD_IMPORT_ERROR}\n'
+        f'Typical fix — export mujoco paths before launching Python:\n'
+        f'    export LD_LIBRARY_PATH='
+        f'$LD_LIBRARY_PATH:$HOME/.mujoco/mujoco210/bin:/usr/lib/nvidia\n'
+        f'    export MUJOCO_PY_MUJOCO_PATH=$HOME/.mujoco/mujoco210\n'
+        f'    export MUJOCO_GL=osmesa'
+    ) from _METAWORLD_IMPORT_ERROR
 import point_env
 
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
@@ -66,11 +100,11 @@ def load(env_name, fixed_start_end=None):
   return gym_env, obs_dim, max_episode_steps
 
 
-class SawyerBin(
-    metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['bin-picking-v2']):
+class SawyerBin(_MW_BIN):
   """Wrapper for the SawyerBin environment."""
 
   def __init__(self, fixed_start_end=None):
+    _require_metaworld('sawyer_bin')
     self._goal = np.zeros(3)
     super(SawyerBin, self).__init__()
     self._partially_observable = False
@@ -134,11 +168,11 @@ class SawyerBin(
         dtype=np.float32)
 
 
-class SawyerBox(
-    metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['box-close-v2']):
+class SawyerBox(_MW_BOX):
   """Wrapper for the SawyerBox environment."""
 
   def __init__(self, fixed_start_end=None):
+    _require_metaworld('sawyer_box')
     self._goal_pos = np.zeros(3)
     self._goal_quat = np.zeros(4)
     super(SawyerBox, self).__init__()
@@ -208,11 +242,11 @@ class SawyerBox(
         high=np.full(2 * 11, np.inf),
         dtype=np.float32)
 
-class SawyerPeg(
-    metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['peg-insert-side-v2']):
+class SawyerPeg(_MW_PEG):
   """Wrapper for the SawyerPeg environment."""
 
   def __init__(self, fixed_start_end=None):
+    _require_metaworld('sawyer_peg')
     self._goal_pos = np.zeros(3)
     super(SawyerPeg, self).__init__()
     self._fixed_start_end=fixed_start_end
