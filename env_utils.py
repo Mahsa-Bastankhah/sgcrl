@@ -46,6 +46,67 @@ import point_env
 
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 
+try:
+  from riverswim import RiverSwim
+except ImportError:  # pragma: no cover
+  RiverSwim = None
+
+
+class GymRiverSwimEnv(gym.Env):
+  """gym wrapper around ``RiverSwim`` (``use_absorbing_states=False``) for Acme/CRL.
+
+  Observations are ``[one_hot(state); one_hot(goal)]`` as float32.  Actions are
+  one-dimensional in ``[-1, 1]`` (same as point envs); see ``RiverSwim.step``
+  for the mapping to discrete ``{0, 1}``.
+  """
+
+  def __init__(self, river_len, horizon, seed, randomize_actions=False,
+               fixed_start_end=None, action_mapping=None):
+    super().__init__()
+    if RiverSwim is None:
+      raise ImportError('riverswim.RiverSwim is unavailable')
+    self._river_len = int(river_len)
+    self._rs = RiverSwim(
+        self._river_len,
+        bool(randomize_actions),
+        int(horizon),
+        int(seed),
+        use_absorbing_states=False,
+        action_mapping=action_mapping)
+    self._fixed = fixed_start_end
+    d = 2 * self._river_len
+    self.observation_space = gym.spaces.Box(
+        low=0.0, high=1.0, shape=(d,), dtype=np.float32)
+    self.action_space = gym.spaces.Box(
+        low=np.array([-1.0], dtype=np.float32),
+        high=np.array([1.0], dtype=np.float32),
+        dtype=np.float32)
+    self._max_episode_steps = int(horizon)
+
+  def _goal_idx_from_fixed(self):
+    if self._fixed is None:
+      return None
+    arr = np.asarray(self._fixed, dtype=np.float64).ravel()
+    if arr.size == self._river_len:
+      return int(np.argmax(arr))
+    if arr.size >= 1:
+      return int(arr[0])
+    return None
+
+  def reset(self):
+    g = self._goal_idx_from_fixed()
+    obs = self._rs.reset(goal_idx=g)
+    return np.asarray(obs, dtype=np.float32)
+
+  def step(self, action):
+    obs, rew, done, info = self._rs.step(action)
+    return (np.asarray(obs, dtype=np.float32),
+            float(rew), bool(done), info)
+
+  @property
+  def walls(self):
+    return None
+
 
 def euler2quat(euler):
   """Convert Euler angles to quaternions."""
@@ -66,8 +127,14 @@ def euler2quat(euler):
   return quat
 
 
-def load(env_name, fixed_start_end=None):
-  """Loads the train and eval environments, as well as the obs_dim."""
+def load(env_name, fixed_start_end=None, seed=None):
+  """Loads the train and eval environments, as well as the obs_dim.
+
+  Args:
+    env_name: Registered environment id.
+    fixed_start_end: Env-specific fixed goal / start–goal (see each env).
+    seed: Optional RNG seed (used by ``riverswim``; others may ignore it).
+  """
   # pylint: disable=invalid-name
   kwargs = {}
   if env_name == 'sawyer_bin':
@@ -90,6 +157,23 @@ def load(env_name, fixed_start_end=None):
       max_episode_steps = 100
     else:
       max_episode_steps = 50
+  elif env_name == 'riverswim':
+    if RiverSwim is None:
+      raise ImportError(
+          'riverswim is required for env riverswim (import failed).')
+    river_len = int(os.environ.get('RIVERSWIM_LEN', '6'))
+    horizon = int(os.environ.get(
+        'RIVERSWIM_HORIZON', str(max(100, river_len * 20))))
+    rs_seed = int(seed) if seed is not None else 0
+    gym_env = GymRiverSwimEnv(
+        river_len=river_len,
+        horizon=horizon,
+        seed=rs_seed,
+        randomize_actions=False,
+        fixed_start_end=fixed_start_end)
+    obs_dim = river_len
+    max_episode_steps = horizon
+    return gym_env, obs_dim, max_episode_steps
   else:
     raise NotImplementedError('Unsupported environment: %s' % env_name)
 

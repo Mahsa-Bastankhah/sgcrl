@@ -63,6 +63,11 @@ class ContrastiveConfig:
   twin_q: bool = False
   use_kappa: bool = False   # Train κ(s,a): discounted-sum-of-φ value network.
   twin_kappa: bool = False  # Two independent κ networks + targets; actor uses min(κ1,κ2)·ψ.
+  # If True (reward_shaping_mode='kappa' only): in the actor loss, rescale each κ
+  # row so ‖κ‖_2 = ‖φ‖_2 using φ = sa_repr from the same critic forward as ψ,
+  # before κ·ψ.  Independent of repr_norm (which L2-normalizes φ, ψ inside the
+  # critic).  κ Bellman regression still uses raw κ vs raw φ.
+  kappa_actor_match_phi_norm: bool = False
   # Separate discount and LR for κ.  Rationale:
   #   - κ* has ‖κ*‖ ≤ (max ‖φ‖) / (1 - γ_κ); at γ=0.99 that's 100·‖φ‖ which
   #     is a huge distance for a bootstrapped net to travel while φ itself
@@ -150,7 +155,10 @@ class ContrastiveConfig:
   ppo_num_minibatches: int = 4        # Minibatches per epoch
   ppo_clip_coef: float = 0.2
   ppo_vf_coef: float = 0.5
-  ppo_ent_coef: float = 0.08
+  ppo_ent_coef: float = 0.01
+  # PPO-only discount used for GAE/returns in standalone PPO.  If <=0,
+  # `config.discount` is used (backward-compatible behavior).
+  ppo_discount: float = -1.0
   ppo_gae_lambda: float = 0.95
   ppo_max_grad_norm: float = 0.5
   ppo_clip_vloss: bool = True
@@ -170,25 +178,21 @@ class ContrastiveConfig:
   # through `network_factory` in `ppo_contrastive.py`.
   ppo_actor_min_std: float = 0.1
   # CRL updates per PPO iteration (InfoNCE on φ, ψ over replay).
-  ppo_crl_steps_per_iter: int = 64
+  ppo_crl_steps_per_iter: int = 128
   # Minimum replay size before CRL updates start.
   ppo_min_replay_size: int = 10_000
   # Checkpointing: save policy/value/CRL params every N PPO iterations.
   # At default settings (8 envs × 128 steps = 1024 env-steps/iter), 100
   # iterations ≈ 100k env steps — light enough not to bottleneck training.
   # Set to 0 or a negative number to disable.
-  ppo_checkpoint_interval: int = 250
+  ppo_checkpoint_interval: int = 100
   # How many milestone checkpoints to keep on disk (older ones are
   # deleted in FIFO order).  `latest.pkl` is always overwritten in place.
   ppo_checkpoint_keep_last: int = 30
-  # When PPO's clipped surrogate `pg_loss` stays at/below `ppo_goal_neg_pg_on`
-  # (policy improvement effectively stalled), CRL adds the environment goal
-  # slice from each transition as an extra InfoNCE / binary-NCE negative for
-  # every row.  When `pg_loss` rises above `ppo_goal_neg_pg_off`, that mode
-  # turns off (hysteresis avoids chatter).  Only used by `ppo_learner.py`.
-  ppo_goal_neg_enable: bool = True
-  ppo_goal_neg_pg_on: float = 1e-5
-  ppo_goal_neg_pg_off: float = 5e-5
+
+
+
+
   use_image_obs: bool = False
   random_goals: float = 0.5
   jit: bool = True

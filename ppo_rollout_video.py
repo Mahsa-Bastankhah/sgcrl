@@ -267,7 +267,7 @@ def main():
   networks, _ = _build_networks(args.env, seed=args.seed)
 
   gym_env, _, env_max_steps = env_utils.load(
-      args.env, fixed_start_end=fixed_goal_dict[args.env])
+      args.env, fixed_start_end=fixed_goal_dict[args.env], seed=args.seed)
   max_steps = env_max_steps if args.max_steps < 0 else int(args.max_steps)
   camera = args.camera or _DEFAULT_CAMERA.get(args.env, 'corner')
   print(f'[rollout] env={args.env}  max_steps={max_steps}  '

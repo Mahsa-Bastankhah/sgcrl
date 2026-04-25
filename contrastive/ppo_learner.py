@@ -254,9 +254,6 @@ class EpisodeReplay:
       obs        : (B, obs_dim_total)   [ s_t       ; obs_to_goal(s_j) ]
       action     : (B, act_dim)
       next_obs   : (B, obs_dim_total)   [ s_{t+1}   ; obs_to_goal(s_j) ]
-      task_goal  : (B, goal_dim)        goal slice from the raw stored obs at
-                                        time t (env task goal), used when PPO
-                                        stalls to push φ(s,a) away from ψ(g_task).
     """
     assert self.size > 0, 'Cannot sample from an empty buffer.'
     B = int(batch_size)
@@ -298,7 +295,6 @@ class EpisodeReplay:
     act_out = np.empty((B, act_dim), dtype=np.float32)
     # We don't know goal_dim until we call _obs_to_goal on the first sample.
     next_obs_out = None
-    task_goal_out = None
     goal_dim = None
     for i in range(B):
       ep = self._episodes[int(ep_ids[i])]
@@ -309,24 +305,20 @@ class EpisodeReplay:
       s_tp1     = full_obs[ti + 1, :self._obs_dim]
       s_j       = full_obs[ji,     :self._obs_dim]
       goal      = self._obs_to_goal(s_j[None])[0]
-      task_g    = full_obs[ti, self._obs_dim:]
       if goal_dim is None:
         goal_dim = goal.shape[0]
         obs_out = np.empty((B, self._obs_dim + goal_dim), dtype=np.float32)
         next_obs_out = np.empty_like(obs_out)
-        task_goal_out = np.empty((B, goal_dim), dtype=np.float32)
       obs_out[i, :self._obs_dim] = s_t
       obs_out[i,  self._obs_dim:] = goal
       next_obs_out[i, :self._obs_dim] = s_tp1
       next_obs_out[i,  self._obs_dim:] = goal
-      task_goal_out[i] = task_g
       act_out[i] = act[ti]
 
     return {
         'obs': obs_out,
         'action': act_out,
         'next_obs': next_obs_out,
-        'task_goal': task_goal_out,
     }
 
 
@@ -371,7 +363,9 @@ def make_gae_fn(config: contrastive_config.ContrastiveConfig):
   `next_done` correspond to the state after the last collected step
   (used for bootstrapping A_{T-1}).
   """
-  gamma = float(config.discount)
+  ppo_gamma = (float(config.ppo_discount)
+               if float(getattr(config, 'ppo_discount', -1.0)) > 0.0
+               else float(config.discount))
   gae_lambda = float(config.ppo_gae_lambda)
 
   @jax.jit
@@ -385,11 +379,11 @@ def make_gae_fn(config: contrastive_config.ContrastiveConfig):
     next_dones_seq = jnp.concatenate([dones[1:], next_done[None]], axis=0)   # (T, E)
     next_nonterm = 1.0 - next_dones_seq.astype(jnp.float32)
 
-    deltas = rewards + gamma * next_vals_seq * next_nonterm - values  # (T, E)
+    deltas = rewards + ppo_gamma * next_vals_seq * next_nonterm - values  # (T, E)
 
     def scan_fn(last_gae, inputs):
       delta_t, nnt_t = inputs
-      new_gae = delta_t + gamma * gae_lambda * nnt_t * last_gae
+      new_gae = delta_t + ppo_gamma * gae_lambda * nnt_t * last_gae
       return new_gae, new_gae
 
     init = jnp.zeros(rewards.shape[1], dtype=rewards.dtype)
@@ -498,193 +492,100 @@ def make_ppo_update_fn(
 
 def make_crl_update_fn(
     networks: contrastive_networks.ContrastiveNetworks,
-    config: contrastive_config.ContrastiveConfig,
     q_optimizer: optax.GradientTransformation,
-    obs_to_goal: Callable[[jnp.ndarray], jnp.ndarray],
 ):
   """Returns a jitted CRL critic update over one replay batch.
 
-  This is a *direct port* of `learning.py::critic_loss` — the CRL loss
-  body is unchanged; only the batch plumbing is adapted (dict inputs
-  instead of a `Transition` namedtuple) and the actor-parameter path
-  is dropped (PPO handles the policy, so the TD branch uses the
-  *current* policy params passed in).  All three original branches
-  are supported so behavior exactly matches the off-policy SAC
-  codebase:
-
-    • use_td=True                  →  C-learning with HER + twin-Q
-    • use_td=False, use_cpc=True   →  InfoNCE + 0.01 · logsumexp² penalty
-    • use_td=False, use_cpc=False  →  binary NCE
-
-  The `logits` / `sa_repr` / `g_repr` tuple and the `(B, B[, 2])` shape
-  conventions are untouched.
+  PPO CRL uses a single loss: in-batch InfoNCE (softmax cross-entropy on the
+  diagonal) plus ``0.01 * logsumexp(logits, axis=1)^2``, matching the CPC path
+  in ``learning.py``.  Supports ``(B, B)`` or twin ``(B, B, 2)`` logits.
 
   Args:
-    networks:  ContrastiveNetworks with `q_network` and `policy_network`.
-    config:    Training config (reads `use_td`, `use_cpc`, `add_mc_to_td`,
-               `obs_dim`, `discount`).
-    q_optimizer: optax optimizer for the critic (φ, ψ) parameters.
-    obs_to_goal: Host-side function state→goal (same as the one passed
-                 to the SAC learner).  Used by the TD branch for HER.
+    networks: ContrastiveNetworks (``q_network`` only is used here).
+    q_optimizer: Adam (or other) transform for Q / representation params.
 
   Returns:
-    update(q_params, q_optimizer_state, policy_params, batch, key, goal_neg_active)
-      → (new_q_params, new_q_optimizer_state, metrics)
-
-  When ``goal_neg_active`` is True (static for JAX), the MC path appends one
-  extra negative logit per row: φ(s_i,a_i)·ψ(g^task_i) where ``g^task`` is the
-  environment goal slice from ``batch['task_goal']`` (see ``EpisodeReplay``).
+    ``update(q_params, q_optimizer_state, batch, key)``
+    → ``(new_q_params, new_q_optimizer_state, metrics)``
   """
+  _logsumexp_penalty_coef = 0.01
 
-  def critic_loss(q_params, policy_params, batch, key, goal_neg_active: bool):
+  def critic_loss(q_params, batch, key):
+    del key
     obs = batch['obs']
     action = batch['action']
-    next_obs = batch['next_obs']
     batch_size = obs.shape[0]
+    labels = jnp.eye(batch_size)
 
-    if config.use_td:
-      # ---- HER relabel: set goal = next_state (diagonal = immediate next) ----
-      s, g = jnp.split(obs, [config.obs_dim], axis=1)
-      next_s, _ = jnp.split(next_obs, [config.obs_dim], axis=1)
-      if config.add_mc_to_td:
-        next_fraction = (1 - config.discount) / ((1 - config.discount) + 1)
-        num_next = int(batch_size * next_fraction)
-        new_g = jnp.concatenate([
-            obs_to_goal(next_s[:num_next]),
-            g[num_next:],
-        ], axis=0)
-      else:
-        new_g = obs_to_goal(next_s)
-      obs = jnp.concatenate([s, new_g], axis=1)
+    logits, _, _ = networks.q_network.apply(q_params, obs, action)
 
-    logits, sa_repr, _ = networks.q_network.apply(q_params, obs, action)  # (B, B[, 2])
-    train_logits = logits  # overwritten in MC branch; used for metrics / logsumexp
+    def loss_fn(_logits, _labels):
+      return (
+          optax.softmax_cross_entropy(logits=_logits, labels=_labels)
+          + _logsumexp_penalty_coef * jax.nn.logsumexp(_logits, axis=1) ** 2)
 
-    if config.use_td:
-      # Twin Q is required by the TD branch (matches original code).
-      assert len(logits.shape) == 3, 'TD branch requires twin_q=True'
-
-      s, g = jnp.split(obs, [config.obs_dim], axis=1)
-      del s
-      next_s2 = next_obs[:, :config.obs_dim]
-      # "Random goal" critic evaluation: shift goals in the batch by one.
-      goal_indices = jnp.roll(jnp.arange(batch_size, dtype=jnp.int32), -1)
-      g_rolled = g[goal_indices]
-      next_obs_relab = jnp.concatenate([next_s2, g_rolled], axis=1)
-
-      next_dist_params = networks.policy_network.apply(
-          policy_params, next_obs_relab)
-      next_action = networks.sample(next_dist_params, key)
-
-      next_q, _, _ = networks.q_network.apply(
-          q_params, next_obs_relab, next_action)
-      next_q = jax.nn.sigmoid(next_q)
-      next_v = jnp.min(next_q, axis=-1)
-      next_v = jax.lax.stop_gradient(next_v)
-      next_v = jnp.diag(next_v)
-      w = next_v / (1 - next_v)
-      w = jnp.clip(w, 0, 20.0)
-
-      # (B, B, 2) → (B, 2): diagonal of each twin.
-      pos_logits = jax.vmap(jnp.diag, -1, -1)(logits)
-      loss_pos = optax.sigmoid_binary_cross_entropy(logits=pos_logits, labels=1)
-      neg_logits = logits[jnp.arange(batch_size), goal_indices]
-      loss_neg1 = w[:, None] * optax.sigmoid_binary_cross_entropy(
-          logits=neg_logits, labels=1)
-      loss_neg2 = optax.sigmoid_binary_cross_entropy(
-          logits=neg_logits, labels=0)
-
-      if config.add_mc_to_td:
-        loss = ((1 + (1 - config.discount)) * loss_pos
-                + config.discount * loss_neg1 + 2 * loss_neg2)
-      else:
-        loss = ((1 - config.discount) * loss_pos
-                + config.discount * loss_neg1 + loss_neg2)
-      # Collapse twin dim for diagnostic use.
-      logits_flat = jnp.mean(logits, axis=-1)
+    if logits.ndim == 3:
+      loss = jax.vmap(loss_fn, in_axes=(2, None), out_axes=-1)(logits, labels)
+      loss = jnp.mean(loss, axis=-1)
     else:
-      # ---- MC InfoNCE / binary NCE branch ----
-      logits_contrastive = logits
-      I = jnp.eye(batch_size)  # pylint: disable=invalid-name
-      if goal_neg_active and logits.ndim == 2:
-        task_goal = batch['task_goal']
-        obs_task = jnp.concatenate(
-            [obs[:, :config.obs_dim], task_goal], axis=1)
-        _, _, g_task = networks.q_network.apply(q_params, obs_task, action)
-        logits_extra = jnp.sum(sa_repr * g_task, axis=-1, keepdims=True)
-        logits_contrastive = jnp.concatenate([logits, logits_extra], axis=1)
-        I = jnp.concatenate(
-            [I, jnp.zeros((batch_size, 1), dtype=logits.dtype)], axis=1)
-
-      def loss_fn(_logits, _labels):
-        if config.use_cpc:
-          return (optax.softmax_cross_entropy(logits=_logits, labels=_labels)
-                  + 0.01 * jax.nn.logsumexp(_logits, axis=1) ** 2)
-        else:
-          return optax.sigmoid_binary_cross_entropy(
-              logits=_logits, labels=_labels)
-
-      if len(logits_contrastive.shape) == 3:  # twin q
-        loss = jax.vmap(loss_fn, in_axes=(2, None), out_axes=-1)(
-            logits_contrastive, I)
-        loss = jnp.mean(loss, axis=-1)
-        logits_flat = jnp.mean(logits_contrastive, axis=-1)
-      else:
-        loss = loss_fn(logits_contrastive, I)
-        logits_flat = logits_contrastive
-
-      train_logits = logits_contrastive
+      loss = loss_fn(logits, labels)
 
     loss = jnp.mean(loss)
+    train_logits = logits
 
-    if config.use_td:
-      narrow_logits = train_logits
+    if train_logits.ndim == 2:
+      narrow_logits = train_logits[:, :batch_size]
     else:
-      if train_logits.ndim == 2:
-        narrow_logits = train_logits[:, :batch_size]
-      else:
-        narrow_logits = train_logits[:, :batch_size, :]
+      narrow_logits = train_logits[:, :batch_size, :]
 
-    I = jnp.eye(batch_size)  # pylint: disable=invalid-name  (for metrics)
-    if len(narrow_logits.shape) == 3:
+    if narrow_logits.ndim == 3:
       logits_flat = jnp.mean(narrow_logits, axis=-1)
     else:
       logits_flat = narrow_logits
 
-    correct = (jnp.argmax(logits_flat, axis=1) == jnp.argmax(I, axis=1))
-    logits_pos = jnp.sum(logits_flat * I) / jnp.sum(I)
-    logits_neg = jnp.sum(logits_flat * (1 - I)) / jnp.sum(1 - I)
-    if len(train_logits.shape) == 3:
+    correct = (jnp.argmax(logits_flat, axis=1) == jnp.argmax(labels, axis=1))
+    logits_pos = jnp.sum(logits_flat * labels) / jnp.sum(labels)
+    logits_neg = jnp.sum(logits_flat * (1 - labels)) / jnp.sum(1 - labels)
+    if train_logits.ndim == 3:
       logsumexp_val = jax.nn.logsumexp(train_logits[:, :, 0], axis=1) ** 2
     else:
       logsumexp_val = jax.nn.logsumexp(train_logits, axis=1) ** 2
 
     metrics = {
         'crl_loss': loss,
-        'binary_accuracy': jnp.mean((logits_flat > 0) == I),
+        'binary_accuracy': jnp.mean((logits_flat > 0) == labels),
         'categorical_accuracy': jnp.mean(correct),
         'logits_pos': logits_pos,
         'logits_neg': logits_neg,
         'logsumexp': logsumexp_val.mean(),
     }
-    if (goal_neg_active and not config.use_td and train_logits.ndim == 2
-        and train_logits.shape[1] == batch_size + 1):
-      metrics['goal_neg_col_logit_mean'] = jnp.mean(train_logits[:, batch_size])
     return loss, metrics
 
   grad_fn = jax.value_and_grad(critic_loss, has_aux=True)
 
-  @jax.jit(static_argnames=('goal_neg_active',))
-  def update(q_params, q_optimizer_state, policy_params, batch, key,
-             goal_neg_active: bool):
-    (_, metrics), grads = grad_fn(
-        q_params, policy_params, batch, key, goal_neg_active)
-    updates, new_opt_state = q_optimizer.update(
-        grads, q_optimizer_state, q_params)
-    new_q_params = optax.apply_updates(q_params, updates)
+  def update(q_params, q_optimizer_state, batch, key):
+    (_, metrics), grads = grad_fn(q_params, batch, key)
+    grads_finite = jnp.all(jnp.asarray(jax.tree_util.tree_leaves(
+        jax.tree_util.tree_map(lambda x: jnp.all(jnp.isfinite(x)), grads))))
+    loss_finite = jnp.isfinite(metrics['crl_loss'])
+    do_update = jnp.logical_and(grads_finite, loss_finite)
+
+    def _apply(_):
+      updates, new_opt_state = q_optimizer.update(
+          grads, q_optimizer_state, q_params)
+      new_q_params = optax.apply_updates(q_params, updates)
+      return new_q_params, new_opt_state
+
+    def _skip(_):
+      return q_params, q_optimizer_state
+
+    new_q_params, new_opt_state = jax.lax.cond(
+        do_update, _apply, _skip, operand=None)
+    metrics = dict(metrics)
+    metrics['update_skipped_nonfinite'] = 1.0 - do_update.astype(jnp.float32)
     return new_q_params, new_opt_state, metrics
 
-  return update
+  return jax.jit(update)
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +631,11 @@ class VecEnv:
     env_rewards = np.zeros(self._num_envs, dtype=np.float32)
     dones = np.zeros(self._num_envs, dtype=bool)
     for i, env in enumerate(self._envs):
-      ts = env.step(actions[i].astype(action_dtype))
+      a = np.asarray(actions[i], dtype=np.float32)
+      a = np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=-1.0)
+      if hasattr(self._action_spec, 'minimum') and hasattr(self._action_spec, 'maximum'):
+        a = np.clip(a, self._action_spec.minimum, self._action_spec.maximum)
+      ts = env.step(a.astype(action_dtype))
       env_rewards[i] = 0.0 if ts.reward is None else float(ts.reward)
       terminal_obs[i] = ts.observation
       if ts.last():
@@ -840,11 +745,10 @@ def run_ppo_training(
         sample future-goal batch from EpisodeReplay, CRL SGD step
       log metrics; periodically evaluate
 
-  The CRL side is kept unchanged (loss body is a byte-for-byte port of
-  learning.py::critic_loss).  The PPO side follows CleanRL.
+  The CRL side is InfoNCE + logsumexp penalty on replay batches only.
+  The PPO side follows CleanRL.
   """
   # ---- build networks from env spec -------------------------------------
-  import functools as _ft
   from acme import specs as _specs
   import contrastive.utils as _cu
 
@@ -898,11 +802,7 @@ def run_ppo_training(
   gae_fn = make_gae_fn(config)
   ppo_update = make_ppo_update_fn(networks, config, ppo_optimizer)
 
-  obs_to_goal = _ft.partial(
-      _cu.obs_to_goal_2d,
-      start_index=config.start_index,
-      end_index=config.end_index)
-  crl_update = make_crl_update_fn(networks, config, q_optimizer, obs_to_goal)
+  crl_update = make_crl_update_fn(networks, q_optimizer)
 
   @jax.jit
   def act_and_value(policy_p, value_p, obs, rng):
@@ -944,9 +844,6 @@ def run_ppo_training(
   for i in range(E):
     ep_obs[i].append(obs[i].copy())
 
-  # ---- PPO pg_loss gate for CRL “task goal as extra negative” mode -----
-  goal_neg_active = False
-
   # ---- loggers ----------------------------------------------------------
   learner_logger = logger_fn(label='learner')
   eval_logger = logger_fn(label='eval')
@@ -954,7 +851,13 @@ def run_ppo_training(
   # Persistent eval observers (mirrors Acme's evaluator loop).  Keeping
   # them alive across iterations is what lets `success_1000` and
   # `*_dist_{10,100,1000}` smooth over eval history.
-  eval_success_obs = _cu.SuccessObserver()
+  # RiverSwim: success = visited goal cell at least once (not env +1 reward).
+  _env = str(getattr(config, 'env_name', '') or '').lower()
+  if _env == 'riverswim':
+    eval_success_obs = _cu.RiverSwimGoalVisitSuccessObserver(
+        obs_dim=int(config.obs_dim))
+  else:
+    eval_success_obs = _cu.SuccessObserver()
   eval_dist_obs = _cu.DistanceObserver(
       obs_dim=int(config.obs_dim),
       start_index=int(config.start_index),
@@ -976,8 +879,11 @@ def run_ppo_training(
   # be O(10) and non-stationary, leading to unbounded advantages and
   # policy collapse within a handful of updates.
   norm_reward = bool(getattr(config, 'ppo_norm_reward', True))
+  ppo_gamma = (float(config.ppo_discount)
+               if float(getattr(config, 'ppo_discount', -1.0)) > 0.0
+               else float(config.discount))
   reward_normalizer = (
-      ReturnNormalizer(num_envs=E, discount=float(config.discount))
+      ReturnNormalizer(num_envs=E, discount=ppo_gamma)
       if norm_reward else None)
 
   # ---- checkpointing ----------------------------------------------------
@@ -1102,13 +1008,6 @@ def run_ppo_training(
 
     pg_vals = ppo_metrics_agg.get('pg_loss', [])
     mean_pg = float(np.mean(pg_vals)) if pg_vals else float('inf')
-    if bool(getattr(config, 'ppo_goal_neg_enable', True)):
-      if (not goal_neg_active
-          and mean_pg <= float(getattr(config, 'ppo_goal_neg_pg_on', 1e-5))):
-        goal_neg_active = True
-      elif (goal_neg_active
-            and mean_pg >= float(getattr(config, 'ppo_goal_neg_pg_off', 5e-5))):
-        goal_neg_active = False
 
     # =================================================================
     # 4. CRL updates (off-policy, from replay)
@@ -1120,8 +1019,7 @@ def run_ppo_training(
         crl_batch = {k_: jnp.asarray(v) for k_, v in crl_batch_np.items()}
         key, k_crl = jax.random.split(key)
         q_params, q_opt_state, m = crl_update(
-            q_params, q_opt_state, ppo_params['policy'], crl_batch, k_crl,
-            goal_neg_active)
+            q_params, q_opt_state, crl_batch, k_crl)
         for k_, v in m.items():
           crl_metrics_agg.setdefault(k_, []).append(float(v))
 
@@ -1148,7 +1046,6 @@ def run_ppo_training(
         'advantage_std':     float(adv.std()),
         'early_stop_epochs': int(early_stop),
         'ppo/mean_pg_loss': mean_pg,
-        'ppo/goal_neg_active': float(goal_neg_active),
         # Always emit these keys so the CSV header is fixed at iter 0,
         # even if the first iteration has no completed episodes or
         # skips CRL for lack of replay data.
@@ -1170,8 +1067,9 @@ def run_ppo_training(
     # =================================================================
     # 6. Periodic evaluation  (5 episodes every 10 iters)
     #
-    # Uses the same observers the SAC side uses (`SuccessObserver` +
-    # `DistanceObserver` from contrastive/utils.py) so the eval CSV
+    # Uses the same observers the SAC side uses (`SuccessObserver` or
+    # `RiverSwimGoalVisitSuccessObserver` + `DistanceObserver` from
+    # contrastive/utils.py) so the eval CSV
     # schema matches the kappa_sac runs:
     #   success, success_1000, init_dist, final_dist, delta_dist,
     #   min_dist, *_10, *_100, *_1000, episode_return, episode_length
@@ -1189,7 +1087,9 @@ def run_ppo_training(
           a, _, _ = act_and_value(
               ppo_params['policy'], ppo_params['value'],
               jnp.asarray(ts.observation)[None], k_eval)
-          action = np.asarray(a)[0]
+          action = np.asarray(a)[0].astype(np.float32)
+          action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
+          action = np.clip(action, -1.0, 1.0)
           ts = env.step(action)
           eval_success_obs.observe(env, ts, action)
           eval_dist_obs.observe(env, ts, action)
@@ -1201,7 +1101,7 @@ def run_ppo_training(
         ep_metrics_list.append(ep_metrics)
 
       # Average across the 5 eval episodes.  `success_1000` is already
-      # a running statistic inside SuccessObserver, so we just take its
+      # a running statistic inside the success observer, so we just take its
       # last value (same as Acme's evaluator loop).
       agg = {
           'iteration':     iteration,

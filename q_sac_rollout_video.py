@@ -425,7 +425,8 @@ def main():
       print(f'[rollout]   building networks/env for {env_name}...')
       networks, _ = _build_networks_from_cfg(env_name, args.seed, cfg_dict)
       gym_env, _, env_max_steps = env_utils.load(
-          env_name, fixed_start_end=fixed_goal_dict[env_name])
+          env_name, fixed_start_end=fixed_goal_dict[env_name],
+          seed=args.seed)
       camera = args.camera or _DEFAULT_CAMERA.get(env_name, 'corner')
       render = _get_render_fn(gym_env, args.width, args.height, camera,
                               rotate_deg=args.rotate)

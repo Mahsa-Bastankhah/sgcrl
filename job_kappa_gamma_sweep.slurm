@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=kappa_g
-#SBATCH --output=slurm/kappa_gamma_sweep_hard%A_%a.out
+#SBATCH --output=slurm/kappa_gamma_sweep_normmatch%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -60,16 +60,22 @@ export MUJOCO_PY_MUJOCO_PATH="${HOME}/.mujoco/mujoco210"
 ENV=sawyer_bin
 ALG=kappa_sac
 NUM_STEPS=15000000
-LOG_DIR="logs/kappa_gamma_sweep_bin_hard/${SWEEP_TAG}/"
+LOG_DIR="logs/kappa_gamma_sweep_bin_normmatch/${SWEEP_TAG}/"
 
 # --- lp_contrastive knobs (edit here; sweep_config.json uses the same values) ---
-# Defaults: twin κ on, κ Adam LR 1e-4, κ grad clip 1.0, no hard-goal actor term, no repr_norm.
-KAPPA_ACTOR_HARD_GOAL_COEF="${KAPPA_ACTOR_HARD_GOAL_COEF:-0.1}"
+# Defaults: twin κ on, κ Adam LR 1e-4, κ grad clip 1.0, no hard-goal actor term, no repr_norm,
+# no κ–‖φ‖ actor rescaling (set KAPPA_ACTOR_MATCH_PHI_NORM=1 to enable).
+KAPPA_ACTOR_HARD_GOAL_COEF="${KAPPA_ACTOR_HARD_GOAL_COEF:-0.0}"
 LEARNING_RATE_KAPPA="${LEARNING_RATE_KAPPA:-1e-4}"
 KAPPA_MAX_GRAD_NORM="${KAPPA_MAX_GRAD_NORM:-1.0}"
+# Note: ``:-0`` is default-if-unset; ``:0`` alone is substring expansion and
+# leaves the value empty when the env var is unset (breaks sweep_config + lp).
 Q_ACTOR_KL_TO_PREV_COEF="${Q_ACTOR_KL_TO_PREV_COEF:-0}"
 TWIN_KAPPA="${TWIN_KAPPA:-1}"
 REPR_NORM="${REPR_NORM:-0}"
+KAPPA_ACTOR_MATCH_PHI_NORM="${KAPPA_ACTOR_MATCH_PHI_NORM:-1}"
+# Comma-separated MLP trunk widths, e.g. 256,256,256 (empty = config default 256,256).
+HIDDEN_LAYER_SIZES="${HIDDEN_LAYER_SIZES:-}"
 
 LP_EXTRA=(
   --kappa_actor_hard_goal_coef="${KAPPA_ACTOR_HARD_GOAL_COEF}"
@@ -87,12 +93,20 @@ if [ "${REPR_NORM}" = "1" ]; then
 else
   LP_EXTRA+=(--norepr_norm)
 fi
+if [ "${KAPPA_ACTOR_MATCH_PHI_NORM}" = "1" ]; then
+  LP_EXTRA+=(--kappa_actor_match_phi_norm)
+else
+  LP_EXTRA+=(--nokappa_actor_match_phi_norm)
+fi
+if [ -n "${HIDDEN_LAYER_SIZES}" ]; then
+  LP_EXTRA+=(--hidden_layer_sizes="${HIDDEN_LAYER_SIZES}")
+fi
 
 RUN_DIR="${LOG_DIR}${ALG}_${ENV}_${SEED}"
 mkdir -p "${RUN_DIR}"
 
 echo "task=${TASK_ID}  seed=${SEED}  discount_kappa=${GAMMA}  run_dir=${RUN_DIR}"
-echo "kappa_actor_hard_goal_coef=${KAPPA_ACTOR_HARD_GOAL_COEF}  learning_rate_kappa=${LEARNING_RATE_KAPPA}  kappa_max_grad_norm=${KAPPA_MAX_GRAD_NORM}  q_actor_kl_to_prev_coef=${Q_ACTOR_KL_TO_PREV_COEF}  twin_kappa=${TWIN_KAPPA}  repr_norm=${REPR_NORM}"
+echo "kappa_actor_hard_goal_coef=${KAPPA_ACTOR_HARD_GOAL_COEF}  learning_rate_kappa=${LEARNING_RATE_KAPPA}  kappa_max_grad_norm=${KAPPA_MAX_GRAD_NORM}  q_actor_kl_to_prev_coef=${Q_ACTOR_KL_TO_PREV_COEF}  twin_kappa=${TWIN_KAPPA}  repr_norm=${REPR_NORM}  kappa_actor_match_phi_norm=${KAPPA_ACTOR_MATCH_PHI_NORM}  hidden_layer_sizes=${HIDDEN_LAYER_SIZES:-<default>}"
 
 export SWEEP_SEED="${SEED}" SWEEP_ENV="${ENV}" SWEEP_ALG="${ALG}" \
   SWEEP_NUM_STEPS="${NUM_STEPS}" SWEEP_LOG_DIR="${LOG_DIR}" \
@@ -101,7 +115,9 @@ export SWEEP_SEED="${SEED}" SWEEP_ENV="${ENV}" SWEEP_ALG="${ALG}" \
   SWEEP_LEARNING_RATE_KAPPA="${LEARNING_RATE_KAPPA}" \
   SWEEP_KAPPA_MAX_GRAD_NORM="${KAPPA_MAX_GRAD_NORM}" \
   SWEEP_Q_ACTOR_KL_TO_PREV_COEF="${Q_ACTOR_KL_TO_PREV_COEF}" \
-  SWEEP_TWIN_KAPPA="${TWIN_KAPPA}" SWEEP_REPR_NORM="${REPR_NORM}"
+  SWEEP_TWIN_KAPPA="${TWIN_KAPPA}" SWEEP_REPR_NORM="${REPR_NORM}" \
+  SWEEP_KAPPA_ACTOR_MATCH_PHI_NORM="${KAPPA_ACTOR_MATCH_PHI_NORM}" \
+  SWEEP_HIDDEN_LAYER_SIZES="${HIDDEN_LAYER_SIZES}"
 
 cat > "${RUN_DIR}/sweep_config.txt" <<EOF
 discount_kappa=${GAMMA}
@@ -114,6 +130,8 @@ kappa_max_grad_norm=${KAPPA_MAX_GRAD_NORM}
 q_actor_kl_to_prev_coef=${Q_ACTOR_KL_TO_PREV_COEF}
 twin_kappa=${TWIN_KAPPA}
 repr_norm=${REPR_NORM}
+kappa_actor_match_phi_norm=${KAPPA_ACTOR_MATCH_PHI_NORM}
+hidden_layer_sizes=${HIDDEN_LAYER_SIZES:-}
 env=${ENV}  alg=${ALG}  num_steps=${NUM_STEPS}
 run_dir=${RUN_DIR}
 EOF
@@ -141,11 +159,18 @@ p = dict(
     reward_shaping_mode='kappa',
     discount_kappa=float(os.environ['SWEEP_GAMMA']),
     repr_norm=_b('SWEEP_REPR_NORM', '0'),
+    kappa_actor_match_phi_norm=_b('SWEEP_KAPPA_ACTOR_MATCH_PHI_NORM', '0'),
     kappa_actor_hard_goal_coef=float(os.environ['SWEEP_KAPPA_ACTOR_HARD_GOAL_COEF']),
     learning_rate_kappa=float(os.environ['SWEEP_LEARNING_RATE_KAPPA']),
     kappa_max_grad_norm=float(os.environ['SWEEP_KAPPA_MAX_GRAD_NORM']),
     q_actor_kl_to_prev_coef=float(os.environ['SWEEP_Q_ACTOR_KL_TO_PREV_COEF']),
 )
+hls = os.environ.get('SWEEP_HIDDEN_LAYER_SIZES', '').strip()
+if hls:
+    hls = hls.strip('()[]')
+    _parts = [int(x.strip()) for x in hls.split(',') if x.strip()]
+    if _parts:
+        p['hidden_layer_sizes'] = tuple(_parts)
 hg = lp._extract_hard_goal(os.environ['SWEEP_ENV'])
 if hg is not None:
     p['hard_goal'] = hg
@@ -155,14 +180,20 @@ d = {k: (v if isinstance(v, (int, float, str, bool, list, tuple, type(None))) el
 d['sweep_tag'] = os.environ['SWEEP_TAG']
 d['slurm_job_id'] = os.environ.get('SLURM_JOB_ID', '')
 d['slurm_array_task_id'] = os.environ.get('SLURM_ARRAY_TASK_ID', '')
-d['launch_lp_extras'] = [
+_extras = [
     '--kappa_actor_hard_goal_coef=' + os.environ['SWEEP_KAPPA_ACTOR_HARD_GOAL_COEF'],
     '--learning_rate_kappa=' + os.environ['SWEEP_LEARNING_RATE_KAPPA'],
     '--kappa_max_grad_norm=' + os.environ['SWEEP_KAPPA_MAX_GRAD_NORM'],
     '--q_actor_kl_to_prev_coef=' + os.environ['SWEEP_Q_ACTOR_KL_TO_PREV_COEF'],
     '--twin_kappa' if _b('SWEEP_TWIN_KAPPA', '1') else '--notwin_kappa',
     '--repr_norm' if _b('SWEEP_REPR_NORM', '0') else '--norepr_norm',
+    '--kappa_actor_match_phi_norm' if _b('SWEEP_KAPPA_ACTOR_MATCH_PHI_NORM', '0')
+    else '--nokappa_actor_match_phi_norm',
 ]
+_hls_ex = os.environ.get('SWEEP_HIDDEN_LAYER_SIZES', '').strip()
+if _hls_ex:
+    _extras.append('--hidden_layer_sizes=' + _hls_ex)
+d['launch_lp_extras'] = _extras
 path = os.path.join(os.environ['SWEEP_RUN_DIR'], 'sweep_config.json')
 with open(path, 'w') as f:
     json.dump(d, f, indent=2, default=str)
@@ -177,5 +208,4 @@ exec python -u lp_contrastive.py \
   --num_steps="${NUM_STEPS}" \
   --log_dir_path="${LOG_DIR}" \
   --discount_kappa="${GAMMA}" \
-  "${LP_EXTRA[@]}" \
-  # --hidden_layer_sizes=256,256,256,256,256,256
+  "${LP_EXTRA[@]}"

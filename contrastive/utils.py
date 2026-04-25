@@ -62,6 +62,43 @@ class SuccessObserver(observers_base.EnvLoopObserver):
     }
 
 
+class RiverSwimGoalVisitSuccessObserver(observers_base.EnvLoopObserver):
+  """Eval success for RiverSwim: agent reached the goal cell at least once.
+
+  Uses the goal-conditioned observation ``[one_hot(state); one_hot(goal)]``
+  (``obs_dim`` cells each). Env reward (+1 only when swimming right at the
+  far bank) is **not** used, since PPO trains on φ·ψ and the sparse env
+  bonus can diverge from "visited the goal state".
+  """
+
+  def __init__(self, obs_dim: int):
+    self._obs_dim = int(obs_dim)
+    self._visited_goal = []  # bool per env step this episode
+    self._success = []  # bool per completed episode (for success_1000)
+
+  def observe_first(self, env, timestep):
+    if self._visited_goal:
+      self._success.append(bool(np.any(self._visited_goal)))
+    self._visited_goal = []
+
+  def observe(self, env, timestep, action):
+    obs = np.asarray(timestep.observation, dtype=np.float64).ravel()
+    d = self._obs_dim
+    if obs.size < 2 * d:
+      self._visited_goal.append(False)
+      return
+    s = int(np.argmax(obs[:d]))
+    g = int(np.argmax(obs[d:2 * d]))
+    self._visited_goal.append(s == g)
+
+  def get_metrics(self):
+    hit = bool(np.any(self._visited_goal)) if self._visited_goal else False
+    s1k = (
+        float(np.mean(self._success[-1000:]))
+        if self._success else float('nan'))
+    return {'success': float(hit), 'success_1000': s1k}
+
+
 class DistanceObserver(observers_base.EnvLoopObserver):
   """Observer that measures the L2 distance to the goal."""
 
@@ -263,7 +300,8 @@ def make_environment(env_name, start_index, end_index,
       the start_index/end_index is applied.
   """
   np.random.seed(seed)
-  gym_env, obs_dim, max_episode_steps = env_utils.load(env_name, fixed_start_end)
+  gym_env, obs_dim, max_episode_steps = env_utils.load(
+      env_name, fixed_start_end, seed)
   goal_indices = obs_dim + obs_to_goal_1d(np.arange(obs_dim), start_index,
                                           end_index)
   indices = np.concatenate([
@@ -276,13 +314,33 @@ def make_environment(env_name, start_index, end_index,
   return env, obs_dim
 
 
+def _policy_trunk_linear0_bias_all_zero(params) -> bool:
+  """True before the first learner actor update (bias init is zeros).
+
+  Policy trunk param names differ by architecture:
+  ``mlp/~/linear_0`` (``hk.Sequential`` + unnamed ``hk.nets.MLP``) vs
+  ``policy_mlp/linear_0`` (named ``ResidualMLP`` / ``_mlp_or_residual`` trunk).
+  """
+  preferred = ('mlp/~/linear_0', 'policy_mlp/linear_0')
+  for key in preferred:
+    block = params.get(key)
+    if isinstance(block, dict) and 'b' in block:
+      return bool((block['b'] == 0).all())
+  for key in sorted(params):
+    if key.endswith('/linear_0'):
+      block = params[key]
+      if isinstance(block, dict) and 'b' in block:
+        return bool((block['b'] == 0).all())
+  return False
+
+
 class InitiallyRandomActor(actors.GenericActor):
   """Actor that takes actions uniformly at random until the actor is updated.
   """
 
   def select_action(self,
                     observation):
-    if (self._params['mlp/~/linear_0']['b'] == 0).all():
+    if _policy_trunk_linear0_bias_all_zero(self._params):
       shape = self._params['Normal/~/linear']['b'].shape
       rng, self._state = jax.random.split(self._state)
       action = jax.random.uniform(key=rng, shape=shape,

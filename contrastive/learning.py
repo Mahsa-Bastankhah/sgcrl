@@ -51,6 +51,17 @@ class TrainingState(NamedTuple):
   q_repr_optimizer_state_2: Optional[optax.OptState] = None
 
 
+def _scale_kappa_rows_to_phi_norm(kappa, phi_sa):
+  """Rescale each κ row so ‖κ‖_2 = ‖φ‖_2 (same batch as φ = sa_repr).
+
+  Used in the κ actor loss when config.kappa_actor_match_phi_norm is True.
+  """
+  eps = jnp.asarray(1e-8, dtype=kappa.dtype)
+  n_phi = jnp.linalg.norm(phi_sa, axis=-1, keepdims=True) + eps
+  n_k = jnp.linalg.norm(kappa, axis=-1, keepdims=True) + eps
+  return kappa * (n_phi / n_k)
+
+
 class ContrastiveLearner(acme.Learner):
   """Contrastive RL learner."""
 
@@ -297,15 +308,20 @@ class ContrastiveLearner(acme.Learner):
       if config.reward_shaping_mode == 'kappa':
         # Same HER-shaped batch as stock CRL, but maximise min(κ1·ψ, κ2·ψ) instead
         # of the contrastive logits diagonal.  Critic + κ params are stop-gradiented.
-        _, _, psi_g = networks.q_network.apply(
+        _, phi_sa, psi_g = networks.q_network.apply(
             jax.lax.stop_gradient(q_params), new_obs, action)
+        phi_sa = jax.lax.stop_gradient(phi_sa)
         psi_g = jax.lax.stop_gradient(psi_g)
         kappa1 = networks.kappa_network.apply(
             jax.lax.stop_gradient(kappa_params), new_obs, action)
+        if config.kappa_actor_match_phi_norm:
+          kappa1 = _scale_kappa_rows_to_phi_norm(kappa1, phi_sa)
         q1 = jnp.sum(kappa1 * psi_g, axis=-1)
         if config.twin_kappa:
           kappa2 = networks.kappa_network_2.apply(
               jax.lax.stop_gradient(kappa_params_2), new_obs, action)
+          if config.kappa_actor_match_phi_norm:
+            kappa2 = _scale_kappa_rows_to_phi_norm(kappa2, phi_sa)
           q2 = jnp.sum(kappa2 * psi_g, axis=-1)
           q_scalar = jnp.minimum(q1, q2)
         else:
@@ -322,15 +338,20 @@ class ContrastiveLearner(acme.Learner):
           hg = jnp.broadcast_to(
               hg[None, :], (new_state.shape[0], hg.shape[0]))
           hard_obs = jnp.concatenate([new_state, hg], axis=1)
-          _, _, psi_h = networks.q_network.apply(
+          _, phi_h, psi_h = networks.q_network.apply(
               jax.lax.stop_gradient(q_params), hard_obs, action)
+          phi_h = jax.lax.stop_gradient(phi_h)
           psi_h = jax.lax.stop_gradient(psi_h)
           k1h = networks.kappa_network.apply(
               jax.lax.stop_gradient(kappa_params), hard_obs, action)
+          if config.kappa_actor_match_phi_norm:
+            k1h = _scale_kappa_rows_to_phi_norm(k1h, phi_h)
           qh1 = jnp.sum(k1h * psi_h, axis=-1)
           if config.twin_kappa:
             k2h = networks.kappa_network_2.apply(
                 jax.lax.stop_gradient(kappa_params_2), hard_obs, action)
+            if config.kappa_actor_match_phi_norm:
+              k2h = _scale_kappa_rows_to_phi_norm(k2h, phi_h)
             q_hard = jnp.minimum(qh1, jnp.sum(k2h * psi_h, axis=-1))
           else:
             q_hard = qh1

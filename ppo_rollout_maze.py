@@ -167,7 +167,7 @@ def _get_raw_point_env(env_name):
         f'This script is maze-specific; got env={env_name!r}.  '
         f'Use ppo_rollout_video.py for sawyer_*.')
   gym_env, obs_dim, max_steps = env_utils.load(
-      env_name, fixed_start_end=fixed_goal_dict[env_name])
+      env_name, fixed_start_end=fixed_goal_dict[env_name], seed=None)
   walls = np.asarray(gym_env._walls)   # (H, W), 1=wall, 0=free
   return gym_env, obs_dim, max_steps, walls
 
@@ -224,22 +224,40 @@ def _point_state_goal_dim(gym_env) -> int:
   return d // 2
 
 
-def _make_maze_repr_field_fn(networks, state_dim: int):
-  """Jitted (policy, q, positions, goal) -> (phi_dot, psi_dot) per position."""
+def _make_maze_repr_field_fn(
+    networks,
+    state_dim: int,
+    normalize_repr: bool = False,
+):
+  """Jitted (policy, q, positions, goal) -> scalar representation fields."""
 
   @jax.jit
   def _eval(policy_p, q_p, pos_batch: jnp.ndarray, goal_vec: jnp.ndarray):
+    def _l2_normalize(x: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
+      denom = jnp.linalg.norm(x, axis=-1, keepdims=True)
+      return x / jnp.maximum(denom, eps)
+
     g = jnp.broadcast_to(goal_vec[None, :], (pos_batch.shape[0], state_dim))
     obs_pg = jnp.concatenate([pos_batch, g], axis=-1)
     dist = networks.policy_network.apply(policy_p, obs_pg)
     act = networks.sample_eval(dist, jax.random.PRNGKey(0))
 
     _, phi, psi_g = networks.q_network.apply(q_p, obs_pg, act)
-    phi_dot = jnp.sum(phi * psi_g, axis=-1)
+    if normalize_repr:
+      phi_l = _l2_normalize(phi)
+      psi_g_l = _l2_normalize(psi_g)
+      phi_dot = jnp.sum(phi_l * psi_g_l, axis=-1)
+    else:
+      phi_dot = jnp.sum(phi * psi_g, axis=-1)
 
     obs_ss = jnp.concatenate([pos_batch, pos_batch], axis=-1)
     _, _, psi_s = networks.q_network.apply(q_p, obs_ss, act)
-    psi_dot = jnp.sum(psi_s * psi_g, axis=-1)
+    if normalize_repr:
+      psi_s_l = _l2_normalize(psi_s)
+      psi_g_l = _l2_normalize(psi_g)
+      psi_dot = jnp.sum(psi_s_l * psi_g_l, axis=-1)
+    else:
+      psi_dot = jnp.sum(psi_s * psi_g, axis=-1)
     return phi_dot, psi_dot
 
   return _eval
@@ -338,6 +356,7 @@ def _plot_trajectory(
     success: bool,
     heatmap_phi: Optional[np.ndarray] = None,
     heatmap_psi: Optional[np.ndarray] = None,
+    normalize_repr: bool = False,
 ):
   """Save a PNG: trajectory on maze; optional side-by-side CRL heatmaps."""
   H, W = walls.shape
@@ -348,17 +367,14 @@ def _plot_trajectory(
         f'{title}\n'
         f'len={len(states)}  reward_sum={reward_sum:.2f}  success={success}')
     fig.suptitle(supt, fontsize=11)
-    _draw_maze_panel(
-        ax0, walls, states, goal, heatmap_phi,
-        r'$\phi(s,a)\cdot\psi(g)$',
-    )
-    ax0.set_title(r'$\phi(s,a)\cdot\psi(g)$  (policy mode $a$)')
-    _draw_maze_panel(
-        ax1, walls, states, goal, heatmap_psi,
-        r'$\psi(s)\cdot\psi(g)$',
-    )
-    ax1.set_title(
-        r'$\psi(s)\cdot\psi(g)$  ($\psi$ = goal encoder; $s$ in goal slot)')
+    heat0 = (r'$\cos(\phi(s,a), \psi(g))$'
+             if normalize_repr else r'$\phi(s,a)\cdot\psi(g)$')
+    heat1 = (r'$\cos(\psi(s), \psi(g))$'
+             if normalize_repr else r'$\psi(s)\cdot\psi(g)$')
+    _draw_maze_panel(ax0, walls, states, goal, heatmap_phi, heat0)
+    ax0.set_title(f'{heat0}  (policy mode $a$)')
+    _draw_maze_panel(ax1, walls, states, goal, heatmap_psi, heat1)
+    ax1.set_title(f'{heat1}  ($\\psi$ = goal encoder; $s$ in goal slot)')
   else:
     fig, ax0 = plt.subplots(figsize=(6, h_in))
     _draw_maze_panel(ax0, walls, states, goal, None, '')
@@ -437,6 +453,12 @@ def main():
   parser.add_argument('--no_repr_overlay', action='store_true',
                       help='Do not compute CRL heatmaps; single trajectory '
                            'panel only.')
+  parser.add_argument(
+      '--no_repr_normalize', action='store_true',
+      help='Use raw dot products for heatmaps instead of cosine similarity.')
+  parser.add_argument(
+      '--repr_normalize', action='store_true',
+      help='Use cosine similarity heatmaps (L2-normalized representations).')
   args = parser.parse_args()
 
   # ----- Test-only branch: no checkpoint, no networks, no rollout -------
@@ -463,7 +485,9 @@ def main():
   networks, _ = _build_networks(args.env, seed=args.seed)
   gym_env, _, env_max_steps, walls = _get_raw_point_env(args.env)
   state_dim = _point_state_goal_dim(gym_env)
-  eval_fields = _make_maze_repr_field_fn(networks, state_dim)
+  use_repr_normalize = bool(args.repr_normalize and not args.no_repr_normalize)
+  eval_fields = _make_maze_repr_field_fn(
+      networks, state_dim, normalize_repr=use_repr_normalize)
   max_steps = env_max_steps if args.max_steps < 0 else int(args.max_steps)
   print(f'[maze] env={args.env}  max_steps={max_steps}  '
         f'walls shape={walls.shape} (rows, cols)')
@@ -503,7 +527,8 @@ def main():
         walls=walls, states=states, goal=goal,
         title=f'{args.env}  seed={args.seed}  ckpt={label}',
         out_path=out_path, reward_sum=reward_sum, success=success,
-        heatmap_phi=h_phi, heatmap_psi=h_psi)
+        heatmap_phi=h_phi, heatmap_psi=h_psi,
+        normalize_repr=use_repr_normalize)
     print(f'[maze]   wrote {out_path}')
 
 

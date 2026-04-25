@@ -76,6 +76,11 @@ flags.DEFINE_float(
 # If True, L2-normalize φ/ψ in the critic (see ContrastiveConfig.repr_norm).
 flags.DEFINE_bool('repr_norm', False,
                   'If True, L2-normalize critic φ and ψ before the dot product.')
+flags.DEFINE_bool(
+    'kappa_actor_match_phi_norm', False,
+    'If True (kappa_sac only): in the κ actor loss, rescale each κ row so '
+    '‖κ‖=‖φ‖ (φ from the same critic forward) before κ·ψ.  Orthogonal to '
+    'repr_norm.')
 # Comma-separated trunk widths for policy/critic/κ/etc. (see make_networks).
 # Example: --hidden_layer_sizes=256,256,256  or  --hidden_layer_sizes="(256, 256, 256)"
 # Empty string keeps ContrastiveConfig default (256, 256).
@@ -93,7 +98,10 @@ fixed_goal_dict={'point_Spiral11x11': [np.array([5, 5], dtype=float),
                  #note: sawyer fixed goal positions vary slightly with each episode
                       'sawyer_bin': np.array([0.12, 0.7, 0.02]),
                       'sawyer_box': np.array([0.0, 0.75, 0.133]),
-                      'sawyer_peg': np.array([-0.3, 0.6, 0.0])}
+                      'sawyer_peg': np.array([-0.3, 0.6, 0.0]),
+                      # One-hot goal; length must match RIVERSWIM_LEN (default 6).
+                      'riverswim': np.array(
+                          [0., 0., 0., 0., 0., 1.], dtype=float)}
 
 
 def _extract_hard_goal(env_name):
@@ -302,6 +310,10 @@ def main(_):
   params['repr_norm'] = bool(FLAGS.repr_norm)
   if FLAGS.repr_norm:
     print('Using repr_norm=True...')
+  params['kappa_actor_match_phi_norm'] = bool(
+      FLAGS.kappa_actor_match_phi_norm)
+  if FLAGS.kappa_actor_match_phi_norm:
+    print('Using kappa_actor_match_phi_norm=True...')
 
   hls = FLAGS.hidden_layer_sizes.strip()
   if hls:

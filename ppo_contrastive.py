@@ -7,12 +7,20 @@ Run with:
       --num_steps=8000000 \
       --log_dir_path=logs/ppo/
 
+Sawyer bin (fixed goal, vanilla CRL without task-goal extra negatives):
+  python ppo_contrastive.py \
+      --env=sawyer_bin \
+      --seed=0 \
+      --num_steps=8000000 \
+      --log_dir_path=logs/ppo/
+
 PPO is on-policy and single-process; this script does NOT go through
 Launchpad.  The SAC-based kappa actor stays untouched and is still
 launched via lp_contrastive.py --alg=kappa_sac.
 """
 import sgcrl_jax_acme_compat  # noqa: F401 — must precede all acme/jax imports
 import functools
+import json
 import os
 
 from absl import app
@@ -32,6 +40,9 @@ flags.DEFINE_string('env', 'point_FourRooms', 'Environment type')
 flags.DEFINE_integer('num_steps', 8_000_000, 'Total env steps', lower_bound=0)
 flags.DEFINE_bool('sample_goals', False,
                   'Sample goal uniformly (else use the fixed goal dict)')
+flags.DEFINE_bool(
+    'repr_norm', False,
+    'If True, L2-normalize critic φ and ψ before dot products.')
 # Optional explicit overrides for the two per-env-defaulted knobs.
 # If left at -1 (the default), the per-env lookup in PPO_ENV_DEFAULTS wins;
 # any non-negative value supplied on the CLI overrides that table.  This lets
@@ -40,6 +51,19 @@ flags.DEFINE_integer('ppo_rollout_length', -1,
                      'If >=0, overrides the per-env rollout length default.')
 flags.DEFINE_integer('ppo_crl_steps_per_iter', -1,
                      'If >=0, overrides the per-env CRL-steps default.')
+flags.DEFINE_float(
+    'discount', -1.0,
+    'If >=0, overrides ContrastiveConfig.discount (CRL discount).')
+flags.DEFINE_float(
+    'ppo_discount', -1.0,
+    'If >0, overrides PPO discount for GAE/returns only; '
+    '<=0 falls back to config.discount.')
+flags.DEFINE_float(
+    'ppo_clip_coef', -1.0,
+    'If >0, overrides PPO clip coefficient.')
+flags.DEFINE_float(
+    'ppo_actor_min_std', -1.0,
+    'If >0, overrides PPO actor min std.')
 
 # ---------------------------------------------------------------------------
 # Fixed-goal lookup reused from lp_contrastive.py.
@@ -54,6 +78,8 @@ fixed_goal_dict = {
     'sawyer_bin':  np.array([0.12, 0.7, 0.02]),
     'sawyer_box':  np.array([0.0, 0.75, 0.133]),
     'sawyer_peg':  np.array([-0.3, 0.6, 0.0]),
+    # One-hot goal over river cells (length must match RIVERSWIM_LEN, default 6).
+    'riverswim': np.array([0., 0., 0., 0., 0., 1.], dtype=float),
 }
 
 # ---------------------------------------------------------------------------
@@ -75,10 +101,26 @@ fixed_goal_dict = {
 PPO_ENV_DEFAULTS = {
     'point_FourRooms':   dict(rollout_length=128, crl_steps_per_iter=64),
     'point_Spiral11x11': dict(rollout_length=128, crl_steps_per_iter=64),
+    'riverswim':         dict(rollout_length=128, crl_steps_per_iter=64),
     'sawyer_bin':        dict(rollout_length=256, crl_steps_per_iter=128),
     'sawyer_box':        dict(rollout_length=256, crl_steps_per_iter=128),
     'sawyer_peg':        dict(rollout_length=256, crl_steps_per_iter=128),
 }
+
+
+def _json_safe(value):
+  if isinstance(value, (str, int, float, bool)) or value is None:
+    return value
+  if isinstance(value, (list, tuple)):
+    return [_json_safe(v) for v in value]
+  if isinstance(value, dict):
+    return {str(k): _json_safe(v) for k, v in value.items()}
+  if hasattr(value, 'tolist'):
+    try:
+      return value.tolist()
+    except Exception:  # pragma: no cover
+      pass
+  return str(value)
 
 
 def main(_):
@@ -102,6 +144,7 @@ def main(_):
       fix_goals=not FLAGS.sample_goals,
   )
   config = contrastive.ContrastiveConfig(**params)
+  config.repr_norm = bool(FLAGS.repr_norm)
 
   # ---- Per-env PPO defaults (CLI flags still override) -------------------
   env_defaults = PPO_ENV_DEFAULTS.get(env_name)
@@ -118,14 +161,26 @@ def main(_):
     config.ppo_rollout_length = int(FLAGS.ppo_rollout_length)
   if FLAGS.ppo_crl_steps_per_iter >= 0:
     config.ppo_crl_steps_per_iter = int(FLAGS.ppo_crl_steps_per_iter)
+  if FLAGS.discount >= 0.0:
+    config.discount = float(FLAGS.discount)
+  if FLAGS.ppo_discount > 0.0:
+    config.ppo_discount = float(FLAGS.ppo_discount)
+  if FLAGS.ppo_clip_coef > 0.0:
+    config.ppo_clip_coef = float(FLAGS.ppo_clip_coef)
+  if FLAGS.ppo_actor_min_std > 0.0:
+    config.ppo_actor_min_std = float(FLAGS.ppo_actor_min_std)
 
   print(f'[ppo_contrastive] PPO knobs: '
         f'rollout_length={config.ppo_rollout_length}, '
         f'crl_steps_per_iter={config.ppo_crl_steps_per_iter}, '
         f'num_envs={config.ppo_num_envs}, '
+        f'clip_coef={config.ppo_clip_coef}, '
         f'actor_min_std={config.ppo_actor_min_std}, '
         f'ent_coef={config.ppo_ent_coef}, '
-        f'norm_reward={config.ppo_norm_reward}')
+        f'discount_crl={config.discount}, '
+        f'discount_ppo={config.ppo_discount if config.ppo_discount > 0 else config.discount}, '
+        f'norm_reward={config.ppo_norm_reward}, '
+        f'repr_norm={config.repr_norm}')
 
   # ---- Build env factories ----------------------------------------------
   fixed_start_end = (fixed_goal_dict[env_name]
@@ -173,6 +228,21 @@ def main(_):
       config.log_dir,
       f'{config.alg_name}_{config.env_name}_{seed}')
   os.makedirs(run_dir, exist_ok=True)
+  run_config_path = os.path.join(run_dir, 'run_config.json')
+  run_cfg_payload = {
+      'entrypoint': 'ppo_contrastive.py',
+      'env': env_name,
+      'seed': int(seed),
+      'flags': {k: _json_safe(v) for k, v in FLAGS.flag_values_dict().items()},
+      'resolved_config': {
+          k: _json_safe(v) for k, v in config.__dict__.items()
+      },
+      'fixed_start_end': _json_safe(fixed_start_end),
+      'ppo_env_defaults': _json_safe(env_defaults),
+  }
+  with open(run_config_path, 'w', encoding='utf-8') as fh:
+    json.dump(run_cfg_payload, fh, indent=2, sort_keys=True)
+  print(f'[ppo_contrastive] wrote run config: {run_config_path}')
   from default import make_default_logger
   logger_fn = functools.partial(
       make_default_logger,

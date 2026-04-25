@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_crl_new_sampling
+#SBATCH --job-name=ppo_crl
 #SBATCH --output=slurm/ppo_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=8G
 #SBATCH --gres=gpu:1
-#SBATCH --time=3:00:00
+#SBATCH --time=01:00:00
 #SBATCH --account=seas
 #SBATCH --array=0-0          # seeds; change range to run more
 
@@ -53,14 +53,14 @@ source .venv/bin/activate
 # LD_LIBRARY_PATH — identical order to job_kappa_sac.slurm.
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/mb6458/.mujoco/mujoco210/bin
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${HOME}/.mujoco/mujoco210/bin
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
 
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.8
 export PYTHONUNBUFFERED=1
 export MUJOCO_GL=osmesa
-export MUJOCO_PY_MUJOCO_PATH=$HOME/.mujoco/mujoco210
+export MUJOCO_PY_MUJOCO_PATH=${HOME}/.mujoco/mujoco210
 
 # ---------------------------------------------------------------------------
 # Config — edit to taste.  ppo_contrastive.py is NOT Launchpad-based; it runs
@@ -68,13 +68,15 @@ export MUJOCO_PY_MUJOCO_PATH=$HOME/.mujoco/mujoco210
 # contrastive/config.py::ContrastiveConfig (ppo_num_envs, ppo_rollout_length,
 # ppo_num_epochs, ppo_num_minibatches, ppo_clip_coef, ...) and can be edited
 # there or overridden per-run by subclassing in a wrapper script.
+# Use --sample_goals for random goals (else fixed_goal_dict in
+# ppo_contrastive.py, same as lp_contrastive).
 # ---------------------------------------------------------------------------
-ENV=point_Spiral11x11
-NUM_STEPS=8000000
-LOG_DIR=logs/ppo/
+ENV=point_FourRooms
+NUM_STEPS=1000000
+LOG_DIR=logs/ppo_fourrooms/
 
 # Offset the array-id so submitting `--array=0-2` produces seeds 3, 4, 5.
-SEED_OFFSET=${SEED_OFFSET:-7}
+SEED_OFFSET=${SEED_OFFSET:-26}
 SEED=$(( ${SLURM_ARRAY_TASK_ID:-0} + SEED_OFFSET ))
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
@@ -94,4 +96,5 @@ python -u ppo_contrastive.py \
     --env="${ENV}" \
     --seed="${SEED}" \
     --num_steps="${NUM_STEPS}" \
-    --log_dir_path="${LOG_DIR}"
+    --log_dir_path="${LOG_DIR}" \
+    --norepr_norm
