@@ -457,6 +457,8 @@ def make_ppo_update_fn(
 
     # ---- entropy bonus ----
     entropy_mean = jnp.mean(entropy_est)
+    # Term as it enters the minimized objective: L includes -coef * H.
+    entropy_loss_term = -ent_coef * entropy_mean
 
     # ---- combined loss ----
     total = pg_loss - ent_coef * entropy_mean + vf_coef * v_loss
@@ -471,6 +473,7 @@ def make_ppo_update_fn(
         'pg_loss': pg_loss,
         'v_loss': v_loss,
         'entropy': entropy_mean,
+        'entropy_loss': entropy_loss_term,
         'approx_kl': approx_kl,
         'old_approx_kl': old_approx_kl,
         'clipfrac': clipfrac,
@@ -779,10 +782,17 @@ def run_ppo_training(
 
   # ---- optimizers -------------------------------------------------------
   if config.ppo_anneal_lr:
+    total_ppo_updates = (
+      num_iterations
+      * int(config.ppo_num_epochs)
+      * int(config.ppo_num_minibatches)
+    )
+
     lr_schedule = optax.linear_schedule(
-        init_value=float(config.learning_rate),
-        end_value=0.0,
-        transition_steps=max(1, num_iterations))
+      init_value=float(config.learning_rate),
+      end_value=0.0,
+      transition_steps=max(1, total_ppo_updates),
+    )
     # A single Adam with schedule + grad-clip (CleanRL-style).
     ppo_optimizer = optax.chain(
         optax.clip_by_global_norm(float(config.ppo_max_grad_norm)),
@@ -896,6 +906,7 @@ def run_ppo_training(
 
   start_time = time.time()
   global_step = 0
+  ppo_sgd_step = 0  # minibatch PPO updates so far (matches lr schedule index)
 
   for iteration in range(num_iterations):
     # =================================================================
@@ -998,6 +1009,7 @@ def run_ppo_training(
         key, k_mb = jax.random.split(key)
         ppo_params, ppo_opt_state, m = ppo_update(
             ppo_params, ppo_opt_state, batch, k_mb)
+        ppo_sgd_step += 1
         last_kl = float(m['approx_kl'])
         for k_, v in m.items():
           ppo_metrics_agg.setdefault(k_, []).append(float(v))
@@ -1062,6 +1074,12 @@ def run_ppo_training(
       log[f'ppo/{k_}'] = float(np.mean(vs))
     for k_, vs in crl_metrics_agg.items():
       log[f'crl/{k_}'] = float(np.mean(vs))
+    if config.ppo_anneal_lr:
+      lr_log = float(lr_schedule(max(0, ppo_sgd_step - 1)))
+    else:
+      lr_log = float(config.learning_rate)
+    # Seven fractional digits so CSV / terminal show stable small LRs.
+    log['ppo/learning_rate'] = round(lr_log, 7)
     learner_logger.write(log)
 
     # =================================================================

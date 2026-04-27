@@ -155,7 +155,7 @@ class ContrastiveConfig:
   ppo_num_minibatches: int = 4        # Minibatches per epoch
   ppo_clip_coef: float = 0.2
   ppo_vf_coef: float = 0.5
-  ppo_ent_coef: float = 0.01
+  ppo_ent_coef: float = 0.05
   # PPO-only discount used for GAE/returns in standalone PPO.  If <=0,
   # `config.discount` is used (backward-compatible behavior).
   ppo_discount: float = -1.0
@@ -176,9 +176,9 @@ class ContrastiveConfig:
   # has no such mechanism and needs a larger floor (~0.05-0.1) to prevent
   # the tanh-squashed Gaussian from collapsing to a point mass.  Passed
   # through `network_factory` in `ppo_contrastive.py`.
-  ppo_actor_min_std: float = 0.1
+  ppo_actor_min_std: float = 0.01
   # CRL updates per PPO iteration (InfoNCE on φ, ψ over replay).
-  ppo_crl_steps_per_iter: int = 128
+  ppo_crl_steps_per_iter: int = 64
   # Minimum replay size before CRL updates start.
   ppo_min_replay_size: int = 10_000
   # Checkpointing: save policy/value/CRL params every N PPO iterations.
@@ -189,8 +189,6 @@ class ContrastiveConfig:
   # How many milestone checkpoints to keep on disk (older ones are
   # deleted in FIFO order).  `latest.pkl` is always overwritten in place.
   ppo_checkpoint_keep_last: int = 30
-
-
 
 
   use_image_obs: bool = False

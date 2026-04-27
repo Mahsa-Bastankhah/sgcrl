@@ -28,10 +28,8 @@ Examples:
 When a checkpoint is loaded, each PNG defaults to a **1×2** figure: the
 left panel overlays a heatmap of **φ(s,a)·ψ(g)** over every free cell
 (``a`` is the policy's deterministic action at ``concat([s,g])``,
-matching ``ppo_learner.make_reward_fn``); the right panel overlays
-**ψ(s)·ψ(g)**, where **ψ** is the goal encoder on the goal slice of the
-observation, and **ψ(s)** means that encoder applied to cell-center
-coordinates ``s`` placed in the goal slot (``obs = concat([s,s])``).
+matching ``ppo_learner.make_reward_fn``); the right panel overlays the
+PPO value estimate **V(s,g)** from the value head.
 Use ``--no_repr_overlay`` to skip the heatmaps and recover a single
 trajectory panel.
 
@@ -53,6 +51,7 @@ import sgcrl_jax_acme_compat  # noqa: F401  must precede acme/jax imports
 
 import argparse
 import glob
+import json
 import os
 import re
 from typing import Optional, Tuple
@@ -129,6 +128,36 @@ def _resolve_output_path(output_arg: str, env: str, label: str,
   return f'{stem}_{label}{e}'
 
 
+def _append_suffix_to_path(path: str, suffix: str) -> str:
+  stem, ext = os.path.splitext(path)
+  if not ext:
+    ext = '.png'
+  return f'{stem}_{suffix}{ext}'
+
+
+def _infer_repr_norm_from_checkpoint(ckpt_path: str) -> Optional[bool]:
+  """Best-effort infer repr_norm flag from neighboring run_config.json."""
+  # Expected layout:
+  #   <run_dir>/checkpoints/ckpt_iter_*.pkl
+  #   <run_dir>/run_config.json
+  ckpt_abs = os.path.abspath(ckpt_path)
+  ckpt_dir = os.path.dirname(ckpt_abs)
+  run_dir = os.path.dirname(ckpt_dir)
+  run_cfg = os.path.join(run_dir, 'run_config.json')
+  if not os.path.isfile(run_cfg):
+    return None
+  try:
+    with open(run_cfg, 'r', encoding='utf-8') as fh:
+      payload = json.load(fh)
+    resolved = payload.get('resolved_config', {})
+    v = resolved.get('repr_norm', None)
+    if isinstance(v, bool):
+      return v
+  except Exception:
+    return None
+  return None
+
+
 # ---------------------------------------------------------------------------
 # Network + env construction — matches PPO training-time config so the
 # checkpoint's policy_params plug in cleanly.
@@ -176,7 +205,9 @@ def _get_raw_point_env(env_name):
 # Rollout
 # ---------------------------------------------------------------------------
 def _rollout_one(policy_params, gym_env, networks,
-                 max_steps: int, stochastic: bool, seed: int):
+                 max_steps: int, stochastic: bool, seed: int,
+                 log_actions: bool = False,
+                 log_prefix: str = ''):
   """Run one rollout and return (states (T+1, 2), goal (2,), reward_sum, success)."""
   @jax.jit
   def policy_mode(params, obs):
@@ -191,6 +222,7 @@ def _rollout_one(policy_params, gym_env, networks,
   obs = np.asarray(gym_env.reset(), dtype=np.float32)
   goal = obs[2:].copy()                       # (2,)
   states = [obs[:2].copy()]
+  action_rows: Optional[list] = [] if log_actions else None
   total_reward = 0.0
   success = False
   rng = jax.random.PRNGKey(seed)
@@ -201,6 +233,8 @@ def _rollout_one(policy_params, gym_env, networks,
     else:
       action_j = policy_mode(policy_params, obs[None])
     action = np.asarray(action_j)[0].astype(np.float32)
+    if action_rows is not None:
+      action_rows.append(action.copy())
     obs_next, r, done, _ = gym_env.step(action)
     obs = np.asarray(obs_next, dtype=np.float32)
     states.append(obs[:2].copy())
@@ -209,6 +243,16 @@ def _rollout_one(policy_params, gym_env, networks,
       success = True
     if done:
       break
+  if log_actions:
+    if action_rows:
+      A = np.stack(action_rows, axis=0)
+      l2 = np.linalg.norm(A, axis=-1)
+      print(f'{log_prefix}[maze] policy actions: shape={A.shape} dtype={A.dtype} '
+            f'action_dim={A.shape[-1]}  per-step ||a||_2: '
+            f'min={l2.min():.4f} mean={l2.mean():.4f} max={l2.max():.4f}  '
+            f'elem-wise min/max={A.min():.4f}/{A.max():.4f}')
+    else:
+      print(f'{log_prefix}[maze] policy actions: no env steps (empty rollout).')
   return (np.asarray(states, dtype=np.float32), goal,
           float(total_reward), bool(success))
 
@@ -229,10 +273,10 @@ def _make_maze_repr_field_fn(
     state_dim: int,
     normalize_repr: bool = False,
 ):
-  """Jitted (policy, q, positions, goal) -> scalar representation fields."""
+  """Jitted (policy, q, value, positions, goal) -> scalar fields."""
 
   @jax.jit
-  def _eval(policy_p, q_p, pos_batch: jnp.ndarray, goal_vec: jnp.ndarray):
+  def _eval(policy_p, q_p, value_p, pos_batch: jnp.ndarray, goal_vec: jnp.ndarray):
     def _l2_normalize(x: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
       denom = jnp.linalg.norm(x, axis=-1, keepdims=True)
       return x / jnp.maximum(denom, eps)
@@ -250,15 +294,8 @@ def _make_maze_repr_field_fn(
     else:
       phi_dot = jnp.sum(phi * psi_g, axis=-1)
 
-    obs_ss = jnp.concatenate([pos_batch, pos_batch], axis=-1)
-    _, _, psi_s = networks.q_network.apply(q_p, obs_ss, act)
-    if normalize_repr:
-      psi_s_l = _l2_normalize(psi_s)
-      psi_g_l = _l2_normalize(psi_g)
-      psi_dot = jnp.sum(psi_s_l * psi_g_l, axis=-1)
-    else:
-      psi_dot = jnp.sum(psi_s * psi_g, axis=-1)
-    return phi_dot, psi_dot
+    v = networks.value_network.apply(value_p, obs_pg)
+    return phi_dot, v
 
   return _eval
 
@@ -268,22 +305,36 @@ def _repr_grids_over_maze(
     goal: np.ndarray,
     policy_params,
     q_params,
+    value_params,
     eval_fields,
+    subcells: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray]:
-  """Scalar fields on an H×W grid (NaN on walls) at cell centers."""
+  """Scalar fields on an (H*subcells)×(W*subcells) grid (NaN on walls)."""
   H, W = walls.shape
+  subcells = max(1, int(subcells))
   rows, cols = np.where(walls == 0)
-  pos = np.stack(
-      [rows.astype(np.float32) + 0.5, cols.astype(np.float32) + 0.5],
-      axis=-1)
+  # Sample each free cell on a uniform sub-grid.
+  rr = (np.arange(subcells, dtype=np.float32) + 0.5) / float(subcells)
+  cc = (np.arange(subcells, dtype=np.float32) + 0.5) / float(subcells)
+  offsets = np.stack(np.meshgrid(rr, cc, indexing='ij'), axis=-1).reshape(-1, 2)
+  base = np.stack([rows.astype(np.float32), cols.astype(np.float32)], axis=-1)
+  pos = (base[:, None, :] + offsets[None, :, :]).reshape(-1, 2)
   gvec = jnp.asarray(goal, dtype=jnp.float32)
   pos_j = jnp.asarray(pos, dtype=jnp.float32)
-  phi_dot, psi_dot = eval_fields(policy_params, q_params, pos_j, gvec)
-  phi_grid = np.full((H, W), np.nan, dtype=np.float32)
-  psi_grid = np.full((H, W), np.nan, dtype=np.float32)
-  phi_grid[rows, cols] = np.asarray(phi_dot, dtype=np.float32)
-  psi_grid[rows, cols] = np.asarray(psi_dot, dtype=np.float32)
-  return phi_grid, psi_grid
+  phi_dot, v = eval_fields(policy_params, q_params, value_params, pos_j, gvec)
+  HH, WW = H * subcells, W * subcells
+  phi_grid = np.full((HH, WW), np.nan, dtype=np.float32)
+  value_grid = np.full((HH, WW), np.nan, dtype=np.float32)
+  # Map each sampled subcell back into the upsampled heatmap lattice.
+  i0 = np.repeat(rows * subcells, subcells * subcells)
+  j0 = np.repeat(cols * subcells, subcells * subcells)
+  di = np.tile(np.repeat(np.arange(subcells), subcells), rows.shape[0])
+  dj = np.tile(np.tile(np.arange(subcells), subcells), rows.shape[0])
+  ii = i0 + di
+  jj = j0 + dj
+  phi_grid[ii, jj] = np.asarray(phi_dot, dtype=np.float32)
+  value_grid[ii, jj] = np.asarray(v, dtype=np.float32)
+  return phi_grid, value_grid
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +343,8 @@ def _repr_grids_over_maze(
 def _draw_maze_panel(
     ax,
     walls: np.ndarray,
-    states: np.ndarray,
+    states: Optional[np.ndarray],
+    trajectories: Optional[list[np.ndarray]],
     goal: np.ndarray,
     heatmap: Optional[np.ndarray],
     heat_label: str,
@@ -325,15 +377,20 @@ def _draw_maze_panel(
     cbar = fig.colorbar(hm, cax=cax)
     cbar.ax.set_ylabel(heat_label, rotation=270, labelpad=12)
 
-  xs = states[:, 1]
-  ys = states[:, 0]
-  ax.plot(xs, ys, '-', color='tab:blue', linewidth=1.8, alpha=0.95,
-          label='trajectory')
-  ax.plot(xs, ys, 'o', color='tab:blue', markersize=2.0, alpha=0.6)
-  ax.plot(xs[0], ys[0], marker='o', color='lime', markersize=12,
-          markeredgecolor='black', linewidth=0, label='start')
-  ax.plot(xs[-1], ys[-1], marker='X', color='orange', markersize=12,
-          markeredgecolor='black', linewidth=0, label='end')
+  trjs = trajectories if trajectories is not None else (
+      [states] if states is not None else [])
+  cmap = plt.get_cmap('tab10')
+  for t_i, st in enumerate(trjs):
+    xs = st[:, 1]
+    ys = st[:, 0]
+    color = cmap(t_i % 10)
+    label = f'traj {t_i}' if len(trjs) > 1 else 'trajectory'
+    ax.plot(xs, ys, '-', color=color, linewidth=1.8, alpha=0.9, label=label)
+    ax.plot(xs, ys, 'o', color=color, markersize=1.8, alpha=0.5)
+    ax.plot(xs[0], ys[0], marker='o', color='lime', markersize=9,
+            markeredgecolor='black', linewidth=0)
+    ax.plot(xs[-1], ys[-1], marker='X', color='orange', markersize=9,
+            markeredgecolor='black', linewidth=0)
   ax.plot(goal[1], goal[0], marker='*', color='red', markersize=18,
           markeredgecolor='black', linewidth=0, label='goal')
 
@@ -349,35 +406,37 @@ def _draw_maze_panel(
 def _plot_trajectory(
     walls: np.ndarray,
     states: np.ndarray,
+    trajectories: Optional[list[np.ndarray]],
     goal: np.ndarray,
     title: str,
     out_path: str,
     reward_sum: float,
     success: bool,
     heatmap_phi: Optional[np.ndarray] = None,
-    heatmap_psi: Optional[np.ndarray] = None,
+    heatmap_value: Optional[np.ndarray] = None,
     normalize_repr: bool = False,
+    fig_scale: float = 1.0,
 ):
   """Save a PNG: trajectory on maze; optional side-by-side CRL heatmaps."""
   H, W = walls.shape
-  h_in = 6 * H / max(W, 1)
-  if heatmap_phi is not None and heatmap_psi is not None:
-    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(12, h_in), layout='constrained')
+  h_in = (6 * H / max(W, 1)) * float(fig_scale)
+  if heatmap_phi is not None and heatmap_value is not None:
+    fig, (ax0, ax1) = plt.subplots(
+        1, 2, figsize=(14 * float(fig_scale), h_in), layout='constrained')
     supt = (
         f'{title}\n'
         f'len={len(states)}  reward_sum={reward_sum:.2f}  success={success}')
     fig.suptitle(supt, fontsize=11)
     heat0 = (r'$\cos(\phi(s,a), \psi(g))$'
              if normalize_repr else r'$\phi(s,a)\cdot\psi(g)$')
-    heat1 = (r'$\cos(\psi(s), \psi(g))$'
-             if normalize_repr else r'$\psi(s)\cdot\psi(g)$')
-    _draw_maze_panel(ax0, walls, states, goal, heatmap_phi, heat0)
+    heat1 = r'$V(s,g)$'
+    _draw_maze_panel(ax0, walls, states, trajectories, goal, heatmap_phi, heat0)
     ax0.set_title(f'{heat0}  (policy mode $a$)')
-    _draw_maze_panel(ax1, walls, states, goal, heatmap_psi, heat1)
-    ax1.set_title(f'{heat1}  ($\\psi$ = goal encoder; $s$ in goal slot)')
+    _draw_maze_panel(ax1, walls, states, trajectories, goal, heatmap_value, heat1)
+    ax1.set_title(f'{heat1}  (PPO value head)')
   else:
-    fig, ax0 = plt.subplots(figsize=(6, h_in))
-    _draw_maze_panel(ax0, walls, states, goal, None, '')
+    fig, ax0 = plt.subplots(figsize=(7 * float(fig_scale), h_in))
+    _draw_maze_panel(ax0, walls, states, trajectories, goal, None, '')
     ax0.set_title(
         f'{title}\n'
         f'len={len(states)}  reward_sum={reward_sum:.2f}  success={success}')
@@ -385,7 +444,7 @@ def _plot_trajectory(
   out_dir = os.path.dirname(os.path.abspath(out_path))
   if out_dir:
     os.makedirs(out_dir, exist_ok=True)
-  if heatmap_phi is None or heatmap_psi is None:
+  if heatmap_phi is None or heatmap_value is None:
     fig.tight_layout()
   fig.savefig(out_path, dpi=150)
   plt.close(fig)
@@ -442,6 +501,11 @@ def main():
                            'or already exists) when rendering many checkpoints.')
   parser.add_argument('--stochastic', action='store_true',
                       help='Sample from the policy instead of using mode().')
+  parser.add_argument('--num_trajectories', type=int, default=1,
+                      help='Number of trajectories to render per checkpoint. '
+                           'If >1, stochastic sampling is enabled.')
+  parser.add_argument('--fig_scale', type=float, default=1.0,
+                      help='Scale factor for figure size (e.g., 1.8 for larger plots).')
   parser.add_argument('--max_steps', type=int, default=-1,
                       help='Override rollout length; -1 = env default.')
   parser.add_argument('--seed', type=int, default=0)
@@ -459,7 +523,16 @@ def main():
   parser.add_argument(
       '--repr_normalize', action='store_true',
       help='Use cosine similarity heatmaps (L2-normalized representations).')
+  parser.add_argument(
+      '--heatmap_subcells', type=int, default=1,
+      help='Subdivisions per maze cell for overlay sampling. '
+           'Use 5 for 25 samples per cell.')
+  parser.add_argument(
+      '--log_rollout_actions', action='store_true',
+      help='Print action-vector shape and min/mean/max norms for each rollout.')
   args = parser.parse_args()
+  if args.num_trajectories < 1:
+    parser.error('--num_trajectories must be >= 1')
 
   # ----- Test-only branch: no checkpoint, no networks, no rollout -------
   if args.test_only:
@@ -485,12 +558,19 @@ def main():
   networks, _ = _build_networks(args.env, seed=args.seed)
   gym_env, _, env_max_steps, walls = _get_raw_point_env(args.env)
   state_dim = _point_state_goal_dim(gym_env)
-  use_repr_normalize = bool(args.repr_normalize and not args.no_repr_normalize)
-  eval_fields = _make_maze_repr_field_fn(
-      networks, state_dim, normalize_repr=use_repr_normalize)
+  force_repr_normalize = bool(args.repr_normalize and not args.no_repr_normalize)
+  force_no_repr_normalize = bool(args.no_repr_normalize)
+  eval_fields_raw = _make_maze_repr_field_fn(
+      networks, state_dim, normalize_repr=False)
+  eval_fields_norm = _make_maze_repr_field_fn(
+      networks, state_dim, normalize_repr=True)
   max_steps = env_max_steps if args.max_steps < 0 else int(args.max_steps)
   print(f'[maze] env={args.env}  max_steps={max_steps}  '
-        f'walls shape={walls.shape} (rows, cols)')
+        f'walls shape={walls.shape} (rows, cols)  '
+        f'force_repr_normalize={force_repr_normalize}  '
+        f'force_no_repr_normalize={force_no_repr_normalize}')
+  if args.num_trajectories > 1 and not args.stochastic:
+    print('[maze] num_trajectories>1 -> enabling stochastic policy sampling.')
 
   # ----- 3. Render one PNG per checkpoint --------------------------------
   multi = len(ckpt_entries) > 1
@@ -501,34 +581,83 @@ def main():
     print(f'[maze]   iteration={ckpt.get("iteration")} '
           f'global_step={ckpt.get("global_step")}')
 
-    states, goal, reward_sum, success = _rollout_one(
+    if force_repr_normalize:
+      use_repr_normalize = True
+      repr_src = 'cli(--repr_normalize)'
+    elif force_no_repr_normalize:
+      use_repr_normalize = False
+      repr_src = 'cli(--no_repr_normalize)'
+    else:
+      inferred = _infer_repr_norm_from_checkpoint(path)
+      if inferred is None:
+        use_repr_normalize = False
+        repr_src = 'default(raw; no run_config repr_norm found)'
+      else:
+        use_repr_normalize = bool(inferred)
+        repr_src = 'checkpoint(run_config.json)'
+    eval_fields = eval_fields_norm if use_repr_normalize else eval_fields_raw
+    print(f'[maze]   repr_normalize={use_repr_normalize}  source={repr_src}')
+
+    # Build overlays once per checkpoint (goal is fixed-goal in point envs).
+    states0, goal0, reward_sum0, success0 = _rollout_one(
         policy_params=policy_params,
         gym_env=gym_env,
         networks=networks,
         max_steps=max_steps,
-        stochastic=args.stochastic,
+        stochastic=(args.stochastic or args.num_trajectories > 1),
         seed=args.seed,
+        log_actions=bool(args.log_rollout_actions),
+        log_prefix=f'[{label}] traj=0 ',
     )
-    print(f'[maze]   length={len(states)}  reward_sum={reward_sum:.3f}  '
-          f'success={success}  goal=(row={goal[0]:.2f}, col={goal[1]:.2f})')
-
-    out_path = _resolve_output_path(args.output, args.env, label, multi,
-                                    ext='.png')
-    h_phi = h_psi = None
+    h_phi = h_value = None
     if not args.no_repr_overlay:
       q_params = ckpt.get('q_params')
-      if q_params is None:
-        print('[maze]   warning: checkpoint has no q_params; skipping '
-              'CRL heatmaps (use --no_repr_overlay to silence).')
+      value_params = ckpt.get('value_params')
+      if q_params is None or value_params is None:
+        print('[maze]   warning: checkpoint missing q_params/value_params; '
+              'skipping overlays (use --no_repr_overlay to silence).')
       else:
-        h_phi, h_psi = _repr_grids_over_maze(
-            walls, goal, policy_params, q_params, eval_fields)
+        h_phi, h_value = _repr_grids_over_maze(
+            walls, goal0, policy_params, q_params, value_params, eval_fields,
+            subcells=int(args.heatmap_subcells))
+
+    trjs = []
+    metrics = []
+    for traj_idx in range(int(args.num_trajectories)):
+      if traj_idx == 0:
+        states, goal, reward_sum, success = states0, goal0, reward_sum0, success0
+      else:
+        states, goal, reward_sum, success = _rollout_one(
+            policy_params=policy_params,
+            gym_env=gym_env,
+            networks=networks,
+            max_steps=max_steps,
+            stochastic=(args.stochastic or args.num_trajectories > 1),
+            seed=args.seed + traj_idx,
+            log_actions=bool(args.log_rollout_actions),
+            log_prefix=f'[{label}] traj={traj_idx} ',
+        )
+      trjs.append(states)
+      metrics.append((reward_sum, success))
+      print(f'[maze]   traj={traj_idx}  length={len(states)}  '
+            f'reward_sum={reward_sum:.3f}  success={success}  '
+            f'goal=(row={goal[0]:.2f}, col={goal[1]:.2f})')
+
+    out_path = _resolve_output_path(args.output, args.env, label, multi, ext='.png')
+    avg_reward = float(np.mean([m[0] for m in metrics])) if metrics else 0.0
+    any_success = any(m[1] for m in metrics)
+    n_traj = int(args.num_trajectories)
+    ttl = f'{args.env}  seed={args.seed}  ckpt={label}'
+    if n_traj > 1:
+      out_path = _append_suffix_to_path(out_path, f'trajset{n_traj:02d}')
+      ttl += f'  stochastic trajectories={n_traj}'
     _plot_trajectory(
-        walls=walls, states=states, goal=goal,
-        title=f'{args.env}  seed={args.seed}  ckpt={label}',
-        out_path=out_path, reward_sum=reward_sum, success=success,
-        heatmap_phi=h_phi, heatmap_psi=h_psi,
-        normalize_repr=use_repr_normalize)
+        walls=walls, states=trjs[0], trajectories=(trjs if n_traj > 1 else None),
+        goal=goal0, title=ttl, out_path=out_path,
+        reward_sum=avg_reward, success=any_success,
+        heatmap_phi=h_phi, heatmap_value=h_value,
+        normalize_repr=use_repr_normalize,
+        fig_scale=float(max(0.5, args.fig_scale)))
     print(f'[maze]   wrote {out_path}')
 
 

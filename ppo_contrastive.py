@@ -64,7 +64,14 @@ flags.DEFINE_float(
 flags.DEFINE_float(
     'ppo_actor_min_std', -1.0,
     'If >0, overrides PPO actor min std.')
-
+flags.DEFINE_float(
+    'ppo_ent_coef', -1.0,
+    'If >=0, overrides PPO entropy bonus coefficient; '
+    '<0 keeps ContrastiveConfig default.')
+flags.DEFINE_bool(
+    'ppo_anneal_lr', True,
+    'If True, linearly decay PPO Adam learning rate to 0 over training; '
+    'if False, use a fixed learning_rate.  Pass --noppo_anneal_lr to disable.')
 # ---------------------------------------------------------------------------
 # Fixed-goal lookup reused from lp_contrastive.py.
 # ---------------------------------------------------------------------------
@@ -169,6 +176,9 @@ def main(_):
     config.ppo_clip_coef = float(FLAGS.ppo_clip_coef)
   if FLAGS.ppo_actor_min_std > 0.0:
     config.ppo_actor_min_std = float(FLAGS.ppo_actor_min_std)
+  if FLAGS.ppo_ent_coef >= 0.0:
+    config.ppo_ent_coef = float(FLAGS.ppo_ent_coef)
+  config.ppo_anneal_lr = bool(FLAGS.ppo_anneal_lr)
 
   print(f'[ppo_contrastive] PPO knobs: '
         f'rollout_length={config.ppo_rollout_length}, '
@@ -180,7 +190,8 @@ def main(_):
         f'discount_crl={config.discount}, '
         f'discount_ppo={config.ppo_discount if config.ppo_discount > 0 else config.discount}, '
         f'norm_reward={config.ppo_norm_reward}, '
-        f'repr_norm={config.repr_norm}')
+        f'repr_norm={config.repr_norm}, '
+        f'ppo_anneal_lr={config.ppo_anneal_lr}')
 
   # ---- Build env factories ----------------------------------------------
   fixed_start_end = (fixed_goal_dict[env_name]
