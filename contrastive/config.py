@@ -185,10 +185,14 @@ class ContrastiveConfig:
   # At default settings (8 envs × 128 steps = 1024 env-steps/iter), 100
   # iterations ≈ 100k env steps — light enough not to bottleneck training.
   # Set to 0 or a negative number to disable.
-  ppo_checkpoint_interval: int = 100
+  ppo_checkpoint_interval: int = 500
   # How many milestone checkpoints to keep on disk (older ones are
   # deleted in FIFO order).  `latest.pkl` is always overwritten in place.
-  ppo_checkpoint_keep_last: int = 30
+  ppo_checkpoint_keep_last: int = 5
+  # If True, mix 50% uniformly sampled goals into each CRL replay batch so
+  # that half the in-batch negatives come from the uniform goal distribution
+  # rather than the replay future-state distribution.
+  uniform_sampling: bool = False
 
 
   use_image_obs: bool = False

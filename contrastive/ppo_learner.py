@@ -321,6 +321,28 @@ class EpisodeReplay:
         'next_obs': next_obs_out,
     }
 
+  def sample_with_uniform_negatives(
+      self, batch_size: int, rng: np.random.Generator,
+      goal_low: np.ndarray, goal_high: np.ndarray,
+  ) -> Dict[str, np.ndarray]:
+    """Like sample(), but the second half of the batch has goals replaced
+    by goals sampled uniformly from [goal_low, goal_high].
+
+    This gives a 50/50 mix: half the in-batch negatives seen by the InfoNCE
+    loss come from the replay future-state distribution, half from the
+    uniform goal distribution — without changing the loss function.
+    """
+    batch = self.sample(batch_size, rng)
+    half = batch_size // 2
+    goal_dim = batch['obs'].shape[1] - self._obs_dim
+    uniform_goals = rng.uniform(
+        goal_low, goal_high, size=(half, goal_dim)).astype(np.float32)
+    obs = batch['obs'].copy()
+    next_obs = batch['next_obs'].copy()
+    obs[half:, self._obs_dim:] = uniform_goals
+    next_obs[half:, self._obs_dim:] = uniform_goals
+    return {'obs': obs, 'action': batch['action'], 'next_obs': next_obs}
+
 
 # ---------------------------------------------------------------------------
 # Core factories.  Each returns a jitted function plus any needed metadata.
@@ -723,6 +745,34 @@ def load_checkpoint(path: str):
     return _pkl.load(fh)
 
 
+def _truncate_csv_to_iteration(csv_path: str, max_iteration: int) -> None:
+  """Rewrite a log CSV keeping only rows with learner_steps <= max_iteration.
+
+  Called on resume to remove log entries written after the last checkpoint
+  (which would otherwise create non-monotonic step sequences in the CSV).
+  """
+  import csv as _csv
+  if not os.path.exists(csv_path):
+    return
+  try:
+    with open(csv_path, 'r', newline='') as fh:
+      reader = _csv.DictReader(fh)
+      fieldnames = reader.fieldnames
+      if not fieldnames:
+        return
+      rows = [r for r in reader
+              if int(float(r.get('learner_steps', max_iteration + 1)))
+              <= max_iteration]
+    with open(csv_path, 'w', newline='') as fh:
+      writer = _csv.DictWriter(fh, fieldnames=fieldnames)
+      writer.writeheader()
+      writer.writerows(rows)
+    print(f'[ppo] truncated {csv_path} to learner_steps<={max_iteration} '
+          f'({len(rows)} rows kept)')
+  except Exception as exc:
+    print(f'[ppo] warning: could not truncate {csv_path}: {exc}')
+
+
 # ---------------------------------------------------------------------------
 # Top-level training loop.
 # ---------------------------------------------------------------------------
@@ -807,6 +857,35 @@ def run_ppo_training(
   q_optimizer = optax.adam(float(config.learning_rate))
   q_opt_state = q_optimizer.init(q_params)
 
+  # ---- resume from checkpoint if one exists -----------------------------
+  start_iteration = 0
+  global_step = 0
+  ppo_sgd_step = 0
+  if checkpoint_dir is not None:
+    _latest = os.path.join(checkpoint_dir, 'latest.pkl')
+    if os.path.exists(_latest):
+      _ckpt = load_checkpoint(_latest)
+      policy_params = _ckpt['policy_params']
+      value_params  = _ckpt['value_params']
+      q_params      = _ckpt['q_params']
+      ppo_opt_state = _ckpt['ppo_optimizer_state']
+      q_opt_state   = _ckpt['q_optimizer_state']
+      ppo_params    = {'policy': policy_params, 'value': value_params}
+      start_iteration = int(_ckpt['iteration']) + 1
+      global_step     = int(_ckpt['global_step'])
+      key             = _ckpt['key']
+      ppo_sgd_step    = (start_iteration
+                         * int(config.ppo_num_epochs)
+                         * int(config.ppo_num_minibatches))
+      print(f'[ppo] resumed from checkpoint: '
+            f'start_iteration={start_iteration}, global_step={global_step}')
+      # Truncate CSV logs to remove any entries written after the checkpoint
+      # (can happen if training ran past the last checkpoint before preemption).
+      _run_dir = os.path.dirname(checkpoint_dir)
+      for _label in ('learner', 'eval'):
+        _csv_path = os.path.join(_run_dir, 'logs', _label, 'logs.csv')
+        _truncate_csv_to_iteration(_csv_path, int(_ckpt['iteration']))
+
   # ---- jitted helpers ---------------------------------------------------
   reward_fn = make_reward_fn(networks)
   gae_fn = make_gae_fn(config)
@@ -831,6 +910,17 @@ def run_ppo_training(
     # Deterministic policy mean for evaluation.
     dist = networks.policy_network.apply(policy_p, obs)
     return networks.sample(dist, jax.random.PRNGKey(0))  # sample still; we log both below
+
+  # ---- uniform-sampling goal bounds (extracted once from env spec) ------
+  uniform_sampling = bool(getattr(config, 'uniform_sampling', False))
+  goal_low = goal_high = None
+  if uniform_sampling:
+    _obs_min = np.asarray(spec.observations.minimum, dtype=np.float32)
+    _obs_max = np.asarray(spec.observations.maximum, dtype=np.float32)
+    _end = int(config.end_index) if int(config.end_index) != -1 else int(config.obs_dim)
+    goal_low = _obs_min[int(config.start_index):_end]
+    goal_high = _obs_max[int(config.start_index):_end]
+    print(f'[ppo] uniform_sampling: goal_low={goal_low}, goal_high={goal_high}')
 
   # ---- replay buffer (episodes) -----------------------------------------
   replay = EpisodeReplay(
@@ -905,10 +995,10 @@ def run_ppo_training(
           f'(every {ckpt_interval} iters, keep last {ckpt_keep_last})')
 
   start_time = time.time()
-  global_step = 0
-  ppo_sgd_step = 0  # minibatch PPO updates so far (matches lr schedule index)
+  # global_step, ppo_sgd_step, start_iteration set above (0 for fresh runs,
+  # restored from checkpoint on resume).
 
-  for iteration in range(num_iterations):
+  for iteration in range(start_iteration, num_iterations):
     # =================================================================
     # 1. Rollout (on-policy, CleanRL convention)
     # =================================================================
@@ -1027,7 +1117,11 @@ def run_ppo_training(
     crl_metrics_agg: Dict[str, list] = {}
     if replay.size >= int(config.ppo_min_replay_size):
       for _ in range(int(config.ppo_crl_steps_per_iter)):
-        crl_batch_np = replay.sample(int(config.batch_size), np_rng)
+        if uniform_sampling:
+          crl_batch_np = replay.sample_with_uniform_negatives(
+              int(config.batch_size), np_rng, goal_low, goal_high)
+        else:
+          crl_batch_np = replay.sample(int(config.batch_size), np_rng)
         crl_batch = {k_: jnp.asarray(v) for k_, v in crl_batch_np.items()}
         key, k_crl = jax.random.split(key)
         q_params, q_opt_state, m = crl_update(
@@ -1138,18 +1232,6 @@ def run_ppo_training(
         and checkpoint_dir is not None
         and (iteration % ckpt_interval == 0
              or iteration == num_iterations - 1)):
-      milestone_path = os.path.join(
-          checkpoint_dir, f'ckpt_iter_{iteration:07d}.pkl')
-      _save_checkpoint(
-          milestone_path,
-          policy_params=ppo_params['policy'],
-          value_params=ppo_params['value'],
-          q_params=q_params,
-          ppo_opt_state=ppo_opt_state,
-          q_opt_state=q_opt_state,
-          iteration=iteration,
-          global_step=global_step,
-          key=key)
       _save_checkpoint(
           os.path.join(checkpoint_dir, 'latest.pkl'),
           policy_params=ppo_params['policy'],
@@ -1160,7 +1242,6 @@ def run_ppo_training(
           iteration=iteration,
           global_step=global_step,
           key=key)
-      _prune_old_checkpoints(checkpoint_dir, ckpt_keep_last)
 
   # ---- return final state in case the caller wants to checkpoint --------
   return PPOTrainingState(

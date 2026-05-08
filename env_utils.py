@@ -153,7 +153,8 @@ def load(env_name, fixed_start_end=None, seed=None):
     CLASS = point_env.PointEnv
     kwargs['walls'] = env_name.split('_')[-1]
     kwargs['fixed_start_end'] = fixed_start_end
-    if '11x11' in env_name:
+    if ('11x11' in env_name or '9x9' in env_name or '7x7' in env_name
+        or 'Impossible' in env_name):
       max_episode_steps = 100
     else:
       max_episode_steps = 50

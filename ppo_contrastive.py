@@ -72,16 +72,30 @@ flags.DEFINE_bool(
     'ppo_anneal_lr', True,
     'If True, linearly decay PPO Adam learning rate to 0 over training; '
     'if False, use a fixed learning_rate.  Pass --noppo_anneal_lr to disable.')
+flags.DEFINE_bool(
+    'uniform_sampling', False,
+    'If True, mix 50% uniformly sampled goals into each CRL replay batch. '
+    'Half the in-batch InfoNCE negatives come from the uniform goal '
+    'distribution, half from the replay future-state distribution.')
 # ---------------------------------------------------------------------------
 # Fixed-goal lookup reused from lp_contrastive.py.
 # ---------------------------------------------------------------------------
 fixed_goal_dict = {
+    'point_Spiral7x7':   [np.array([3, 3], dtype=float),
+                          np.array([6, 6], dtype=float)],
+    'point_Spiral9x9':   [np.array([5, 5], dtype=float),
+                          np.array([8, 8], dtype=float)],
     'point_Spiral11x11': [np.array([5, 5], dtype=float),
                           np.array([10, 10], dtype=float)],
     'point_FourRooms':   [np.array([0, 0], dtype=float),
                           np.array([10, 8],  dtype=float)],
-    'point_Impossible': [np.array([9, 0], dtype=float),
-                         np.array([7, 9], dtype=float)],
+    # point_Impossible: start top-left (0,0), goal row 6 col 8 (reachable via
+    # the long winding path through the maze).
+    'point_Impossible': [np.array([0, 0], dtype=float),
+                         np.array([6, 8], dtype=float)],
+    # point_Maze11x11: start top-left (0,0), goal top-right (0,10).
+    'point_Maze11x11':  [np.array([0, 0], dtype=float),
+                         np.array([0, 10], dtype=float)],
     'sawyer_bin':  np.array([0.12, 0.7, 0.02]),
     'sawyer_box':  np.array([0.0, 0.75, 0.133]),
     'sawyer_peg':  np.array([-0.3, 0.6, 0.0]),
@@ -107,7 +121,11 @@ fixed_goal_dict = {
 # ---------------------------------------------------------------------------
 PPO_ENV_DEFAULTS = {
     'point_FourRooms':   dict(rollout_length=128, crl_steps_per_iter=64),
+    'point_Spiral7x7':   dict(rollout_length=128, crl_steps_per_iter=64),
+    'point_Spiral9x9':   dict(rollout_length=128, crl_steps_per_iter=64),
     'point_Spiral11x11': dict(rollout_length=128, crl_steps_per_iter=64),
+    'point_Maze11x11':   dict(rollout_length=128, crl_steps_per_iter=64),
+    'point_Impossible':  dict(rollout_length=128, crl_steps_per_iter=64),
     'riverswim':         dict(rollout_length=128, crl_steps_per_iter=64),
     'sawyer_bin':        dict(rollout_length=256, crl_steps_per_iter=128),
     'sawyer_box':        dict(rollout_length=256, crl_steps_per_iter=128),
@@ -179,6 +197,7 @@ def main(_):
   if FLAGS.ppo_ent_coef >= 0.0:
     config.ppo_ent_coef = float(FLAGS.ppo_ent_coef)
   config.ppo_anneal_lr = bool(FLAGS.ppo_anneal_lr)
+  config.uniform_sampling = bool(FLAGS.uniform_sampling)
 
   print(f'[ppo_contrastive] PPO knobs: '
         f'rollout_length={config.ppo_rollout_length}, '

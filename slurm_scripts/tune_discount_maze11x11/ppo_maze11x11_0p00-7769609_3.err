@@ -1,0 +1,10 @@
+/home/gliu2/miniconda3/envs/contrastive_rl/lib/python3.9/site-packages/gym/spaces/box.py:127: UserWarning: [33mWARN: Box bound precision lowered by casting to float32[0m
+  logger.warn(f"Box bound precision lowered by casting to {self.dtype}")
+/home/gliu2/miniconda3/envs/contrastive_rl/lib/python3.9/site-packages/gym/spaces/box.py:127: UserWarning: [33mWARN: Box bound precision lowered by casting to float32[0m
+  logger.warn(f"Box bound precision lowered by casting to {self.dtype}")
+I0506 14:04:37.983890 23403586176832 xla_bridge.py:448] Unable to initialize backend 'rocm': NOT_FOUND: Could not find registered platform with name: "rocm". Available platform names are: CUDA Interpreter Host
+I0506 14:04:37.984203 23403586176832 xla_bridge.py:448] Unable to initialize backend 'tpu': module 'jaxlib.xla_extension' has no attribute 'get_tpu_client'
+I0506 14:04:37.984256 23403586176832 xla_bridge.py:448] Unable to initialize backend 'plugin': xla_extension has no attributes named get_plugin_device_client. Compile TensorFlow with //tensorflow/compiler/xla/python:enable_plugin_device set to true (defaults to false) to enable this.
+W0506 14:04:39.316405 23403586176832 __init__.py:773] The use of `check_types` is deprecated and does not have any effect.
+I0506 14:04:42.339870 23403586176832 csv.py:76] Logging to /home/gliu2/dist_matching/sgcrl/logs/ppo_maze11x11_discount_tune/discount_0p00/ppo_point_Maze11x11_3/logs/learner/logs.csv
+I0506 14:04:42.340150 23403586176832 csv.py:76] Logging to /home/gliu2/dist_matching/sgcrl/logs/ppo_maze11x11_discount_tune/discount_0p00/ppo_point_Maze11x11_3/logs/eval/logs.csv
