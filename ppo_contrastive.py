@@ -77,6 +77,37 @@ flags.DEFINE_bool(
     'If True, mix 50% uniformly sampled goals into each CRL replay batch. '
     'Half the in-batch InfoNCE negatives come from the uniform goal '
     'distribution, half from the replay future-state distribution.')
+flags.DEFINE_string(
+    'ppo_reward_mode', '',
+    "PPO rollout reward baseline. '' = φ(s,a)·ψ(g); "
+    "'dirac_target' = log(eps)−φ(s0,a)·ψ(s) off-goal, −φ(s0,a)·ψ(g) at goal; "
+    "'kde_dirac' = same formula but densities estimated via Gaussian KDE on "
+    "the replay buffer instead of CRL dot products.")
+flags.DEFINE_float(
+    'ppo_dirac_eps', 1e-6,
+    'Epsilon in dirac_target / kde_dirac reward: log(eps) − log_p(s).')
+flags.DEFINE_integer(
+    'kde_max_points', 2000,
+    'Number of replay-buffer states to fit the Gaussian KDE on (kde_dirac mode).')
+flags.DEFINE_integer(
+    'kde_refit_interval', 1,
+    'Refit the KDE every N PPO iterations (kde_dirac mode). 1 = every iteration.')
+flags.DEFINE_float(
+    'kde_bandwidth', 0.0,
+    'KDE bandwidth (kde_dirac mode). 0.0 = Scott\'s rule automatically.')
+flags.DEFINE_integer(
+    'ppo_checkpoint_interval', -1,
+    'Save checkpoints every N PPO iterations. <0 keeps config default (500).')
+flags.DEFINE_integer(
+    'ppo_checkpoint_keep_last', -1,
+    'Max milestone ckpt_iter_*.pkl files to retain (FIFO). '
+    '0 = keep all. <0 keeps config default (0 = keep all).')
+flags.DEFINE_string(
+    'hidden_layer_sizes', '',
+    'Comma-separated hidden layer widths, e.g. "256,256,256,256,256,256". '
+    'Empty string keeps the ContrastiveConfig default. '
+    'Stacks with >2 layers automatically use ResidualMLP (LayerNorm + Swish, '
+    'skip every 2 layers).')
 # ---------------------------------------------------------------------------
 # Fixed-goal lookup reused from lp_contrastive.py.
 # ---------------------------------------------------------------------------
@@ -88,7 +119,21 @@ fixed_goal_dict = {
     'point_Spiral11x11': [np.array([5, 5], dtype=float),
                           np.array([10, 10], dtype=float)],
     'point_FourRooms':   [np.array([0, 0], dtype=float),
-                          np.array([10, 8],  dtype=float)],
+                          np.array([2, 8],  dtype=float)],
+    # point_EightRooms: start top-left corner, goal bottom-right corner.
+    # Must traverse all 8 rooms (11×21 grid, 100-step episodes).
+    'point_EightRooms':  [np.array([0, 0],   dtype=float),
+                          np.array([10, 20], dtype=float)],
+    # point_SixteenRooms: start top-left corner, goal bottom-right corner.
+    # Must traverse all 16 rooms (21×21 grid, 200-step episodes).
+    'point_SixteenRooms': [np.array([0, 0],   dtype=float),
+                           np.array([20, 20], dtype=float)],
+    # point_SixteenRooms4D: same maze + 2 free extra dims (all start/goal at 0).
+    'point_SixteenRooms4D': [np.array([0, 0, 0],    dtype=float),
+                              np.array([20, 20, 0], dtype=float)],
+    # point_SixteenRoomsActual4D: same maze + 2 free extra dims.
+    'point_SixteenRoomsActual4D': [np.array([0, 0, 0, 0],    dtype=float),
+                                   np.array([20, 20, 0, 0], dtype=float)],
     # point_Impossible: start top-left (0,0), goal row 6 col 8 (reachable via
     # the long winding path through the maze).
     'point_Impossible': [np.array([0, 0], dtype=float),
@@ -96,6 +141,10 @@ fixed_goal_dict = {
     # point_Maze11x11: start top-left (0,0), goal top-right (0,10).
     'point_Maze11x11':  [np.array([0, 0], dtype=float),
                          np.array([0, 10], dtype=float)],
+    # point_Wall11x11: start top-left (0,0), goal bottom-right (10,10);
+    # must go along the top corridor, down the right gap, then along the bottom.
+    'point_Wall11x11':  [np.array([0, 0], dtype=float),
+                         np.array([10, 10], dtype=float)],
     'sawyer_bin':  np.array([0.12, 0.7, 0.02]),
     'sawyer_box':  np.array([0.0, 0.75, 0.133]),
     'sawyer_peg':  np.array([-0.3, 0.6, 0.0]),
@@ -121,10 +170,18 @@ fixed_goal_dict = {
 # ---------------------------------------------------------------------------
 PPO_ENV_DEFAULTS = {
     'point_FourRooms':   dict(rollout_length=128, crl_steps_per_iter=64),
+    # EightRooms: 100-step episodes (2× FourRooms) → T=256 keeps ~2 episodes/rollout.
+    'point_EightRooms':   dict(rollout_length=256, crl_steps_per_iter=128),
+    # SixteenRooms: 200-step episodes (2× EightRooms) → T=512 keeps ~2 episodes/rollout.
+    'point_SixteenRooms': dict(rollout_length=512, crl_steps_per_iter=256),
+    # SixteenRooms4D / SixteenRoomsActual4D: same episode length, same rollout budget.
+    'point_SixteenRooms4D':       dict(rollout_length=512, crl_steps_per_iter=256),
+    'point_SixteenRoomsActual4D': dict(rollout_length=512, crl_steps_per_iter=256),
     'point_Spiral7x7':   dict(rollout_length=128, crl_steps_per_iter=64),
     'point_Spiral9x9':   dict(rollout_length=128, crl_steps_per_iter=64),
     'point_Spiral11x11': dict(rollout_length=128, crl_steps_per_iter=64),
     'point_Maze11x11':   dict(rollout_length=128, crl_steps_per_iter=64),
+    'point_Wall11x11':   dict(rollout_length=128, crl_steps_per_iter=64),
     'point_Impossible':  dict(rollout_length=128, crl_steps_per_iter=64),
     'riverswim':         dict(rollout_length=128, crl_steps_per_iter=64),
     'sawyer_bin':        dict(rollout_length=256, crl_steps_per_iter=128),
@@ -198,6 +255,18 @@ def main(_):
     config.ppo_ent_coef = float(FLAGS.ppo_ent_coef)
   config.ppo_anneal_lr = bool(FLAGS.ppo_anneal_lr)
   config.uniform_sampling = bool(FLAGS.uniform_sampling)
+  config.ppo_reward_mode = str(FLAGS.ppo_reward_mode).strip()
+  config.ppo_dirac_eps = float(FLAGS.ppo_dirac_eps)
+  config.kde_max_points = int(FLAGS.kde_max_points)
+  config.kde_refit_interval = int(FLAGS.kde_refit_interval)
+  config.kde_bandwidth = float(FLAGS.kde_bandwidth)
+  if FLAGS.ppo_checkpoint_interval >= 0:
+    config.ppo_checkpoint_interval = int(FLAGS.ppo_checkpoint_interval)
+  if FLAGS.ppo_checkpoint_keep_last >= 0:
+    config.ppo_checkpoint_keep_last = int(FLAGS.ppo_checkpoint_keep_last)
+  if FLAGS.hidden_layer_sizes.strip():
+    config.hidden_layer_sizes = tuple(
+        int(x) for x in FLAGS.hidden_layer_sizes.split(',') if x.strip())
 
   print(f'[ppo_contrastive] PPO knobs: '
         f'rollout_length={config.ppo_rollout_length}, '
@@ -210,7 +279,16 @@ def main(_):
         f'discount_ppo={config.ppo_discount if config.ppo_discount > 0 else config.discount}, '
         f'norm_reward={config.ppo_norm_reward}, '
         f'repr_norm={config.repr_norm}, '
-        f'ppo_anneal_lr={config.ppo_anneal_lr}')
+        f'ppo_anneal_lr={config.ppo_anneal_lr}  '
+        f'ppo_reward_mode={config.ppo_reward_mode!r}  '
+        f'ppo_dirac_eps={config.ppo_dirac_eps}  '
+        f'kde_max_points={config.kde_max_points}  '
+        f'kde_refit_interval={config.kde_refit_interval}  '
+        f'kde_bandwidth={config.kde_bandwidth}  '
+        f'ckpt_interval={config.ppo_checkpoint_interval}  '
+        f'ckpt_keep_last={config.ppo_checkpoint_keep_last} '
+        f'({"all milestones" if config.ppo_checkpoint_keep_last <= 0 else "FIFO prune"})  '
+        f'hidden_layers={config.hidden_layer_sizes}')
 
   # ---- Build env factories ----------------------------------------------
   fixed_start_end = (fixed_goal_dict[env_name]

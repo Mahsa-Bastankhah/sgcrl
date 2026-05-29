@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_eightrooms
-#SBATCH --output=slurm/ppo_eightrooms_%A_%a.out
+#SBATCH --job-name=ppo_16r4d_kde_nounif
+#SBATCH --output=slurm/ppo_sixteenroomsactual4d_kde_nouniform_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=8G
 #SBATCH --gres=gpu:1
-#SBATCH --time=06:00:00
+#SBATCH --time=03:00:00
 #SBATCH --account=seas
-#SBATCH --array=0-3
+#SBATCH --array=0-2
 
 module purge
 
@@ -55,30 +55,23 @@ export PYTHONUNBUFFERED=1
 export MUJOCO_GL=osmesa
 export MUJOCO_PY_MUJOCO_PATH=${HOME}/.mujoco/mujoco210
 
-ENV=${ENV:-point_EightRooms}
-NUM_STEPS=${NUM_STEPS:-10000000}
-SEED_OFFSET=${SEED_OFFSET:-120}
+ENV="${ENV:-point_SixteenRoomsActual4D}"
+NUM_STEPS="${NUM_STEPS:-10000000}"
+SEED_OFFSET="${SEED_OFFSET:-130}"
 SEED=$(( SEED_OFFSET + ${SLURM_ARRAY_TASK_ID:-0} ))
+LOG_DIR="${LOG_DIR:-logs/ppo_sixteenroomsactual4d_kde_nouniform/}"
 
-CRL_STEPS=64
+CRL_STEPS=256
 ENT_COEF=0.05
 MIN_STD=0.01
-LOG_DIR="${LOG_DIR:-logs/ppo_eightrooms_kde_dirac/}"
-REWARD_MODE="${REWARD_MODE-kde_dirac}"
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} variant=crl64_ent0p05_minstd0p1"
+echo "env=${ENV} seed=${SEED} log_dir=${LOG_DIR} uniform_sampling=False reward_mode=kde_dirac"
 echo "overrides: crl_steps=${CRL_STEPS} ent_coef=${ENT_COEF} min_std=${MIN_STD}"
-echo "log_dir=${LOG_DIR} reward_mode=${REWARD_MODE}"
 nvidia-smi
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
-
-REWARD_MODE_ARGS=()
-if [ -n "${REWARD_MODE}" ]; then
-  REWARD_MODE_ARGS=(--ppo_reward_mode="${REWARD_MODE}")
-fi
 
 python -u ppo_contrastive.py \
   --env="${ENV}" \
@@ -90,6 +83,5 @@ python -u ppo_contrastive.py \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
-  --uniform_sampling=True \
   --hidden_layer_sizes="256,256,256,256,256,256" \
-  "${REWARD_MODE_ARGS[@]}"
+  --ppo_reward_mode="kde_dirac"

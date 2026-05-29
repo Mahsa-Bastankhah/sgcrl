@@ -14,5 +14,6 @@ logs/
 training_videos/
 plots/
 videos/
-figures/
+figure
+slurm/
 

@@ -9,6 +9,35 @@ from acme.utils.loggers import base
 from acme.utils.loggers import csv
 from acme.utils.loggers import filters
 from acme.utils.loggers import terminal
+import numpy as np
+
+
+def _format_key(key: str) -> str:
+  return key.replace('_', ' ').title()
+
+
+def _format_value(value: Any, precision: int = 3) -> str:
+  """Format a scalar for terminal logging with configurable precision."""
+  value = base.to_numpy(value)
+  if isinstance(value, (float, np.number)):
+    v = float(value)
+    if np.isnan(v):
+      return 'nan'
+    if np.isinf(v):
+      return 'inf' if v > 0 else '-inf'
+    if v != 0.0 and (abs(v) < 10 ** (-precision) or abs(v) >= 10 ** (precision + 2)):
+      return f'{v:.{precision}e}'
+    return f'{v:.{precision}f}'
+  return f'{value}'
+
+
+def make_serialize_fn(precision: int = 3):
+  """Build a terminal serialize function with *precision* decimal digits."""
+  def serialize(values: base.LoggingData) -> str:
+    return ' | '.join(
+        f'{_format_key(k)} = {_format_value(v, precision=precision)}'
+        for k, v in sorted(values.items()))
+  return serialize
 
 
 def make_default_logger(
@@ -21,6 +50,7 @@ def make_default_logger(
     print_fn: Optional[Callable[[str], None]] = None,
     serialize_fn: Optional[Callable[[Mapping[str, Any]], str]] = base.to_numpy,
     steps_key: str = 'steps',
+    float_precision: int = 3,
 ) -> base.Logger:
   """Makes a default Acme logger.
 
@@ -33,6 +63,7 @@ def make_default_logger(
     serialize_fn: An optional function to apply to the write inputs before
       passing them to the various loggers.
     steps_key: Ignored.
+    float_precision: Decimal digits for floats in terminal output.
 
   Returns:
     A logger object that responds to logger.write(some_dict).
@@ -40,7 +71,9 @@ def make_default_logger(
   del steps_key
   if not print_fn:
     print_fn = logging.info
-  terminal_logger = terminal.TerminalLogger(label=label, print_fn=print_fn)
+  terminal_serialize = make_serialize_fn(precision=float_precision)
+  terminal_logger = terminal.TerminalLogger(
+      label=label, print_fn=print_fn, serialize_fn=terminal_serialize)
 
   loggers = [terminal_logger]
 

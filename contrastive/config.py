@@ -31,7 +31,7 @@ class ContrastiveConfig:
   n_step: int = 1
   # Target smoothing coefficient.
   tau: float = 0.005
-  hidden_layer_sizes: Tuple[int, Ellipsis] = (256, 256)
+  hidden_layer_sizes: Tuple[int, Ellipsis] = (256, 256, 256, 256, 256, 256)
   
   # Loss options - entropy
   # Coefficient applied to the entropy bonus. If None, an adaptative
@@ -185,14 +185,28 @@ class ContrastiveConfig:
   # At default settings (8 envs × 128 steps = 1024 env-steps/iter), 100
   # iterations ≈ 100k env steps — light enough not to bottleneck training.
   # Set to 0 or a negative number to disable.
-  ppo_checkpoint_interval: int = 500
-  # How many milestone checkpoints to keep on disk (older ones are
-  # deleted in FIFO order).  `latest.pkl` is always overwritten in place.
-  ppo_checkpoint_keep_last: int = 5
+  ppo_checkpoint_interval: int = 100
+  # How many milestone ckpt_iter_*.pkl files to keep (FIFO prune of oldest).
+  # 0 = keep all milestones (no pruning).  `latest.pkl` is always overwritten.
+  ppo_checkpoint_keep_last: int = 0
   # If True, mix 50% uniformly sampled goals into each CRL replay batch so
   # that half the in-batch negatives come from the uniform goal distribution
   # rather than the replay future-state distribution.
   uniform_sampling: bool = False
+  # PPO reward baseline (standalone PPO only).  '' = r = φ(s,a)·ψ(g).
+  # 'dirac_target': for s ≠ g, r = log(eps) − φ(s0,a)·ψ(s); at s = g,
+  # r = −φ(s0,a)·ψ(g).  s0 is the episode initial state; a ~ π(·|s).
+  # 'kde_dirac': same formula but CRL dot products replaced by Gaussian KDE
+  # log-densities estimated from the replay buffer.
+  ppo_reward_mode: str = ''
+  ppo_dirac_eps: float = 1e-6
+  # KDE options (only used when ppo_reward_mode == 'kde_dirac').
+  # kde_max_points: number of replay states to fit the KDE on.
+  # kde_refit_interval: refit the KDE every N PPO iterations (1 = every iter).
+  # kde_bandwidth: fixed bandwidth; 0.0 = use Scott's rule automatically.
+  kde_max_points: int = 2000
+  kde_refit_interval: int = 1
+  kde_bandwidth: float = 0.0
 
 
   use_image_obs: bool = False

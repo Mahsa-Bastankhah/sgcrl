@@ -24,7 +24,11 @@ def _use_residual_mlp(hidden_layer_sizes: Sequence[int]) -> bool:
 
 
 # When `_use_residual_mlp` is true, all such stacks share this layout (repr-style).
-_RESIDUAL_SKIP_EVERY = 4
+# skip_every=2 means residual blocks span 2 hidden layers each.  With 6 hidden
+# layers this gives 2 real residual additions (at layers 3 and 5); with 4 layers
+# it gives 1.  Keeping it at 2 (not 4) ensures skips are actually used for the
+# default 6-layer depth.
+_RESIDUAL_SKIP_EVERY = 2
 _RESIDUAL_ACTIVATION = jax.nn.swish
 _RESIDUAL_USE_LAYER_NORM = True
 

@@ -151,10 +151,22 @@ def load(env_name, fixed_start_end=None, seed=None):
     kwargs['fixed_start_end'] = fixed_start_end
   elif env_name.startswith('point_'):
     CLASS = point_env.PointEnv
-    kwargs['walls'] = env_name.split('_')[-1]
+    # point_SixteenRooms4D  →  walls='SixteenRooms', extra_dims=2
+    if env_name == 'point_SixteenRooms4D':
+      kwargs['walls'] = 'SixteenRooms'
+      kwargs['extra_dims'] = 1
+      kwargs['goal_tolerance'] = 2.0
+    elif env_name == 'point_SixteenRoomsActual4D':
+      kwargs['walls'] = 'SixteenRooms'
+      kwargs['extra_dims'] = 2
+      kwargs['goal_tolerance'] = 2.0
+    else:
+      kwargs['walls'] = env_name.split('_')[-1]
     kwargs['fixed_start_end'] = fixed_start_end
-    if ('11x11' in env_name or '9x9' in env_name or '7x7' in env_name
-        or 'Impossible' in env_name):
+    if 'SixteenRooms' in env_name:
+      max_episode_steps = 200
+    elif ('11x11' in env_name or '9x9' in env_name or '7x7' in env_name
+          or 'Impossible' in env_name or 'EightRooms' in env_name):
       max_episode_steps = 100
     else:
       max_episode_steps = 50
@@ -185,8 +197,60 @@ def load(env_name, fixed_start_end=None, seed=None):
   return gym_env, obs_dim, max_episode_steps
 
 
+def unwrap_gym_env(env):
+  """Unwrap acme/dm_env wrappers down to the underlying ``gym.Env``."""
+  while hasattr(env, '_environment'):
+    env = env._environment
+  return env
+
+
+def resolve_uniform_goal_bounds(
+    spec,
+    wrapped_env,
+    obs_dim: int,
+    start_index: int,
+    end_index: int,
+):
+  """Goal-slice bounds for ``uniform_sampling`` CRL negatives.
+
+  Uses ``spec.observations`` when finite; otherwise ``uniform_goal_obs_bounds``
+  on Sawyer wrappers (see ``env_utils.Sawyer*``).
+  """
+  obs_dim = int(obs_dim)
+  si = int(start_index)
+  ei = int(end_index) if int(end_index) != -1 else obs_dim
+  obs_min = np.asarray(spec.observations.minimum, dtype=np.float32)
+  obs_max = np.asarray(spec.observations.maximum, dtype=np.float32)
+  goal_low = obs_min[obs_dim + si:obs_dim + ei]
+  goal_high = obs_max[obs_dim + si:obs_dim + ei]
+  if np.all(np.isfinite(goal_low)) and np.all(np.isfinite(goal_high)):
+    return goal_low, goal_high
+  base = unwrap_gym_env(wrapped_env)
+  if not hasattr(base, 'uniform_goal_obs_bounds'):
+    raise ValueError(
+        f'uniform_sampling requires finite goal bounds; got '
+        f'goal_low={goal_low}, goal_high={goal_high}. '
+        f'Underlying env {type(base).__name__!r} has no '
+        f'uniform_goal_obs_bounds().')
+  glo, ghi = base.uniform_goal_obs_bounds()
+  return np.asarray(glo[si:ei], dtype=np.float32), np.asarray(
+      ghi[si:ei], dtype=np.float32)
+
+
 class SawyerBin(_MW_BIN):
   """Wrapper for the SawyerBin environment."""
+
+  # Goal slice of ``_get_obs()`` (7-d): [goal_xyz+offset, grip, goal_xyz].
+  # Ranges from ``reset()`` goal sampling (bin_goal ± 0.05, interp to object,
+  # z ∈ [0.03, 0.12]); empirically verified on bin-picking-v2.
+  UNIFORM_GOAL_OBS_LOW = np.array(
+      [-0.22, 0.64, 0.01, 0.2, -0.22, 0.64, 0.01], dtype=np.float32)
+  UNIFORM_GOAL_OBS_HIGH = np.array(
+      [0.17, 0.76, 0.16, 0.5, 0.17, 0.76, 0.13], dtype=np.float32)
+
+  def uniform_goal_obs_bounds(self):
+    """Bounds on the goal block appended in ``_get_obs`` (for CRL uniform negs)."""
+    return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
 
   def __init__(self, fixed_start_end=None):
     _require_metaworld('sawyer_bin')
@@ -255,6 +319,16 @@ class SawyerBin(_MW_BIN):
 
 class SawyerBox(_MW_BOX):
   """Wrapper for the SawyerBox environment."""
+
+  UNIFORM_GOAL_OBS_LOW = np.array(
+      [-0.10, 0.50, 0.11, 0.4, -0.10, 0.50, 0.08,
+       0.707, 0.0, 0.0, 0.707], dtype=np.float32)
+  UNIFORM_GOAL_OBS_HIGH = np.array(
+      [0.10, 0.80, 0.17, 0.4, 0.10, 0.80, 0.14,
+       0.707, 0.0, 0.0, 0.707], dtype=np.float32)
+
+  def uniform_goal_obs_bounds(self):
+    return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
 
   def __init__(self, fixed_start_end=None):
     _require_metaworld('sawyer_box')
@@ -329,6 +403,14 @@ class SawyerBox(_MW_BOX):
 
 class SawyerPeg(_MW_PEG):
   """Wrapper for the SawyerPeg environment."""
+
+  UNIFORM_GOAL_OBS_LOW = np.array(
+      [-0.20, 0.39, 0.05, 0.4, -0.32, 0.39, 0.02], dtype=np.float32)
+  UNIFORM_GOAL_OBS_HIGH = np.array(
+      [0.23, 0.71, 0.17, 0.4, 0.10, 0.71, 0.14], dtype=np.float32)
+
+  def uniform_goal_obs_bounds(self):
+    return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
 
   def __init__(self, fixed_start_end=None):
     _require_metaworld('sawyer_peg')

@@ -56,7 +56,7 @@ export MPLBACKEND=Agg
 # Config — edit to taste
 # ---------------------------------------------------------------------------
 ENV=${ENV:-point_Impossible}
-LOG_SUBDIR=${LOG_SUBDIR:-ppo}                 # logs live under logs/$LOG_SUBDIR/
+LOG_SUBDIR=${LOG_SUBDIR:-ppo_fourrooms}       # logs live under logs/$LOG_SUBDIR/
 PLOT_DIR=${PLOT_DIR:-plots}
 STOCHASTIC=${STOCHASTIC:-0}                   # 1 = sample from policy
 MAX_STEPS=${MAX_STEPS:--1}                    # -1 = env default
@@ -65,7 +65,7 @@ MAX_STEPS=${MAX_STEPS:--1}                    # -1 = env default
 # retrained PPO runs.  Override via
 # `sbatch --export=ALL,SEED_OFFSET=0 job_rollout_maze.slurm` to restore the
 # 0-indexed mapping.
-SEED_OFFSET=${SEED_OFFSET:-5}
+SEED_OFFSET=${SEED_OFFSET:-400}
 SEED=$(( ${SLURM_ARRAY_TASK_ID:-0} + SEED_OFFSET ))
 RUN_DIR="logs/${LOG_SUBDIR}/ppo_${ENV}_${SEED}"
 
@@ -123,6 +123,9 @@ python -u ppo_rollout_maze.py \
     --env="${ENV}" \
     --output="${OUT}" \
     --seed="${SEED}" \
+    --num_trajectories=5 \
+    --heatmap_subcells=25 \
+    --fig_scale=2.0 \
     "${EXTRA_FLAGS[@]}"
 
 echo "Done. Output:"

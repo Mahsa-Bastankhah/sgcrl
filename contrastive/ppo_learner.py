@@ -321,6 +321,16 @@ class EpisodeReplay:
         'next_obs': next_obs_out,
     }
 
+  def sample_states(self, n: int,
+                    rng: np.random.Generator) -> np.ndarray:
+    """Return up to *n* raw states (shape ``(n, obs_dim)``) sampled uniformly
+    from all stored transitions.  Used for KDE fitting."""
+    all_states = np.concatenate(
+        [ep['obs'][:, :self._obs_dim] for ep in self._episodes], axis=0)
+    n = min(n, len(all_states))
+    idx = rng.choice(len(all_states), size=n, replace=False)
+    return all_states[idx].astype(np.float32)
+
   def sample_with_uniform_negatives(
       self, batch_size: int, rng: np.random.Generator,
       goal_low: np.ndarray, goal_high: np.ndarray,
@@ -347,19 +357,163 @@ class EpisodeReplay:
 # ---------------------------------------------------------------------------
 # Core factories.  Each returns a jitted function plus any needed metadata.
 # ---------------------------------------------------------------------------
-def make_reward_fn(networks: contrastive_networks.ContrastiveNetworks):
-  """Returns r(q_params, obs, action) = φ(s,a) · ψ(g).
+# ---------------------------------------------------------------------------
+# Gaussian KDE density estimator (pure numpy, fitted to replay buffer states)
+# ---------------------------------------------------------------------------
+class GaussianKDE:
+  """Isotropic Gaussian KDE fitted to a set of training points.
 
-  The q_network's apply() returns `(critic_val, sa_repr, g_repr)`; we
-  ignore the outer-product critic_val and just take the per-sample dot
-  product `Σ_k sa_repr[b,k] * g_repr[b,k]` — that is φ(s,a)·ψ(g).
-  Note: PPO does not use twin_q (so no min() needed here).
+  All maths is in numpy so it can be called from the (non-jitted) rollout
+  loop without JAX overhead or shape-recompilation issues.
+
+  Log density at a batch of test points ``x`` (shape ``(B, d)``)::
+
+      log p(x) = logsumexp_n [ log(1/N) − d·log(h) − d/2·log(2π)
+                                − ½·‖(x − x_n)/h‖² ]
+
+  Bandwidth *h* defaults to Scott's rule: ``N^{-1/(d+4)}``.
   """
+
+  def __init__(self, train_xs: np.ndarray, bandwidth: float):
+    self.train_xs = train_xs.astype(np.float32)    # (N, d)
+    self.bandwidth = float(bandwidth)
+    n, d = train_xs.shape
+    self._log_w = -np.log(float(n))                # uniform log-weight
+    self._log_norm = (0.5 * d * np.log(2.0 * np.pi)
+                      + d * np.log(self.bandwidth))
+
+  def log_density(self, test_x: np.ndarray,
+                  chunk_size: int = 2000) -> np.ndarray:
+    """Return log p(test_x) for test_x of shape ``(B, d)``.
+
+    Processes in chunks of *chunk_size* to keep peak memory bounded at
+    ``chunk_size × N_train × d × 4`` bytes (≈64 MB for 2000×2000×2).
+    """
+    test_x = np.asarray(test_x, dtype=np.float32)
+    B = len(test_x)
+    if B <= chunk_size:
+      return self._log_density_chunk(test_x)
+    out = np.empty(B, dtype=np.float32)
+    for i in range(0, B, chunk_size):
+      out[i:i + chunk_size] = self._log_density_chunk(test_x[i:i + chunk_size])
+    return out
+
+  def _log_density_chunk(self, test_x: np.ndarray) -> np.ndarray:
+    diffs = (test_x[:, None, :] - self.train_xs[None, :, :]) / self.bandwidth
+    log_k = -0.5 * np.sum(diffs ** 2, axis=-1) - self._log_norm  # (B, N)
+    log_contrib = self._log_w + log_k                              # (B, N)
+    lc_max = log_contrib.max(axis=-1, keepdims=True)
+    log_p = (np.log(np.exp(log_contrib - lc_max).sum(axis=-1))
+             + lc_max[:, 0])
+    return log_p  # (B,)
+
+  @classmethod
+  def fit(cls,
+          replay: 'EpisodeReplay',
+          obs_dim: int,
+          max_points: int,
+          rng: np.random.Generator,
+          bandwidth: Optional[float] = None) -> 'GaussianKDE':
+    """Sample *max_points* states from *replay* and fit the KDE."""
+    states = replay.sample_states(max_points, rng)
+    n, d = states.shape
+    if bandwidth is None:
+      bandwidth = float(n) ** (-1.0 / (d + 4))
+    return cls(states, bandwidth)
+
+
+def make_reward_fn(
+    networks: contrastive_networks.ContrastiveNetworks,
+    config: contrastive_config.ContrastiveConfig,
+):
+  """Factory for the per-step PPO reward used during rollouts.
+
+  Modes (``config.ppo_reward_mode``):
+    * ``''`` (default): r = φ(s,a) · ψ(g).
+    * ``'dirac_target'``: for s ≠ g, r = log(eps) − φ(s0,a)·ψ(s);
+      at s = g, r = −φ(s0,a)·ψ(g).  s0 is fixed per episode; a ~ π(·|s).
+    * ``'kde_dirac'``: same formula as ``dirac_target`` but the CRL dot
+      products are replaced by Gaussian KDE log-densities fitted on replay
+      buffer states.  Requires a ``GaussianKDE`` object to be maintained
+      externally and passed as the first argument of the returned function.
+  """
+  mode = (getattr(config, 'ppo_reward_mode', '') or '').strip().lower()
+  if mode == 'dirac_target':
+    return make_dirac_target_reward_fn(networks, config)
+  if mode == 'kde_dirac':
+    return make_kde_dirac_reward_fn(config)
+  if mode not in ('', 'phi_psi'):
+    raise ValueError(
+        f'Unknown ppo_reward_mode={config.ppo_reward_mode!r}; '
+        f"supported: '', 'phi_psi', 'dirac_target', 'kde_dirac'")
+
   @jax.jit
   def reward_fn(q_params: networks_lib.Params,
                 obs: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
     _, sa_repr, g_repr = networks.q_network.apply(q_params, obs, action)
     return jnp.sum(sa_repr * g_repr, axis=-1)  # (B,)
+  return reward_fn
+
+
+def make_dirac_target_reward_fn(
+    networks: contrastive_networks.ContrastiveNetworks,
+    config: contrastive_config.ContrastiveConfig,
+):
+  """Dirac-target baseline: log(eps) − φ(s0,a)·ψ(s) off-goal, −φ(s0,a)·ψ(g) at g."""
+  obs_dim = int(config.obs_dim)
+  eps = float(getattr(config, 'ppo_dirac_eps', 1e-6))
+  goal_tol = 1e-2
+
+  @jax.jit
+  def reward_fn(q_params: networks_lib.Params,
+                obs: jnp.ndarray,
+                action: jnp.ndarray,
+                s0_states: jnp.ndarray) -> jnp.ndarray:
+    s = obs[:, :obs_dim]
+    g = obs[:, obs_dim:]
+    obs_s0 = jnp.concatenate([s0_states, g], axis=-1)
+    obs_ss = jnp.concatenate([s, s], axis=-1)
+    _, phi_s0, psi_g = networks.q_network.apply(q_params, obs_s0, action)
+    _, _, psi_s = networks.q_network.apply(q_params, obs_ss, action)
+    dot_ps = jnp.sum(phi_s0 * psi_s, axis=-1)
+    dot_pg = jnp.sum(phi_s0 * psi_g, axis=-1)
+    at_goal = jnp.linalg.norm(s - g, axis=-1) < goal_tol
+    log_rew = jnp.log(jnp.maximum(eps, 1e-10)) - dot_ps
+    return jnp.where(at_goal, -dot_pg, log_rew)
+  return reward_fn
+
+
+def make_kde_dirac_reward_fn(config: contrastive_config.ContrastiveConfig):
+  """KDE-dirac reward: same sign convention as dirac_target but CRL dot
+  products are replaced by Gaussian KDE log-densities from the replay buffer.
+
+  Off-goal:  r = log(eps) − log p_kde(s)
+  At goal:   r = −log p_kde(g)
+
+  The returned function signature is::
+
+      reward_fn(kde: GaussianKDE, obs: np.ndarray) -> np.ndarray
+
+  *kde* is a :class:`GaussianKDE` fitted to recent replay-buffer states
+  and must be updated by the caller (see ``kde_refit_interval`` config).
+  The function operates entirely in numpy so it can be called without JAX.
+  """
+  obs_dim = int(config.obs_dim)
+  eps = float(getattr(config, 'ppo_dirac_eps', 1e-6))
+  log_eps = float(np.log(max(eps, 1e-10)))
+  goal_tol = 1e-2
+
+  def reward_fn(kde: GaussianKDE,
+                obs: np.ndarray) -> np.ndarray:
+    obs = np.asarray(obs, dtype=np.float32)
+    s = obs[:, :obs_dim]
+    g = obs[:, obs_dim:]
+    log_ps = kde.log_density(s)
+    log_pg = kde.log_density(g)
+    at_goal = np.linalg.norm(s - g, axis=-1) < goal_tol
+    log_rew = log_eps - log_ps
+    return np.where(at_goal, -log_pg, log_rew)
+
   return reward_fn
 
 
@@ -712,7 +866,10 @@ def _save_checkpoint(path: str,
 
 
 def _prune_old_checkpoints(ckpt_dir: str, keep_last: int):
-  """Delete all but the `keep_last` most recent ckpt_iter_*.pkl files."""
+  """Delete oldest ckpt_iter_*.pkl until at most `keep_last` remain.
+
+  No-op when ``keep_last <= 0`` (retain every milestone checkpoint).
+  """
   import os as _os
   if keep_last <= 0:
     return
@@ -887,7 +1044,21 @@ def run_ppo_training(
         _truncate_csv_to_iteration(_csv_path, int(_ckpt['iteration']))
 
   # ---- jitted helpers ---------------------------------------------------
-  reward_fn = make_reward_fn(networks)
+  reward_mode = (getattr(config, 'ppo_reward_mode', '') or '').strip().lower()
+  use_dirac_target = reward_mode == 'dirac_target'
+  use_kde_dirac    = reward_mode == 'kde_dirac'
+  reward_fn = make_reward_fn(networks, config)
+  if use_dirac_target:
+    print(f'[ppo] reward mode: dirac_target (eps={config.ppo_dirac_eps})')
+  if use_kde_dirac:
+    kde_max_points     = int(getattr(config, 'kde_max_points', 2000))
+    kde_refit_interval = int(getattr(config, 'kde_refit_interval', 1))
+    kde_bandwidth_cfg  = float(getattr(config, 'kde_bandwidth', 0.0))
+    kde_bandwidth_arg  = kde_bandwidth_cfg if kde_bandwidth_cfg > 0.0 else None
+    kde_state: Optional[GaussianKDE] = None
+    print(f'[ppo] reward mode: kde_dirac  (eps={config.ppo_dirac_eps}, '
+          f'max_points={kde_max_points}, refit_interval={kde_refit_interval}, '
+          f'bandwidth={"Scott" if kde_bandwidth_arg is None else kde_bandwidth_cfg})')
   gae_fn = make_gae_fn(config)
   ppo_update = make_ppo_update_fn(networks, config, ppo_optimizer)
 
@@ -915,11 +1086,10 @@ def run_ppo_training(
   uniform_sampling = bool(getattr(config, 'uniform_sampling', False))
   goal_low = goal_high = None
   if uniform_sampling:
-    _obs_min = np.asarray(spec.observations.minimum, dtype=np.float32)
-    _obs_max = np.asarray(spec.observations.maximum, dtype=np.float32)
-    _end = int(config.end_index) if int(config.end_index) != -1 else int(config.obs_dim)
-    goal_low = _obs_min[int(config.start_index):_end]
-    goal_high = _obs_max[int(config.start_index):_end]
+    import env_utils as _env_utils
+    goal_low, goal_high = _env_utils.resolve_uniform_goal_bounds(
+        spec, vec_env._envs[0], int(config.obs_dim),
+        int(config.start_index), int(config.end_index))
     print(f'[ppo] uniform_sampling: goal_low={goal_low}, goal_high={goal_high}')
 
   # ---- replay buffer (episodes) -----------------------------------------
@@ -941,6 +1111,7 @@ def run_ppo_training(
 
   obs = vec_env.reset()
   next_done = np.zeros(E, dtype=np.float32)
+  s0_states = np.asarray(obs[:, :int(config.obs_dim)], dtype=np.float32)
   for i in range(E):
     ep_obs[i].append(obs[i].copy())
 
@@ -988,11 +1159,14 @@ def run_ppo_training(
 
   # ---- checkpointing ----------------------------------------------------
   ckpt_interval = int(getattr(config, 'ppo_checkpoint_interval', 0))
-  ckpt_keep_last = int(getattr(config, 'ppo_checkpoint_keep_last', 10))
+  ckpt_keep_last = int(getattr(config, 'ppo_checkpoint_keep_last', 0))
   if ckpt_interval > 0 and checkpoint_dir is not None:
     os.makedirs(checkpoint_dir, exist_ok=True)
+    keep_msg = ('keep all milestones'
+                if ckpt_keep_last <= 0
+                else f'keep last {ckpt_keep_last} milestones')
     print(f'[ppo] checkpoints → {checkpoint_dir} '
-          f'(every {ckpt_interval} iters, keep last {ckpt_keep_last})')
+          f'(every {ckpt_interval} iters, {keep_msg})')
 
   start_time = time.time()
   # global_step, ppo_sgd_step, start_iteration set above (0 for fresh runs,
@@ -1016,8 +1190,18 @@ def run_ppo_training(
       roll_vals[t] = np.asarray(value_j)
 
       # reps-based reward, computed BEFORE env step (frozen q_params).
-      rep_rew = reward_fn(q_params, jnp.asarray(obs), action_j)
-      rep_rew_np = np.asarray(rep_rew)
+      if use_dirac_target:
+        rep_rew = reward_fn(
+            q_params, jnp.asarray(obs), action_j, jnp.asarray(s0_states))
+        rep_rew_np = np.asarray(rep_rew)
+      elif use_kde_dirac:
+        if kde_state is None:
+          rep_rew_np = np.zeros(E, dtype=np.float32)
+        else:
+          rep_rew_np = reward_fn(kde_state, obs).astype(np.float32)
+      else:
+        rep_rew = reward_fn(q_params, jnp.asarray(obs), action_j)
+        rep_rew_np = np.asarray(rep_rew)
       roll_rew_raw[t] = rep_rew_np
 
       next_obs, env_rew, dones, terminal_obs = vec_env.step(action)
@@ -1045,6 +1229,7 @@ def run_ppo_training(
           except AssertionError:
             pass  # degenerate len-0 episodes; skip
           ep_obs[i] = [next_obs[i].copy()]  # auto-reset state seeds next ep
+          s0_states[i] = next_obs[i, :int(config.obs_dim)].copy()
           ep_act[i] = []
           recent_returns.append(float(ep_return[i]))
           recent_lengths.append(int(ep_len[i]))
@@ -1128,6 +1313,15 @@ def run_ppo_training(
             q_params, q_opt_state, crl_batch, k_crl)
         for k_, v in m.items():
           crl_metrics_agg.setdefault(k_, []).append(float(v))
+
+    # =================================================================
+    # 4b. KDE refit (kde_dirac mode only)
+    # =================================================================
+    if use_kde_dirac and replay.size >= int(config.ppo_min_replay_size):
+      if iteration % kde_refit_interval == 0:
+        kde_state = GaussianKDE.fit(
+            replay, int(config.obs_dim),
+            kde_max_points, np_rng, kde_bandwidth_arg)
 
     # =================================================================
     # 5. Logging
@@ -1224,16 +1418,14 @@ def run_ppo_training(
       eval_logger.write(agg)
 
     # =================================================================
-    # 7. Checkpointing (every `ppo_checkpoint_interval` iterations,
-    #    plus a rolling `latest.pkl` and FIFO pruning of older
-    #    milestone files).
+    # 7. Checkpointing: ckpt_iter_{iter}.pkl every `ppo_checkpoint_interval`
+    #    iters + rolling latest.pkl.  Prune only if ppo_checkpoint_keep_last>0.
     # =================================================================
     if (ckpt_interval > 0
         and checkpoint_dir is not None
         and (iteration % ckpt_interval == 0
              or iteration == num_iterations - 1)):
-      _save_checkpoint(
-          os.path.join(checkpoint_dir, 'latest.pkl'),
+      ckpt_kw = dict(
           policy_params=ppo_params['policy'],
           value_params=ppo_params['value'],
           q_params=q_params,
@@ -1242,6 +1434,11 @@ def run_ppo_training(
           iteration=iteration,
           global_step=global_step,
           key=key)
+      milestone_path = os.path.join(
+          checkpoint_dir, f'ckpt_iter_{iteration:07d}.pkl')
+      _save_checkpoint(milestone_path, **ckpt_kw)
+      _save_checkpoint(os.path.join(checkpoint_dir, 'latest.pkl'), **ckpt_kw)
+      _prune_old_checkpoints(checkpoint_dir, ckpt_keep_last)
 
   # ---- return final state in case the caller wants to checkpoint --------
   return PPOTrainingState(

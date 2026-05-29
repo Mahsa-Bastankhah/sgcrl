@@ -43,7 +43,7 @@ def _iter_checkpoint_dirs(log_roots: list[str]) -> list[str]:
         continue
       pkls = glob.glob(os.path.join(d, '*.pkl'))
       if not pkls:
-        continue
+        continue  # includes latest.pkl-only dirs
       out.append(os.path.normpath(d))
   # Stable unique order
   return sorted(set(out))
@@ -103,12 +103,12 @@ def main() -> None:
   ap.add_argument(
       '--log_roots',
       nargs='+',
-      default=['logs'],
-      help='Directories to search recursively (default: logs).')
+      default=['logs/ppo_fourrooms'],
+      help='Directories to search recursively (default: logs/ppo_fourrooms).')
   ap.add_argument(
       '--output_base',
-      default='plots/ppo_impossible_all_ckpts_sub25_traj5',
-      help='PNG tree root (default: plots/ppo_impossible_all_ckpts_sub25_traj5).')
+      default='plots/ppo_fourrooms_impossible_sub25_traj5',
+      help='PNG tree root (default: plots/ppo_fourrooms_impossible_sub25_traj5).')
   ap.add_argument(
       '--repo_root',
       default='.',
