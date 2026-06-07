@@ -324,24 +324,28 @@ class EpisodeReplay:
   def sample_with_uniform_negatives(
       self, batch_size: int, rng: np.random.Generator,
       goal_low: np.ndarray, goal_high: np.ndarray,
+      num_negatives: int = -1,
   ) -> Dict[str, np.ndarray]:
-    """Like sample(), but the second half of the batch has goals replaced
-    by goals sampled uniformly from [goal_low, goal_high].
+    """Like sample(), but adds uniform goals as *extra negatives only*.
 
-    This gives a 50/50 mix: half the in-batch negatives seen by the InfoNCE
-    loss come from the replay future-state distribution, half from the
-    uniform goal distribution — without changing the loss function.
+    Returns the standard B-sample batch where every pair has a true
+    replay-future-state positive on the InfoNCE diagonal, plus an
+    'extra_goals' key with K goals sampled uniformly from [goal_low, goal_high].
+    K = num_negatives if >= 0, else batch_size // 2.
+    The CRL loss treats those extra goals as additional off-diagonal negatives
+    for all B anchors — they are never used as positives for any row.
     """
     batch = self.sample(batch_size, rng)
-    half = batch_size // 2
+    K = num_negatives if num_negatives >= 0 else batch_size // 2
     goal_dim = batch['obs'].shape[1] - self._obs_dim
     uniform_goals = rng.uniform(
-        goal_low, goal_high, size=(half, goal_dim)).astype(np.float32)
-    obs = batch['obs'].copy()
-    next_obs = batch['next_obs'].copy()
-    obs[half:, self._obs_dim:] = uniform_goals
-    next_obs[half:, self._obs_dim:] = uniform_goals
-    return {'obs': obs, 'action': batch['action'], 'next_obs': next_obs}
+        goal_low, goal_high, size=(K, goal_dim)).astype(np.float32)
+    return {
+        'obs': batch['obs'],
+        'action': batch['action'],
+        'next_obs': batch['next_obs'],
+        'extra_goals': uniform_goals,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -540,9 +544,35 @@ def make_crl_update_fn(
     obs = batch['obs']
     action = batch['action']
     batch_size = obs.shape[0]
-    labels = jnp.eye(batch_size)
+    labels_replay = jnp.eye(batch_size)
 
-    logits, _, _ = networks.q_network.apply(q_params, obs, action)
+    # If 'extra_goals' is present, augment the forward pass with K dummy rows
+    # whose state/action are zeroed out so only g_encoder sees the uniform
+    # goals.  We then take only the first B rows of the (B+K, B+K) logit
+    # matrix: each true anchor (row i < B) now has B+K logit columns, with
+    # the extra K columns being φ(s_i,a_i)·ψ(uniform_goal_k).  The diagonal
+    # remains the true replay-future-state positive; the uniform goals are
+    # purely off-diagonal negatives for every anchor row.
+    extra_goals = batch.get('extra_goals', None)
+    if extra_goals is not None:
+      K = extra_goals.shape[0]
+      obs_dim_inf = obs.shape[1] - extra_goals.shape[1]
+      act_dim = action.shape[1]
+      obs_extra = jnp.concatenate(
+          [jnp.zeros((K, obs_dim_inf)), extra_goals], axis=1)
+      action_extra = jnp.zeros((K, act_dim))
+      obs_fwd = jnp.concatenate([obs, obs_extra], axis=0)
+      action_fwd = jnp.concatenate([action, action_extra], axis=0)
+      logits_full, _, _ = networks.q_network.apply(q_params, obs_fwd, action_fwd)
+      if logits_full.ndim == 3:
+        logits = logits_full[:batch_size, :, :]   # (B, B+K, 2)
+      else:
+        logits = logits_full[:batch_size, :]       # (B, B+K)
+      labels = jnp.concatenate(
+          [labels_replay, jnp.zeros((batch_size, K))], axis=1)
+    else:
+      logits, _, _ = networks.q_network.apply(q_params, obs, action)
+      labels = labels_replay
 
     def loss_fn(_logits, _labels):
       return (
@@ -558,6 +588,8 @@ def make_crl_update_fn(
     loss = jnp.mean(loss)
     train_logits = logits
 
+    # Metrics are computed on the B×B replay-goal submatrix so they are
+    # comparable whether or not extra uniform-goal negatives are present.
     if train_logits.ndim == 2:
       narrow_logits = train_logits[:, :batch_size]
     else:
@@ -568,9 +600,9 @@ def make_crl_update_fn(
     else:
       logits_flat = narrow_logits
 
-    correct = (jnp.argmax(logits_flat, axis=1) == jnp.argmax(labels, axis=1))
-    logits_pos = jnp.sum(logits_flat * labels) / jnp.sum(labels)
-    logits_neg = jnp.sum(logits_flat * (1 - labels)) / jnp.sum(1 - labels)
+    correct = (jnp.argmax(logits_flat, axis=1) == jnp.argmax(labels_replay, axis=1))
+    logits_pos = jnp.sum(logits_flat * labels_replay) / jnp.sum(labels_replay)
+    logits_neg = jnp.sum(logits_flat * (1 - labels_replay)) / jnp.sum(1 - labels_replay)
     if train_logits.ndim == 3:
       logsumexp_val = jax.nn.logsumexp(train_logits[:, :, 0], axis=1) ** 2
     else:
@@ -578,7 +610,7 @@ def make_crl_update_fn(
 
     metrics = {
         'crl_loss': loss,
-        'binary_accuracy': jnp.mean((logits_flat > 0) == labels),
+        'binary_accuracy': jnp.mean((logits_flat > 0) == labels_replay),
         'categorical_accuracy': jnp.mean(correct),
         'logits_pos': logits_pos,
         'logits_neg': logits_neg,
@@ -1119,7 +1151,8 @@ def run_ppo_training(
       for _ in range(int(config.ppo_crl_steps_per_iter)):
         if uniform_sampling:
           crl_batch_np = replay.sample_with_uniform_negatives(
-              int(config.batch_size), np_rng, goal_low, goal_high)
+              int(config.batch_size), np_rng, goal_low, goal_high,
+              num_negatives=int(getattr(config, 'uniform_num_negatives', -1)))
         else:
           crl_batch_np = replay.sample(int(config.batch_size), np_rng)
         crl_batch = {k_: jnp.asarray(v) for k_, v in crl_batch_np.items()}

@@ -74,9 +74,12 @@ flags.DEFINE_bool(
     'if False, use a fixed learning_rate.  Pass --noppo_anneal_lr to disable.')
 flags.DEFINE_bool(
     'uniform_sampling', False,
-    'If True, mix 50% uniformly sampled goals into each CRL replay batch. '
-    'Half the in-batch InfoNCE negatives come from the uniform goal '
-    'distribution, half from the replay future-state distribution.')
+    'If True, mix uniformly sampled goals into each CRL replay batch as '
+    'extra off-diagonal negatives (never used as positives).')
+flags.DEFINE_integer(
+    'uniform_num_negatives', -1,
+    'Number of uniform negative goals to add per CRL batch when '
+    'uniform_sampling is True.  -1 (default) uses batch_size // 2.')
 # ---------------------------------------------------------------------------
 # Fixed-goal lookup reused from lp_contrastive.py.
 # ---------------------------------------------------------------------------
@@ -198,6 +201,8 @@ def main(_):
     config.ppo_ent_coef = float(FLAGS.ppo_ent_coef)
   config.ppo_anneal_lr = bool(FLAGS.ppo_anneal_lr)
   config.uniform_sampling = bool(FLAGS.uniform_sampling)
+  if FLAGS.uniform_num_negatives >= 0:
+    config.uniform_num_negatives = int(FLAGS.uniform_num_negatives)
 
   print(f'[ppo_contrastive] PPO knobs: '
         f'rollout_length={config.ppo_rollout_length}, '

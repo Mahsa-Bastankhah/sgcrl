@@ -189,10 +189,12 @@ class ContrastiveConfig:
   # How many milestone checkpoints to keep on disk (older ones are
   # deleted in FIFO order).  `latest.pkl` is always overwritten in place.
   ppo_checkpoint_keep_last: int = 5
-  # If True, mix 50% uniformly sampled goals into each CRL replay batch so
-  # that half the in-batch negatives come from the uniform goal distribution
-  # rather than the replay future-state distribution.
+  # If True, mix uniformly sampled goals into each CRL replay batch as extra
+  # off-diagonal negatives (they are never used as positives).
   uniform_sampling: bool = False
+  # Number of uniform negative goals to add per CRL batch.  -1 means
+  # batch_size // 2 (the default when uniform_sampling is True).
+  uniform_num_negatives: int = -1
 
 
   use_image_obs: bool = False
