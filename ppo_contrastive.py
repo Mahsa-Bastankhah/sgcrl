@@ -85,6 +85,11 @@ flags.DEFINE_string(
     "'dirac_target' = log(eps)−φ(s0,a)·ψ(s) off-goal, −φ(s0,a)·ψ(g) at goal; "
     "'kde_dirac' = same formula but densities estimated via Gaussian KDE on "
     "the replay buffer instead of CRL dot products.")
+flags.DEFINE_string(
+    'ppo_repr_mode', 'crl',
+    "Density estimator for the PPO shaped reward. "
+    "'crl' (default) = contrastive φ(s,a)·ψ(g) representations; "
+    "'gaussian' = diagonal Gaussian p_θ(g|s), reward = log p_θ(g|s_t).")
 flags.DEFINE_float(
     'ppo_dirac_eps', 1e-6,
     'Epsilon in dirac_target / kde_dirac reward: log(eps) − log_p(s).')
@@ -152,10 +157,10 @@ fixed_goal_dict = {
     'sawyer_peg':   np.array([-0.3, 0.6, 0.0]),
     # Reach: fixed goal = centre of the goal cube (x=0, y=0.85, z=0.2).
     'sawyer_reach': np.array([0.0, 0.85, 0.2]),
-    # Push: fixed goal = far edge of the table (z≈0.02 = table surface).
+    # Push: fixed goal = puck target (z≈0.02); ψ hand = target − 8 cm y, +3 cm z.
     'sawyer_push':  np.array([0.0, 0.85, 0.02]),
-    # Drawer-open: fixed goal = handle at fully-open position (pulled ~16 cm
-    # toward the robot from its closed position).
+    # Drawer-open: fixed goal = open handle (_target_pos); ψ also places
+    # ideal_hand at closed-handle first-contact (+0.2 y, −0.02 z).
     'sawyer_drawer_open':  np.array([0.0, 0.54, 0.09]),
     # Button-press: fixed goal = button depressed to the hole site (y≈0.78).
     'sawyer_button_press': np.array([0, 0.8, 0.115]),
@@ -323,6 +328,7 @@ def main(_):
   config.ppo_anneal_lr = bool(FLAGS.ppo_anneal_lr)
   config.uniform_sampling = bool(FLAGS.uniform_sampling)
   config.ppo_reward_mode = str(FLAGS.ppo_reward_mode).strip()
+  config.ppo_repr_mode = str(FLAGS.ppo_repr_mode).strip()
   config.ppo_dirac_eps = float(FLAGS.ppo_dirac_eps)
   config.kde_max_points = int(FLAGS.kde_max_points)
   config.kde_refit_interval = int(FLAGS.kde_refit_interval)
@@ -347,6 +353,7 @@ def main(_):
         f'norm_reward={config.ppo_norm_reward}, '
         f'repr_norm={config.repr_norm}, '
         f'ppo_anneal_lr={config.ppo_anneal_lr}  '
+        f'ppo_repr_mode={config.ppo_repr_mode!r}  '
         f'ppo_reward_mode={config.ppo_reward_mode!r}  '
         f'ppo_dirac_eps={config.ppo_dirac_eps}  '
         f'kde_max_points={config.kde_max_points}  '

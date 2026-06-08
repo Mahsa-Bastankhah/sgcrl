@@ -49,6 +49,8 @@ relative to the maze as it's printed.
 """
 from __future__ import annotations
 
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sgcrl_jax_acme_compat  # noqa: F401  must precede acme/jax imports
 
 import argparse

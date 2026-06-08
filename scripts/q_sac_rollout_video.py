@@ -36,12 +36,13 @@ Examples:
 Frame rendering and rotation follow the same conventions as
 `ppo_rollout_video.py`; see its module docstring for the details.
 """
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sgcrl_jax_acme_compat  # noqa: F401 — must precede acme/jax imports
 
 import argparse
 import glob
 import json
-import os
 import re
 
 import numpy as np

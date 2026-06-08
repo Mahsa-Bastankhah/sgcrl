@@ -41,7 +41,7 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
 # sgcrl imports ---------------------------------------------------------------
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sgcrl_jax_acme_compat  # noqa: F401
 import jax
 import jax.numpy as jnp

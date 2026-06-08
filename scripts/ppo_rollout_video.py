@@ -24,11 +24,12 @@ metaworld scene camera yields means the raw image can come out upside-
 down or mirrored depending on the build; rotating in software is cheap
 and robust — easier than chasing the right camera matrix.
 """
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sgcrl_jax_acme_compat  # noqa: F401 — must precede acme/jax imports
 
 import argparse
 import glob
-import os
 import re
 
 import numpy as np

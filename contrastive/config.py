@@ -200,6 +200,10 @@ class ContrastiveConfig:
   # log-densities estimated from the replay buffer.
   ppo_reward_mode: str = ''
   ppo_dirac_eps: float = 1e-6
+  # Density estimator used for the PPO shaped reward.
+  #   'crl'      (default) — φ(s,a)·ψ(g) contrastive representations.
+  #   'gaussian' — diagonal Gaussian  p_θ(g|s); reward = log p_θ(g|s_t).
+  ppo_repr_mode: str = 'crl'
   # KDE options (only used when ppo_reward_mode == 'kde_dirac').
   # kde_max_points: number of replay states to fit the KDE on.
   # kde_refit_interval: refit the KDE every N PPO iterations (1 = every iter).

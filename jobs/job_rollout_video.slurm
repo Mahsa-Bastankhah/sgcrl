@@ -150,7 +150,7 @@ fi
 # ---------------------------------------------------------------------------
 # Render
 # ---------------------------------------------------------------------------
-python -u ppo_rollout_video.py \
+python -u scripts/ppo_rollout_video.py \
     --checkpoint="${CKPT}" \
     --env="${ENV}" \
     --output="${OUT}" \

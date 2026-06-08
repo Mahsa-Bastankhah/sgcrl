@@ -50,6 +50,8 @@ def _require_metaworld(env_name: str):
         f'    export MUJOCO_PY_MUJOCO_PATH=$HOME/.mujoco/mujoco210\n'
         f'    export MUJOCO_GL=osmesa'
     ) from _METAWORLD_IMPORT_ERROR
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'envs'))
 import point_env
 
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
@@ -386,10 +388,11 @@ class SawyerBin(_MW_BIN):
     gripper_distance_apart = np.clip(gripper_distance_apart / 0.1, 0., 1.)
     obs = np.concatenate((pos_hand, [gripper_distance_apart],
                           self._get_pos_objects()))
-    # the ideal goal state has the block in the blue bin and the gripper slightly 
-    # higher than the block center
+    # ψ goal: gripper closed around the object in the target bin.
+    # hand 3 cm above cube center (matches expert grasp offset),
+    # gripper 0.0 = fully closed (holding the cube).
     goal = np.concatenate([self._goal + np.array([0.0, 0.0, 0.03]),
-                           [0.4], self._goal])
+                           [0.0], self._goal])
 
     return np.concatenate([obs, goal]).astype(np.float32)
 
@@ -489,12 +492,19 @@ class SawyerReach(_MW_REACH):
   """Wrapper for reach-v2: move the end-effector to a 3-D goal position.
 
   Observation layout (6-dim):
-    obs = [ hand_xyz (3)   <- state / φ input
-            goal_xyz (3) ] <- goal  / ψ input
+    obs = [ tcp_xyz (3)    <- state / φ input  (gripper TCP centre)
+            goal_xyz (3) ] <- goal  / ψ input  (target reach position)
     obs_dim = 3, start_index = 0, end_index = -1 (defaults)
 
-  CRL negatives: obs_to_goal(future_state) = future hand_xyz (3-D),
+  State uses ``tcp_center`` (midpoint of the two finger sites), matching
+  MetaWorld's native reach success metric — not ``get_endeff_pos()`` (mocap
+  hand body), which is ~4-5 cm offset in z.
+
+  CRL negatives: obs_to_goal(future_state) = future tcp_xyz (3-D),
   which matches the 3-D goal slice perfectly.
+
+  Fixed goal (``fixed_goal_dict``): centre of MW goal_space,
+  ``[0.0, 0.85, 0.2]``  (x=0, y mid of [0.8,0.9], z=0.2).
   """
 
   # Goal space bounds from SawyerReachEnvV2: y ∈ [0.8, 0.9], z ∈ [0.05, 0.3].
@@ -512,6 +522,10 @@ class SawyerReach(_MW_REACH):
     self._freeze_rand_vec = False
     self._set_task_called = True
     self._fixed_start_end = fixed_start_end
+    # Disable random goal/object spawn when using a fixed target so _target_pos
+    # and obs[3:6] always match fixed_goal_dict (same pattern as button_press).
+    if fixed_start_end is not None:
+      self.random_init = False
     self.reset()
 
   def reset(self):
@@ -525,15 +539,15 @@ class SawyerReach(_MW_REACH):
 
   def step(self, action):
     super(SawyerReach, self).step(action)
-    dist = np.linalg.norm(self.get_endeff_pos() - self._goal)
+    dist = np.linalg.norm(self.tcp_center - self._goal)
     obs = self._get_obs()
     r = float(dist <= 0.05)
     return obs, r, False, {}
 
   def _get_obs(self):
-    hand_pos = self.get_endeff_pos().astype(np.float32)
+    tcp_pos = self.tcp_center.astype(np.float32)
     goal = np.asarray(self._goal, dtype=np.float32)
-    return np.concatenate([hand_pos, goal])
+    return np.concatenate([tcp_pos, goal])
 
   @property
   def observation_space(self):
@@ -552,13 +566,15 @@ class SawyerPush(_MW_PUSH):
 
     obs_dim = 7, start_index = 0, end_index = -1 (defaults).
 
-  The goal encodes the ideal end state: object at target, hand slightly
-  behind (−8 cm in y) and above (+3 cm in z) the target, gripper open.
-  ψ therefore sees a full 7-D "state-like" vector — identical layout to
-  what the state half carries — so the contrastive loss aligns φ(s,a) with
-  ψ(g) in the same space as all other sawyer_* envs.  Fixed goal is 3-D
-  (just the target object position); the 7-D goal vector is constructed
-  inside _get_obs.
+  The 3-D fixed goal ``_goal`` is the puck target (MetaWorld ``_target_pos``,
+  table surface z ≈ 0.02).
+
+  The 7-D ψ slice uses a simplified/easier hand target: gripper at the puck
+  goal, slightly behind (−8 cm in y) and a bit above (+3 cm in z), gripper
+  closed, object at ``_goal``:
+
+      ideal_hand = _goal + [0, -0.08, 0.03]
+      goal       = [ideal_hand, gripper=0.0, _goal]
   """
 
   # Goal bounds match goal_space in SawyerPushEnvV2.
@@ -578,6 +594,8 @@ class SawyerPush(_MW_PUSH):
     self._freeze_rand_vec = False
     self._set_task_called = True
     self._fixed_start_end = fixed_start_end
+    if fixed_start_end is not None:
+      self.random_init = False
     self.reset()
 
   def reset(self):
@@ -597,7 +615,7 @@ class SawyerPush(_MW_PUSH):
     return obs, r, False, {}
 
   def _get_obs(self):
-    pos_hand = self.get_endeff_pos()
+    pos_hand = self.tcp_center.astype(np.float32)
     finger_right, finger_left = (
         self._get_site_pos('rightEndEffector'),
         self._get_site_pos('leftEndEffector'),
@@ -606,7 +624,7 @@ class SawyerPush(_MW_PUSH):
         np.linalg.norm(finger_right - finger_left) / 0.1, 0., 1.)
     obj_pos = self._get_pos_objects()
     state = np.concatenate((pos_hand, [gripper_distance_apart], obj_pos))  # 7-D
-    # ideal end state: hand behind and above the target, gripper open, obj at target.
+    # ψ: hand just behind the target puck, slightly above, gripper closed.
     ideal_hand = self._goal + np.array([0.0, -0.08, 0.03], dtype=np.float32)
     goal = np.concatenate([ideal_hand, [0.0], self._goal])                 # 7-D
     return np.concatenate([state, goal]).astype(np.float32)
@@ -629,14 +647,14 @@ class SawyerDrawerOpen(_MW_DRAWER):
   obs_dim = 7, start_index = 0, end_index = -1 (defaults).
 
   Goal-reaching formulation:
-    φ(s, a) represents the (hand, gripper, handle) state the agent transitions
-    through.  ψ(g) represents the desired terminal state — handle at the fully-
-    open target position, hand at the same location (grasping), gripper closed.
-    The contrastive loss aligns φ with ψ by using *future states* as positives:
-    obs_to_goal(future_obs) = future_obs[0:7] = future [hand, gripper, handle],
-    which is exactly the same layout as the goal half.  So ψ learns to embed
-    "where everything should end up", and the agent is rewarded whenever
-    φ(s, a) is close to ψ(goal) in representation space.
+    The 3-D fixed goal ``_goal`` is the *open* handle position (MetaWorld
+    ``_target_pos`` = closed site + [0, -maxDist, +0.09]).
+
+    The 7-D ψ slice encodes an *opening* pose: drawer at the open target,
+    gripper open and below the handle lip, pulling in −y (expert pull offset):
+
+      ideal_hand = _goal + [0, 0, 0]   # TCP at handle bar: fingers straddle the bar
+      goal       = [ideal_hand, gripper=1.0, _goal]
   """
 
   # Goal bounds: handle spans x∈[-0.2,0.2], target y∈[0.40,0.60] (open), z≈0.09.
@@ -657,6 +675,8 @@ class SawyerDrawerOpen(_MW_DRAWER):
     self._freeze_rand_vec = False
     self._set_task_called = True
     self._fixed_start_end = fixed_start_end
+    if fixed_start_end is not None:
+      self.random_init = False
     self.reset()
 
   def reset(self):
@@ -667,6 +687,10 @@ class SawyerDrawerOpen(_MW_DRAWER):
       self._goal = self._target_pos.copy().astype(np.float32)
     self._target_pos = self._goal
     return self._get_obs()
+
+  def _ideal_pull_hand(self) -> np.ndarray:
+    """TCP at the handle bar position: open fingers straddle the bar."""
+    return self._goal.copy()
 
   def step(self, action):
     super(SawyerDrawerOpen, self).step(action)
@@ -685,10 +709,9 @@ class SawyerDrawerOpen(_MW_DRAWER):
         np.linalg.norm(finger_right - finger_left) / 0.1, 0., 1.)
     handle_pos = self._get_pos_objects()
     state = np.concatenate((pos_hand, [gripper], handle_pos))       # 7-D
-    # Ideal end state: hand at the open handle position (grasping), gripper
-    # closed (0.0), handle at target.
-    ideal_hand = self._goal.copy()
-    goal = np.concatenate([ideal_hand, [0.0], self._goal])          # 7-D
+    # ψ goal: open gripper below handle, pulling drawer to _goal.
+    ideal_hand = self._ideal_pull_hand()
+    goal = np.concatenate([ideal_hand, [1.0], self._goal])            # 7-D
     return np.concatenate([state, goal]).astype(np.float32)
 
   @property

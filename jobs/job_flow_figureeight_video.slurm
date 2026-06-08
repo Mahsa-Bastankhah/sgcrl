@@ -79,7 +79,7 @@ echo "output=${OUTPUT}"
 nvidia-smi || true
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend())"
 
-python -u flow_figureeight_video.py \
+python -u scripts/flow_figureeight_video.py \
   --env="${ENV}" \
   --checkpoint="${CHECKPOINT}" \
   --steps="${STEPS}" \

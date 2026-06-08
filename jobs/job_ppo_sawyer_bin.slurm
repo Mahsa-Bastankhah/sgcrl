@@ -1,7 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_drawer
-#SBATCH --output=slurm/ppo_sawyer_drawer_open_%A_%a.out
-#SBATCH --error=slurm/ppo_sawyer_drawer_open_%A_%a.err
+#SBATCH --job-name=ppo_bin
+#SBATCH --output=slurm/ppo_sawyer_bin_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -55,12 +54,12 @@ export MUJOCO_GL=osmesa
 export PYTHONUNBUFFERED=1
 export TMPDIR=/n/fs/mislresearch/mb6458-tmp
 
-ENV=sawyer_drawer_open
+ENV=sawyer_bin
 NUM_STEPS=${NUM_STEPS:-10000000}
 SEED_OFFSET=${SEED_OFFSET:-0}
 SEED=$(( SEED_OFFSET + ${SLURM_ARRAY_TASK_ID:-0} ))
 
-LOG_DIR="${LOG_DIR:-logs/ppo/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_bin/}"
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-4}
 CRL_STEPS=${CRL_STEPS:-128}
 ENT_COEF=0.05
@@ -71,7 +70,7 @@ PPO_CLIP_COEF=0.2
 mkdir -p slurm
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS}"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=crl"
 echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS} crl_steps=${CRL_STEPS}"
 nvidia-smi || true
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"

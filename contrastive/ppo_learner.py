@@ -32,6 +32,7 @@ from acme.jax import networks as networks_lib
 
 from contrastive import config as contrastive_config
 from contrastive import networks as contrastive_networks
+from contrastive import gaussian_density as _gd
 from contrastive.utils import extract_info_reward
 
 
@@ -991,12 +992,41 @@ def run_ppo_training(
       'batch_per_iter must divide evenly into ppo_num_minibatches')
   num_iterations = int(total_steps) // (T * E)
 
+  # ---- density estimator mode ------------------------------------------
+  # 'crl'      (default) — φ(s,a)·ψ(g) contrastive representations.
+  # 'gaussian' — diagonal Gaussian p_θ(g|s);  reward = log p_θ(g|s_t).
+  repr_mode = (getattr(config, 'ppo_repr_mode', 'crl') or 'crl').strip().lower()
+  use_gaussian = repr_mode == 'gaussian'
+  density_nets = None
+  if use_gaussian:
+    obs_dim_cfg  = int(config.obs_dim)
+    total_obs_dim = int(np.prod(obs_shape))      # obs_shape = (obs_dim_total,)
+    goal_dim_cfg  = total_obs_dim - obs_dim_cfg
+    act_dim_cfg   = int(np.prod(act_shape))      # act_shape = (act_dim,)
+    density_nets = _gd.make_gaussian_density_networks(
+        obs_dim=obs_dim_cfg,
+        act_dim=act_dim_cfg,
+        goal_dim=goal_dim_cfg,
+        hidden_layer_sizes=config.hidden_layer_sizes,
+    )
+    print(f'[ppo] repr_mode=gaussian  obs_dim={obs_dim_cfg}  '
+          f'act_dim={act_dim_cfg}  goal_dim={goal_dim_cfg}  '
+          f'hidden_layers={config.hidden_layer_sizes}')
+  else:
+    print(f'[ppo] repr_mode=crl (φ·ψ contrastive)')
+
   # ---- init params ------------------------------------------------------
   key = jax.random.PRNGKey(seed)
   k_pol, k_val, k_q, key = jax.random.split(key, 4)
   policy_params = networks.policy_network.init(k_pol)
   value_params = networks.value_network.init(k_val)
-  q_params = networks.q_network.init(k_q)
+  # q_params holds the density-estimator params in both modes:
+  #   crl mode      → CRL (φ, ψ) contrastive params from networks.q_network
+  #   gaussian mode → Gaussian density p_θ(g|s) params from density_nets
+  if use_gaussian:
+    q_params = density_nets.density_net.init(k_q)
+  else:
+    q_params = networks.q_network.init(k_q)
   ppo_params = {'policy': policy_params, 'value': value_params}
 
   # ---- optimizers -------------------------------------------------------
@@ -1074,7 +1104,16 @@ def run_ppo_training(
   gae_fn = make_gae_fn(config)
   ppo_update = make_ppo_update_fn(networks, config, ppo_optimizer)
 
-  crl_update = make_crl_update_fn(networks, q_optimizer)
+  if use_gaussian:
+    # Density update: maximise log p_θ(g | s) over (s, g) from replay.
+    crl_update = _gd.make_gaussian_density_update_fn(
+        density_nets, q_optimizer, obs_dim=int(config.obs_dim))
+    # Reward: r_t = log p_θ(g | s_t).  Signature: fn(density_params, obs)
+    gaussian_reward_fn = _gd.make_gaussian_reward_fn(
+        density_nets, obs_dim=int(config.obs_dim))
+  else:
+    crl_update = make_crl_update_fn(networks, q_optimizer)
+    gaussian_reward_fn = None
 
   @jax.jit
   def act_and_value(policy_p, value_p, obs, rng):
@@ -1206,7 +1245,11 @@ def run_ppo_training(
       roll_vals[t] = np.asarray(value_j)
 
       # reps-based reward, computed BEFORE env step (frozen q_params).
-      if use_dirac_target:
+      if use_gaussian:
+        # Gaussian: r_t = log p_θ(g | s_t, a_t).
+        rep_rew = gaussian_reward_fn(q_params, jnp.asarray(obs), action_j)
+        rep_rew_np = np.asarray(rep_rew)
+      elif use_dirac_target:
         rep_rew = reward_fn(
             q_params, jnp.asarray(obs), action_j, jnp.asarray(s0_states))
         rep_rew_np = np.asarray(rep_rew)
@@ -1387,11 +1430,21 @@ def run_ppo_training(
         'crl/logits_pos':         float('nan'),
         'crl/logits_neg':         float('nan'),
         'crl/logsumexp':          float('nan'),
+        # Gaussian density estimator metrics (only populated when repr_mode='gaussian').
+        'gaussian/density_loss':  float('nan'),
+        'gaussian/log_p_mean':    float('nan'),
+        'gaussian/mu_norm':       float('nan'),
+        'gaussian/std_mean':      float('nan'),
     }
     for k_, vs in ppo_metrics_agg.items():
       log[f'ppo/{k_}'] = float(np.mean(vs))
-    for k_, vs in crl_metrics_agg.items():
-      log[f'crl/{k_}'] = float(np.mean(vs))
+    if use_gaussian:
+      # gaussian density metrics use gaussian/ prefix in the log.
+      for k_, vs in crl_metrics_agg.items():
+        log[f'gaussian/{k_}'] = float(np.mean(vs))
+    else:
+      for k_, vs in crl_metrics_agg.items():
+        log[f'crl/{k_}'] = float(np.mean(vs))
     if config.ppo_anneal_lr:
       lr_log = float(lr_schedule(max(0, ppo_sgd_step - 1)))
     else:
