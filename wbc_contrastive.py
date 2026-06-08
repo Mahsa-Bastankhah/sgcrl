@@ -134,6 +134,11 @@ flags.DEFINE_float(
     'Coefficient for KL trust-region penalty: coef * mean(log π_new - log π_old).  '
     '0 = disabled.  Positive values penalise the policy drifting far from '
     'the rollout policy, preventing tanh-saturation collapse.')
+flags.DEFINE_float(
+    'wbc_loc_clip', 0.0,
+    'WBC only: clamp pre-tanh Gaussian loc (policy mean μ) to '
+    '[-wbc_loc_clip, wbc_loc_clip] during rollout and policy updates.  '
+    '0 = disabled.  e.g. 4.0 keeps tanh(loc) away from saturation rails.')
 
 # Misc
 flags.DEFINE_bool('uniform_sampling', False,
@@ -191,6 +196,7 @@ def main(_):
     config.uniform_sampling = bool(FLAGS.uniform_sampling)
     config.wbc_weight_offset = float(FLAGS.wbc_weight_offset)
     config.wbc_kl_coef = float(FLAGS.wbc_kl_coef)
+    config.wbc_loc_clip = float(FLAGS.wbc_loc_clip)
     if FLAGS.ppo_checkpoint_interval >= 0:
         config.ppo_checkpoint_interval = int(FLAGS.ppo_checkpoint_interval)
     if FLAGS.ppo_checkpoint_keep_last >= 0:
@@ -210,6 +216,7 @@ def main(_):
           f'anneal_lr={config.ppo_anneal_lr}  '
           f'wbc_weight_offset={config.wbc_weight_offset}  '
           f'wbc_kl_coef={config.wbc_kl_coef}  '
+          f'wbc_loc_clip={config.wbc_loc_clip}  '
           f'hidden_layers={config.hidden_layer_sizes}')
 
     # ---- Env factories -----------------------------------------------------

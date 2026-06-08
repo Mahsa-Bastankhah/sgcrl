@@ -96,7 +96,7 @@ STOCHASTIC=${STOCHASTIC:-0}                   # set to 1 to sample instead of mo
 # original 0-indexed mapping.
 SEED_OFFSET=${SEED_OFFSET:-3}
 SEED=$(( ${SLURM_ARRAY_TASK_ID:-0} + SEED_OFFSET ))
-RUN_DIR="logs/ppo_${ENV}_${SEED}"
+RUN_DIR="logs/${LOG_SUBDIR}/ppo_${ENV}_${SEED}"
 
 # Checkpoint selection:
 #   - If $CHECKPOINT is set explicitly (a single .pkl), render just that one.

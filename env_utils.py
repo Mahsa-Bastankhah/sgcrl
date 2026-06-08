@@ -11,9 +11,13 @@ import numpy as np
 _METAWORLD_IMPORT_ERROR = None
 try:
   import metaworld as _metaworld
-  _MW_BIN = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['bin-picking-v2']
-  _MW_BOX = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['box-close-v2']
-  _MW_PEG = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['peg-insert-side-v2']
+  _MW_BIN    = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['bin-picking-v2']
+  _MW_BOX    = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['box-close-v2']
+  _MW_PEG    = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['peg-insert-side-v2']
+  _MW_REACH  = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['reach-v2']
+  _MW_PUSH   = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['push-v2']
+  _MW_DRAWER = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['drawer-open-v2']
+  _MW_BUTTON = _metaworld.envs.mujoco.env_dict.ALL_V2_ENVIRONMENTS['button-press-v2']
 except Exception as _e:  # noqa: BLE001  ImportError, OR mujoco_py's env-var
   # checks, OR any other metaworld/mujoco_py load-time failure.  We
   # deliberately cast a wide net so that point-only workflows (e.g.
@@ -23,9 +27,13 @@ except Exception as _e:  # noqa: BLE001  ImportError, OR mujoco_py's env-var
   # `__init__` so users instantiating them get a clear message instead of
   # a downstream `super().reset()` AttributeError.
   _metaworld = None
-  _MW_BIN = object
-  _MW_BOX = object
-  _MW_PEG = object
+  _MW_BIN    = object
+  _MW_BOX    = object
+  _MW_PEG    = object
+  _MW_REACH  = object
+  _MW_PUSH   = object
+  _MW_DRAWER = object
+  _MW_BUTTON = object
   _METAWORLD_IMPORT_ERROR = _e
 
 
@@ -149,6 +157,34 @@ def load(env_name, fixed_start_end=None, seed=None):
     CLASS = SawyerPeg
     max_episode_steps = 150
     kwargs['fixed_start_end'] = fixed_start_end
+  elif env_name == 'sawyer_reach':
+    CLASS = SawyerReach
+    max_episode_steps = 150
+    kwargs['fixed_start_end'] = fixed_start_end
+    gym_env = CLASS(**kwargs)
+    obs_dim = 3  # hand_xyz only; goal_xyz appended separately
+    return gym_env, obs_dim, max_episode_steps
+  elif env_name == 'sawyer_push':
+    CLASS = SawyerPush
+    max_episode_steps = 150
+    kwargs['fixed_start_end'] = fixed_start_end
+    gym_env = CLASS(**kwargs)
+    obs_dim = 7  # hand_xyz(3) + gripper(1) + obj_xyz(3); goal is also 7-D
+    return gym_env, obs_dim, max_episode_steps
+  elif env_name == 'sawyer_drawer_open':
+    CLASS = SawyerDrawerOpen
+    max_episode_steps = 150
+    kwargs['fixed_start_end'] = fixed_start_end
+    gym_env = CLASS(**kwargs)
+    obs_dim = 7  # hand_xyz(3) + gripper(1) + handle_xyz(3); goal is also 7-D
+    return gym_env, obs_dim, max_episode_steps
+  elif env_name == 'sawyer_button_press':
+    CLASS = SawyerButtonPress
+    max_episode_steps = 150
+    kwargs['fixed_start_end'] = fixed_start_end
+    gym_env = CLASS(**kwargs)
+    obs_dim = 7  # hand_xyz(3) + gripper(1) + button_xyz(3); goal is also 7-D
+    return gym_env, obs_dim, max_episode_steps
   elif env_name.startswith('point_'):
     CLASS = point_env.PointEnv
     # point_SixteenRooms4D  →  walls='SixteenRooms', extra_dims=2
@@ -186,6 +222,54 @@ def load(env_name, fixed_start_end=None, seed=None):
         fixed_start_end=fixed_start_end)
     obs_dim = river_len
     max_episode_steps = horizon
+    return gym_env, obs_dim, max_episode_steps
+  elif env_name == 'flow_figureeight':
+    from flow_env import FlowFigureEightEnv
+    gym_env = FlowFigureEightEnv(fixed_start_end=fixed_start_end)
+    obs_dim = FlowFigureEightEnv.STATE_OBS_DIM  # 28: speeds + positions
+    max_episode_steps = gym_env._max_episode_steps       # = 1500
+    return gym_env, obs_dim, max_episode_steps
+  elif env_name == 'flow_figureeight_7rl':
+    from flow_env import FlowFigureEight7RL
+    gym_env = FlowFigureEight7RL(fixed_start_end=fixed_start_end)
+    obs_dim = FlowFigureEight7RL.STATE_OBS_DIM  # 28
+    max_episode_steps = gym_env._max_episode_steps       # = 1500
+    return gym_env, obs_dim, max_episode_steps
+  elif env_name == 'flow_figureeight_14rl':
+    from flow_env import FlowFigureEight14RL
+    gym_env = FlowFigureEight14RL(fixed_start_end=fixed_start_end)
+    obs_dim = FlowFigureEight14RL.STATE_OBS_DIM  # 28
+    max_episode_steps = gym_env._max_episode_steps       # = 1500
+    return gym_env, obs_dim, max_episode_steps
+  elif env_name == 'flow_figureeight_4v2rl':
+    from flow_env import FlowFigureEight4V2RL
+    gym_env = FlowFigureEight4V2RL(fixed_start_end=fixed_start_end)
+    obs_dim = FlowFigureEight4V2RL.STATE_OBS_DIM  # 8
+    max_episode_steps = gym_env._max_episode_steps
+    return gym_env, obs_dim, max_episode_steps
+  elif env_name == 'flow_figureeight_8v4rl':
+    from flow_env import FlowFigureEight8V4RL
+    gym_env = FlowFigureEight8V4RL(fixed_start_end=fixed_start_end)
+    obs_dim = FlowFigureEight8V4RL.STATE_OBS_DIM  # 16
+    max_episode_steps = gym_env._max_episode_steps
+    return gym_env, obs_dim, max_episode_steps
+  elif env_name == 'flow_figureeight_1v1rl':
+    from flow_env import FlowFigureEight1V1RL
+    gym_env = FlowFigureEight1V1RL(fixed_start_end=fixed_start_end)
+    obs_dim = FlowFigureEight1V1RL.STATE_OBS_DIM  # 2
+    max_episode_steps = gym_env._max_episode_steps       # = 1500
+    return gym_env, obs_dim, max_episode_steps
+  elif env_name == 'flow_figureeight_2v1rl':
+    from flow_env import FlowFigureEight2V1RL
+    gym_env = FlowFigureEight2V1RL(fixed_start_end=fixed_start_end)
+    obs_dim = FlowFigureEight2V1RL.STATE_OBS_DIM  # 4
+    max_episode_steps = gym_env._max_episode_steps       # = 1500
+    return gym_env, obs_dim, max_episode_steps
+  elif env_name == 'flow_figureeight_2v2rl':
+    from flow_env import FlowFigureEight2V2RL
+    gym_env = FlowFigureEight2V2RL(fixed_start_end=fixed_start_end)
+    obs_dim = FlowFigureEight2V2RL.STATE_OBS_DIM  # 4
+    max_episode_steps = gym_env._max_episode_steps       # = 1500
     return gym_env, obs_dim, max_episode_steps
   else:
     raise NotImplementedError('Unsupported environment: %s' % env_name)
@@ -400,6 +484,298 @@ class SawyerBox(_MW_BOX):
         low=np.full(2 * 11, -np.inf),
         high=np.full(2 * 11, np.inf),
         dtype=np.float32)
+
+class SawyerReach(_MW_REACH):
+  """Wrapper for reach-v2: move the end-effector to a 3-D goal position.
+
+  Observation layout (6-dim):
+    obs = [ hand_xyz (3)   <- state / φ input
+            goal_xyz (3) ] <- goal  / ψ input
+    obs_dim = 3, start_index = 0, end_index = -1 (defaults)
+
+  CRL negatives: obs_to_goal(future_state) = future hand_xyz (3-D),
+  which matches the 3-D goal slice perfectly.
+  """
+
+  # Goal space bounds from SawyerReachEnvV2: y ∈ [0.8, 0.9], z ∈ [0.05, 0.3].
+  UNIFORM_GOAL_OBS_LOW  = np.array([-0.1, 0.8, 0.05], dtype=np.float32)
+  UNIFORM_GOAL_OBS_HIGH = np.array([ 0.1, 0.9, 0.30], dtype=np.float32)
+
+  def uniform_goal_obs_bounds(self):
+    return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
+
+  def __init__(self, fixed_start_end=None):
+    _require_metaworld('sawyer_reach')
+    self._goal = np.zeros(3)
+    super(SawyerReach, self).__init__()
+    self._partially_observable = False
+    self._freeze_rand_vec = False
+    self._set_task_called = True
+    self._fixed_start_end = fixed_start_end
+    self.reset()
+
+  def reset(self):
+    super(SawyerReach, self).reset()
+    if self._fixed_start_end is not None:
+      self._goal = np.asarray(self._fixed_start_end, dtype=np.float32).ravel()
+    else:
+      self._goal = self._target_pos.copy().astype(np.float32)
+    self._target_pos = self._goal
+    return self._get_obs()
+
+  def step(self, action):
+    super(SawyerReach, self).step(action)
+    dist = np.linalg.norm(self.get_endeff_pos() - self._goal)
+    obs = self._get_obs()
+    r = float(dist <= 0.05)
+    return obs, r, False, {}
+
+  def _get_obs(self):
+    hand_pos = self.get_endeff_pos().astype(np.float32)
+    goal = np.asarray(self._goal, dtype=np.float32)
+    return np.concatenate([hand_pos, goal])
+
+  @property
+  def observation_space(self):
+    return gym.spaces.Box(
+        low=np.full(6, -np.inf, dtype=np.float32),
+        high=np.full(6,  np.inf, dtype=np.float32),
+        dtype=np.float32)
+
+
+class SawyerPush(_MW_PUSH):
+  """Wrapper for push-v2: slide a puck to a 3-D goal position.
+
+  Observation layout (14-dim):
+    obs = [ hand_xyz (3)  gripper (1)  obj_xyz (3)        <- state (7) / φ
+            ideal_hand_xyz (3)  gripper (1)  target_xyz (3) ] <- goal (7) / ψ
+
+    obs_dim = 7, start_index = 0, end_index = -1 (defaults).
+
+  The goal encodes the ideal end state: object at target, hand slightly
+  behind (−8 cm in y) and above (+3 cm in z) the target, gripper open.
+  ψ therefore sees a full 7-D "state-like" vector — identical layout to
+  what the state half carries — so the contrastive loss aligns φ(s,a) with
+  ψ(g) in the same space as all other sawyer_* envs.  Fixed goal is 3-D
+  (just the target object position); the 7-D goal vector is constructed
+  inside _get_obs.
+  """
+
+  # Goal bounds match goal_space in SawyerPushEnvV2.
+  UNIFORM_GOAL_OBS_LOW  = np.array(
+      [-0.1, 0.8, 0.01, 0.0, -0.1, 0.8, 0.01], dtype=np.float32)
+  UNIFORM_GOAL_OBS_HIGH = np.array(
+      [ 0.1, 0.9, 0.02, 0.4,  0.1, 0.9, 0.02], dtype=np.float32)
+
+  def uniform_goal_obs_bounds(self):
+    return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
+
+  def __init__(self, fixed_start_end=None):
+    _require_metaworld('sawyer_push')
+    self._goal = np.zeros(3)
+    super(SawyerPush, self).__init__()
+    self._partially_observable = False
+    self._freeze_rand_vec = False
+    self._set_task_called = True
+    self._fixed_start_end = fixed_start_end
+    self.reset()
+
+  def reset(self):
+    super(SawyerPush, self).reset()
+    if self._fixed_start_end is not None:
+      self._goal = np.asarray(self._fixed_start_end, dtype=np.float32).ravel()
+    else:
+      self._goal = self._target_pos.copy().astype(np.float32)
+    self._target_pos = self._goal
+    return self._get_obs()
+
+  def step(self, action):
+    super(SawyerPush, self).step(action)
+    dist = np.linalg.norm(self._get_pos_objects() - self._goal)
+    obs = self._get_obs()
+    r = float(dist <= 0.05)
+    return obs, r, False, {}
+
+  def _get_obs(self):
+    pos_hand = self.get_endeff_pos()
+    finger_right, finger_left = (
+        self._get_site_pos('rightEndEffector'),
+        self._get_site_pos('leftEndEffector'),
+    )
+    gripper_distance_apart = np.clip(
+        np.linalg.norm(finger_right - finger_left) / 0.1, 0., 1.)
+    obj_pos = self._get_pos_objects()
+    state = np.concatenate((pos_hand, [gripper_distance_apart], obj_pos))  # 7-D
+    # ideal end state: hand behind and above the target, gripper open, obj at target.
+    ideal_hand = self._goal + np.array([0.0, -0.08, 0.03], dtype=np.float32)
+    goal = np.concatenate([ideal_hand, [0.0], self._goal])                 # 7-D
+    return np.concatenate([state, goal]).astype(np.float32)
+
+  @property
+  def observation_space(self):
+    return gym.spaces.Box(
+        low=np.full(14, -np.inf, dtype=np.float32),
+        high=np.full(14,  np.inf, dtype=np.float32),
+        dtype=np.float32)
+
+
+class SawyerDrawerOpen(_MW_DRAWER):
+  """Wrapper for drawer-open-v2: pull the drawer handle to the open position.
+
+  Observation layout (14-dim):
+    obs = [ hand_xyz (3)  gripper (1)  handle_xyz (3)          <- state (7) / φ
+            ideal_hand_xyz (3)  gripper (1)  target_handle (3) ] <- goal (7) / ψ
+
+  obs_dim = 7, start_index = 0, end_index = -1 (defaults).
+
+  Goal-reaching formulation:
+    φ(s, a) represents the (hand, gripper, handle) state the agent transitions
+    through.  ψ(g) represents the desired terminal state — handle at the fully-
+    open target position, hand at the same location (grasping), gripper closed.
+    The contrastive loss aligns φ with ψ by using *future states* as positives:
+    obs_to_goal(future_obs) = future_obs[0:7] = future [hand, gripper, handle],
+    which is exactly the same layout as the goal half.  So ψ learns to embed
+    "where everything should end up", and the agent is rewarded whenever
+    φ(s, a) is close to ψ(goal) in representation space.
+  """
+
+  # Goal bounds: handle spans x∈[-0.2,0.2], target y∈[0.40,0.60] (open), z≈0.09.
+  # Goal obs = [hand(3), gripper(1), target_handle(3)] — same layout as state.
+  UNIFORM_GOAL_OBS_LOW  = np.array(
+      [-0.2, 0.40, 0.05, 0.0, -0.2, 0.40, 0.05], dtype=np.float32)
+  UNIFORM_GOAL_OBS_HIGH = np.array(
+      [ 0.2, 0.60, 0.20, 1.0,  0.2, 0.60, 0.20], dtype=np.float32)
+
+  def uniform_goal_obs_bounds(self):
+    return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
+
+  def __init__(self, fixed_start_end=None):
+    _require_metaworld('sawyer_drawer_open')
+    self._goal = np.zeros(3)
+    super(SawyerDrawerOpen, self).__init__()
+    self._partially_observable = False
+    self._freeze_rand_vec = False
+    self._set_task_called = True
+    self._fixed_start_end = fixed_start_end
+    self.reset()
+
+  def reset(self):
+    super(SawyerDrawerOpen, self).reset()
+    if self._fixed_start_end is not None:
+      self._goal = np.asarray(self._fixed_start_end, dtype=np.float32).ravel()
+    else:
+      self._goal = self._target_pos.copy().astype(np.float32)
+    self._target_pos = self._goal
+    return self._get_obs()
+
+  def step(self, action):
+    super(SawyerDrawerOpen, self).step(action)
+    dist = np.linalg.norm(self._get_pos_objects() - self._goal)
+    obs = self._get_obs()
+    r = float(dist <= 0.03)
+    return obs, r, False, {}
+
+  def _get_obs(self):
+    pos_hand = self.get_endeff_pos()
+    finger_right, finger_left = (
+        self._get_site_pos('rightEndEffector'),
+        self._get_site_pos('leftEndEffector'),
+    )
+    gripper = np.clip(
+        np.linalg.norm(finger_right - finger_left) / 0.1, 0., 1.)
+    handle_pos = self._get_pos_objects()
+    state = np.concatenate((pos_hand, [gripper], handle_pos))       # 7-D
+    # Ideal end state: hand at the open handle position (grasping), gripper
+    # closed (0.0), handle at target.
+    ideal_hand = self._goal.copy()
+    goal = np.concatenate([ideal_hand, [0.0], self._goal])          # 7-D
+    return np.concatenate([state, goal]).astype(np.float32)
+
+  @property
+  def observation_space(self):
+    return gym.spaces.Box(
+        low=np.full(14, -np.inf, dtype=np.float32),
+        high=np.full(14,  np.inf, dtype=np.float32),
+        dtype=np.float32)
+
+
+class SawyerButtonPress(_MW_BUTTON):
+  """Wrapper for button-press-v2: push the button to the depressed position.
+
+  Observation layout (14-dim):
+    obs = [ hand_xyz (3)  gripper (1)  button_xyz (3)           <- state (7) / φ
+            ideal_hand_xyz (3)  gripper (1)  target_button (3) ] <- goal (7) / ψ
+
+  obs_dim = 7, start_index = 0, end_index = -1 (defaults).
+
+  Goal-reaching formulation:
+    The button moves along the y-axis when pressed (MetaWorld convention).
+    φ(s, a) represents the current (hand, gripper, button) configuration.
+    ψ(g) represents the terminal state — button depressed to _target_pos,
+    hand directly above the button (pressing from above), gripper open.
+    obs_to_goal(future_obs) = future_obs[0:7] provides the same layout,
+    so future successful states naturally supply the positive training signal.
+  """
+
+  # Goal bounds: button spans x∈[-0.1,0.1], target y∈[0.74,0.80] (pressed), z≈0.115.
+  UNIFORM_GOAL_OBS_LOW  = np.array(
+      [-0.1, 0.74, 0.10, 0.0, -0.1, 0.74, 0.10], dtype=np.float32)
+  UNIFORM_GOAL_OBS_HIGH = np.array(
+      [ 0.1, 0.80, 0.25, 1.0,  0.1, 0.80, 0.12], dtype=np.float32)
+
+  def uniform_goal_obs_bounds(self):
+    return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
+
+  def __init__(self, fixed_start_end=None):
+    _require_metaworld('sawyer_button_press')
+    self._goal = np.zeros(3)
+    super(SawyerButtonPress, self).__init__()
+    self._partially_observable = False
+    self._freeze_rand_vec = False
+    self._set_task_called = True
+    self.random_init = False  # always spawn at default position so _goal is consistent
+    self._fixed_start_end = fixed_start_end
+    self.reset()
+
+  def reset(self):
+    super(SawyerButtonPress, self).reset()
+    if self._fixed_start_end is not None:
+      self._goal = np.asarray(self._fixed_start_end, dtype=np.float32).ravel()
+    else:
+      self._goal = self._target_pos.copy().astype(np.float32)
+    self._target_pos = self._goal
+    return self._get_obs()
+
+  def step(self, action):
+    super(SawyerButtonPress, self).step(action)
+    dist = abs(self._get_pos_objects()[1] - self._goal[1])
+    obs = self._get_obs()
+    r = float(dist <= 0.02)
+    return obs, r, False, {}
+
+  def _get_obs(self):
+    pos_hand = self.get_endeff_pos()
+    finger_right, finger_left = (
+        self._get_site_pos('rightEndEffector'),
+        self._get_site_pos('leftEndEffector'),
+    )
+    gripper = np.clip(
+        np.linalg.norm(finger_right - finger_left) / 0.1, 0., 1.)
+    button_pos = self._get_pos_objects()
+    state = np.concatenate((pos_hand, [gripper], button_pos))       # 7-D
+    # Ideal end state: hand coincident with the depressed button target so the
+    # agent is rewarded for driving the end-effector into the button.
+    ideal_hand = self._goal + np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    goal = np.concatenate([ideal_hand, [1.0], self._goal])          # 7-D
+    return np.concatenate([state, goal]).astype(np.float32)
+
+  @property
+  def observation_space(self):
+    return gym.spaces.Box(
+        low=np.full(14, -np.inf, dtype=np.float32),
+        high=np.full(14,  np.inf, dtype=np.float32),
+        dtype=np.float32)
+
 
 class SawyerPeg(_MW_PEG):
   """Wrapper for the SawyerPeg environment."""

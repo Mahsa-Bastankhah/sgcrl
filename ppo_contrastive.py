@@ -51,6 +51,8 @@ flags.DEFINE_integer('ppo_rollout_length', -1,
                      'If >=0, overrides the per-env rollout length default.')
 flags.DEFINE_integer('ppo_crl_steps_per_iter', -1,
                      'If >=0, overrides the per-env CRL-steps default.')
+flags.DEFINE_integer('ppo_num_envs', -1,
+                     'If >=0, overrides the number of parallel env rollouts.')
 flags.DEFINE_float(
     'discount', -1.0,
     'If >=0, overrides ContrastiveConfig.discount (CRL discount).')
@@ -145,11 +147,30 @@ fixed_goal_dict = {
     # must go along the top corridor, down the right gap, then along the bottom.
     'point_Wall11x11':  [np.array([0, 0], dtype=float),
                          np.array([10, 10], dtype=float)],
-    'sawyer_bin':  np.array([0.12, 0.7, 0.02]),
-    'sawyer_box':  np.array([0.0, 0.75, 0.133]),
-    'sawyer_peg':  np.array([-0.3, 0.6, 0.0]),
+    'sawyer_bin':   np.array([0.12, 0.7, 0.02]),
+    'sawyer_box':   np.array([0.0, 0.75, 0.133]),
+    'sawyer_peg':   np.array([-0.3, 0.6, 0.0]),
+    # Reach: fixed goal = centre of the goal cube (x=0, y=0.85, z=0.2).
+    'sawyer_reach': np.array([0.0, 0.85, 0.2]),
+    # Push: fixed goal = far edge of the table (z≈0.02 = table surface).
+    'sawyer_push':  np.array([0.0, 0.85, 0.02]),
+    # Drawer-open: fixed goal = handle at fully-open position (pulled ~16 cm
+    # toward the robot from its closed position).
+    'sawyer_drawer_open':  np.array([0.0, 0.54, 0.09]),
+    # Button-press: fixed goal = button depressed to the hole site (y≈0.78).
+    'sawyer_button_press': np.array([0, 0.8, 0.115]),
     # One-hot goal over river cells (length must match RIVERSWIM_LEN, default 6).
     'riverswim': np.array([0., 0., 0., 0., 0., 1.], dtype=float),
+    # Flow figureeight variants: goal = all N vehicles at target_velocity
+    # (20 m/s), normalized by the network max_speed (30 m/s).
+    'flow_figureeight':       np.full(14, 20.0 / 30.0, dtype=float),
+    'flow_figureeight_7rl':   np.full(14, 20.0 / 30.0, dtype=float),
+    'flow_figureeight_14rl':  np.full(14, 20.0 / 30.0, dtype=float),
+    'flow_figureeight_4v2rl': np.full(4,  20.0 / 30.0, dtype=float),
+    'flow_figureeight_8v4rl': np.full(8,  20.0 / 30.0, dtype=float),
+    'flow_figureeight_1v1rl': np.full(1,  20.0 / 30.0, dtype=float),
+    'flow_figureeight_2v1rl': np.full(2,  20.0 / 30.0, dtype=float),
+    'flow_figureeight_2v2rl': np.full(2,  20.0 / 30.0, dtype=float),
 }
 
 # ---------------------------------------------------------------------------
@@ -187,6 +208,46 @@ PPO_ENV_DEFAULTS = {
     'sawyer_bin':        dict(rollout_length=256, crl_steps_per_iter=128),
     'sawyer_box':        dict(rollout_length=256, crl_steps_per_iter=128),
     'sawyer_peg':        dict(rollout_length=256, crl_steps_per_iter=128),
+    # Reach: very short episodes (150 steps), tiny obs → fast.
+    'sawyer_reach':      dict(rollout_length=256, crl_steps_per_iter=128),
+    # Push: same budget as bin (same episode length, similar obs structure).
+    'sawyer_push':       dict(rollout_length=256, crl_steps_per_iter=128),
+    # Drawer-open: same episode length / obs structure as push.
+    'sawyer_drawer_open':  dict(rollout_length=256, crl_steps_per_iter=128),
+    # Button-press: same episode length / obs structure as push.
+    'sawyer_button_press': dict(rollout_length=256, crl_steps_per_iter=128),
+    # flow_figureeight: 1500-step episodes. T=1500 gives one complete episode
+    # per env per rollout (important for GAE accuracy on a long-horizon env).
+    # φ: state = speeds+positions; ψ: goal speeds only (end_index=14 on state).
+    'flow_figureeight':  dict(
+        rollout_length=1500, crl_steps_per_iter=750,
+        start_index=0, end_index=14),
+    # 7/14 RL variant: same horizon and indexing, wider action space (7-D).
+    'flow_figureeight_7rl':  dict(
+        rollout_length=1500, crl_steps_per_iter=750,
+        start_index=0, end_index=14),
+    # 14/14 RL variant: all vehicles RL-controlled, 14-D action space.
+    'flow_figureeight_14rl': dict(
+        rollout_length=1500, crl_steps_per_iter=750,
+        start_index=0, end_index=14),
+    'flow_figureeight_4v2rl': dict(
+        rollout_length=1500, crl_steps_per_iter=750,
+        start_index=0, end_index=4),
+    'flow_figureeight_8v4rl': dict(
+        rollout_length=1500, crl_steps_per_iter=750,
+        start_index=0, end_index=8),
+    # 1-vehicle sanity check: 2-D state, 1-D goal. ψ sees only the 1 goal speed.
+    'flow_figureeight_1v1rl': dict(
+        rollout_length=1500, crl_steps_per_iter=750,
+        start_index=0, end_index=1),
+    # 2-vehicle variants: 4-D state (speeds+positions), 2-D goal (target speeds).
+    # end_index=2 so ψ only sees the 2 goal speeds.
+    'flow_figureeight_2v1rl': dict(
+        rollout_length=1500, crl_steps_per_iter=750,
+        start_index=0, end_index=2),
+    'flow_figureeight_2v2rl': dict(
+        rollout_length=1500, crl_steps_per_iter=750,
+        start_index=0, end_index=2),
 }
 
 
@@ -238,11 +299,17 @@ def main(_):
   else:
     config.ppo_rollout_length = int(env_defaults['rollout_length'])
     config.ppo_crl_steps_per_iter = int(env_defaults['crl_steps_per_iter'])
+    if 'start_index' in env_defaults:
+      config.start_index = int(env_defaults['start_index'])
+    if 'end_index' in env_defaults:
+      config.end_index = int(env_defaults['end_index'])
 
   if FLAGS.ppo_rollout_length >= 0:
     config.ppo_rollout_length = int(FLAGS.ppo_rollout_length)
   if FLAGS.ppo_crl_steps_per_iter >= 0:
     config.ppo_crl_steps_per_iter = int(FLAGS.ppo_crl_steps_per_iter)
+  if FLAGS.ppo_num_envs >= 0:
+    config.ppo_num_envs = int(FLAGS.ppo_num_envs)
   if FLAGS.discount >= 0.0:
     config.discount = float(FLAGS.discount)
   if FLAGS.ppo_discount > 0.0:

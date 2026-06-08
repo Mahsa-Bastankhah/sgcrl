@@ -16,4 +16,6 @@ plots/
 videos/
 figure
 slurm/
+figs/
+.pip_cache/
 

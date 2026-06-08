@@ -31,6 +31,7 @@ ENV = 'sawyer_bin'
 RUNS = (
     ('default', 'ppo_sawyer_bin'),
     ('dirac_baseline', 'ppo_sawyer_bin_dirac_baseline'),
+    ('nouniform', 'ppo_sawyer_bin_nouniform'),
 )
 RUN_DIR_RE = re.compile(r'^ppo_sawyer_bin_(\d+)$')
 
@@ -116,6 +117,14 @@ def _render_one(repo: str, pkl_path: str, out_dir: str, seed: int) -> int:
   env.setdefault('JAX_PLATFORMS', 'cpu')
   env.setdefault('MUJOCO_GL', 'osmesa')
   env.setdefault('MUJOCO_PY_MUJOCO_PATH', os.path.expanduser('~/.mujoco/mujoco210'))
+  mujoco_bin = os.path.expanduser('~/.mujoco/mujoco210/bin')
+  extra_libs = [mujoco_bin, '/usr/lib/nvidia']
+  existing = env.get('LD_LIBRARY_PATH', '')
+  parts = [p for p in existing.split(':') if p]
+  for lib in extra_libs:
+    if lib not in parts:
+      parts.append(lib)
+  env['LD_LIBRARY_PATH'] = ':'.join(parts)
   print(f'[watch_sawyer] {" ".join(cmd)}', flush=True)
   return subprocess.call(cmd, cwd=repo, env=env)
 

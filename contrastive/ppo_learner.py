@@ -32,6 +32,7 @@ from acme.jax import networks as networks_lib
 
 from contrastive import config as contrastive_config
 from contrastive import networks as contrastive_networks
+from contrastive.utils import extract_info_reward
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +645,11 @@ def make_ppo_update_fn(
     old_approx_kl = jnp.mean(-logratio)
     clipfrac = jnp.mean((jnp.abs(ratio - 1.0) > clip_coef).astype(jnp.float32))
 
+    # Pre-tanh Gaussian loc (μ) and scale (σ) from the policy head.
+    normal = dist.distribution.distribution
+    policy_loc = normal.loc
+    policy_scale = normal.scale
+
     metrics = {
         'ppo_total_loss': total,
         'pg_loss': pg_loss,
@@ -654,6 +660,10 @@ def make_ppo_update_fn(
         'old_approx_kl': old_approx_kl,
         'clipfrac': clipfrac,
         'ratio_mean': jnp.mean(ratio),
+        'policy_loc_mean': jnp.mean(policy_loc),
+        'policy_loc_abs_mean': jnp.mean(jnp.abs(policy_loc)),
+        'policy_scale_mean': jnp.mean(policy_scale),
+        'policy_scale_min': jnp.min(policy_scale),
     }
     return total, metrics
 
@@ -777,7 +787,7 @@ class VecEnv:
   contrastive_utils.make_environment.  Exposes a CleanRL-like API:
 
       obs = vec_env.reset()                                    # (E, obs_dim_total)
-      next_obs, env_rew, dones, terminal_obs = vec_env.step(actions)
+      next_obs, env_rew, dones, terminal_obs, info_rew = vec_env.step(actions)
 
   Envs auto-reset on episode end (matching gymnasium semantics), so
   `next_obs[i]` is the fresh initial observation of the new episode when
@@ -808,6 +818,7 @@ class VecEnv:
     next_obs = np.zeros((self._num_envs,) + shape, dtype=np.float32)
     terminal_obs = np.zeros((self._num_envs,) + shape, dtype=np.float32)
     env_rewards = np.zeros(self._num_envs, dtype=np.float32)
+    info_rewards = np.full(self._num_envs, np.nan, dtype=np.float32)
     dones = np.zeros(self._num_envs, dtype=bool)
     for i, env in enumerate(self._envs):
       a = np.asarray(actions[i], dtype=np.float32)
@@ -816,6 +827,7 @@ class VecEnv:
         a = np.clip(a, self._action_spec.minimum, self._action_spec.maximum)
       ts = env.step(a.astype(action_dtype))
       env_rewards[i] = 0.0 if ts.reward is None else float(ts.reward)
+      info_rewards[i] = extract_info_reward(env)
       terminal_obs[i] = ts.observation
       if ts.last():
         dones[i] = True
@@ -823,7 +835,7 @@ class VecEnv:
         next_obs[i] = env.reset().observation
       else:
         next_obs[i] = ts.observation
-    return next_obs, env_rewards, dones, terminal_obs
+    return next_obs, env_rewards, dones, terminal_obs, info_rewards
 
   @property
   def num_envs(self) -> int:
@@ -1105,8 +1117,11 @@ def run_ppo_training(
   ep_obs: list = [[] for _ in range(E)]
   ep_act: list = [[] for _ in range(E)]
   ep_return = np.zeros(E, dtype=np.float32)
+  ep_flow_dense_return = np.zeros(E, dtype=np.float32)
+  ep_has_flow_dense = np.zeros(E, dtype=bool)
   ep_len = np.zeros(E, dtype=np.int32)
   recent_returns: list = []
+  recent_flow_dense_returns: list = []
   recent_lengths: list = []
 
   obs = vec_env.reset()
@@ -1141,6 +1156,7 @@ def run_ppo_training(
   roll_rew = np.zeros((T, E), dtype=np.float32)            # reps reward (possibly normalized)
   roll_rew_raw = np.zeros((T, E), dtype=np.float32)        # reps reward (pre-normalization, log only)
   roll_env_rew = np.zeros((T, E), dtype=np.float32)        # gt reward (log only)
+  roll_flow_dense_rew = np.full((T, E), np.nan, dtype=np.float32)
   roll_dones = np.zeros((T, E), dtype=np.float32)
   roll_vals = np.zeros((T, E), dtype=np.float32)
 
@@ -1204,8 +1220,9 @@ def run_ppo_training(
         rep_rew_np = np.asarray(rep_rew)
       roll_rew_raw[t] = rep_rew_np
 
-      next_obs, env_rew, dones, terminal_obs = vec_env.step(action)
+      next_obs, env_rew, dones, terminal_obs, info_rew = vec_env.step(action)
       roll_env_rew[t] = env_rew
+      roll_flow_dense_rew[t] = info_rew
 
       # Scale reps reward by the running std of discounted returns.
       # Applied AFTER the env step so `dones` is available to reset the
@@ -1219,6 +1236,9 @@ def run_ppo_training(
       for i in range(E):
         ep_act[i].append(action[i].copy())
         ep_return[i] += float(env_rew[i])
+        if not np.isnan(info_rew[i]):
+          ep_flow_dense_return[i] += float(info_rew[i])
+          ep_has_flow_dense[i] = True
         ep_len[i] += 1
         if dones[i]:
           ep_obs[i].append(terminal_obs[i].copy())
@@ -1232,12 +1252,18 @@ def run_ppo_training(
           s0_states[i] = next_obs[i, :int(config.obs_dim)].copy()
           ep_act[i] = []
           recent_returns.append(float(ep_return[i]))
+          if ep_has_flow_dense[i]:
+            recent_flow_dense_returns.append(float(ep_flow_dense_return[i]))
           recent_lengths.append(int(ep_len[i]))
           ep_return[i] = 0.0
+          ep_flow_dense_return[i] = 0.0
+          ep_has_flow_dense[i] = False
           ep_len[i] = 0
           if len(recent_returns) > 100:
             recent_returns.pop(0)
             recent_lengths.pop(0)
+          if len(recent_flow_dense_returns) > 100:
+            recent_flow_dense_returns.pop(0)
         else:
           ep_obs[i].append(next_obs[i].copy())
 
@@ -1340,6 +1366,7 @@ def run_ppo_training(
             float(reward_normalizer.std) if reward_normalizer is not None
             else float('nan')),
         'reward_env_mean':       float(roll_env_rew.mean()),
+        'reward_flow_dense_mean': float(np.nanmean(roll_flow_dense_rew)),
         'value_mean':        float(roll_vals.mean()),
         'returns_mean':      float(ret.mean()),
         'advantage_mean':    float(adv.mean()),
@@ -1351,6 +1378,9 @@ def run_ppo_training(
         # skips CRL for lack of replay data.
         'ep_return_mean':    float(np.mean(recent_returns)) if recent_returns else float('nan'),
         'ep_length_mean':    float(np.mean(recent_lengths)) if recent_lengths else float('nan'),
+        'ep_flow_dense_return_mean': (
+            float(np.mean(recent_flow_dense_returns))
+            if recent_flow_dense_returns else float('nan')),
         'crl/crl_loss':           float('nan'),
         'crl/categorical_accuracy': float('nan'),
         'crl/binary_accuracy':    float('nan'),
@@ -1376,9 +1406,10 @@ def run_ppo_training(
     # Uses the same observers the SAC side uses (`SuccessObserver` or
     # `RiverSwimGoalVisitSuccessObserver` + `DistanceObserver` from
     # contrastive/utils.py) so the eval CSV
-    # schema matches the kappa_sac runs:
+    # schema matches the kappa_sac runs, plus Flow dense-return stats:
     #   success, success_1000, init_dist, final_dist, delta_dist,
-    #   min_dist, *_10, *_100, *_1000, episode_return, episode_length
+    #   min_dist, *_10, *_100, *_1000, episode_return, episode_length,
+    #   flow_dense_return, flow_dense_reward_mean, ep_flow_dense_return_mean
     # =================================================================
     if iteration % 10 == 0:
       ep_metrics_list = []
@@ -1388,6 +1419,8 @@ def run_ppo_training(
         eval_success_obs.observe_first(env, ts)
         eval_dist_obs.observe_first(env, ts)
         ret_e, n_e = 0.0, 0
+        flow_dense_ret_e = 0.0
+        flow_dense_steps = 0
         while not ts.last():
           key, k_eval = jax.random.split(key)
           a, _, _ = act_and_value(
@@ -1400,8 +1433,15 @@ def run_ppo_training(
           eval_success_obs.observe(env, ts, action)
           eval_dist_obs.observe(env, ts, action)
           ret_e += float(ts.reward or 0.0)
+          dense_r = _cu.extract_info_reward(env)
+          if not np.isnan(dense_r):
+            flow_dense_ret_e += dense_r
+            flow_dense_steps += 1
           n_e += 1
         ep_metrics = {'episode_return': ret_e, 'episode_length': n_e}
+        ep_metrics.update(
+            _cu.flow_dense_eval_episode_metrics(
+                flow_dense_ret_e, flow_dense_steps))
         ep_metrics.update(eval_success_obs.get_metrics())
         ep_metrics.update(eval_dist_obs.get_metrics())
         ep_metrics_list.append(ep_metrics)
@@ -1409,12 +1449,7 @@ def run_ppo_training(
       # Average across the 5 eval episodes.  `success_1000` is already
       # a running statistic inside the success observer, so we just take its
       # last value (same as Acme's evaluator loop).
-      agg = {
-          'iteration':     iteration,
-          'learner_steps': iteration,
-      }
-      for k_ in ep_metrics_list[0].keys():
-        agg[k_] = float(np.nanmean([m[k_] for m in ep_metrics_list]))
+      agg = _cu.aggregate_eval_metrics(ep_metrics_list, iteration)
       eval_logger.write(agg)
 
     # =================================================================

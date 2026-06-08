@@ -185,7 +185,7 @@ class ContrastiveConfig:
   # At default settings (8 envs × 128 steps = 1024 env-steps/iter), 100
   # iterations ≈ 100k env steps — light enough not to bottleneck training.
   # Set to 0 or a negative number to disable.
-  ppo_checkpoint_interval: int = 100
+  ppo_checkpoint_interval: int = 200
   # How many milestone ckpt_iter_*.pkl files to keep (FIFO prune of oldest).
   # 0 = keep all milestones (no pruning).  `latest.pkl` is always overwritten.
   ppo_checkpoint_keep_last: int = 0

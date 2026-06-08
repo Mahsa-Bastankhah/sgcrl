@@ -19,6 +19,60 @@ import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 import os
 
+FLOW_DENSE_REWARD_KEY = 'flow_dense_reward'
+
+
+def extract_info_reward(env, key: str = FLOW_DENSE_REWARD_KEY) -> float:
+  """Read a scalar diagnostic from the last env step (via Acme ``get_info``)."""
+  get_info = getattr(env, 'get_info', None)
+  if get_info is None:
+    return float('nan')
+  info = get_info()
+  if not isinstance(info, dict) or key not in info:
+    return float('nan')
+  return float(info[key])
+
+
+def flow_dense_eval_episode_metrics(
+    episode_return: float, num_steps: int) -> Dict[str, float]:
+  """Per-episode Flow ``desired_velocity`` return for eval logging."""
+  if num_steps <= 0:
+    return {
+        'flow_dense_return': float('nan'),
+        'flow_dense_reward_mean': float('nan'),
+    }
+  ret = float(episode_return)
+  return {
+      'flow_dense_return': ret,
+      'flow_dense_reward_mean': ret / float(num_steps),
+  }
+
+
+def aggregate_eval_metrics(
+    ep_metrics_list: Sequence[Dict],
+    iteration: int) -> Dict[str, float]:
+  """Mean eval metrics across episodes; always includes dense-return stats."""
+  agg: Dict[str, float] = {
+      'iteration': float(iteration),
+      'learner_steps': float(iteration),
+  }
+  if not ep_metrics_list:
+    agg['ep_flow_dense_return_mean'] = float('nan')
+    return agg
+  all_keys = set()
+  for m in ep_metrics_list:
+    all_keys.update(m.keys())
+  for k_ in all_keys:
+    if k_ in ('iteration', 'learner_steps'):
+      continue
+    agg[k_] = float(np.nanmean(
+        [m.get(k_, float('nan')) for m in ep_metrics_list]))
+  dense_returns = [
+      m.get('flow_dense_return', float('nan')) for m in ep_metrics_list]
+  agg['ep_flow_dense_return_mean'] = float(np.nanmean(dense_returns))
+  return agg
+
+
 def obs_to_goal_1d(obs, start_index, end_index):
   assert len(obs.shape) == 1
   return obs_to_goal_2d(obs[None], start_index, end_index)[0]

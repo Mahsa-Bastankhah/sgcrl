@@ -29,6 +29,11 @@ from acme.jax import networks as networks_lib
 
 from contrastive import config as contrastive_config
 from contrastive import networks as contrastive_networks
+from distributional import TanhTransformedDistribution
+
+import tensorflow_probability
+tfp = tensorflow_probability.substrates.jax
+tfd = tfp.distributions
 
 # Reuse utilities that don't depend on the PPO objective.
 from contrastive.ppo_learner import (
@@ -40,6 +45,30 @@ from contrastive.ppo_learner import (
     load_checkpoint,
     make_crl_update_fn,
 )
+
+
+# ---------------------------------------------------------------------------
+# WBC-only policy distribution helpers (not used by PPO)
+# ---------------------------------------------------------------------------
+def _wbc_clamp_tanh_normal_loc(dist: tfd.Distribution,
+                               loc_clip: float) -> tfd.Distribution:
+  """Return dist with pre-tanh Normal loc clamped to [-loc_clip, loc_clip]."""
+  tanh_dist = dist.distribution
+  normal = tanh_dist.distribution
+  loc = jnp.clip(normal.loc, -loc_clip, loc_clip)
+  clamped_normal = tfd.Normal(loc=loc, scale=normal.scale)
+  clamped_tanh = TanhTransformedDistribution(
+      clamped_normal, threshold=tanh_dist._threshold)
+  return tfd.Independent(clamped_tanh, reinterpreted_batch_ndims=1)
+
+
+def _wbc_policy_dist(networks: contrastive_networks.ContrastiveNetworks,
+                     policy_params, obs, loc_clip: float):
+  """Policy forward; optionally clamp loc when loc_clip > 0 (WBC only)."""
+  dist = networks.policy_network.apply(policy_params, obs)
+  if loc_clip > 0.0:
+    dist = _wbc_clamp_tanh_normal_loc(dist, loc_clip)
+  return dist
 
 
 # ---------------------------------------------------------------------------
@@ -64,9 +93,11 @@ def make_wbc_update_fn(
     # KL trust-region: penalise KL(π_new || π_old) = mean(log π_new - log π_old)
     # which discourages the policy from drifting far from the rollout policy.
     kl_coef = float(getattr(config, 'wbc_kl_coef', 0.0))
+    # Clamp pre-tanh Gaussian loc to [-loc_clip, loc_clip] (0 = disabled).
+    loc_clip = float(getattr(config, 'wbc_loc_clip', 0.0))
 
     def wbc_loss(policy_params, batch, key):
-        dist = networks.policy_network.apply(policy_params, batch['obs'])
+        dist = _wbc_policy_dist(networks, policy_params, batch['obs'], loc_clip)
         log_pi = networks.log_prob(dist, batch['actions'])          # (B,)
 
         # Entropy bonus: MC estimate H ≈ -log π(ã|s)
@@ -204,6 +235,11 @@ def run_wbc_training(
     assert mb_size * int(config.ppo_num_minibatches) == batch_per_iter
     num_iterations = int(total_steps) // (T * E)
 
+    loc_clip_cfg = float(getattr(config, 'wbc_loc_clip', 0.0))
+    if loc_clip_cfg > 0.0:
+        print(f'[wbc] loc_clip={loc_clip_cfg} (pre-tanh Gaussian μ clamped to '
+              f'[-{loc_clip_cfg}, {loc_clip_cfg}] during WBC rollout/updates)')
+
     # ---- init params -------------------------------------------------------
     key = jax.random.PRNGKey(seed)
     k_pol, k_q, key = jax.random.split(key, 3)
@@ -263,15 +299,17 @@ def run_wbc_training(
     wbc_update = make_wbc_update_fn(networks, config, policy_optimizer)
     crl_update = make_crl_update_fn(networks, q_optimizer)
 
+    loc_clip = float(getattr(config, 'wbc_loc_clip', 0.0))
+
     @jax.jit
     def sample_action(policy_p, obs, rng):
-        dist = networks.policy_network.apply(policy_p, obs)
+        dist = _wbc_policy_dist(networks, policy_p, obs, loc_clip)
         action = networks.sample(dist, rng)
         return action
 
     @jax.jit
     def compute_log_prob(policy_p, obs, actions):
-        dist = networks.policy_network.apply(policy_p, obs)
+        dist = _wbc_policy_dist(networks, policy_p, obs, loc_clip)
         return networks.log_prob(dist, actions)
 
     # ---- uniform-goal bounds -----------------------------------------------
@@ -298,8 +336,11 @@ def run_wbc_training(
     ep_obs: list = [[] for _ in range(E)]
     ep_act: list = [[] for _ in range(E)]
     ep_return = np.zeros(E, dtype=np.float32)
+    ep_flow_dense_return = np.zeros(E, dtype=np.float32)
+    ep_has_flow_dense = np.zeros(E, dtype=bool)
     ep_len = np.zeros(E, dtype=np.int32)
     recent_returns: list = []
+    recent_flow_dense_returns: list = []
     recent_lengths: list = []
 
     obs = vec_env.reset()
@@ -329,6 +370,7 @@ def run_wbc_training(
     roll_obs = np.zeros((T, E) + obs_shape, dtype=np.float32)
     roll_acts = np.zeros((T, E) + act_shape, dtype=np.float32)
     roll_env_rew = np.zeros((T, E), dtype=np.float32)
+    roll_flow_dense_rew = np.full((T, E), np.nan, dtype=np.float32)
     roll_dones = np.zeros((T, E), dtype=np.float32)
     # Weights computed after rollout; stored flat for minibatch indexing.
     roll_weights = np.zeros((T, E), dtype=np.float32)
@@ -364,12 +406,16 @@ def run_wbc_training(
             roll_log_pi_old[t] = np.asarray(compute_log_prob(
                 policy_params, jnp.asarray(obs), action_j))
 
-            next_obs, env_rew, dones, terminal_obs = vec_env.step(action)
+            next_obs, env_rew, dones, terminal_obs, info_rew = vec_env.step(action)
             roll_env_rew[t] = env_rew
+            roll_flow_dense_rew[t] = info_rew
 
             for i in range(E):
                 ep_act[i].append(action[i].copy())
                 ep_return[i] += float(env_rew[i])
+                if not np.isnan(info_rew[i]):
+                    ep_flow_dense_return[i] += float(info_rew[i])
+                    ep_has_flow_dense[i] = True
                 ep_len[i] += 1
                 if dones[i]:
                     ep_obs[i].append(terminal_obs[i].copy())
@@ -382,12 +428,19 @@ def run_wbc_training(
                     ep_obs[i] = [next_obs[i].copy()]
                     ep_act[i] = []
                     recent_returns.append(float(ep_return[i]))
+                    if ep_has_flow_dense[i]:
+                        recent_flow_dense_returns.append(
+                            float(ep_flow_dense_return[i]))
                     recent_lengths.append(int(ep_len[i]))
                     ep_return[i] = 0.0
+                    ep_flow_dense_return[i] = 0.0
+                    ep_has_flow_dense[i] = False
                     ep_len[i] = 0
                     if len(recent_returns) > 100:
                         recent_returns.pop(0)
                         recent_lengths.pop(0)
+                    if len(recent_flow_dense_returns) > 100:
+                        recent_flow_dense_returns.pop(0)
                 else:
                     ep_obs[i].append(next_obs[i].copy())
 
@@ -469,10 +522,14 @@ def run_wbc_training(
             'weight_raw_mean':        float(flat_weights.mean()),
             'weight_raw_std':         float(flat_weights.std()),
             'reward_env_mean':        float(roll_env_rew.mean()),
+            'reward_flow_dense_mean': float(np.nanmean(roll_flow_dense_rew)),
             'ep_return_mean':  (float(np.mean(recent_returns))
                                 if recent_returns else float('nan')),
             'ep_length_mean':  (float(np.mean(recent_lengths))
                                 if recent_lengths else float('nan')),
+            'ep_flow_dense_return_mean': (
+                float(np.mean(recent_flow_dense_returns))
+                if recent_flow_dense_returns else float('nan')),
             'wbc/learning_rate':      lr_log,
             'crl/crl_loss':           float('nan'),
             'crl/categorical_accuracy': float('nan'),
@@ -499,6 +556,8 @@ def run_wbc_training(
                 eval_success_obs.observe_first(env, ts)
                 eval_dist_obs.observe_first(env, ts)
                 ret_e, n_e = 0.0, 0
+                flow_dense_ret_e = 0.0
+                flow_dense_steps = 0
                 while not ts.last():
                     key, k_eval = jax.random.split(key)
                     a_j = sample_action(
@@ -512,16 +571,20 @@ def run_wbc_training(
                     eval_success_obs.observe(env, ts, action)
                     eval_dist_obs.observe(env, ts, action)
                     ret_e += float(ts.reward or 0.0)
+                    dense_r = _cu.extract_info_reward(env)
+                    if not np.isnan(dense_r):
+                        flow_dense_ret_e += dense_r
+                        flow_dense_steps += 1
                     n_e += 1
                 ep_m = {'episode_return': ret_e, 'episode_length': n_e}
+                ep_m.update(
+                    _cu.flow_dense_eval_episode_metrics(
+                        flow_dense_ret_e, flow_dense_steps))
                 ep_m.update(eval_success_obs.get_metrics())
                 ep_m.update(eval_dist_obs.get_metrics())
                 ep_metrics_list.append(ep_m)
 
-            agg = {'iteration': iteration, 'learner_steps': iteration}
-            for k_ in ep_metrics_list[0].keys():
-                agg[k_] = float(
-                    np.nanmean([m[k_] for m in ep_metrics_list]))
+            agg = _cu.aggregate_eval_metrics(ep_metrics_list, iteration)
             eval_logger.write(agg)
 
         # =================================================================

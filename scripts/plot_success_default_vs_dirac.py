@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compare eval success: preimage matching (default) vs dirac target (baseline).
 
-Reads ``logs/<log_root>/ppo_point_<Env>_<seed>/logs/eval/logs.csv`` for seeds
-123–128 and plots mean ± SE across seeds (shaded band).
+Reads ``logs/<log_root>/<prefix>_point_<Env>_<seed>/logs/eval/logs.csv`` for
+seeds 123–128 (override with ``--seeds``) and plots mean ± SE across seeds
+(shaded band).  Run prefix is ``ppo`` or ``wbc`` (auto from log folder name).
 
 Outputs PNGs under ``--output_dir`` (``success_*`` and ``success_1000_*``).
 
@@ -51,10 +52,15 @@ CONDITIONS = {
         ('KDE dirac', 'ppo_sixteenrooms4d_1d_kde_dirac'),
     ],
     'SixteenRoomsActual4D': [
-        ('preimage matching (default)', 'ppo_sixteenroomsactual4d'),
-        ('KDE dirac', 'ppo_sixteenroomsactual4d_kde_dirac'),
+        ('PPO nouniform', 'ppo_sixteenroomsactual4d_nouniform'),
+        ('WBC nouniform locclip', 'wbc_sixteenroomsactual4d_nouniform_locclip'),
     ],
 }
+
+
+def _run_prefix(log_root: str) -> str:
+  base = log_root.strip('/').split('/')[-1]
+  return 'wbc' if base.startswith('wbc_') else 'ppo'
 
 
 def _read_eval_series(path: str, metric: str) -> Dict[int, float]:
@@ -110,11 +116,13 @@ def _load_condition(
     env: str,
     seeds: List[int],
     metric: str,
+    run_prefix: str | None = None,
 ) -> List[Dict[int, float]]:
+  prefix = run_prefix or _run_prefix(log_root)
   series = []
   for seed in seeds:
     path = os.path.join(
-        log_root, f'ppo_point_{env}_{seed}', 'logs', 'eval', 'logs.csv')
+        log_root, f'{prefix}_point_{env}_{seed}', 'logs', 'eval', 'logs.csv')
     if not os.path.isfile(path):
       print(f'[warn] missing {path}')
       continue
@@ -138,7 +146,7 @@ def _plot_env(
   colors = [_palette[i % len(_palette)] for i in range(len(conditions))]
 
   for (label, log_root), color in zip(conditions, colors):
-    print(f'[{env}] {label} <- logs/{log_root}')
+    print(f'[{env}] {label} <- logs/{log_root} ({_run_prefix(log_root)})')
     series_list = _load_condition(
         os.path.join('logs', log_root), env, seeds, metric)
     if not series_list:
