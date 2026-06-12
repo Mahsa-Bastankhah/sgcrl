@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=4:00:00
+#SBATCH --time=5:00:00
 #SBATCH --account=seas
 #SBATCH --array=0-2
 
@@ -55,7 +55,7 @@ export PYTHONUNBUFFERED=1
 export TMPDIR=/n/fs/mislresearch/mb6458-tmp
 
 ENV=sawyer_reach
-NUM_STEPS=${NUM_STEPS:-2000000}
+NUM_STEPS=${NUM_STEPS:-9000000}
 SEED_OFFSET=${SEED_OFFSET:-0}
 SEED=$(( SEED_OFFSET + ${SLURM_ARRAY_TASK_ID:-0} ))
 
@@ -87,4 +87,8 @@ python -u ppo_contrastive.py \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
-  --hidden_layer_sizes="256,256,256,256,256,256"
+  --hidden_layer_sizes="256,256,256,256,256,256" \
+  --ppo_skip_first_eval=true
+PY_EXIT=$?
+pkill -P $$ 2>/dev/null || true
+exit $PY_EXIT

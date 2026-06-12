@@ -92,4 +92,7 @@ python -u ppo_contrastive.py \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
   --uniform_sampling=True \
   --hidden_layer_sizes="256,256,256,256,256,256" \
+PY_EXIT=$?
+pkill -P $$ 2>/dev/null || true
+exit $PY_EXIT
   "${REWARD_MODE_ARGS[@]}"

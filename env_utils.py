@@ -137,13 +137,15 @@ def euler2quat(euler):
   return quat
 
 
-def load(env_name, fixed_start_end=None, seed=None):
+def load(env_name, fixed_start_end=None, seed=None, **env_kwargs):
   """Loads the train and eval environments, as well as the obs_dim.
 
   Args:
     env_name: Registered environment id.
     fixed_start_end: Env-specific fixed goal / start–goal (see each env).
     seed: Optional RNG seed (used by ``riverswim``; others may ignore it).
+    **env_kwargs: Extra kwargs forwarded to env constructors (e.g.
+      ``nf_closed_gripper_init`` for SawyerPush).
   """
   # pylint: disable=invalid-name
   kwargs = {}
@@ -170,6 +172,8 @@ def load(env_name, fixed_start_end=None, seed=None):
     CLASS = SawyerPush
     max_episode_steps = 150
     kwargs['fixed_start_end'] = fixed_start_end
+    if 'nf_closed_gripper_init' in env_kwargs:
+      kwargs['nf_closed_gripper_init'] = env_kwargs['nf_closed_gripper_init']
     gym_env = CLASS(**kwargs)
     obs_dim = 7  # hand_xyz(3) + gripper(1) + obj_xyz(3); goal is also 7-D
     return gym_env, obs_dim, max_episode_steps
@@ -354,17 +358,32 @@ class SawyerBin(_MW_BIN):
     pos1 = self.sim.data.body_xpos[body_id].copy()
     pos1 += np.random.uniform(-0.05, 0.05, 3)
     pos2 = self._get_pos_objects().copy()
-    
+
     if self._fixed_start_end is not None:
-        # Set the goal to be a fixed location
-        self._goal = self._fixed_start_end 
+        self._goal = self._fixed_start_end
     else:
         t = np.random.random()
-        # Set the goal to be a uniformly sampled location
-        # between the starting and end point
         self._goal = t * pos1 + (1 - t) * pos2
         self._goal[2] = np.random.uniform(0.03, 0.12)
     self._target_pos = self._goal
+
+    # ── Move gripper to be just above / touching the object at episode start ──
+    # The agent begins with its fingers around the cube (open, ready to grasp)
+    # rather than at the default arm-retracted position.
+    obj_pos     = self._get_pos_objects().copy()
+    grip_target = obj_pos + np.array([0., 0., 0.03], dtype=np.float64)
+    mocap_pos   = grip_target.copy()
+    mocap_quat  = np.array([1., 0., 1., 0.], dtype=np.float64)
+    for _ in range(50):
+        mocap_pos += grip_target - self.get_endeff_pos()
+        self.data.set_mocap_pos('mocap', mocap_pos)
+        self.data.set_mocap_quat('mocap', mocap_quat)
+        self.do_simulation([-1, 1], self.frame_skip)   # gripper open
+    self.sim.forward()
+    # Re-lock object position in case physics nudged it during arm movement.
+    self._set_obj_xyz(obj_pos)
+    self.sim.forward()
+
     return self._get_obs()
 
   def step(self, action):
@@ -378,6 +397,10 @@ class SawyerBin(_MW_BIN):
         
     return obs, r, done, info
 
+  def _ideal_grasp_hand(self) -> np.ndarray:
+    """TCP pose for ψ goal: directly above the cube in the target bin."""
+    return self._goal + np.array([0.0, 0.0, 0.03], dtype=np.float32)
+
   def _get_obs(self):
     pos_hand = self.get_endeff_pos()
     finger_right, finger_left = (
@@ -388,11 +411,11 @@ class SawyerBin(_MW_BIN):
     gripper_distance_apart = np.clip(gripper_distance_apart / 0.1, 0., 1.)
     obs = np.concatenate((pos_hand, [gripper_distance_apart],
                           self._get_pos_objects()))
-    # ψ goal: gripper closed around the object in the target bin.
-    # hand 3 cm above cube center (matches expert grasp offset),
-    # gripper 0.0 = fully closed (holding the cube).
-    goal = np.concatenate([self._goal + np.array([0.0, 0.0, 0.03]),
-                           [0.0], self._goal])
+    # ψ goal: cube in target bin, gripper closed and holding it.
+    #   hand  = cube centre + 3 cm (grasp TCP above object)
+    #   gripper = 0.0 (fully closed)
+    #   object  = _goal (cube in target bin)
+    goal = np.concatenate([self._ideal_grasp_hand(), [0.0], self._goal])
 
     return np.concatenate([obs, goal]).astype(np.float32)
 
@@ -511,8 +534,16 @@ class SawyerReach(_MW_REACH):
   UNIFORM_GOAL_OBS_LOW  = np.array([-0.1, 0.8, 0.05], dtype=np.float32)
   UNIFORM_GOAL_OBS_HIGH = np.array([ 0.1, 0.9, 0.30], dtype=np.float32)
 
+  # For reach the goal IS the effector position, which is also the state;
+  # effector can start anywhere in the workspace before the goal is reached.
+  NF_GOAL_NORM_LOW  = np.array([-0.1, 0.8, 0.05], dtype=np.float32)
+  NF_GOAL_NORM_HIGH = np.array([ 0.1, 0.9, 0.30], dtype=np.float32)
+
   def uniform_goal_obs_bounds(self):
     return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
+
+  def nf_goal_norm_bounds(self):
+    return self.NF_GOAL_NORM_LOW.copy(), self.NF_GOAL_NORM_HIGH.copy()
 
   def __init__(self, fixed_start_end=None):
     _require_metaworld('sawyer_reach')
@@ -583,12 +614,25 @@ class SawyerPush(_MW_PUSH):
   UNIFORM_GOAL_OBS_HIGH = np.array(
       [ 0.1, 0.9, 0.02, 0.4,  0.1, 0.9, 0.02], dtype=np.float32)
 
+  # NF normalisation bounds: cover the FULL workspace so that hindsight goals
+  # (where obj starts at y≈0.60–0.70) are within [-1, 1] after normalisation.
+  # Layout: [hand_x, hand_y, hand_z, gripper, obj_x, obj_y, obj_z]
+  #   hand = obj_goal + [0, -0.08, 0.03]  →  hand_y range offset by -0.08
+  NF_GOAL_NORM_LOW  = np.array(
+      [-0.15, 0.47, 0.00, 0.0, -0.15, 0.55, 0.01], dtype=np.float32)
+  NF_GOAL_NORM_HIGH = np.array(
+      [ 0.15, 0.87, 0.30, 0.4,  0.15, 0.95, 0.03], dtype=np.float32)
+
   def uniform_goal_obs_bounds(self):
     return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
 
-  def __init__(self, fixed_start_end=None):
+  def nf_goal_norm_bounds(self):
+    return self.NF_GOAL_NORM_LOW.copy(), self.NF_GOAL_NORM_HIGH.copy()
+
+  def __init__(self, fixed_start_end=None, nf_closed_gripper_init=False):
     _require_metaworld('sawyer_push')
     self._goal = np.zeros(3)
+    self._nf_closed_gripper_init = bool(nf_closed_gripper_init)
     super(SawyerPush, self).__init__()
     self._partially_observable = False
     self._freeze_rand_vec = False
@@ -598,6 +642,16 @@ class SawyerPush(_MW_PUSH):
       self.random_init = False
     self.reset()
 
+  def _close_gripper_at_reset(self) -> None:
+    """Hold hand position and close fingers (NF push init only)."""
+    mocap_quat = np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float64)
+    for _ in range(40):
+      mocap_pos = self.tcp_center.copy()
+      self.data.set_mocap_pos('mocap', mocap_pos)
+      self.data.set_mocap_quat('mocap', mocap_quat)
+      self.do_simulation([1.0, -1.0], self.frame_skip)
+    self.sim.forward()
+
   def reset(self):
     super(SawyerPush, self).reset()
     if self._fixed_start_end is not None:
@@ -605,6 +659,8 @@ class SawyerPush(_MW_PUSH):
     else:
       self._goal = self._target_pos.copy().astype(np.float32)
     self._target_pos = self._goal
+    if self._nf_closed_gripper_init:
+      self._close_gripper_at_reset()
     return self._get_obs()
 
   def step(self, action):

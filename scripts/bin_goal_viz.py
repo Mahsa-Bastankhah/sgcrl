@@ -38,6 +38,27 @@ def _place_gripper(env, target_pos: np.ndarray,
   env.sim.forward()
 
 
+def _grasp_object_at(env, obj_pos: np.ndarray) -> None:
+  """Place cube at ``obj_pos`` and close gripper around it (goal pose)."""
+  obj_pos = np.asarray(obj_pos, dtype=np.float64)
+  grip_pos = obj_pos + np.array([0.0, 0.0, 0.03])   # matches ψ hand offset
+
+  _place_object(env, obj_pos)
+  _place_gripper(env, grip_pos, grip=-1.0, steps=160)
+  _place_gripper(env, grip_pos, grip=1.0, steps=320)
+
+  mocap_quat = np.array([1.0, 0.0, 1.0, 0.0])
+  mocap_pos = grip_pos.copy()
+  for _ in range(240):
+    hand = env.get_endeff_pos()
+    mocap_pos += grip_pos - hand
+    env.data.set_mocap_pos('mocap', mocap_pos)
+    env.data.set_mocap_quat('mocap', mocap_quat)
+    env.do_simulation([1.0, -1.0], env.frame_skip)
+  env.sim.forward()
+  _place_object(env, obj_pos)
+
+
 def _render(env, camera: str, width: int, height: int) -> np.ndarray:
   return np.asarray(
       env.render(offscreen=True, camera_name=camera, resolution=(width, height)),
@@ -55,6 +76,7 @@ def main():
   env, _, _ = env_utils.load('sawyer_bin', fixed_goal, seed=0)
 
   # ── INIT state ────────────────────────────────────────────────────────────
+  # reset() now places the gripper touching the object automatically.
   obs_init     = env.reset()
   hand_init    = obs_init[0:3]
   obj_init     = obs_init[4:7]
@@ -64,17 +86,11 @@ def main():
   init_frames = [_render(env, c, args.width, args.height) for c in cam_list]
 
   # ── GOAL state ────────────────────────────────────────────────────────────
-  # Object init pos is ~[-0.12, 0.7, 0.02]; target bin is [0.12, 0.7, 0.02].
-  # Expert grips at cube + [0, 0, 0.03].  We close the gripper (ctrl +1).
+  # ψ goal: cube in target bin, gripper closed and holding it.
   env.reset()
-  goal_pos    = env._goal.copy()              # [0.12, 0.7, 0.02]
-  # hand grips the cube: TCP at cube center + 3cm above
-  grip_pos    = goal_pos + np.array([0.0, 0.0, 0.03])
-
-  _place_object(env, goal_pos)
-  _place_gripper(env, grip_pos, grip=1.0)     # grip=+1 → close fingers
-  # Re-lock object in case physics moved it slightly
-  _place_object(env, goal_pos)
+  goal_pos = env._goal.copy()              # [0.12, 0.7, 0.02]
+  grip_pos = env._ideal_grasp_hand()
+  _grasp_object_at(env, goal_pos)
 
   obs_goal     = env._get_obs()
   hand_goal    = obs_goal[0:3]
@@ -89,19 +105,21 @@ def main():
 
   fig, axes = plt.subplots(2, 3, figsize=(18, 10))
   fig.suptitle(
-      'SawyerBin — TOP: init state   BOTTOM: ψ goal state\n'
-      'ψ goal: object in target bin, gripper closed (holding)',
+      'SawyerBin — TOP: init (gripper open, touching object)   BOTTOM: ψ goal\n'
+      'ψ goal: object in target bin, gripper closed holding cube',
       fontsize=12, fontweight='bold')
 
   init_label = [
       f'hand:    [{hand_init[0]:.3f}  {hand_init[1]:.3f}  {hand_init[2]:.3f}]',
       f'object:  [{obj_init[0]:.3f}  {obj_init[1]:.3f}  {obj_init[2]:.3f}]  LEFT bin',
-      f'gripper: {gripper_init:.2f}  (open=1)',
+      f'gripper: {gripper_init:.2f}  (open≈1)',
+      f'hand-obj dist: {np.linalg.norm(hand_init - obj_init):.3f} m',
   ]
   goal_label = [
       f'hand:    [{hand_goal[0]:.3f}  {hand_goal[1]:.3f}  {hand_goal[2]:.3f}]',
       f'object:  [{obj_goal[0]:.3f}  {obj_goal[1]:.3f}  {obj_goal[2]:.3f}]  RIGHT bin',
       f'gripper: {gripper_goal:.2f}  (closed≈0)',
+      f'hand-obj dist: {np.linalg.norm(hand_goal - obj_goal):.3f} m',
   ]
 
   for col, (cam, init_img, goal_img) in enumerate(

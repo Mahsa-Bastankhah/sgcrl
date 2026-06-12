@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_gauss_8rooms
-#SBATCH --output=slurm/ppo_gaussian_eightrooms_%A_%a.out
+#SBATCH --job-name=ppo_nf_drawer
+#SBATCH --output=slurm/ppo_nf_sawyer_drawer_open_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=8G
+#SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --account=seas
 #SBATCH --array=0-2
 
@@ -42,34 +42,41 @@ if [ "$CUDA_LOADED" != 1 ]; then
 fi
 
 cd /n/fs/mislresearch/sgcrl
-source .venv/bin/activate
+source /n/fs/mislresearch/miniconda3/etc/profile.d/conda.sh
+conda activate sgcrl_flow
 
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/n/fs/mislresearch/miniconda3/envs/sgcrl_flow/lib:${LD_LIBRARY_PATH}
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${HOME}/.mujoco/mujoco210/bin
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
-
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.8
-export PYTHONUNBUFFERED=1
-export MUJOCO_GL=osmesa
 export MUJOCO_PY_MUJOCO_PATH=${HOME}/.mujoco/mujoco210
+export MUJOCO_GL=osmesa
+export PYTHONUNBUFFERED=1
+export TMPDIR=/n/fs/mislresearch/mb6458-tmp
 
-ENV="point_EightRooms"
-NUM_STEPS="${NUM_STEPS:-10000000}"
-SEED_OFFSET="${SEED_OFFSET:-0}"
+ENV=sawyer_drawer_open
+NUM_STEPS=${NUM_STEPS:-10000000}
+SEED_OFFSET=${SEED_OFFSET:-0}
 SEED=$(( SEED_OFFSET + ${SLURM_ARRAY_TASK_ID:-0} ))
-LOG_DIR="${LOG_DIR:-logs/ppo_gaussian_eightrooms/}"
 
-CRL_STEPS=128
+LOG_DIR="${LOG_DIR:-logs/ppo_nf_drawer_gradclip/}"
+PPO_NUM_ENVS=${PPO_NUM_ENVS:-4}
+CRL_STEPS=${CRL_STEPS:-128}
 ENT_COEF=0.05
 MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
+NF_REP_SIZE=64
+NF_NUM_BLOCKS=8
+NF_GRAD_CLIP=1.0
+
+mkdir -p slurm
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV}  seed=${SEED}  log_dir=${LOG_DIR}  repr_mode=gaussian"
-nvidia-smi
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=nf"
+echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS} density_steps=${CRL_STEPS}"
+echo "nf_rep_size=${NF_REP_SIZE} nf_num_blocks=${NF_NUM_BLOCKS} nf_grad_clip=${NF_GRAD_CLIP}"
+nvidia-smi || true
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
 
 python -u ppo_contrastive.py \
@@ -77,10 +84,17 @@ python -u ppo_contrastive.py \
   --seed="${SEED}" \
   --num_steps="${NUM_STEPS}" \
   --log_dir_path="${LOG_DIR}" \
-  --ppo_repr_mode="gaussian" \
+  --ppo_repr_mode="nf" \
+  --nf_rep_size="${NF_REP_SIZE}" \
+  --nf_num_blocks="${NF_NUM_BLOCKS}" \
+  --ppo_num_envs="${PPO_NUM_ENVS}" \
   --ppo_crl_steps_per_iter="${CRL_STEPS}" \
   --ppo_ent_coef="${ENT_COEF}" \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
+  --nf_grad_clip="${NF_GRAD_CLIP}" \
   --hidden_layer_sizes="256,256,256,256,256,256"
+PY_EXIT=$?
+pkill -P $$ 2>/dev/null || true
+exit $PY_EXIT

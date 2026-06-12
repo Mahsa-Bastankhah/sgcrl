@@ -89,3 +89,6 @@ python -u ppo_contrastive.py \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
   --hidden_layer_sizes="256,256,256,256,256,256"
+PY_EXIT=$?
+pkill -P $$ 2>/dev/null || true
+exit $PY_EXIT

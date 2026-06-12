@@ -179,6 +179,13 @@ class ContrastiveConfig:
   ppo_actor_min_std: float = 0.01
   # CRL updates per PPO iteration (InfoNCE on φ, ψ over replay).
   ppo_crl_steps_per_iter: int = 64
+  # InfoNCE direction for PPO-CRL. 'forward': fix anchor sᵢ, vary goal gⱼ
+  # (standard). 'backward': fix goal gᵢ, vary anchor sⱼ (logits transposed).
+  ppo_crl_loss_direction: str = 'forward'  # 'forward' | 'backward'
+  # EMA decay τ for φ, ψ used in the PPO reward r = φ·ψ (CRL mode only).
+  # Reward uses EMA params: ema ← τ·ema + (1−τ)·online after each CRL step.
+  # τ=0 uses online params directly (no EMA).  Higher τ = slower / smoother reward.
+  ppo_crl_repr_tau: float = 0.0
   # Minimum replay size before CRL updates start.
   ppo_min_replay_size: int = 10_000
   # Checkpointing: save policy/value/CRL params every N PPO iterations.
@@ -203,7 +210,25 @@ class ContrastiveConfig:
   # Density estimator used for the PPO shaped reward.
   #   'crl'      (default) — φ(s,a)·ψ(g) contrastive representations.
   #   'gaussian' — diagonal Gaussian  p_θ(g|s); reward = log p_θ(g|s_t).
+  #   'nf'       — conditional RealNVP  log p_NF(g|s,a); reward = log p_NF.
   ppo_repr_mode: str = 'crl'
+  # NF-specific options (only used when ppo_repr_mode == 'nf').
+  nf_rep_size: int = 256       # SA encoder output dim (conditioning vector)
+  nf_num_blocks: int = 12      # number of affine coupling blocks
+  nf_coupling_width: int = 512  # width of s/t sub-networks inside each block
+  nf_encoder_lr: float = 3e-4   # Adam lr for SA encoder (ref: actor_lr)
+  nf_critic_lr: float = 1e-4    # AdamW lr for RealNVP flow (ref: critic_lr)
+  nf_critic_weight_decay: float = 1e-6  # AdamW wd for RealNVP (ref)
+  nf_grad_clip: float = 1.0     # global-norm gradient clipping for NF (0 = disabled)
+  nf_noise_std: float = 0.05   # Gaussian noise added to goals during NF training (0 = disabled)
+  nf_goal_std_min: float = 0.1  # floor on per-dim replay std (avoids blow-ups on static dims)
+  nf_mix_env_goal_stats: bool = False  # also include rollout env goals when computing NF normalisation stats
+  nf_goal_enc_size: int = 0     # >0 enables goal encoder (maps goal → goal_enc_size-dim latent)
+  ppo_return_norm_window: int = 0  # >0 caps effective count in return normalizer (soft sliding window)
+  nf_no_norm_goal_dims: tuple = ()  # deprecated; unused (running stats + std floor only)
+  nf_goal_norm_low: Optional[Any] = None   # deprecated; unused
+  nf_goal_norm_high: Optional[Any] = None  # deprecated; unused
+  ppo_skip_first_eval: bool = False  # skip logging the iteration-0 eval (avoids artificially high checkpoint result)
   # KDE options (only used when ppo_reward_mode == 'kde_dirac').
   # kde_max_points: number of replay states to fit the KDE on.
   # kde_refit_interval: refit the KDE every N PPO iterations (1 = every iter).

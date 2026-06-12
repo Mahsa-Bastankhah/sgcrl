@@ -30,6 +30,7 @@ import numpy as np
 import contrastive
 from contrastive import ppo_learner
 from contrastive import utils as contrastive_utils
+import env_utils
 
 FLAGS = flags.FLAGS
 
@@ -89,7 +90,56 @@ flags.DEFINE_string(
     'ppo_repr_mode', 'crl',
     "Density estimator for the PPO shaped reward. "
     "'crl' (default) = contrastive φ(s,a)·ψ(g) representations; "
-    "'gaussian' = diagonal Gaussian p_θ(g|s), reward = log p_θ(g|s_t).")
+    "'gaussian' = diagonal Gaussian p_θ(g|s), reward = log p_θ(g|s_t); "
+    "'nf' = conditional RealNVP log p_NF(g|s,a), reward = log p_NF.")
+flags.DEFINE_integer(
+    'nf_rep_size', 64,
+    'NF mode: SA encoder output dim (conditioning vector size).')
+flags.DEFINE_integer(
+    'nf_num_blocks', 8,
+    'NF mode: number of affine coupling blocks in RealNVP.')
+flags.DEFINE_integer(
+    'nf_coupling_width', 256,
+    'NF mode: width of s/t sub-networks inside each coupling block.')
+flags.DEFINE_float(
+    'nf_encoder_lr', 3e-4,
+    'NF mode: Adam learning rate for SA encoder (ref actor_lr).')
+flags.DEFINE_float(
+    'nf_critic_lr', 1e-4,
+    'NF mode: AdamW learning rate for RealNVP flow (ref critic_lr).')
+flags.DEFINE_float(
+    'nf_critic_weight_decay', 1e-6,
+    'NF mode: AdamW weight decay for RealNVP flow (ref critic_weight_decay).')
+flags.DEFINE_float(
+    'nf_grad_clip', 1.0,
+    'NF mode: global-norm gradient clipping for both SA encoder and flow (0 = disabled).')
+flags.DEFINE_float(
+    'nf_noise_std', 0.05,
+    'NF mode: std of Gaussian noise added to goals during training (0 = disabled).')
+flags.DEFINE_float(
+    'nf_goal_std_min', 0.02,
+    'NF mode: minimum per-dim goal std from replay stats (prevents div-by-tiny-std on static dims).')
+flags.DEFINE_string(
+    'nf_no_norm_goal_dims', '',
+    'Deprecated; ignored. NF uses running replay mean/std with nf_goal_std_min floor.')
+flags.DEFINE_boolean(
+    'ppo_skip_first_eval', False,
+    'Skip logging the iteration-0 eval (avoids logging the checkpoint result as the first data point when resuming).')
+flags.DEFINE_boolean(
+    'ppo_norm_reward', True,
+    'Normalize the repr reward by the running std of discounted returns. Set False to pass raw reward directly to PPO.')
+flags.DEFINE_boolean(
+    'nf_mix_env_goal_stats', False,
+    'NF mode: when computing normalisation stats, also include the actual env goals '
+    '(obs[obs_dim:] from current rollout) so the normaliser covers reward goals too.')
+flags.DEFINE_integer(
+    'nf_goal_enc_size', 0,
+    'Goal encoder output dim for NF mode. 0 = disabled (raw normalized goal fed to flow). '
+    '>0 adds a compact 2×(Dense256+LN+swish)→Dense(N) encoder trained end-to-end with the flow.')
+flags.DEFINE_integer(
+    'ppo_return_norm_window', 0,
+    'Soft sliding-window size for the return normalizer. 0 = infinite (standard Welford). '
+    '>0 caps the effective sample count so the variance stays responsive to recent reward shifts.')
 flags.DEFINE_float(
     'ppo_dirac_eps', 1e-6,
     'Epsilon in dirac_target / kde_dirac reward: log(eps) − log_p(s).')
@@ -103,12 +153,28 @@ flags.DEFINE_float(
     'kde_bandwidth', 0.0,
     'KDE bandwidth (kde_dirac mode). 0.0 = Scott\'s rule automatically.')
 flags.DEFINE_integer(
+    'max_replay_size', -1,
+    'Max transitions in the PPO episode replay buffer. <0 keeps default (1e6).')
+flags.DEFINE_integer(
+    'ppo_min_replay_size', -1,
+    'Min replay transitions before density/CRL updates start. <0 keeps default (1e4).')
+flags.DEFINE_integer(
     'ppo_checkpoint_interval', -1,
     'Save checkpoints every N PPO iterations. <0 keeps config default (500).')
 flags.DEFINE_integer(
     'ppo_checkpoint_keep_last', -1,
     'Max milestone ckpt_iter_*.pkl files to retain (FIFO). '
     '0 = keep all. <0 keeps config default (0 = keep all).')
+flags.DEFINE_string(
+    'ppo_crl_loss_direction', 'forward',
+    "InfoNCE loss direction for PPO-CRL: 'forward' (fix anchor, vary goal) "
+    "or 'backward' (fix goal, vary anchor = transpose logits).")
+flags.DEFINE_float(
+    'ppo_crl_repr_tau', -1.0,
+    'CRL mode: EMA decay τ for φ, ψ used in PPO reward r=φ·ψ. '
+    'ema ← τ·ema + (1−τ)·online after each CRL step. '
+    '0 = use online params (default). Higher τ = slower reward tracking. '
+    '<0 keeps config default.')
 flags.DEFINE_string(
     'hidden_layer_sizes', '',
     'Comma-separated hidden layer widths, e.g. "256,256,256,256,256,256". '
@@ -330,13 +396,35 @@ def main(_):
   config.ppo_reward_mode = str(FLAGS.ppo_reward_mode).strip()
   config.ppo_repr_mode = str(FLAGS.ppo_repr_mode).strip()
   config.ppo_dirac_eps = float(FLAGS.ppo_dirac_eps)
+  config.nf_rep_size = int(FLAGS.nf_rep_size)
+  config.nf_num_blocks = int(FLAGS.nf_num_blocks)
+  config.nf_coupling_width = int(FLAGS.nf_coupling_width)
+  config.nf_encoder_lr = float(FLAGS.nf_encoder_lr)
+  config.nf_critic_lr = float(FLAGS.nf_critic_lr)
+  config.nf_critic_weight_decay = float(FLAGS.nf_critic_weight_decay)
+  config.nf_grad_clip = float(FLAGS.nf_grad_clip)
+  config.nf_noise_std = float(FLAGS.nf_noise_std)
+  config.nf_goal_std_min = float(FLAGS.nf_goal_std_min)
+  config.nf_mix_env_goal_stats = bool(FLAGS.nf_mix_env_goal_stats)
+  config.ppo_skip_first_eval = bool(FLAGS.ppo_skip_first_eval)
+  config.ppo_norm_reward = bool(FLAGS.ppo_norm_reward)
+  config.nf_goal_enc_size = int(FLAGS.nf_goal_enc_size)
+  config.ppo_return_norm_window = int(FLAGS.ppo_return_norm_window)
   config.kde_max_points = int(FLAGS.kde_max_points)
   config.kde_refit_interval = int(FLAGS.kde_refit_interval)
   config.kde_bandwidth = float(FLAGS.kde_bandwidth)
+  if FLAGS.max_replay_size >= 0:
+    config.max_replay_size = int(FLAGS.max_replay_size)
+  if FLAGS.ppo_min_replay_size >= 0:
+    config.ppo_min_replay_size = int(FLAGS.ppo_min_replay_size)
   if FLAGS.ppo_checkpoint_interval >= 0:
     config.ppo_checkpoint_interval = int(FLAGS.ppo_checkpoint_interval)
   if FLAGS.ppo_checkpoint_keep_last >= 0:
     config.ppo_checkpoint_keep_last = int(FLAGS.ppo_checkpoint_keep_last)
+  if FLAGS.ppo_crl_loss_direction.strip():
+    config.ppo_crl_loss_direction = FLAGS.ppo_crl_loss_direction.strip().lower()
+  if FLAGS.ppo_crl_repr_tau >= 0.0:
+    config.ppo_crl_repr_tau = float(FLAGS.ppo_crl_repr_tau)
   if FLAGS.hidden_layer_sizes.strip():
     config.hidden_layer_sizes = tuple(
         int(x) for x in FLAGS.hidden_layer_sizes.split(',') if x.strip())
@@ -355,7 +443,10 @@ def main(_):
         f'ppo_anneal_lr={config.ppo_anneal_lr}  '
         f'ppo_repr_mode={config.ppo_repr_mode!r}  '
         f'ppo_reward_mode={config.ppo_reward_mode!r}  '
+        f'ppo_crl_repr_tau={config.ppo_crl_repr_tau}  '
         f'ppo_dirac_eps={config.ppo_dirac_eps}  '
+        f'max_replay_size={config.max_replay_size}  '
+        f'ppo_min_replay_size={config.ppo_min_replay_size}  '
         f'kde_max_points={config.kde_max_points}  '
         f'kde_refit_interval={config.kde_refit_interval}  '
         f'kde_bandwidth={config.kde_bandwidth}  '
@@ -368,22 +459,29 @@ def main(_):
   fixed_start_end = (fixed_goal_dict[env_name]
                      if config.fix_goals else None)
 
+  # NF push: start episodes with gripper closed (does not affect CRL/Gaussian).
+  _env_kwargs = {}
+  if (str(config.ppo_repr_mode).strip().lower() == 'nf'
+      and env_name == 'sawyer_push'):
+    _env_kwargs['nf_closed_gripper_init'] = True
+    print('[ppo] sawyer_push NF init: closed gripper at reset')
+
   def env_factory(s):
     env, _ = contrastive_utils.make_environment(
         env_name, config.start_index, config.end_index, s,
-        fixed_start_end=fixed_start_end)
+        fixed_start_end=fixed_start_end, **_env_kwargs)
     return env
 
   def eval_env_factory(s):
     env, _ = contrastive_utils.make_environment(
         env_name, config.start_index, config.end_index, s,
-        fixed_start_end=fixed_goal_dict[env_name])
+        fixed_start_end=fixed_goal_dict[env_name], **_env_kwargs)
     return env
 
   # obs_dim / max_episode_steps inferred from one sample env.
   probe_env, obs_dim = contrastive_utils.make_environment(
       env_name, config.start_index, config.end_index, seed,
-      fixed_start_end=fixed_start_end)
+      fixed_start_end=fixed_start_end, **_env_kwargs)
   config.obs_dim = obs_dim
   config.max_episode_steps = getattr(probe_env, '_step_limit') + 1
   del probe_env

@@ -6,7 +6,7 @@ from typing import Any, Callable, Mapping, Optional
 from acme.utils.loggers import aggregators
 from acme.utils.loggers import asynchronous as async_logger
 from acme.utils.loggers import base
-from acme.utils.loggers import csv
+from contrastive import resumable_csv_logger
 from acme.utils.loggers import filters
 from acme.utils.loggers import terminal
 import numpy as np
@@ -78,7 +78,8 @@ def make_default_logger(
   loggers = [terminal_logger]
 
   if save_data:
-    loggers.append(csv.CSVLogger(label=label, directory_or_file=save_dir, add_uid=add_uid))
+    loggers.append(resumable_csv_logger.ResumableCSVLogger(
+        label=label, directory_or_file=save_dir, add_uid=add_uid))
 
   # Dispatch to all writers and filter Nones and by time.
   logger = aggregators.Dispatcher(loggers, serialize_fn)

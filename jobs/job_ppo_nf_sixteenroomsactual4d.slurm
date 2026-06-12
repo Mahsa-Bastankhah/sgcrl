@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_spiral_nounif
-#SBATCH --output=slurm/ppo_spiral11x11_nouniform_%A_%a.out
+#SBATCH --job-name=ppo_nf_16r4d
+#SBATCH --output=slurm/ppo_nf_sixteenroomsactual4d_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=8G
 #SBATCH --gres=gpu:1
-#SBATCH --time=06:00:00
+#SBATCH --time=08:00:00
 #SBATCH --account=seas
-#SBATCH --array=0
+#SBATCH --array=0-2
 
 module purge
 
@@ -55,21 +55,24 @@ export PYTHONUNBUFFERED=1
 export MUJOCO_GL=osmesa
 export MUJOCO_PY_MUJOCO_PATH=${HOME}/.mujoco/mujoco210
 
-ENV="${ENV:-point_Spiral11x11}"
+# SixteenRooms maze + 2 free extra dims (4D state/action, 4D goal).
+ENV="point_SixteenRoomsActual4D"
 NUM_STEPS="${NUM_STEPS:-10000000}"
-SEED_OFFSET="${SEED_OFFSET:-130}"
+SEED_OFFSET="${SEED_OFFSET:-0}"
 SEED=$(( SEED_OFFSET + ${SLURM_ARRAY_TASK_ID:-0} ))
-LOG_DIR="${LOG_DIR:-logs/ppo_spiral11x11_nouniform/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_nf_sixteenroomsactual4d/}"
 
-CRL_STEPS=64
+CRL_STEPS=256
 ENT_COEF=0.05
 MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
+NF_REP_SIZE=64
+NF_NUM_BLOCKS=8
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} log_dir=${LOG_DIR} uniform_sampling=False reward_mode=preimage(default)"
-echo "overrides: crl_steps=${CRL_STEPS} ent_coef=${ENT_COEF} min_std=${MIN_STD}"
+echo "env=${ENV}  seed=${SEED}  log_dir=${LOG_DIR}  repr_mode=nf"
+echo "nf_rep_size=${NF_REP_SIZE}  nf_num_blocks=${NF_NUM_BLOCKS}"
 nvidia-smi
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
 
@@ -78,9 +81,15 @@ python -u ppo_contrastive.py \
   --seed="${SEED}" \
   --num_steps="${NUM_STEPS}" \
   --log_dir_path="${LOG_DIR}" \
+  --ppo_repr_mode="nf" \
+  --nf_rep_size="${NF_REP_SIZE}" \
+  --nf_num_blocks="${NF_NUM_BLOCKS}" \
   --ppo_crl_steps_per_iter="${CRL_STEPS}" \
   --ppo_ent_coef="${ENT_COEF}" \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
   --hidden_layer_sizes="256,256,256,256,256,256"
+PY_EXIT=$?
+pkill -P $$ 2>/dev/null || true
+exit $PY_EXIT

@@ -48,28 +48,51 @@ def flow_dense_eval_episode_metrics(
   }
 
 
+_FLOW_DENSE_KEYS = frozenset({
+    'flow_dense_return', 'flow_dense_reward_mean', 'ep_flow_dense_return_mean'})
+
+
 def aggregate_eval_metrics(
     ep_metrics_list: Sequence[Dict],
     iteration: int) -> Dict[str, float]:
-  """Mean eval metrics across episodes; always includes dense-return stats."""
+  """Mean eval metrics across episodes.
+
+  Flow-dense keys (flow_dense_return, flow_dense_reward_mean,
+  ep_flow_dense_return_mean) are only included when at least one episode
+  actually produced a non-nan flow-dense return — i.e. the environment
+  provides the flow benchmark reward signal.
+  """
   agg: Dict[str, float] = {
       'iteration': float(iteration),
       'learner_steps': float(iteration),
   }
   if not ep_metrics_list:
-    agg['ep_flow_dense_return_mean'] = float('nan')
     return agg
   all_keys = set()
   for m in ep_metrics_list:
     all_keys.update(m.keys())
+
+  # Decide whether to include flow-dense keys at all.
+  dense_returns = [
+      m.get('flow_dense_return', float('nan')) for m in ep_metrics_list]
+  include_flow_dense = any(not np.isnan(v) for v in dense_returns)
+
   for k_ in all_keys:
     if k_ in ('iteration', 'learner_steps'):
       continue
+    if k_ in _FLOW_DENSE_KEYS and not include_flow_dense:
+      continue
     agg[k_] = float(np.nanmean(
         [m.get(k_, float('nan')) for m in ep_metrics_list]))
-  dense_returns = [
-      m.get('flow_dense_return', float('nan')) for m in ep_metrics_list]
-  agg['ep_flow_dense_return_mean'] = float(np.nanmean(dense_returns))
+
+  # Always emit flow-dense columns so eval CSV schema stays stable on resume.
+  if include_flow_dense:
+    agg['ep_flow_dense_return_mean'] = float(np.nanmean(dense_returns))
+  else:
+    agg['ep_flow_dense_return_mean'] = float('nan')
+    agg['flow_dense_return'] = float('nan')
+    agg['flow_dense_reward_mean'] = float('nan')
+
   return agg
 
 
@@ -339,7 +362,7 @@ class ObservationFilterWrapper(base.EnvironmentWrapper):
 
 
 def make_environment(env_name, start_index, end_index,
-                     seed, fixed_start_end = None):
+                     seed, fixed_start_end=None, **env_kwargs):
   """Creates the environment.
 
   Args:
@@ -348,6 +371,7 @@ def make_environment(env_name, start_index, end_index,
     end_index: final index of the observation to use in the goal. The goal
       is then obs[start_index:goal_index].
     seed: random seed.
+    **env_kwargs: forwarded to ``env_utils.load`` (env-specific).
   Returns:
     env: the environment
     obs_dim: integer specifying the size of the observations, before
@@ -355,7 +379,7 @@ def make_environment(env_name, start_index, end_index,
   """
   np.random.seed(seed)
   gym_env, obs_dim, max_episode_steps = env_utils.load(
-      env_name, fixed_start_end, seed)
+      env_name, fixed_start_end, seed, **env_kwargs)
   goal_indices = obs_dim + obs_to_goal_1d(np.arange(obs_dim), start_index,
                                           end_index)
   indices = np.concatenate([

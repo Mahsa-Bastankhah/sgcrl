@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_gauss_button
-#SBATCH --output=slurm/ppo_gaussian_sawyer_button_press_%A_%a.out
+#SBATCH --job-name=ppo_gauss_push
+#SBATCH --output=slurm/ppo_gaussian_sawyer_push_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -54,24 +54,28 @@ export MUJOCO_GL=osmesa
 export PYTHONUNBUFFERED=1
 export TMPDIR=/n/fs/mislresearch/mb6458-tmp
 
-ENV=sawyer_button_press
-NUM_STEPS=${NUM_STEPS:-9800000}
+ENV=sawyer_push
+NUM_STEPS=${NUM_STEPS:-23000000}
 SEED_OFFSET=${SEED_OFFSET:-0}
 SEED=$(( SEED_OFFSET + ${SLURM_ARRAY_TASK_ID:-0} ))
 
-LOG_DIR="${LOG_DIR:-logs/ppo_gaussian_button/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_gaussian_push/}"
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-4}
 CRL_STEPS=${CRL_STEPS:-128}
-ENT_COEF=0.05
+ENT_COEF=0.01
 MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
+MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:--1}
+CKPT_INTERVAL=${CKPT_INTERVAL:-1000}
+CKPT_KEEP=${CKPT_KEEP:-3}
 
 mkdir -p slurm
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
 echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=gaussian"
-echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS} density_steps=${CRL_STEPS}"
+echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS} density_steps=${CRL_STEPS} max_replay_size=${MAX_REPLAY_SIZE}"
+echo "ckpt_interval=${CKPT_INTERVAL} ckpt_keep=${CKPT_KEEP}"
 nvidia-smi || true
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
 
@@ -88,7 +92,10 @@ python -u ppo_contrastive.py \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
   --hidden_layer_sizes="256,256,256,256,256,256" \
-  --ppo_skip_first_eval=true
+  --max_replay_size="${MAX_REPLAY_SIZE}" \
+  --ppo_skip_first_eval=true \
+  --ppo_checkpoint_interval="${CKPT_INTERVAL}" \
+  --ppo_checkpoint_keep_last="${CKPT_KEEP}"
 PY_EXIT=$?
 pkill -P $$ 2>/dev/null || true
 exit $PY_EXIT
