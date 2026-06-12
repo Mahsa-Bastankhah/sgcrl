@@ -153,6 +153,8 @@ def load(env_name, fixed_start_end=None, seed=None, **env_kwargs):
     CLASS = SawyerBin
     max_episode_steps = 150
     kwargs['fixed_start_end'] = fixed_start_end
+    if 'randomize_gripper_init' in env_kwargs:
+      kwargs['randomize_gripper_init'] = env_kwargs['randomize_gripper_init']
   elif env_name == 'sawyer_box':
     CLASS = SawyerBox
     max_episode_steps = 150
@@ -342,9 +344,10 @@ class SawyerBin(_MW_BIN):
     """Bounds on the goal block appended in ``_get_obs`` (for CRL uniform negs)."""
     return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
 
-  def __init__(self, fixed_start_end=None):
+  def __init__(self, fixed_start_end=None, randomize_gripper_init=False):
     _require_metaworld('sawyer_bin')
     self._goal = np.zeros(3)
+    self._randomize_gripper_init = bool(randomize_gripper_init)
     super(SawyerBin, self).__init__()
     self._partially_observable = False
     self._freeze_rand_vec = False
@@ -371,7 +374,14 @@ class SawyerBin(_MW_BIN):
     # The agent begins with its fingers around the cube (open, ready to grasp)
     # rather than at the default arm-retracted position.
     obj_pos     = self._get_pos_objects().copy()
-    grip_target = obj_pos + np.array([0., 0., 0.03], dtype=np.float64)
+    if self._randomize_gripper_init:
+      grip_target = obj_pos + np.array([
+          np.random.uniform(-0.05, 0.05),
+          np.random.uniform(-0.05, 0.05),
+          np.random.uniform(0.01, 0.06),
+      ], dtype=np.float64)
+    else:
+      grip_target = obj_pos + np.array([0., 0., 0.03], dtype=np.float64)
     mocap_pos   = grip_target.copy()
     mocap_quat  = np.array([1., 0., 1., 0.], dtype=np.float64)
     for _ in range(50):

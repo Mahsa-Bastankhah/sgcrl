@@ -175,6 +175,9 @@ flags.DEFINE_float(
     'ema ← τ·ema + (1−τ)·online after each CRL step. '
     '0 = use online params (default). Higher τ = slower reward tracking. '
     '<0 keeps config default.')
+flags.DEFINE_boolean(
+    'bin_randomize_gripper_init', False,
+    'SawyerBin: randomize initial gripper TCP offset around the object at reset.')
 flags.DEFINE_string(
     'hidden_layer_sizes', '',
     'Comma-separated hidden layer widths, e.g. "256,256,256,256,256,256". '
@@ -465,6 +468,9 @@ def main(_):
       and env_name == 'sawyer_push'):
     _env_kwargs['nf_closed_gripper_init'] = True
     print('[ppo] sawyer_push NF init: closed gripper at reset')
+  if env_name == 'sawyer_bin' and FLAGS.bin_randomize_gripper_init:
+    _env_kwargs['randomize_gripper_init'] = True
+    print('[ppo] sawyer_bin init: randomized gripper position at reset')
 
   def env_factory(s):
     env, _ = contrastive_utils.make_environment(

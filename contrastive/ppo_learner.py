@@ -20,6 +20,7 @@ Implementation style mirrors CleanRL's ppo_continuous_action.py:
 
 Everything runs in JAX for consistency with the rest of this codebase.
 """
+import concurrent.futures
 import os
 import time
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
@@ -700,6 +701,7 @@ def make_crl_update_fn(
     networks: contrastive_networks.ContrastiveNetworks,
     q_optimizer: optax.GradientTransformation,
     backward: bool = False,
+    _return_raw: bool = False,
 ):
   """Returns a jitted CRL critic update over one replay batch.
 
@@ -805,7 +807,58 @@ def make_crl_update_fn(
     metrics['update_skipped_nonfinite'] = 1.0 - do_update.astype(jnp.float32)
     return new_q_params, new_opt_state, metrics
 
+  if _return_raw:
+    return jax.jit(update), update
   return jax.jit(update)
+
+
+def make_scan_crl_update_fn(
+    networks: contrastive_networks.ContrastiveNetworks,
+    q_optimizer: optax.GradientTransformation,
+    backward: bool = False,
+    repr_tau: float = 0.0,
+):
+  """Scan-based CRL updater: runs N steps in one JIT call.
+
+  Caller pre-samples all N batches in NumPy, stacks them into
+  ``(N, B, dim)`` arrays, and transfers to GPU once.  A single
+  ``jax.lax.scan`` call replaces N separate dispatch-and-sync rounds.
+
+  The φ/ψ EMA for the PPO reward (``repr_tau > 0``) is also updated
+  inside the scan, eliminating the 128 un-JIT-compiled ``_ema_tree``
+  calls per iteration.
+
+  Returns:
+    ``multi_update(q_params, q_opt_state, q_params_ema, batches, key)``
+    → ``(new_q_params, new_q_opt_state, new_q_params_ema, new_key,
+         mean_metrics)``
+    where ``batches`` is a dict of ``(N, B, dim)`` JAX arrays.
+  """
+  _, raw_update = make_crl_update_fn(
+      networks, q_optimizer, backward=backward, _return_raw=True)
+
+  use_ema = 0.0 < float(repr_tau) < 1.0
+  _tau = float(repr_tau)
+
+  @jax.jit
+  def multi_update(q_params, q_opt_state, q_params_ema, batches, key):
+    def scan_step(carry, batch):
+      q_p, q_opt, q_ema, k = carry
+      k, k_crl = jax.random.split(k)
+      q_p, q_opt, m = raw_update(q_p, q_opt, batch, k_crl)
+      if use_ema:
+        q_ema = jax.tree_util.tree_map(
+            lambda t, o: _tau * t + (1.0 - _tau) * o, q_ema, q_p)
+      else:
+        q_ema = q_p
+      return (q_p, q_opt, q_ema, k), m
+
+    (q_params, q_opt_state, q_params_ema, key), metrics = jax.lax.scan(
+        scan_step, (q_params, q_opt_state, q_params_ema, key), batches)
+    metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+    return q_params, q_opt_state, q_params_ema, key, metrics
+
+  return multi_update
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +889,11 @@ class VecEnv:
     self._num_envs = num_envs
     self._obs_spec = self._envs[0].observation_spec()
     self._action_spec = self._envs[0].action_spec()
+    # Thread pool: MuJoCo C extensions release the GIL during sim.step(),
+    # so threads can run env physics in parallel.
+    self._executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=num_envs,
+        thread_name_prefix='vecenv_worker')
 
   def reset(self) -> np.ndarray:
     obs = np.stack([e.reset().observation for e in self._envs], axis=0)
@@ -846,26 +904,35 @@ class VecEnv:
   ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     action_dtype = self._action_spec.dtype
     shape = self._obs_spec.shape
-    next_obs = np.zeros((self._num_envs,) + shape, dtype=np.float32)
+    next_obs    = np.zeros((self._num_envs,) + shape, dtype=np.float32)
     terminal_obs = np.zeros((self._num_envs,) + shape, dtype=np.float32)
-    env_rewards = np.zeros(self._num_envs, dtype=np.float32)
+    env_rewards  = np.zeros(self._num_envs, dtype=np.float32)
     info_rewards = np.full(self._num_envs, np.nan, dtype=np.float32)
-    dones = np.zeros(self._num_envs, dtype=bool)
-    for i, env in enumerate(self._envs):
+    dones        = np.zeros(self._num_envs, dtype=bool)
+
+    def _step_one(i: int):
+      env = self._envs[i]
       a = np.asarray(actions[i], dtype=np.float32)
       a = np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=-1.0)
       if hasattr(self._action_spec, 'minimum') and hasattr(self._action_spec, 'maximum'):
         a = np.clip(a, self._action_spec.minimum, self._action_spec.maximum)
       ts = env.step(a.astype(action_dtype))
-      env_rewards[i] = 0.0 if ts.reward is None else float(ts.reward)
-      info_rewards[i] = extract_info_reward(env)
-      terminal_obs[i] = ts.observation
-      if ts.last():
-        dones[i] = True
-        # Auto-reset: next_obs is the start of the next episode.
-        next_obs[i] = env.reset().observation
-      else:
-        next_obs[i] = ts.observation
+      env_r  = 0.0 if ts.reward is None else float(ts.reward)
+      info_r = extract_info_reward(env)
+      term   = ts.observation.copy()
+      done   = bool(ts.last())
+      nxt    = env.reset().observation.copy() if done else ts.observation.copy()
+      return env_r, info_r, term, nxt, done
+
+    futures = [self._executor.submit(_step_one, i) for i in range(self._num_envs)]
+    for i, fut in enumerate(futures):
+      env_r, info_r, term, nxt, done = fut.result()
+      env_rewards[i]  = env_r
+      info_rewards[i] = info_r
+      terminal_obs[i] = term
+      next_obs[i]     = nxt
+      dones[i]        = done
+
     return next_obs, env_rewards, dones, terminal_obs, info_rewards
 
   @property
@@ -1221,6 +1288,9 @@ def run_ppo_training(
     _direction = str(getattr(config, 'ppo_crl_loss_direction', 'forward')).lower()
     _backward = (_direction == 'backward')
     crl_update = make_crl_update_fn(networks, q_optimizer, backward=_backward)
+    # Scan-based multi-step updater: one JIT dispatch for all CRL steps.
+    crl_scan_update = make_scan_crl_update_fn(
+        networks, q_optimizer, backward=_backward, repr_tau=_repr_tau)
     print(f'[ppo] CRL loss direction: {_direction}')
     if _use_repr_ema:
       print(f'[ppo] CRL reward repr EMA: tau={_repr_tau} '
@@ -1310,15 +1380,20 @@ def run_ppo_training(
       end_index=int(config.end_index))
 
   # ---- rollout storage (reused each iteration) --------------------------
-  roll_obs = np.zeros((T, E) + obs_shape, dtype=np.float32)
-  roll_acts = np.zeros((T, E) + act_shape, dtype=np.float32)
-  roll_logp = np.zeros((T, E), dtype=np.float32)
-  roll_rew = np.zeros((T, E), dtype=np.float32)            # reps reward (possibly normalized)
+  roll_obs   = np.zeros((T, E) + obs_shape, dtype=np.float32)
+  roll_acts  = np.zeros((T, E) + act_shape, dtype=np.float32)
+  roll_logp  = np.zeros((T, E), dtype=np.float32)
+  roll_rew   = np.zeros((T, E), dtype=np.float32)          # reps reward (possibly normalized)
   roll_rew_raw = np.zeros((T, E), dtype=np.float32)        # reps reward (pre-normalization, log only)
   roll_env_rew = np.zeros((T, E), dtype=np.float32)        # gt reward (log only)
   roll_flow_dense_rew = np.full((T, E), np.nan, dtype=np.float32)
   roll_dones = np.zeros((T, E), dtype=np.float32)
-  roll_vals = np.zeros((T, E), dtype=np.float32)
+  roll_vals  = np.zeros((T, E), dtype=np.float32)
+  # Per-step dones from env (used for reward normalization after rollout).
+  roll_step_dones = np.zeros((T, E), dtype=np.float32)
+  # s0 state tracked for dirac_target: batched reward call after rollout.
+  roll_s0_states = np.zeros(
+      (T, E, int(config.obs_dim)), dtype=np.float32)
 
   # ---- reward normalizer (CleanRL NormalizeReward) ----------------------
   # Normalizes the reps-based reward by the running std of discounted
@@ -1369,41 +1444,20 @@ def run_ppo_training(
       roll_logp[t] = np.asarray(logprob_j)
       roll_vals[t] = np.asarray(value_j)
 
-      # reps-based reward, computed BEFORE env step (frozen q_params).
-      if use_nf:
-        # NF: r_t = log p_NF(g | s_t, a_t).
-        rep_rew = nf_reward_fn(q_params, jnp.asarray(obs), action_j,
-                               jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std))
-        rep_rew_np = np.asarray(rep_rew)
-      elif use_gaussian:
-        # Gaussian: r_t = log p_θ(g | s_t, a_t).
-        rep_rew = gaussian_reward_fn(q_params, jnp.asarray(obs), action_j)
-        rep_rew_np = np.asarray(rep_rew)
-      elif use_dirac_target:
-        rep_rew = reward_fn(
-            _reward_q_params(), jnp.asarray(obs), action_j, jnp.asarray(s0_states))
-        rep_rew_np = np.asarray(rep_rew)
+      # For dirac_target, record s0 for the batched reward call later.
+      if use_dirac_target:
+        roll_s0_states[t] = s0_states
+      # kde_dirac reward is pure NumPy — compute per-step to avoid storing KDE.
       elif use_kde_dirac:
-        if kde_state is None:
-          rep_rew_np = np.zeros(E, dtype=np.float32)
-        else:
-          rep_rew_np = reward_fn(kde_state, obs).astype(np.float32)
-      else:
-        rep_rew = reward_fn(_reward_q_params(), jnp.asarray(obs), action_j)
-        rep_rew_np = np.asarray(rep_rew)
-      roll_rew_raw[t] = rep_rew_np
+        rep_rew_np = (np.zeros(E, dtype=np.float32) if kde_state is None
+                      else reward_fn(kde_state, obs).astype(np.float32))
+        roll_rew_raw[t] = rep_rew_np
 
       next_obs, env_rew, dones, terminal_obs, info_rew = vec_env.step(action)
       roll_env_rew[t] = env_rew
       roll_flow_dense_rew[t] = info_rew
-
-      # Scale reps reward by the running std of discounted returns.
-      # Applied AFTER the env step so `dones` is available to reset the
-      # running-return tracker at episode boundaries.
-      if reward_normalizer is not None:
-        roll_rew[t] = reward_normalizer(rep_rew_np, dones)
-      else:
-        roll_rew[t] = rep_rew_np
+      # Store step-level dones for the post-rollout reward normalizer loop.
+      roll_step_dones[t] = dones.astype(np.float32)
 
       # Episode flushing / per-env accounting.
       for i in range(E):
@@ -1443,6 +1497,38 @@ def run_ppo_training(
       obs = next_obs
       next_done = dones.astype(np.float32)
       global_step += E
+
+    # =================================================================
+    # 1b. Batched reward computation (single GPU call over full rollout)
+    # =================================================================
+    # kde_dirac rewards were already filled per-step above (CPU-only).
+    if not use_kde_dirac:
+      _flat_obs_j  = jnp.asarray(roll_obs.reshape(T * E, -1))
+      _flat_acts_j = jnp.asarray(roll_acts.reshape(T * E, -1))
+      if use_nf:
+        _rew_flat = np.asarray(nf_reward_fn(
+            q_params, _flat_obs_j, _flat_acts_j,
+            jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std)))
+      elif use_gaussian:
+        _rew_flat = np.asarray(
+            gaussian_reward_fn(q_params, _flat_obs_j, _flat_acts_j))
+      elif use_dirac_target:
+        _flat_s0_j = jnp.asarray(roll_s0_states.reshape(T * E, -1))
+        _rew_flat  = np.asarray(
+            reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j, _flat_s0_j))
+      else:
+        # Default CRL: r = φ(s,a)·ψ(g)
+        _rew_flat = np.asarray(
+            reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
+      roll_rew_raw[:] = _rew_flat.reshape(T, E)
+
+    # Apply reward normalisation (cheap NumPy loop; normalizer state is shared
+    # across the rollout, reset on episode boundaries via roll_step_dones).
+    if reward_normalizer is not None:
+      for _t in range(T):
+        roll_rew[_t] = reward_normalizer(roll_rew_raw[_t], roll_step_dones[_t])
+    else:
+      roll_rew[:] = roll_rew_raw
 
     # =================================================================
     # 2. GAE advantages / returns
@@ -1525,25 +1611,44 @@ def run_ppo_training(
           _nf_stat_log[f'nf/goal_mean_{_di}'] = float(_gm)
           _nf_stat_log[f'nf/goal_std_{_di}']  = float(_gs)
 
-      for _ in range(int(config.ppo_crl_steps_per_iter)):
-        if uniform_sampling:
-          crl_batch_np = replay.sample_with_uniform_negatives(
-              int(config.batch_size), np_rng, goal_low, goal_high)
-        else:
-          crl_batch_np = replay.sample(int(config.batch_size), np_rng)
-        crl_batch = {k_: jnp.asarray(v) for k_, v in crl_batch_np.items()}
-        key, k_crl = jax.random.split(key)
-        if use_nf:
-          q_params, q_opt_state, m = crl_update(
-              q_params, q_opt_state, crl_batch, k_crl,
-              jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std))
-        else:
-          q_params, q_opt_state, m = crl_update(
-              q_params, q_opt_state, crl_batch, k_crl)
-        if _use_repr_ema:
-          q_params_reward = _ema_tree(q_params_reward, q_params, _repr_tau)
-        for k_, v in m.items():
-          crl_metrics_agg.setdefault(k_, []).append(float(v))
+      _n_crl = int(config.ppo_crl_steps_per_iter)
+      if use_nf or use_gaussian:
+        # NF / Gaussian loops take extra args — keep the Python loop for now.
+        for _ in range(_n_crl):
+          if uniform_sampling:
+            crl_batch_np = replay.sample_with_uniform_negatives(
+                int(config.batch_size), np_rng, goal_low, goal_high)
+          else:
+            crl_batch_np = replay.sample(int(config.batch_size), np_rng)
+          crl_batch = {k_: jnp.asarray(v) for k_, v in crl_batch_np.items()}
+          key, k_crl = jax.random.split(key)
+          if use_nf:
+            q_params, q_opt_state, m = crl_update(
+                q_params, q_opt_state, crl_batch, k_crl,
+                jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std))
+          else:
+            q_params, q_opt_state, m = crl_update(
+                q_params, q_opt_state, crl_batch, k_crl)
+          if _use_repr_ema:
+            q_params_reward = _ema_tree(q_params_reward, q_params, _repr_tau)
+          for k_, v in m.items():
+            crl_metrics_agg.setdefault(k_, []).append(float(v))
+      else:
+        # Standard CRL: pre-sample all batches → one H→D transfer → one JIT.
+        # This eliminates _n_crl rounds of dispatch + host sync.
+        _samples = [
+            (replay.sample_with_uniform_negatives(
+                int(config.batch_size), np_rng, goal_low, goal_high)
+             if uniform_sampling
+             else replay.sample(int(config.batch_size), np_rng))
+            for _ in range(_n_crl)]
+        _stacked = {
+            k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
+            for k_ in _samples[0]}
+        (q_params, q_opt_state, q_params_reward,
+         key, m) = crl_scan_update(
+            q_params, q_opt_state, q_params_reward, _stacked, key)
+        crl_metrics_agg = {k_: [float(v)] for k_, v in m.items()}
 
     # =================================================================
     # 4b. KDE refit (kde_dirac mode only)

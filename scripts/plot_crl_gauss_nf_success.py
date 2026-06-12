@@ -427,6 +427,12 @@ def _task_configs() -> List[Tuple[str, str, List[Tuple[str, List[str], str]]]]:
             ('NF', [f'{r}/logs/ppo_nf_push_v6/ppo_sawyer_push_{s}' for s in (0, 1)], '#4CE87A'),
             ('CRL backward', [f'{r}/logs/ppo_backward/ppo_sawyer_push_{s}'
                               for s in (0, 1)], '#9B59B6', 'raw'),
+            ('CRL τ=0.05', [f'{r}/logs/ppo_push_tau0p05/ppo_sawyer_push_{s}'
+                            for s in (0, 1, 2)], '#1f77b4', 'raw'),
+            ('CRL τ=0.5', [f'{r}/logs/ppo_push_tau0p5/ppo_sawyer_push_{s}'
+                           for s in (0, 1, 2)], '#ff7f0e', 'raw'),
+            ('CRL τ=0.8', [f'{r}/logs/ppo_push_tau0p8/ppo_sawyer_push_{s}'
+                           for s in (0, 1, 2)], '#2ca02c', 'raw'),
         ]),
         ('push_nf', 'Sawyer Push — NF runs (labeled)',
          os.path.join(FIGS, 'success_1000_sawyer_push_nf_runs.png'), [
@@ -443,6 +449,12 @@ def _task_configs() -> List[Tuple[str, str, List[Tuple[str, List[str], str]]]]:
              [f'{r}/logs/ppo_nf_push_small_noclip/ppo_sawyer_push_{s}' for s in (2, 3)], '#E74C3C'),
             ('CRL backward', [f'{r}/logs/ppo_backward/ppo_sawyer_push_{s}'
                               for s in (0, 1)], '#9B59B6', 'raw'),
+            ('CRL τ=0.05', [f'{r}/logs/ppo_push_tau0p05/ppo_sawyer_push_{s}'
+                            for s in (0, 1, 2)], '#1f77b4', 'raw'),
+            ('CRL τ=0.5', [f'{r}/logs/ppo_push_tau0p5/ppo_sawyer_push_{s}'
+                           for s in (0, 1, 2)], '#ff7f0e', 'raw'),
+            ('CRL τ=0.8', [f'{r}/logs/ppo_push_tau0p8/ppo_sawyer_push_{s}'
+                           for s in (0, 1, 2)], '#2ca02c', 'raw'),
         ]),
     ]
 
