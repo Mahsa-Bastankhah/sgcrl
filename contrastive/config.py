@@ -3,8 +3,9 @@ import dataclasses
 from typing import Any, Optional, Union, Tuple
 
 from acme import specs
-from acme.adders import reverb as adders_reverb
 import numpy as onp
+
+_DEFAULT_PRIORITY_TABLE = 'priority_table'
 
 
 @dataclasses.dataclass
@@ -43,7 +44,7 @@ class ContrastiveConfig:
   # Replay options
   min_replay_size: int = 10000
   max_replay_size: int = 1000000
-  replay_table_name: str = adders_reverb.DEFAULT_PRIORITY_TABLE
+  replay_table_name: str = _DEFAULT_PRIORITY_TABLE
   prefetch_size: int = 4
   num_parallel_calls: Optional[int] = 4
   samples_per_insert: float = 256
@@ -229,6 +230,8 @@ class ContrastiveConfig:
   nf_goal_norm_low: Optional[Any] = None   # deprecated; unused
   nf_goal_norm_high: Optional[Any] = None  # deprecated; unused
   ppo_skip_first_eval: bool = False  # skip logging the iteration-0 eval (avoids artificially high checkpoint result)
+  ppo_eval_interval: int = 10  # run eval every N PPO iterations (0 = disabled)
+  ppo_eval_episodes: int = 5  # number of eval episodes per eval round
   # KDE options (only used when ppo_reward_mode == 'kde_dirac').
   # kde_max_points: number of replay states to fit the KDE on.
   # kde_refit_interval: refit the KDE every N PPO iterations (1 = every iter).

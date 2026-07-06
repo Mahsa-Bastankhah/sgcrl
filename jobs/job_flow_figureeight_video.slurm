@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=flow_video
-#SBATCH --output=slurm/flow_video_%A_%a.out
-#SBATCH --error=slurm/flow_video_%A_%a.out
+#SBATCH --output=slurm/flow_video_%A_%a.log
+#SBATCH --error=slurm/flow_video_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4

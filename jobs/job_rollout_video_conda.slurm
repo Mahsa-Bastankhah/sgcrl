@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ppo_video_conda
-#SBATCH --output=slurm/video_conda_%A_%a.out
+#SBATCH --output=slurm/video_conda_%A_%a.log
+#SBATCH --error=slurm/video_conda_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4

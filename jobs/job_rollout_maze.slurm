@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ppo_maze
-#SBATCH --output=slurm/maze_%A_%a.out
+#SBATCH --output=slurm/maze_%A_%a.log
+#SBATCH --error=slurm/maze_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2

@@ -8,8 +8,8 @@
 #SBATCH --time=1:00:00
 #SBATCH --requeue
 #SBATCH --array=1
-#SBATCH --output=%x-%A_%a.out
-#SBATCH --error=%x-%A_%a.err
+#SBATCH --output=%x-%A_%a.log
+#SBATCH --error=%x-%A_%a.log
 
 conda init
 source activate base

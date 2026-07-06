@@ -1054,6 +1054,59 @@ def _truncate_csv_to_iteration(csv_path: str, max_iteration: int) -> None:
     print(f'[ppo] warning: could not truncate {csv_path}: {exc}')
 
 
+def _bb_ep_metrics_from_eval_steps(
+    steps,
+    obs_dim: int,
+    start_index: int,
+    end_index: int,
+    episode_length: int,
+) -> list:
+  """Per-env eval metrics from a BuilderBench GPU eval scan."""
+  rewards = np.asarray(steps['reward'], dtype=np.float32)
+  success = np.asarray(steps['success'], dtype=np.float32)
+  state_obs = np.asarray(steps['state_obs'], dtype=np.float32)
+  goals = np.asarray(steps['goal'], dtype=np.float32)
+  ei = int(obs_dim if end_index == -1 else end_index)
+  si = int(start_index)
+  goal_slice = goals[..., : max(1, ei - si)]
+  state_slice = state_obs[..., si:ei]
+  dists = np.linalg.norm(state_slice - goal_slice, axis=-1)
+
+  ep_metrics_list = []
+  for i in range(rewards.shape[1]):
+    ep_metrics_list.append({
+        'episode_return': float(rewards[:, i].sum()),
+        'episode_length': int(episode_length),
+        'success': float(np.max(success[:, i]) >= 0.5),
+        'init_dist': float(dists[0, i]),
+        'final_dist': float(dists[-1, i]),
+        'delta_dist': float(dists[0, i] - dists[-1, i]),
+        'min_dist': float(np.min(dists[:, i])),
+    })
+  return ep_metrics_list
+
+
+def _smooth_bb_eval_metrics(
+    ep_metrics_list: list,
+    success_obs,
+    dist_obs,
+) -> list:
+  """Attach running success_1000 / dist_* smoothers (matches observer semantics)."""
+  smoothed = []
+  for ep_m in ep_metrics_list:
+    success_obs._success.append(bool(ep_m['success'] >= 0.5))
+    ep_out = dict(ep_m)
+    ep_out['success_1000'] = float(np.mean(success_obs._success[-1000:]))
+    for key in ('init_dist', 'final_dist', 'delta_dist', 'min_dist'):
+      dist_obs._history.setdefault(key, []).append(float(ep_m[key]))
+    if dist_obs._smooth:
+      for key, vec in dist_obs._history.items():
+        for size in (10, 100, 1000):
+          ep_out[f'{key}_{size}'] = float(np.nanmean(vec[-size:]))
+    smoothed.append(ep_out)
+  return smoothed
+
+
 # ---------------------------------------------------------------------------
 # Top-level training loop.
 # ---------------------------------------------------------------------------
@@ -1066,6 +1119,7 @@ def run_ppo_training(
     total_steps: int,
     seed: int = 0,
     checkpoint_dir: Optional[str] = None,
+    builderbench_kwargs: Optional[Dict[str, Any]] = None,
 ):
   """Top-level PPO-on-φ·ψ training loop.
 
@@ -1092,7 +1146,32 @@ def run_ppo_training(
   del probe_env
 
   # ---- vec env ----------------------------------------------------------
-  vec_env = VecEnv(env_factory, config.ppo_num_envs, seed=seed * 31)
+  _env_name = str(getattr(config, 'env_name', '') or '')
+  _use_jax_bb_vec = _env_name.startswith('builderbench_')
+  if _use_jax_bb_vec:
+    import importlib.util as _ilu
+    _jax_vec_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'envs', 'builderbench_jax_vec.py')
+    _spec = _ilu.spec_from_file_location('builderbench_jax_vec', _jax_vec_path)
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    JaxBuilderBenchVecEnv = _mod.JaxBuilderBenchVecEnv
+    _bb_kw = dict(builderbench_kwargs or {})
+    vec_env = JaxBuilderBenchVecEnv(
+        env_name=_env_name,
+        num_envs=int(config.ppo_num_envs),
+        seed=int(seed * 31),
+        use_pd=bool(_bb_kw.get('builderbench_use_pd', False)),
+        pd_duration=int(_bb_kw.get('builderbench_pd_duration', 5)),
+        pd_filter_policy_obs=bool(
+            _bb_kw.get('builderbench_pd_filter_policy_obs', True)),
+        fixed_target_goal=_bb_kw.get('fixed_target_goal'),
+    )
+    print(f'[ppo] using JAX-batched BuilderBench vec env '
+          f'(E={config.ppo_num_envs})')
+  else:
+    vec_env = VecEnv(env_factory, config.ppo_num_envs, seed=seed * 31)
   E = vec_env.num_envs
   obs_shape = vec_env.observation_shape
   act_shape = vec_env.action_shape
@@ -1309,6 +1388,42 @@ def run_ppo_training(
     value = networks.value_network.apply(value_p, obs)
     return action, logprob, value
 
+  bb_generate_unroll = None
+  bb_eval_unroll = None
+  bb_eval_vec = None
+  if _use_jax_bb_vec:
+    bb_generate_unroll = vec_env.compile_generate_unroll(
+        act_and_value,
+        unroll_length=T,
+        obs_dim=int(config.obs_dim))
+    print(f'[ppo] BuilderBench rollout: jax.lax.scan (T={T})')
+    _eval_iv = int(getattr(config, 'ppo_eval_interval', 10))
+    if _eval_iv > 0:
+      _n_eval = int(getattr(config, 'ppo_eval_episodes', 5))
+      bb_eval_vec = JaxBuilderBenchVecEnv(
+          env_name=_env_name,
+          num_envs=_n_eval,
+          seed=int(seed * 31 + 77),
+          use_pd=bool(_bb_kw.get('builderbench_use_pd', False)),
+          pd_duration=int(_bb_kw.get('builderbench_pd_duration', 5)),
+          fixed_target_goal=_bb_kw.get('fixed_target_goal'),
+      )
+
+      @jax.jit
+      def eval_policy_action(policy_p, obs):
+        dist = networks.policy_network.apply(policy_p, obs)
+        return dist.mode()
+
+      bb_eval_unroll = bb_eval_vec.compile_eval_unroll(
+          eval_policy_action,
+          unroll_length=bb_eval_vec.episode_length)
+      print(f'[ppo] BuilderBench eval: jax.lax.scan '
+            f'(E={_n_eval}, ep_len={bb_eval_vec.episode_length}, '
+            f'every {_eval_iv} iters)')
+    else:
+      print('[ppo] BuilderBench: periodic eval disabled; '
+            'logging train_success_mean / train_success_1000 from rollouts')
+
   @jax.jit
   def value_only(value_p, obs):
     return networks.value_network.apply(value_p, obs)
@@ -1324,9 +1439,17 @@ def run_ppo_training(
   goal_low = goal_high = None
   if uniform_sampling:
     import env_utils as _env_utils
-    goal_low, goal_high = _env_utils.resolve_uniform_goal_bounds(
-        spec, vec_env._envs[0], int(config.obs_dim),
-        int(config.start_index), int(config.end_index))
+    if hasattr(vec_env, 'uniform_goal_obs_bounds'):
+      glo, ghi = vec_env.uniform_goal_obs_bounds()
+      si, ei = int(config.start_index), int(config.end_index)
+      if ei == -1:
+        ei = int(config.obs_dim)
+      goal_low = np.asarray(glo[si:ei], dtype=np.float32)
+      goal_high = np.asarray(ghi[si:ei], dtype=np.float32)
+    else:
+      goal_low, goal_high = _env_utils.resolve_uniform_goal_bounds(
+          spec, vec_env._envs[0], int(config.obs_dim),
+          int(config.start_index), int(config.end_index))
     print(f'[ppo] uniform_sampling: goal_low={goal_low}, goal_high={goal_high}')
 
   # ---- replay buffer (episodes) -----------------------------------------
@@ -1348,6 +1471,9 @@ def run_ppo_training(
   recent_returns: list = []
   recent_flow_dense_returns: list = []
   recent_lengths: list = []
+  recent_success: list = []
+  ep_success_max = np.zeros(E, dtype=np.float32)
+  _track_train_success = _use_jax_bb_vec
 
   # Running goal normalisation stats for NF mode.
   # Updated from replay buffer each iteration; broadcast-compatible with goals.
@@ -1356,7 +1482,7 @@ def run_ppo_training(
 
   obs = vec_env.reset()
   next_done = np.zeros(E, dtype=np.float32)
-  s0_states = np.asarray(obs[:, :int(config.obs_dim)], dtype=np.float32)
+  s0_states = np.asarray(obs[:, :int(config.obs_dim)], dtype=np.float32).copy()
   for i in range(E):
     ep_obs[i].append(obs[i].copy())
 
@@ -1372,6 +1498,8 @@ def run_ppo_training(
   if _env == 'riverswim':
     eval_success_obs = _cu.RiverSwimGoalVisitSuccessObserver(
         obs_dim=int(config.obs_dim))
+  elif _env.startswith('builderbench_'):
+    eval_success_obs = _cu.BuilderBenchSuccessObserver()
   else:
     eval_success_obs = _cu.SuccessObserver()
   eval_dist_obs = _cu.DistanceObserver(
@@ -1431,72 +1559,141 @@ def run_ppo_training(
     # =================================================================
     # 1. Rollout (on-policy, CleanRL convention)
     # =================================================================
-    for t in range(T):
-      roll_obs[t] = obs
-      roll_dones[t] = next_done
-
-      key, k_act = jax.random.split(key)
-      action_j, logprob_j, value_j = act_and_value(
-          ppo_params['policy'], ppo_params['value'],
-          jnp.asarray(obs), k_act)
-      action = np.asarray(action_j)
-      roll_acts[t] = action
-      roll_logp[t] = np.asarray(logprob_j)
-      roll_vals[t] = np.asarray(value_j)
-
-      # For dirac_target, record s0 for the batched reward call later.
+    if bb_generate_unroll is not None:
+      # BuilderBench: fused policy + env unroll via jax.lax.scan (GPU).
+      (vec_env._state, key, next_done, _), _steps_j = bb_generate_unroll(
+          vec_env._state,
+          ppo_params['policy'],
+          ppo_params['value'],
+          key,
+          jnp.asarray(next_done),
+          jnp.asarray(s0_states),
+      )
+      roll_obs[:] = np.asarray(_steps_j['obs'], dtype=np.float32)
+      roll_dones[:] = np.asarray(_steps_j['roll_dones'], dtype=np.float32)
+      roll_acts[:] = np.asarray(_steps_j['actions'], dtype=np.float32)
+      roll_logp[:] = np.asarray(_steps_j['logprobs'], dtype=np.float32)
+      roll_vals[:] = np.asarray(_steps_j['values'], dtype=np.float32)
+      roll_env_rew[:] = np.asarray(_steps_j['env_rew'], dtype=np.float32)
+      roll_step_dones[:] = np.asarray(_steps_j['step_dones'], dtype=np.float32)
       if use_dirac_target:
-        roll_s0_states[t] = s0_states
-      # kde_dirac reward is pure NumPy — compute per-step to avoid storing KDE.
-      elif use_kde_dirac:
-        rep_rew_np = (np.zeros(E, dtype=np.float32) if kde_state is None
-                      else reward_fn(kde_state, obs).astype(np.float32))
-        roll_rew_raw[t] = rep_rew_np
+        roll_s0_states[:] = np.asarray(_steps_j['s0_states'], dtype=np.float32)
+      if use_kde_dirac:
+        for _t in range(T):
+          rep_rew_np = (np.zeros(E, dtype=np.float32) if kde_state is None
+                        else reward_fn(kde_state, roll_obs[_t]).astype(np.float32))
+          roll_rew_raw[_t] = rep_rew_np
+      obs = np.asarray(
+          vec_env.pack_obs_from_state(vec_env._state), dtype=np.float32)
+      _roll_success = (
+          np.asarray(_steps_j['success'], dtype=np.float32)
+          if _track_train_success else None)
+      for _t in range(T):
+        _actions_t = roll_acts[_t]
+        _env_rew_t = roll_env_rew[_t]
+        _dones_t = roll_step_dones[_t].astype(bool)
+        _term_t = np.asarray(_steps_j['terminal_obs'][_t], dtype=np.float32)
+        _next_t = np.asarray(_steps_j['next_obs'][_t], dtype=np.float32)
+        for i in range(E):
+          ep_act[i].append(_actions_t[i].copy())
+          ep_return[i] += float(_env_rew_t[i])
+          ep_len[i] += 1
+          if _roll_success is not None:
+            ep_success_max[i] = max(
+                ep_success_max[i], float(_roll_success[_t, i]))
+          if _dones_t[i]:
+            ep_obs[i].append(_term_t[i].copy())
+            try:
+              replay.add_episode(
+                  np.stack(ep_obs[i], axis=0),
+                  np.stack(ep_act[i], axis=0))
+            except AssertionError:
+              pass
+            ep_obs[i] = [_next_t[i].copy()]
+            s0_states[i] = _next_t[i, :int(config.obs_dim)].copy()
+            ep_act[i] = []
+            recent_returns.append(float(ep_return[i]))
+            recent_lengths.append(int(ep_len[i]))
+            if _roll_success is not None:
+              recent_success.append(float(ep_success_max[i] >= 0.5))
+              ep_success_max[i] = 0.0
+              if len(recent_success) > 1000:
+                recent_success.pop(0)
+            ep_return[i] = 0.0
+            ep_len[i] = 0
+            if len(recent_returns) > 100:
+              recent_returns.pop(0)
+              recent_lengths.pop(0)
+          else:
+            ep_obs[i].append(_next_t[i].copy())
+      global_step += T * E
+    else:
+      for t in range(T):
+        roll_obs[t] = obs
+        roll_dones[t] = next_done
 
-      next_obs, env_rew, dones, terminal_obs, info_rew = vec_env.step(action)
-      roll_env_rew[t] = env_rew
-      roll_flow_dense_rew[t] = info_rew
-      # Store step-level dones for the post-rollout reward normalizer loop.
-      roll_step_dones[t] = dones.astype(np.float32)
+        key, k_act = jax.random.split(key)
+        action_j, logprob_j, value_j = act_and_value(
+            ppo_params['policy'], ppo_params['value'],
+            jnp.asarray(obs), k_act)
+        action = np.asarray(action_j)
+        roll_acts[t] = action
+        roll_logp[t] = np.asarray(logprob_j)
+        roll_vals[t] = np.asarray(value_j)
 
-      # Episode flushing / per-env accounting.
-      for i in range(E):
-        ep_act[i].append(action[i].copy())
-        ep_return[i] += float(env_rew[i])
-        if not np.isnan(info_rew[i]):
-          ep_flow_dense_return[i] += float(info_rew[i])
-          ep_has_flow_dense[i] = True
-        ep_len[i] += 1
-        if dones[i]:
-          ep_obs[i].append(terminal_obs[i].copy())
-          try:
-            replay.add_episode(
-                np.stack(ep_obs[i], axis=0),
-                np.stack(ep_act[i], axis=0))
-          except AssertionError:
-            pass  # degenerate len-0 episodes; skip
-          ep_obs[i] = [next_obs[i].copy()]  # auto-reset state seeds next ep
-          s0_states[i] = next_obs[i, :int(config.obs_dim)].copy()
-          ep_act[i] = []
-          recent_returns.append(float(ep_return[i]))
-          if ep_has_flow_dense[i]:
-            recent_flow_dense_returns.append(float(ep_flow_dense_return[i]))
-          recent_lengths.append(int(ep_len[i]))
-          ep_return[i] = 0.0
-          ep_flow_dense_return[i] = 0.0
-          ep_has_flow_dense[i] = False
-          ep_len[i] = 0
-          if len(recent_returns) > 100:
-            recent_returns.pop(0)
-            recent_lengths.pop(0)
-          if len(recent_flow_dense_returns) > 100:
-            recent_flow_dense_returns.pop(0)
-        else:
-          ep_obs[i].append(next_obs[i].copy())
+        # For dirac_target, record s0 for the batched reward call later.
+        if use_dirac_target:
+          roll_s0_states[t] = s0_states
+        # kde_dirac reward is pure NumPy — compute per-step to avoid storing KDE.
+        elif use_kde_dirac:
+          rep_rew_np = (np.zeros(E, dtype=np.float32) if kde_state is None
+                        else reward_fn(kde_state, obs).astype(np.float32))
+          roll_rew_raw[t] = rep_rew_np
 
-      obs = next_obs
-      next_done = dones.astype(np.float32)
-      global_step += E
+        next_obs, env_rew, dones, terminal_obs, info_rew = vec_env.step(action)
+        roll_env_rew[t] = env_rew
+        roll_flow_dense_rew[t] = info_rew
+        # Store step-level dones for the post-rollout reward normalizer loop.
+        roll_step_dones[t] = dones.astype(np.float32)
+
+        # Episode flushing / per-env accounting.
+        for i in range(E):
+          ep_act[i].append(action[i].copy())
+          ep_return[i] += float(env_rew[i])
+          if not np.isnan(info_rew[i]):
+            ep_flow_dense_return[i] += float(info_rew[i])
+            ep_has_flow_dense[i] = True
+          ep_len[i] += 1
+          if dones[i]:
+            ep_obs[i].append(terminal_obs[i].copy())
+            try:
+              replay.add_episode(
+                  np.stack(ep_obs[i], axis=0),
+                  np.stack(ep_act[i], axis=0))
+            except AssertionError:
+              pass  # degenerate len-0 episodes; skip
+            ep_obs[i] = [next_obs[i].copy()]  # auto-reset state seeds next ep
+            s0_states[i] = next_obs[i, :int(config.obs_dim)].copy()
+            ep_act[i] = []
+            recent_returns.append(float(ep_return[i]))
+            if ep_has_flow_dense[i]:
+              recent_flow_dense_returns.append(float(ep_flow_dense_return[i]))
+            recent_lengths.append(int(ep_len[i]))
+            ep_return[i] = 0.0
+            ep_flow_dense_return[i] = 0.0
+            ep_has_flow_dense[i] = False
+            ep_len[i] = 0
+            if len(recent_returns) > 100:
+              recent_returns.pop(0)
+              recent_lengths.pop(0)
+            if len(recent_flow_dense_returns) > 100:
+              recent_flow_dense_returns.pop(0)
+          else:
+            ep_obs[i].append(next_obs[i].copy())
+
+        obs = next_obs
+        next_done = dones.astype(np.float32)
+        global_step += E
 
     # =================================================================
     # 1b. Batched reward computation (single GPU call over full rollout)
@@ -1688,6 +1885,13 @@ def run_ppo_training(
         'ep_length_mean':    float(np.mean(recent_lengths)) if recent_lengths else float('nan'),
         'ppo/mean_pg_loss':  mean_pg,
     }
+    if _track_train_success:
+      log['train_success_mean'] = (
+          float(np.mean(recent_success[-100:]))
+          if recent_success else float('nan'))
+      log['train_success_1000'] = (
+          float(np.mean(recent_success[-1000:]))
+          if recent_success else float('nan'))
 
     # Acme CSVLogger fixes columns on the *first* write and drops any later
     # keys.  Seed NF/SA columns from iter 0 so training metrics land in CSV.
@@ -1749,56 +1953,62 @@ def run_ppo_training(
     learner_logger.write(log)
 
     # =================================================================
-    # 6. Periodic evaluation  (5 episodes every 10 iters)
-    #
-    # Uses the same observers the SAC side uses (`SuccessObserver` or
-    # `RiverSwimGoalVisitSuccessObserver` + `DistanceObserver` from
-    # contrastive/utils.py) so the eval CSV
-    # schema matches the kappa_sac runs, plus Flow dense-return stats:
-    #   success, success_1000, init_dist, final_dist, delta_dist,
-    #   min_dist, *_10, *_100, *_1000, episode_return, episode_length,
-    #   flow_dense_return, flow_dense_reward_mean, ep_flow_dense_return_mean
+    # 6. Periodic evaluation
     # =================================================================
     _skip_first = bool(getattr(config, 'ppo_skip_first_eval', False))
-    if iteration % 10 == 0 and not (iteration == 0 and _skip_first):
-      ep_metrics_list = []
-      for e_i in range(5):
-        env = eval_env_factory(seed + 900_000 + iteration * 100 + e_i)
-        ts = env.reset()
-        eval_success_obs.observe_first(env, ts)
-        eval_dist_obs.observe_first(env, ts)
-        ret_e, n_e = 0.0, 0
-        flow_dense_ret_e = 0.0
-        flow_dense_steps = 0
-        while not ts.last():
-          key, k_eval = jax.random.split(key)
-          a, _, _ = act_and_value(
-              ppo_params['policy'], ppo_params['value'],
-              jnp.asarray(ts.observation)[None], k_eval)
-          action = np.asarray(a)[0].astype(np.float32)
-          action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
-          action = np.clip(action, -1.0, 1.0)
-          ts = env.step(action)
-          eval_success_obs.observe(env, ts, action)
-          eval_dist_obs.observe(env, ts, action)
-          ret_e += float(ts.reward or 0.0)
-          dense_r = _cu.extract_info_reward(env)
-          if not np.isnan(dense_r):
-            flow_dense_ret_e += dense_r
-            flow_dense_steps += 1
-          n_e += 1
-        ep_metrics = {'episode_return': ret_e, 'episode_length': n_e}
-        if flow_dense_steps > 0:
-          ep_metrics.update(
-              _cu.flow_dense_eval_episode_metrics(
-                  flow_dense_ret_e, flow_dense_steps))
-        ep_metrics.update(eval_success_obs.get_metrics())
-        ep_metrics.update(eval_dist_obs.get_metrics())
-        ep_metrics_list.append(ep_metrics)
+    _eval_interval = int(getattr(config, 'ppo_eval_interval', 10))
+    _n_eval = int(getattr(config, 'ppo_eval_episodes', 5))
+    if (_eval_interval > 0
+        and iteration % _eval_interval == 0
+        and not (iteration == 0 and _skip_first)):
+      if bb_eval_unroll is not None and bb_eval_vec is not None:
+        eval_state = bb_eval_vec.reset_state()
+        steps_j = bb_eval_unroll(eval_state, ppo_params['policy'])
+        ep_metrics_list = _bb_ep_metrics_from_eval_steps(
+            steps_j,
+            obs_dim=int(config.obs_dim),
+            start_index=int(config.start_index),
+            end_index=int(config.end_index),
+            episode_length=int(bb_eval_vec.episode_length),
+        )
+        ep_metrics_list = _smooth_bb_eval_metrics(
+            ep_metrics_list, eval_success_obs, eval_dist_obs)
+      else:
+        ep_metrics_list = []
+        for e_i in range(_n_eval):
+          env = eval_env_factory(seed + 900_000 + iteration * 100 + e_i)
+          ts = env.reset()
+          eval_success_obs.observe_first(env, ts)
+          eval_dist_obs.observe_first(env, ts)
+          ret_e, n_e = 0.0, 0
+          flow_dense_ret_e = 0.0
+          flow_dense_steps = 0
+          while not ts.last():
+            key, k_eval = jax.random.split(key)
+            a, _, _ = act_and_value(
+                ppo_params['policy'], ppo_params['value'],
+                jnp.asarray(ts.observation)[None], k_eval)
+            action = np.asarray(a)[0].astype(np.float32)
+            action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
+            action = np.clip(action, -1.0, 1.0)
+            ts = env.step(action)
+            eval_success_obs.observe(env, ts, action)
+            eval_dist_obs.observe(env, ts, action)
+            ret_e += float(ts.reward or 0.0)
+            dense_r = _cu.extract_info_reward(env)
+            if not np.isnan(dense_r):
+              flow_dense_ret_e += dense_r
+              flow_dense_steps += 1
+            n_e += 1
+          ep_metrics = {'episode_return': ret_e, 'episode_length': n_e}
+          if flow_dense_steps > 0:
+            ep_metrics.update(
+                _cu.flow_dense_eval_episode_metrics(
+                    flow_dense_ret_e, flow_dense_steps))
+          ep_metrics.update(eval_success_obs.get_metrics())
+          ep_metrics.update(eval_dist_obs.get_metrics())
+          ep_metrics_list.append(ep_metrics)
 
-      # Average across the 5 eval episodes.  `success_1000` is already
-      # a running statistic inside the success observer, so we just take its
-      # last value (same as Acme's evaluator loop).
       agg = _cu.aggregate_eval_metrics(ep_metrics_list, iteration)
       eval_logger.write(agg)
 

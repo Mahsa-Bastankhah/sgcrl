@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ppo_peg_tau85
-#SBATCH --output=slurm/ppo_sawyer_peg_crl_tau_%A_%a.out
-#SBATCH --error=slurm/ppo_sawyer_peg_crl_tau_%A_%a.err
+#SBATCH --output=slurm/ppo_sawyer_peg_crl_tau_%A_%a.log
+#SBATCH --error=slurm/ppo_sawyer_peg_crl_tau_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

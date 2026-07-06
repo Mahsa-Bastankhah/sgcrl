@@ -125,6 +125,12 @@ flags.DEFINE_string(
 flags.DEFINE_boolean(
     'ppo_skip_first_eval', False,
     'Skip logging the iteration-0 eval (avoids logging the checkpoint result as the first data point when resuming).')
+flags.DEFINE_integer(
+    'ppo_eval_interval', -1,
+    'Run eval every N PPO iterations. <0 keeps config/env default (10). 0 disables eval.')
+flags.DEFINE_integer(
+    'ppo_eval_episodes', -1,
+    'Number of eval episodes per eval round. <0 keeps config default (5).')
 flags.DEFINE_boolean(
     'ppo_norm_reward', True,
     'Normalize the repr reward by the running std of discounted returns. Set False to pass raw reward directly to PPO.')
@@ -178,6 +184,12 @@ flags.DEFINE_float(
 flags.DEFINE_boolean(
     'bin_randomize_gripper_init', False,
     'SawyerBin: randomize initial gripper TCP offset around the object at reset.')
+flags.DEFINE_boolean(
+    'builderbench_use_pd', False,
+    'BuilderBench: wrap env in PDWrapper (short horizon). Default False = raw control.')
+flags.DEFINE_integer(
+    'builderbench_pd_duration', 5,
+    'BuilderBench PDWrapper: low-level MuJoCo steps per RL step when use_pd=True.')
 flags.DEFINE_string(
     'hidden_layer_sizes', '',
     'Comma-separated hidden layer widths, e.g. "256,256,256,256,256,256". '
@@ -325,6 +337,36 @@ PPO_ENV_DEFAULTS = {
 }
 
 
+def fixed_goal_for_env(env_name: str) -> np.ndarray:
+  """Return the fixed goal vector for ``env_name`` (incl. all BuilderBench creative tasks)."""
+  if env_name in fixed_goal_dict:
+    return fixed_goal_dict[env_name]
+  from envs.builderbench_utils import (
+      default_fixed_target_goal,
+      is_builderbench_creative_env,
+      parse_sgcrl_builderbench_env_name,
+  )
+  if is_builderbench_creative_env(env_name):
+    _, num_cubes, task_index = parse_sgcrl_builderbench_env_name(env_name)
+    return default_fixed_target_goal(num_cubes, task_index)
+  raise KeyError(f'No fixed goal configured for env {env_name!r}')
+
+
+def ppo_env_defaults_for_env(env_name: str, use_pd: bool = False):
+  """Return per-env PPO defaults, including dynamic BuilderBench creative tasks."""
+  if env_name in PPO_ENV_DEFAULTS:
+    return PPO_ENV_DEFAULTS[env_name]
+  from envs.builderbench_utils import (
+      is_builderbench_creative_env,
+      parse_sgcrl_builderbench_env_name,
+      ppo_env_defaults as builderbench_ppo_defaults,
+  )
+  if is_builderbench_creative_env(env_name):
+    _, num_cubes, _ = parse_sgcrl_builderbench_env_name(env_name)
+    return builderbench_ppo_defaults(num_cubes, use_pd=use_pd)
+  return None
+
+
 def _json_safe(value):
   if isinstance(value, (str, int, float, bool)) or value is None:
     return value
@@ -364,7 +406,9 @@ def main(_):
   config.repr_norm = bool(FLAGS.repr_norm)
 
   # ---- Per-env PPO defaults (CLI flags still override) -------------------
-  env_defaults = PPO_ENV_DEFAULTS.get(env_name)
+  _use_pd = (bool(FLAGS.builderbench_use_pd)
+             if env_name.startswith('builderbench_') else False)
+  env_defaults = ppo_env_defaults_for_env(env_name, use_pd=_use_pd)
   if env_defaults is None:
     print(f'[ppo_contrastive] WARNING: no PPO_ENV_DEFAULTS entry for '
           f'{env_name!r}; falling back to ContrastiveConfig defaults '
@@ -377,6 +421,14 @@ def main(_):
       config.start_index = int(env_defaults['start_index'])
     if 'end_index' in env_defaults:
       config.end_index = int(env_defaults['end_index'])
+    if 'num_envs' in env_defaults and FLAGS.ppo_num_envs < 0:
+      config.ppo_num_envs = int(env_defaults['num_envs'])
+    if ('eval_interval' in env_defaults
+        and FLAGS.ppo_eval_interval < 0):
+      config.ppo_eval_interval = int(env_defaults['eval_interval'])
+    if ('checkpoint_interval' in env_defaults
+        and FLAGS.ppo_checkpoint_interval < 0):
+      config.ppo_checkpoint_interval = int(env_defaults['checkpoint_interval'])
 
   if FLAGS.ppo_rollout_length >= 0:
     config.ppo_rollout_length = int(FLAGS.ppo_rollout_length)
@@ -384,6 +436,22 @@ def main(_):
     config.ppo_crl_steps_per_iter = int(FLAGS.ppo_crl_steps_per_iter)
   if FLAGS.ppo_num_envs >= 0:
     config.ppo_num_envs = int(FLAGS.ppo_num_envs)
+
+  total_steps = int(FLAGS.num_steps)
+  if env_name.startswith('builderbench_'):
+    from envs.builderbench_utils import (
+        BUILDERBENCH_NUM_STEPS,
+        builderbench_replay_size,
+    )
+    if FLAGS.max_replay_size < 0:
+      config.max_replay_size = builderbench_replay_size(config.ppo_num_envs)
+    if FLAGS.num_steps == 8_000_000:
+      total_steps = BUILDERBENCH_NUM_STEPS
+      config.max_number_of_steps = total_steps
+    print(f'[ppo] builderbench scale: num_steps={total_steps} '
+          f'max_replay_size={config.max_replay_size} '
+          f'(E={config.ppo_num_envs})')
+
   if FLAGS.discount >= 0.0:
     config.discount = float(FLAGS.discount)
   if FLAGS.ppo_discount > 0.0:
@@ -410,6 +478,10 @@ def main(_):
   config.nf_goal_std_min = float(FLAGS.nf_goal_std_min)
   config.nf_mix_env_goal_stats = bool(FLAGS.nf_mix_env_goal_stats)
   config.ppo_skip_first_eval = bool(FLAGS.ppo_skip_first_eval)
+  if FLAGS.ppo_eval_interval >= 0:
+    config.ppo_eval_interval = int(FLAGS.ppo_eval_interval)
+  if FLAGS.ppo_eval_episodes >= 0:
+    config.ppo_eval_episodes = int(FLAGS.ppo_eval_episodes)
   config.ppo_norm_reward = bool(FLAGS.ppo_norm_reward)
   config.nf_goal_enc_size = int(FLAGS.nf_goal_enc_size)
   config.ppo_return_norm_window = int(FLAGS.ppo_return_norm_window)
@@ -459,7 +531,7 @@ def main(_):
         f'hidden_layers={config.hidden_layer_sizes}')
 
   # ---- Build env factories ----------------------------------------------
-  fixed_start_end = (fixed_goal_dict[env_name]
+  fixed_start_end = (fixed_goal_for_env(env_name)
                      if config.fix_goals else None)
 
   # NF push: start episodes with gripper closed (does not affect CRL/Gaussian).
@@ -471,6 +543,17 @@ def main(_):
   if env_name == 'sawyer_bin' and FLAGS.bin_randomize_gripper_init:
     _env_kwargs['randomize_gripper_init'] = True
     print('[ppo] sawyer_bin init: randomized gripper position at reset')
+  if env_name.startswith('builderbench_'):
+    _env_kwargs['builderbench_use_pd'] = bool(FLAGS.builderbench_use_pd)
+    _env_kwargs['builderbench_pd_duration'] = int(FLAGS.builderbench_pd_duration)
+    if FLAGS.builderbench_use_pd and FLAGS.ppo_rollout_length < 0:
+      pd_defaults = ppo_env_defaults_for_env(env_name, use_pd=True)
+      if pd_defaults is not None:
+        config.ppo_rollout_length = int(pd_defaults['rollout_length'])
+        config.ppo_crl_steps_per_iter = int(pd_defaults['crl_steps_per_iter'])
+    print(f'[ppo] builderbench: use_pd={FLAGS.builderbench_use_pd} '
+          f'pd_duration={FLAGS.builderbench_pd_duration}'
+          + (' pd_policy_obs=pos+select' if FLAGS.builderbench_use_pd else ''))
 
   def env_factory(s):
     env, _ = contrastive_utils.make_environment(
@@ -481,7 +564,7 @@ def main(_):
   def eval_env_factory(s):
     env, _ = contrastive_utils.make_environment(
         env_name, config.start_index, config.end_index, s,
-        fixed_start_end=fixed_goal_dict[env_name], **_env_kwargs)
+        fixed_start_end=fixed_goal_for_env(env_name), **_env_kwargs)
     return env
 
   # obs_dim / max_episode_steps inferred from one sample env.
@@ -538,15 +621,23 @@ def main(_):
 
   # ---- Go ----------------------------------------------------------------
   checkpoint_dir = os.path.join(run_dir, 'checkpoints')
+  _bb_kwargs = None
+  if env_name.startswith('builderbench_'):
+    _bb_kwargs = dict(_env_kwargs)
+    if fixed_start_end is not None:
+      _bb_kwargs['fixed_target_goal'] = np.asarray(
+          fixed_start_end, dtype=np.float32)
+
   ppo_learner.run_ppo_training(
       config=config,
       env_factory=env_factory,
       eval_env_factory=eval_env_factory,
       network_factory=network_factory,
       logger_fn=logger_fn,
-      total_steps=FLAGS.num_steps,
+      total_steps=total_steps,
       seed=seed,
       checkpoint_dir=checkpoint_dir,
+      builderbench_kwargs=_bb_kwargs,
   )
 
 

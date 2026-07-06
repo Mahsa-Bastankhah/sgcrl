@@ -279,6 +279,25 @@ def load(env_name, fixed_start_end=None, seed=None, **env_kwargs):
     obs_dim = FlowFigureEight2V2RL.STATE_OBS_DIM  # 4
     max_episode_steps = gym_env._max_episode_steps       # = 1500
     return gym_env, obs_dim, max_episode_steps
+  elif env_name.startswith('builderbench_creative_'):
+    from envs.builderbench_env import make_builderbench_creative_env
+    from envs.builderbench_utils import sgcrl_env_name_to_bb_env_id
+    fixed_target = None
+    if fixed_start_end is not None:
+      fixed_target = np.asarray(fixed_start_end, dtype=np.float32)
+    bb_env_id = sgcrl_env_name_to_bb_env_id(env_name)
+    gym_env = make_builderbench_creative_env(
+        env_id=bb_env_id,
+        seed=seed,
+        use_pd=bool(env_kwargs.get('builderbench_use_pd', False)),
+        pd_duration=int(env_kwargs.get('builderbench_pd_duration', 5)),
+        pd_filter_policy_obs=bool(
+            env_kwargs.get('builderbench_pd_filter_policy_obs', True)),
+        fixed_target_goal=fixed_target,
+    )
+    obs_dim = gym_env.state_obs_dim
+    max_episode_steps = gym_env._max_episode_steps
+    return gym_env, obs_dim, max_episode_steps
   else:
     raise NotImplementedError('Unsupported environment: %s' % env_name)
 

@@ -23,10 +23,77 @@ this reason (numpy 2.x breaks TF 2.8 C extensions with _ARRAY_API not found).
 Usage — must be the very first import in any entry-point script:
     import sgcrl_jax_acme_compat  # noqa: F401
 """
+import ctypes
+import importlib
+import pathlib
 import sys
 import types
+
+
+def _preload_nvidia_cuda_libs() -> None:
+  """Preload pip NVIDIA CUDA libs before JAX initializes the CUDA plugin.
+
+  JAX 0.10 + jax-cuda12-plugin calls cusparseGetProperty during plugin init.
+  If libcusparse from the pip ``nvidia-*`` packages is not already loaded with
+  global scope, JAX fails version checks and falls back to CPU even when a GPU
+  is allocated by Slurm.
+  """
+  _mods = (
+      'cuda_runtime', 'nvjitlink', 'cublas', 'cusparse', 'cusolver',
+      'cufft', 'cudnn', 'cuda_nvrtc', 'nccl',
+  )
+  for name in _mods:
+    try:
+      mod = importlib.import_module(f'nvidia.{name}')
+    except ImportError:
+      continue
+    lib_dir = pathlib.Path(mod.__path__[0]) / 'lib'
+    if not lib_dir.is_dir():
+      continue
+    for so in sorted(lib_dir.glob('*.so*')):
+      if so.is_symlink() and not so.name.endswith('.so'):
+        continue
+      try:
+        ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
+      except OSError:
+        pass
+
+
+_preload_nvidia_cuda_libs()
+
 import jax
 import jax.numpy as jnp
+import jax.tree_util as _jax_tree_util
+
+# --- jax.tree_* (removed from top-level jax in >= 0.4) ---
+if not hasattr(jax, 'tree_map'):
+    jax.tree_map = _jax_tree_util.tree_map
+if not hasattr(jax, 'tree_flatten'):
+    jax.tree_flatten = _jax_tree_util.tree_flatten
+if not hasattr(jax, 'tree_multimap'):
+    jax.tree_multimap = _jax_tree_util.tree_map
+
+# ---------------------------------------------------------------------------
+# launchpad stub — dm-launchpad is not pip-installable on Python 3.11, but acme
+# imports it in acme/utils/signals.py.  PPO does not use launchpad workers;
+# register_stop_handler / unregister_stop_handler are no-ops.
+# ---------------------------------------------------------------------------
+if 'launchpad' not in sys.modules:
+    _lp = types.ModuleType('launchpad')
+    _lp._stop_handlers = []
+
+    def register_stop_handler(handler):
+        _lp._stop_handlers.append(handler)
+
+    def unregister_stop_handler(handler):
+        try:
+            _lp._stop_handlers.remove(handler)
+        except ValueError:
+            pass
+
+    _lp.register_stop_handler = register_stop_handler
+    _lp.unregister_stop_handler = unregister_stop_handler
+    sys.modules['launchpad'] = _lp
 
 # ---------------------------------------------------------------------------
 # cv2 stub — only installed when the real cv2 cannot be loaded.
@@ -40,8 +107,11 @@ if 'cv2' not in sys.modules:
         class _AutoAttrModule(types.ModuleType):
             """Module stub that returns 0 for any missing attribute (cv2 constants)."""
             def __getattr__(self, name):
+                if name in ('__file__', '__spec__', '__path__'):
+                    return super().__getattribute__(name)
                 return 0
         _cv2_stub = _AutoAttrModule('cv2')
+        _cv2_stub.__file__ = __file__
         _cv2_stub.__version__ = '0.0.0-stub'
         sys.modules['cv2'] = _cv2_stub
         del _AutoAttrModule, _cv2_stub
@@ -74,3 +144,21 @@ else:
 # --- jnp.DeviceArray ---
 if not hasattr(jnp, 'DeviceArray'):
     jnp.DeviceArray = _Array
+
+# --- jax.interpreters.xla.pytype_aval_mappings ---
+# TFP 0.24–0.25 still writes to jax.interpreters.xla.pytype_aval_mappings, but
+# JAX >= 0.4 moved it to jax.core.pytype_aval_mappings (deprecated alias).
+import jax.core as _jax_core
+import jax.interpreters.xla as _jax_xla
+if not hasattr(_jax_xla, 'pytype_aval_mappings'):
+    _jax_xla.pytype_aval_mappings = _jax_core.pytype_aval_mappings
+
+# ---------------------------------------------------------------------------
+# TFP / TensorFlow — acme.jax.networks.distributional does
+#   `tfp = tensorflow_probability.substrates.jax` at import time.
+# TFP 0.25 only attaches `.substrates` after the jax submodule is imported,
+# and its jax backend expects TF + tf_keras to be present.
+# ---------------------------------------------------------------------------
+import tensorflow as _tf  # noqa: F401
+import tf_keras as _tf_keras  # noqa: F401
+import tensorflow_probability.substrates.jax as _tfp_jax  # noqa: F401

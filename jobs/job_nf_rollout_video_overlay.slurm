@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=nf_vid_ov
-#SBATCH --output=slurm/nf_video_overlay_%A_%a.out
+#SBATCH --output=slurm/nf_video_overlay_%A_%a.log
+#SBATCH --error=slurm/nf_video_overlay_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4

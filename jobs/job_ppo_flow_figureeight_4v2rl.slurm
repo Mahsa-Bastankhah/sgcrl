@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ppo_flow_4v2rl
-#SBATCH --output=slurm/ppo_flow_figureeight_4v2rl_%A_%a.out
-#SBATCH --error=slurm/ppo_flow_figureeight_4v2rl_%A_%a.out
+#SBATCH --output=slurm/ppo_flow_figureeight_4v2rl_%A_%a.log
+#SBATCH --error=slurm/ppo_flow_figureeight_4v2rl_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

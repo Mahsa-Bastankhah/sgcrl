@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=push_goal_viz
-#SBATCH --output=slurm/push_goal_viz_%j.out
+#SBATCH --output=slurm/push_goal_viz_%j.log
+#SBATCH --error=slurm/push_goal_viz_%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2

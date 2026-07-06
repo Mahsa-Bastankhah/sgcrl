@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=nf_push_s3
-#SBATCH --output=slurm/ppo_nf_push_seed3_retry_%x_%A_%j.out
+#SBATCH --output=slurm/ppo_nf_push_seed3_retry_%x_%A_%j.log
+#SBATCH --error=slurm/ppo_nf_push_seed3_retry_%x_%A_%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

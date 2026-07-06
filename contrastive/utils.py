@@ -16,7 +16,6 @@ import dm_env
 import env_utils
 import jax
 import numpy as np
-from torch.utils.tensorboard import SummaryWriter
 import os
 
 FLOW_DENSE_REWARD_KEY = 'flow_dense_reward'
@@ -136,6 +135,35 @@ class SuccessObserver(observers_base.EnvLoopObserver):
     return {
         'success': float(np.sum(self._rewards) >= 1),
         'success_1000': np.mean(self._success[-1000:]),
+    }
+
+
+class BuilderBenchSuccessObserver(observers_base.EnvLoopObserver):
+  """Eval success from BuilderBench ``info['success']`` (dense env reward is not 0/1)."""
+
+  def __init__(self):
+    self._step_success = []
+    self._success = []
+
+  def observe_first(self, env, timestep):
+    if self._step_success:
+      self._success.append(bool(np.max(self._step_success) >= 0.5))
+    self._step_success = []
+
+  def observe(self, env, timestep, action):
+    get_info = getattr(env, 'get_info', None)
+    val = 0.0
+    if get_info is not None:
+      info = get_info() or {}
+      val = float(info.get('success', info.get('easy_success', 0.0)))
+    self._step_success.append(val)
+
+  def get_metrics(self):
+    hit = bool(np.max(self._step_success) >= 0.5) if self._step_success else False
+    return {
+        'success': float(hit),
+        'success_1000': float(np.mean(self._success[-1000:]))
+        if self._success else float('nan'),
     }
 
 
