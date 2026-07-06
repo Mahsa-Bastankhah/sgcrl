@@ -179,21 +179,33 @@ def make_networks(
     goal = jnp.reshape(obs[:, obs_dim:], (-1, 64, 64, 3)) / 255.0
     return state, goal
 
-  def _repr_fn(obs, action, hidden=None):
-    # The optional input hidden is the image representations. We include this
-    # as an input for the second Q value when twin_q = True, so that the two Q
-    # values use the same underlying image representation.
-    if hidden is None:
-      if use_image_obs:
-        state, goal = _unflatten_obs(obs)
-        img_encoder = TORSO()
-        state = img_encoder(state)
-        goal = img_encoder(goal)
-      else:
-        state = obs[:, :obs_dim]
-        goal = obs[:, obs_dim:]
+  def _normalize_repr(sa_repr, g_repr):
+    if repr_norm:
+      sa_repr = sa_repr / (
+          jnp.linalg.norm(sa_repr, axis=1, keepdims=True) + 1e-8)
+      g_repr = g_repr / (
+          jnp.linalg.norm(g_repr, axis=1, keepdims=True) + 1e-8)
+      if repr_norm_temp:
+        log_scale = hk.get_parameter('repr_log_scale', [], dtype=sa_repr.dtype,
+                                     init=jnp.zeros)
+        sa_repr = sa_repr / jnp.exp(log_scale)
+    return sa_repr, g_repr
+
+  def _repr_fn(obs, action):
+    """φ(s,a) and ψ(g) encoders.  Goal comes from obs[:, obs_dim:] only.
+
+    When ``twin_q`` is True, a second independent (sa_encoder2, g_encoder2)
+    pair is defined and reps are stacked on the last axis so callers can
+    ``jnp.min(..., axis=-1)``.  sa encoders always take (state, action) only.
+    """
+    if use_image_obs:
+      state, goal = _unflatten_obs(obs)
+      img_encoder = TORSO()
+      state = img_encoder(state)
+      goal = img_encoder(goal)
     else:
-      state, goal = hidden
+      state = obs[:, :obs_dim]
+      goal = obs[:, obs_dim:]
 
     sa_repr = _mlp_or_residual(
         jnp.concatenate([state, action], axis=-1),
@@ -204,7 +216,6 @@ def make_networks(
         activate_final=False,
         w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
     )
-
     g_repr = _mlp_or_residual(
         goal,
         list(hidden_layer_sizes) + [repr_dim],
@@ -214,33 +225,42 @@ def make_networks(
         activate_final=False,
         w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
     )
+    sa_repr, g_repr = _normalize_repr(sa_repr, g_repr)
 
-    if repr_norm:
-      sa_repr = sa_repr / jnp.linalg.norm(sa_repr, axis=1, keepdims=True)
-      g_repr = g_repr / jnp.linalg.norm(g_repr, axis=1, keepdims=True)
+    if twin_q:
+      sa_repr2 = _mlp_or_residual(
+          jnp.concatenate([state, action], axis=-1),
+          list(hidden_layer_sizes) + [repr_dim],
+          hidden_layer_sizes=hidden_layer_sizes,
+          name='sa_encoder2',
+          activation=jax.nn.relu,
+          activate_final=False,
+          w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+      )
+      g_repr2 = _mlp_or_residual(
+          goal,
+          list(hidden_layer_sizes) + [repr_dim],
+          hidden_layer_sizes=hidden_layer_sizes,
+          name='g_encoder2',
+          activation=jax.nn.relu,
+          activate_final=False,
+          w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+      )
+      sa_repr2, g_repr2 = _normalize_repr(sa_repr2, g_repr2)
+      sa_repr = jnp.stack([sa_repr, sa_repr2], axis=-1)
+      g_repr = jnp.stack([g_repr, g_repr2], axis=-1)
 
-      if repr_norm_temp:
-        log_scale = hk.get_parameter('repr_log_scale', [], dtype=sa_repr.dtype,
-                                     init=jnp.zeros)
-        sa_repr = sa_repr / jnp.exp(log_scale)
-    return sa_repr, g_repr, (state, goal)
+    return sa_repr, g_repr
 
-    
   def _combine_repr(sa_repr, g_repr):
-    return jax.numpy.einsum('ik,jk->ij', sa_repr, g_repr)
+    if sa_repr.ndim == 3:
+      return jnp.einsum('ikl,jkl->ijl', sa_repr, g_repr)
+    return jnp.einsum('ik,jk->ij', sa_repr, g_repr)
 
   def _critic_fn(obs, action):
-    sa_repr, g_repr, hidden = _repr_fn(obs, action)
+    sa_repr, g_repr = _repr_fn(obs, action)
     critic_val = _combine_repr(sa_repr, g_repr)
-    if twin_q:
-      sa_repr2, g_repr2, _ = _repr_fn(obs, action, hidden=hidden)
-      product2 = _combine_repr(sa_repr2, g_repr2)
-      # outer.shape = [batch_size, batch_size, 2]
-      critic_val = jnp.stack([critic_val, product2], axis=-1)
-      sa_repr = sa_repr2
-      g_repr = g_repr2
     return critic_val, sa_repr, g_repr
-
   def _actor_fn(obs):
     if use_image_obs:
       state, goal = _unflatten_obs(obs)
@@ -351,7 +371,8 @@ def make_networks(
       policy_network=networks_lib.FeedForwardNetwork(
           lambda key: policy.init(key, dummy_obs), policy.apply),
       q_network=networks_lib.FeedForwardNetwork(
-          lambda key: critic.init(key, dummy_obs, dummy_action), critic.apply),
+          lambda key: critic.init(key, dummy_obs, dummy_action),
+          critic.apply),
       repr_fn=repr_fn.apply,
       log_prob=lambda params, actions: params.log_prob(actions),
       sample=lambda params, key: params.sample(seed=key),

@@ -1,13 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_nf_drawer_dbg
-#SBATCH --output=slurm/ppo_nf_sawyer_drawer_open_debug_%j.out
+#SBATCH --job-name=ref_fetch_reach
+#SBATCH --output=slurm/ref_td_infonce_fetch_reach_%j.out
+#SBATCH --error=slurm/ref_td_infonce_fetch_reach_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
+#SBATCH --mem=24G
 #SBATCH --gres=gpu:1
-#SBATCH --time=2:00:00
+#SBATCH --time=48:00:00
 #SBATCH --account=seas
+
+# Official upstream TD-InfoNCE (README): fetch_reach, 500k actor steps, local_mp.
+# NOT adapted to sawyer / PPO tasks — uses external/td_infonce envs only.
 
 module purge
 
@@ -27,12 +31,18 @@ try_cuda() {
     export CUDA_HOME="${CUDA_HOME:-${CUDA_ROOT:-}}"
     [ -z "${CUDA_HOME:-}" ] && return 1
     CUDA_LOADED=1
+    echo "Loaded CUDA modules: $*"
+    echo "CUDA_HOME=${CUDA_HOME}"
     return 0
   fi
   return 1
 }
+
 try_cuda cudatoolkit/12.6 || true
-[ "$CUDA_LOADED" = 1 ] || { echo "ERROR: Could not load cudatoolkit."; exit 1; }
+if [ "$CUDA_LOADED" != 1 ]; then
+  echo "ERROR: Could not load cudatoolkit."
+  exit 1
+fi
 
 cd /n/fs/mislresearch/sgcrl
 source /n/fs/mislresearch/miniconda3/etc/profile.d/conda.sh
@@ -46,31 +56,24 @@ export MUJOCO_PY_MUJOCO_PATH=${HOME}/.mujoco/mujoco210
 export MUJOCO_GL=osmesa
 export PYTHONUNBUFFERED=1
 export TMPDIR=/n/fs/mislresearch/mb6458-tmp
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
+export TF_FORCE_GPU_ALLOW_GROWTH=true
 
-ENV=sawyer_drawer_open
-SEED=0
-NUM_STEPS=500000
-LOG_DIR=logs/ppo_nf_drawer_debug/
+ENV_NAME="${ENV_NAME:-fetch_reach}"
+SEED="${SEED:-0}"
+MAX_STEPS="${MAX_STEPS:-500000}"
+LOG_DIR="${LOG_DIR:-/n/fs/mislresearch/sgcrl/logs/ref_td_infonce_${ENV_NAME}}"
 
-mkdir -p slurm slurm-debug
+mkdir -p slurm
 
-echo "DEBUG NF drawer_open  seed=${SEED}  steps=${NUM_STEPS}  log_dir=${LOG_DIR}"
+echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
+echo "official ref TD-InfoNCE env=${ENV_NAME} seed=${SEED} max_steps=${MAX_STEPS}"
+echo "log_dir=${LOG_DIR}"
 nvidia-smi || true
+python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
 
-python -u ppo_contrastive.py \
-  --env="${ENV}" \
-  --seed="${SEED}" \
-  --num_steps="${NUM_STEPS}" \
-  --log_dir_path="${LOG_DIR}" \
-  --ppo_repr_mode="nf" \
-  --nf_rep_size=64 \
-  --nf_num_blocks=8 \
-  --nf_encoder_lr=3e-4 \
-  --nf_critic_lr=1e-4 \
-  --nf_critic_weight_decay=1e-6 \
-  --ppo_num_envs=4 \
-  --ppo_crl_steps_per_iter=128 \
-  --ppo_ent_coef=0.05 \
-  --ppo_actor_min_std=0.01 \
-  --ppo_discount=0.99 \
-  --ppo_clip_coef=0.2
+bash scripts/run_ref_td_infonce_official.sh
+PY_EXIT=$?
+pkill -P $$ 2>/dev/null || true
+exit $PY_EXIT

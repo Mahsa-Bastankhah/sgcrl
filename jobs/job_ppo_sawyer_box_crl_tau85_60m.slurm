@@ -1,14 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_gauss_drawer
-#SBATCH --output=slurm/ppo_gaussian_sawyer_drawer_open_%A_%a.out
+#SBATCH --job-name=ppo_box_tau85
+#SBATCH --output=slurm/ppo_sawyer_box_crl_tau85_60m_%A_%a.out
+#SBATCH --error=slurm/ppo_sawyer_box_crl_tau85_60m_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=10:00:00
+#SBATCH --time=48:00:00
 #SBATCH --account=seas
-#SBATCH --array=0-2
+#SBATCH --array=0-1
+
+# Sawyer box: vanilla CRL, reward repr EMA τ=0.85, CRL grad updates/iter=512,
+# 2 seeds, 60M env steps, fresh start (no resume).
 
 module purge
 
@@ -53,15 +57,17 @@ export MUJOCO_PY_MUJOCO_PATH=${HOME}/.mujoco/mujoco210
 export MUJOCO_GL=osmesa
 export PYTHONUNBUFFERED=1
 export TMPDIR=/n/fs/mislresearch/mb6458-tmp
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
 
-ENV=sawyer_drawer_open
-NUM_STEPS=${NUM_STEPS:-10000000}
-SEED_OFFSET=${SEED_OFFSET:-0}
-SEED=$(( SEED_OFFSET + ${SLURM_ARRAY_TASK_ID:-0} ))
-
-LOG_DIR="${LOG_DIR:-logs/ppo_gaussian_drawer/}"
+ENV=sawyer_box
+NUM_STEPS=${NUM_STEPS:-60000000}
+SEED=${SLURM_ARRAY_TASK_ID}
+LOG_DIR="${LOG_DIR:-logs/ppo_box_tau0p85_crl512_60m/}"
+RUN_DIR="${LOG_DIR%/}/ppo_${ENV}_${SEED}"
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-4}
-CRL_STEPS=${CRL_STEPS:-128}
+CRL_STEPS=${CRL_STEPS:-512}
+TAU=0.85
 ENT_COEF=0.05
 MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
@@ -69,9 +75,14 @@ PPO_CLIP_COEF=0.2
 
 mkdir -p slurm
 
+if [ -d "${RUN_DIR}" ]; then
+  echo "Fresh start: removing ${RUN_DIR}"
+  rm -rf "${RUN_DIR}"
+fi
+
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=gaussian"
-echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS} density_steps=${CRL_STEPS}"
+echo "env=${ENV} seed=${SEED} tau=${TAU} num_steps=${NUM_STEPS}"
+echo "log_dir=${LOG_DIR} run_dir=${RUN_DIR} num_envs=${PPO_NUM_ENVS} crl_steps=${CRL_STEPS}"
 nvidia-smi || true
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
 
@@ -80,13 +91,14 @@ python -u ppo_contrastive.py \
   --seed="${SEED}" \
   --num_steps="${NUM_STEPS}" \
   --log_dir_path="${LOG_DIR}" \
-  --ppo_repr_mode="gaussian" \
   --ppo_num_envs="${PPO_NUM_ENVS}" \
   --ppo_crl_steps_per_iter="${CRL_STEPS}" \
   --ppo_ent_coef="${ENT_COEF}" \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
+  --ppo_crl_loss_direction=forward \
+  --ppo_crl_repr_tau="${TAU}" \
   --hidden_layer_sizes="256,256,256,256,256,256"
 PY_EXIT=$?
 pkill -P $$ 2>/dev/null || true

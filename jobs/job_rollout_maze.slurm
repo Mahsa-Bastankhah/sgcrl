@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ppo_maze
 #SBATCH --output=slurm/maze_%A_%a.out
+#SBATCH --error=slurm/maze_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
@@ -69,7 +70,7 @@ SEED_OFFSET=${SEED_OFFSET:-400}
 SEED=$(( ${SLURM_ARRAY_TASK_ID:-0} + SEED_OFFSET ))
 RUN_DIR="logs/${LOG_SUBDIR}/ppo_${ENV}_${SEED}"
 
-# Checkpoint selection (mirrors job_rollout_video.slurm):
+# Checkpoint selection (mirrors job_rollout_video_conda.slurm):
 #   - If $CHECKPOINT is set explicitly (a single .pkl), render just that one.
 #   - Otherwise point at the whole checkpoints/ directory so the python
 #     script iterates every ckpt_iter_*.pkl + latest.pkl.

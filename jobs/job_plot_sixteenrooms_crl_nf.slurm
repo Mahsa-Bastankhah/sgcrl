@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=plot_16r_crl_nf
 #SBATCH --output=slurm/plot_sixteenrooms_crl_nf_%j.out
+#SBATCH --error=slurm/plot_sixteenrooms_crl_nf_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4

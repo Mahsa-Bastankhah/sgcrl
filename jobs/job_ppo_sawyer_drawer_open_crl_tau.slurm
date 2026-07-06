@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ppo_drawer_tau
 #SBATCH --output=slurm/ppo_sawyer_drawer_open_crl_tau_%A_%a.out
-#SBATCH --error=slurm/ppo_sawyer_drawer_open_crl_tau_%A_%a.err
+#SBATCH --error=slurm/ppo_sawyer_drawer_open_crl_tau_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

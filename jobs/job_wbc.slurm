@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=wbc_eightrooms
 #SBATCH --output=slurm/wbc_eightrooms_%A_%a.out
+#SBATCH --error=slurm/wbc_eightrooms_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

@@ -1,15 +1,17 @@
 #!/bin/bash
 #SBATCH --job-name=ppo_peg_tau85
 #SBATCH --output=slurm/ppo_sawyer_peg_crl_tau_%A_%a.out
-#SBATCH --error=slurm/ppo_sawyer_peg_crl_tau_%A_%a.err
+#SBATCH --error=slurm/ppo_sawyer_peg_crl_tau_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=10:00:00
+#SBATCH --time=24:00:00
 #SBATCH --account=seas
 #SBATCH --array=0-1
+
+# Sawyer peg, vanilla CRL + reward repr EMA τ=0.85, 2 seeds, 40M env steps.
 
 module purge
 
@@ -56,9 +58,9 @@ export PYTHONUNBUFFERED=1
 export TMPDIR=/n/fs/mislresearch/mb6458-tmp
 
 ENV=sawyer_peg
-NUM_STEPS=${NUM_STEPS:-10000000}
+NUM_STEPS=${NUM_STEPS:-40000000}
 SEED=${SLURM_ARRAY_TASK_ID}
-LOG_DIR="${LOG_DIR:-logs/ppo_peg_tau0p85/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_peg_tau0p85_40m/}"
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-4}
 CRL_STEPS=${CRL_STEPS:-128}
 TAU=0.85

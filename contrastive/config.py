@@ -182,12 +182,26 @@ class ContrastiveConfig:
   # InfoNCE direction for PPO-CRL. 'forward': fix anchor sᵢ, vary goal gⱼ
   # (standard). 'backward': fix goal gᵢ, vary anchor sⱼ (logits transposed).
   ppo_crl_loss_direction: str = 'forward'  # 'forward' | 'backward'
-  # EMA decay τ for φ, ψ used in the PPO reward r = φ·ψ (CRL mode only).
+  # EMA decay τ for φ, ψ used in the PPO reward r = φ·ψ (standard CRL only).
   # Reward uses EMA params: ema ← τ·ema + (1−τ)·online after each CRL step.
   # τ=0 uses online params directly (no EMA).  Higher τ = slower / smoother reward.
+  # Ignored when ppo_crl_loss_direction='td_infonce' (rewards always use online φ,ψ).
   ppo_crl_repr_tau: float = 0.0
-  # Minimum replay size before CRL updates start.
+  # TD InfoNCE only: EMA rate for the slow target network in IS weights.
+  # target ← τ·target + (1−τ)·online.  Ignored outside td_infonce mode.
+  ppo_crl_td_target_tau: float = 0.995
+  # Minimum replay size before the first CRL block (and before PPO when using
+  # ppo_random_warmup_before_policy).
   ppo_min_replay_size: int = 10_000
+  # TD InfoNCE exploration schedule (see ppo_learner.train loop):
+  #   1) uniform-random env rollouts, no PPO, no CRL until replay >= ppo_min_replay_size
+  #   2) one CRL block (ppo_crl_steps_per_iter grad steps) with uniform-random a'
+  #      in the TD bootstrap; still no PPO / no π rollouts
+  #   3) π rollouts + PPO + CRL with a' ~ π(·|s', g_task)
+  ppo_random_warmup_before_policy: bool = False
+  # TD InfoNCE: number of bins per action dimension for logging the histogram
+  # of bootstrap actions a' in the IS-weight term.
+  td_infonce_action_bins: int = 100
   # Checkpointing: save policy/value/CRL params every N PPO iterations.
   # At default settings (8 envs × 128 steps = 1024 env-steps/iter), 100
   # iterations ≈ 100k env steps — light enough not to bottleneck training.

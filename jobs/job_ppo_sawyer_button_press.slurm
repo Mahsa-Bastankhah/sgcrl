@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ppo_gauss_button
 #SBATCH --output=slurm/ppo_gaussian_sawyer_button_press_%A_%a.out
+#SBATCH --error=slurm/ppo_gaussian_sawyer_button_press_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

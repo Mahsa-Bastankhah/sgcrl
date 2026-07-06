@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ppo_gauss_16r4d
 #SBATCH --output=slurm/ppo_gaussian_sixteenroomsactual4d_%A_%a.out
+#SBATCH --error=slurm/ppo_gaussian_sixteenroomsactual4d_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

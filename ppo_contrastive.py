@@ -44,10 +44,16 @@ flags.DEFINE_bool('sample_goals', False,
 flags.DEFINE_bool(
     'repr_norm', False,
     'If True, L2-normalize critic φ and ψ before dot products.')
+flags.DEFINE_integer(
+    'repr_dim', -1,
+    'If >=0, overrides ContrastiveConfig.repr_dim (φ/ψ output size).')
 # Optional explicit overrides for the two per-env-defaulted knobs.
 # If left at -1 (the default), the per-env lookup in PPO_ENV_DEFAULTS wins;
 # any non-negative value supplied on the CLI overrides that table.  This lets
 # sweeps pin T / crl_steps without editing the source.
+flags.DEFINE_float(
+    'actor_learning_rate', -1.0,
+    'If >0, overrides PPO policy/value Adam lr (ContrastiveConfig.actor_learning_rate).')
 flags.DEFINE_integer('ppo_rollout_length', -1,
                      'If >=0, overrides the per-env rollout length default.')
 flags.DEFINE_integer('ppo_crl_steps_per_iter', -1,
@@ -157,7 +163,18 @@ flags.DEFINE_integer(
     'Max transitions in the PPO episode replay buffer. <0 keeps default (1e6).')
 flags.DEFINE_integer(
     'ppo_min_replay_size', -1,
-    'Min replay transitions before density/CRL updates start. <0 keeps default (1e4).')
+    'Min replay transitions before the first CRL block. <0 keeps default (1e4).')
+flags.DEFINE_bool(
+    'ppo_random_warmup_before_policy', False,
+    'TD InfoNCE: uniform-random rollouts + uniform-random TD bootstrap a′ until '
+    'replay >= ppo_min_replay_size, then one CRL block, then π + PPO.')
+flags.DEFINE_bool(
+    'noppo_random_warmup_before_policy', False,
+    'Disable ppo_random_warmup_before_policy (legacy π-from-iter-0 behavior).')
+flags.DEFINE_integer(
+    'td_infonce_action_bins', -1,
+    'Bins per action dimension for TD InfoNCE a_prime histogram logging. '
+    '<0 keeps config default (100).')
 flags.DEFINE_integer(
     'ppo_checkpoint_interval', -1,
     'Save checkpoints every N PPO iterations. <0 keeps config default (500).')
@@ -167,14 +184,21 @@ flags.DEFINE_integer(
     '0 = keep all. <0 keeps config default (0 = keep all).')
 flags.DEFINE_string(
     'ppo_crl_loss_direction', 'forward',
-    "InfoNCE loss direction for PPO-CRL: 'forward' (fix anchor, vary goal) "
-    "or 'backward' (fix goal, vary anchor = transpose logits).")
+    "InfoNCE loss direction for PPO-CRL: 'forward' (fix anchor, vary goal), "
+    "'backward' (fix goal, vary anchor = transpose logits), or "
+    "'td_infonce' (TD bootstrapped InfoNCE; auto-enables twin_q).")
 flags.DEFINE_float(
     'ppo_crl_repr_tau', -1.0,
-    'CRL mode: EMA decay τ for φ, ψ used in PPO reward r=φ·ψ. '
+    'Standard CRL only: EMA decay τ for φ, ψ used in PPO reward r=φ·ψ. '
     'ema ← τ·ema + (1−τ)·online after each CRL step. '
     '0 = use online params (default). Higher τ = slower reward tracking. '
+    'Ignored when ppo_crl_loss_direction=td_infonce. '
     '<0 keeps config default.')
+flags.DEFINE_float(
+    'ppo_crl_td_target_tau', -1.0,
+    'TD InfoNCE only: EMA rate for the critic target network in IS weights. '
+    'Enforced to 0.995 when ppo_crl_loss_direction=td_infonce (flag ignored). '
+    'Ignored outside td_infonce mode.')
 flags.DEFINE_boolean(
     'bin_randomize_gripper_init', False,
     'SawyerBin: randomize initial gripper TCP offset around the object at reset.')
@@ -362,6 +386,10 @@ def main(_):
   )
   config = contrastive.ContrastiveConfig(**params)
   config.repr_norm = bool(FLAGS.repr_norm)
+  if FLAGS.repr_dim >= 0:
+    config.repr_dim = int(FLAGS.repr_dim)
+  if FLAGS.actor_learning_rate > 0.0:
+    config.actor_learning_rate = float(FLAGS.actor_learning_rate)
 
   # ---- Per-env PPO defaults (CLI flags still override) -------------------
   env_defaults = PPO_ENV_DEFAULTS.get(env_name)
@@ -420,14 +448,33 @@ def main(_):
     config.max_replay_size = int(FLAGS.max_replay_size)
   if FLAGS.ppo_min_replay_size >= 0:
     config.ppo_min_replay_size = int(FLAGS.ppo_min_replay_size)
+  config.ppo_random_warmup_before_policy = bool(
+      FLAGS.ppo_random_warmup_before_policy)
+  if FLAGS.noppo_random_warmup_before_policy:
+    config.ppo_random_warmup_before_policy = False
+  if FLAGS.td_infonce_action_bins >= 0:
+    config.td_infonce_action_bins = int(FLAGS.td_infonce_action_bins)
   if FLAGS.ppo_checkpoint_interval >= 0:
     config.ppo_checkpoint_interval = int(FLAGS.ppo_checkpoint_interval)
   if FLAGS.ppo_checkpoint_keep_last >= 0:
     config.ppo_checkpoint_keep_last = int(FLAGS.ppo_checkpoint_keep_last)
   if FLAGS.ppo_crl_loss_direction.strip():
     config.ppo_crl_loss_direction = FLAGS.ppo_crl_loss_direction.strip().lower()
-  if FLAGS.ppo_crl_repr_tau >= 0.0:
-    config.ppo_crl_repr_tau = float(FLAGS.ppo_crl_repr_tau)
+  if config.ppo_crl_loss_direction == 'td_infonce':
+    config.twin_q = True
+    print('[ppo_contrastive] td_infonce: twin_q=True (min-Q for IS weights)')
+    # TD InfoNCE: slow target for IS weights; rewards always use online φ,ψ.
+    if FLAGS.ppo_crl_repr_tau > 0.0:
+      print('[ppo_contrastive] warning: ppo_crl_repr_tau ignored in td_infonce '
+            '(use ppo_crl_td_target_tau for target-network EMA)')
+    config.ppo_crl_repr_tau = 0.0
+    if FLAGS.ppo_crl_td_target_tau >= 0.0:
+      config.ppo_crl_td_target_tau = float(FLAGS.ppo_crl_td_target_tau)
+  else:
+    if FLAGS.ppo_crl_repr_tau >= 0.0:
+      config.ppo_crl_repr_tau = float(FLAGS.ppo_crl_repr_tau)
+    if FLAGS.ppo_crl_td_target_tau >= 0.0:
+      config.ppo_crl_td_target_tau = float(FLAGS.ppo_crl_td_target_tau)
   if FLAGS.hidden_layer_sizes.strip():
     config.hidden_layer_sizes = tuple(
         int(x) for x in FLAGS.hidden_layer_sizes.split(',') if x.strip())
@@ -442,14 +489,18 @@ def main(_):
         f'discount_crl={config.discount}, '
         f'discount_ppo={config.ppo_discount if config.ppo_discount > 0 else config.discount}, '
         f'norm_reward={config.ppo_norm_reward}, '
-        f'repr_norm={config.repr_norm}, '
+        f'repr_norm={config.repr_norm}, repr_dim={config.repr_dim}, '
         f'ppo_anneal_lr={config.ppo_anneal_lr}  '
         f'ppo_repr_mode={config.ppo_repr_mode!r}  '
         f'ppo_reward_mode={config.ppo_reward_mode!r}  '
         f'ppo_crl_repr_tau={config.ppo_crl_repr_tau}  '
+        f'ppo_crl_td_target_tau={config.ppo_crl_td_target_tau}  '
+        f'twin_q={config.twin_q}  '
         f'ppo_dirac_eps={config.ppo_dirac_eps}  '
         f'max_replay_size={config.max_replay_size}  '
         f'ppo_min_replay_size={config.ppo_min_replay_size}  '
+        f'ppo_random_warmup_before_policy={config.ppo_random_warmup_before_policy}  '
+        f'td_infonce_action_bins={config.td_infonce_action_bins}  '
         f'kde_max_points={config.kde_max_points}  '
         f'kde_refit_interval={config.kde_refit_interval}  '
         f'kde_bandwidth={config.kde_bandwidth}  '

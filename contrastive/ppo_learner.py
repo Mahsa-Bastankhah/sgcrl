@@ -270,9 +270,10 @@ class EpisodeReplay:
     without padding).  The loop is O(B), not O(B·T).
 
     Returns a dict with the exact keys consumed by `critic_loss`:
-      obs        : (B, obs_dim_total)   [ s_t       ; obs_to_goal(s_j) ]
-      action     : (B, act_dim)
-      next_obs   : (B, obs_dim_total)   [ s_{t+1}   ; obs_to_goal(s_j) ]
+      obs         : (B, obs_dim_total)   [ s_t       ; obs_to_goal(s_j) ]
+      action      : (B, act_dim)
+      next_obs    : (B, obs_dim_total)   [ s_{t+1}   ; obs_to_goal(s_j) ]
+      random_goal : (B, goal_dim)        permuted in-batch states → obs_to_goal
     """
     assert self.size > 0, 'Cannot sample from an empty buffer.'
     B = int(batch_size)
@@ -334,10 +335,18 @@ class EpisodeReplay:
       next_obs_out[i,  self._obs_dim:] = goal
       act_out[i] = act[ti]
 
+    # random_goal relabeling (matches builder random_goal_relabeling):
+    #   state = observation[:, :obs_dim]
+    #   shift ~ Uniform[0, B);  goal = roll(state, shift);  obs_to_goal(goal)
+    state = obs_out[:, :self._obs_dim]
+    shift = int(rng.integers(0, B))
+    random_goal = self._obs_to_goal(np.roll(state, shift, axis=0))
+
     return {
         'obs': obs_out,
         'action': act_out,
         'next_obs': next_obs_out,
+        'random_goal': random_goal.astype(np.float32),
     }
 
   def sample_states(self, n: int,
@@ -370,7 +379,12 @@ class EpisodeReplay:
     next_obs = batch['next_obs'].copy()
     obs[half:, self._obs_dim:] = uniform_goals
     next_obs[half:, self._obs_dim:] = uniform_goals
-    return {'obs': obs, 'action': batch['action'], 'next_obs': next_obs}
+    return {
+        'obs': obs,
+        'action': batch['action'],
+        'next_obs': next_obs,
+        'random_goal': batch['random_goal'],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -466,11 +480,15 @@ def make_reward_fn(
         f'Unknown ppo_reward_mode={config.ppo_reward_mode!r}; '
         f"supported: '', 'phi_psi', 'dirac_target', 'kde_dirac'")
 
+  obs_dim = int(config.obs_dim)
+
   @jax.jit
   def reward_fn(q_params: networks_lib.Params,
                 obs: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
-    _, sa_repr, g_repr = networks.q_network.apply(q_params, obs, action)
-    return jnp.sum(sa_repr * g_repr, axis=-1)  # (B,)
+    logits, _, _ = networks.q_network.apply(q_params, obs, action)
+    if logits.ndim == 3:
+      logits = jnp.mean(logits, axis=-1)
+    return jnp.diagonal(logits)
   return reward_fn
 
 
@@ -490,12 +508,16 @@ def make_dirac_target_reward_fn(
                 s0_states: jnp.ndarray) -> jnp.ndarray:
     s = obs[:, :obs_dim]
     g = obs[:, obs_dim:]
-    obs_s0 = jnp.concatenate([s0_states, g], axis=-1)
-    obs_ss = jnp.concatenate([s, s], axis=-1)
-    _, phi_s0, psi_g = networks.q_network.apply(q_params, obs_s0, action)
-    _, _, psi_s = networks.q_network.apply(q_params, obs_ss, action)
-    dot_ps = jnp.sum(phi_s0 * psi_s, axis=-1)
-    dot_pg = jnp.sum(phi_s0 * psi_g, axis=-1)
+    obs_s0g = jnp.concatenate([s0_states, g], axis=1)
+    obs_s0s = jnp.concatenate([s, s], axis=1)
+    logits_s0g, _, _ = networks.q_network.apply(q_params, obs_s0g, action)
+    logits_s0s, _, _ = networks.q_network.apply(q_params, obs_s0s, action)
+    logits_s0g_diag = jnp.diagonal(
+        jnp.mean(logits_s0g, axis=-1) if logits_s0g.ndim == 3 else logits_s0g)
+    logits_s0s_diag = jnp.diagonal(
+        jnp.mean(logits_s0s, axis=-1) if logits_s0s.ndim == 3 else logits_s0s)
+    dot_ps = logits_s0s_diag
+    dot_pg = logits_s0g_diag
     at_goal = jnp.linalg.norm(s - g, axis=-1) < goal_tol
     log_rew = jnp.log(jnp.maximum(eps, 1e-10)) - dot_ps
     return jnp.where(at_goal, -dot_pg, log_rew)
@@ -861,6 +883,246 @@ def make_scan_crl_update_fn(
   return multi_update
 
 
+def _action_bin_counts(
+    actions: jnp.ndarray,
+    action_low: jnp.ndarray,
+    action_high: jnp.ndarray,
+    n_bins: int,
+) -> jnp.ndarray:
+  """Per-dimension histogram counts for actions in [low, high].
+
+  Args:
+    actions:     (B, act_dim)
+    action_low:  (act_dim,)
+    action_high: (act_dim,)
+
+  Returns:
+    (act_dim, n_bins) integer counts.
+  """
+  span = jnp.maximum(action_high - action_low, 1e-8)
+  idx = (actions - action_low[None, :]) / span[None, :] * float(n_bins)
+  idx = jnp.clip(jnp.floor(idx).astype(jnp.int32), 0, n_bins - 1)
+  act_dim = actions.shape[1]
+
+  def _counts_for_dim(d):
+    return jnp.bincount(idx[:, d], length=n_bins)
+
+  return jax.vmap(_counts_for_dim)(jnp.arange(act_dim))
+
+
+def make_td_infonce_update_fn(
+    networks: contrastive_networks.ContrastiveNetworks,
+    q_optimizer: optax.GradientTransformation,
+    obs_dim: int,
+    discount: float,
+    target_tau: float = 0.995,
+    start_index: int = 0,
+    end_index: int = -1,
+    twin_q: bool = False,
+    policy_goal: Optional[np.ndarray] = None,
+    action_low: Optional[np.ndarray] = None,
+    action_high: Optional[np.ndarray] = None,
+    n_action_bins: int = 100,
+):
+  """TD InfoNCE CRL critic update (Zheng et al. 2023 style).
+
+  Combines a one-step forward InfoNCE term with a bootstrapped TD term that
+  uses importance-sampling weights from a slow-moving target network::
+
+      L = (1-γ) * L_InfoNCE(φ·ψ_{g'})  +  γ * L_IS-CE(φ·ψ_randg, w)
+
+  where ``g' = obs_to_goal(s_{t+1})`` (immediate next-state goals, matching
+  ``learning.py`` with ``use_td``), and
+  ``w[i,j] = softmax_j( min_k target_φ(s_{t+1}_i, a'_i) · target_ψ(randg_j) )``
+  are stop-gradient IS weights from the target network; ``rand_g`` is
+  ``jnp.roll(g', -1, axis=0)`` — next-state goals shifted by one row so every
+  sample pairs with a goal from a *different* trajectory.
+
+  The target network is updated inside each call via EMA::
+
+      target_q ← target_tau * target_q + (1 - target_tau) * new_q
+
+  Args:
+    networks:    ContrastiveNetworks with ``q_network``, ``policy_network``,
+                 and ``sample``.
+    q_optimizer: Optimizer for the critic / representation params.
+    obs_dim:     State dimension; batch obs = [state(obs_dim) ; goal(*)].
+    discount:    γ — weight between term 1 (current) and term 2 (TD).
+    target_tau:  EMA rate for the target network.  0 → no memory, 1 → frozen.
+    start_index: Goal coordinate slice start (``obs_to_goal``).
+    end_index:   Goal coordinate slice end; ``-1`` means ``states[:, start:]``.
+
+  Returns:
+    ``update(q_params, q_opt_state, target_q_params, policy_params, batch, key)``
+    → ``(new_q_params, new_q_opt_state, new_target_q_params, metrics_dict)``
+  """
+
+  def obs_to_goal(obs):
+    if end_index == -1:
+      return obs[:, start_index:]
+    return obs[:, start_index:end_index]
+
+  _policy_goal = (None if policy_goal is None
+                  else jnp.asarray(policy_goal, dtype=jnp.float32))
+  if _policy_goal is None:
+    raise ValueError('policy_goal is required for TD InfoNCE (env task goal for π bootstrap)')
+
+  _action_low_j = jnp.asarray(
+      -1.0 if action_low is None else action_low, dtype=jnp.float32)
+  _action_high_j = jnp.asarray(
+      1.0 if action_high is None else action_high, dtype=jnp.float32)
+  if _action_low_j.ndim == 0:
+    _action_low_j = jnp.full((1,), _action_low_j)
+  if _action_high_j.ndim == 0:
+    _action_high_j = jnp.full((1,), _action_high_j)
+  _n_action_bins = int(n_action_bins)
+
+  def critic_loss(
+      q_params, target_q_params, policy_params, batch, key,
+      use_uniform_bootstrap: bool):
+    obs = batch['obs']
+    action = batch['action']
+    next_obs = batch['next_obs']
+    batch_size = obs.shape[0]
+    s = obs[:, :obs_dim]
+    next_s = next_obs[:, :obs_dim]
+    td_g = obs_to_goal(next_s)
+    obs_td = jnp.concatenate([s, td_g], axis=1)
+
+    pos_logits, _, _ = networks.q_network.apply(q_params, obs_td, action)
+    I = jnp.eye(batch_size)
+    if pos_logits.ndim == 3:
+      I = I[:, :, None].repeat(pos_logits.shape[-1], axis=-1)
+    loss1 = jax.vmap(optax.softmax_cross_entropy, -1, -1)(pos_logits, I)
+
+    # term 2 — bootstrap action a' at (s', g_task): uniform random during
+    # exploration warmup, else a' ~ π(·|s', g_task).
+    env_goal = jnp.broadcast_to(
+        _policy_goal[None, :], (batch_size, _policy_goal.shape[0]))
+    next_policy_obs = jnp.concatenate([next_s, env_goal], axis=1)
+    key, k_boot = jax.random.split(key)
+    act_dim = _action_low_j.shape[0]
+
+    def _uniform_a_prime(_):
+      return jax.random.uniform(
+          k_boot, (batch_size, act_dim),
+          minval=_action_low_j, maxval=_action_high_j)
+
+    def _policy_a_prime(_):
+      next_dist_params = networks.policy_network.apply(
+          policy_params, next_policy_obs)
+      return networks.sample(next_dist_params, k_boot)
+
+    next_action = jax.lax.cond(
+        use_uniform_bootstrap, _uniform_a_prime, _policy_a_prime, operand=None)
+    a_prime_hist = _action_bin_counts(
+        next_action, _action_low_j, _action_high_j, _n_action_bins)
+
+    obs_rand = jnp.concatenate([s, batch['random_goal']], axis=1)
+    neg_logits, _, _ = networks.q_network.apply(q_params, obs_rand, action)
+
+    next_critic_obs = jnp.concatenate([next_s, batch['random_goal']], axis=1)
+    logits_w, _, _ = networks.q_network.apply(
+        target_q_params, next_critic_obs, next_action)
+
+    logits_w1 = logits_w[..., 0] if logits_w.ndim == 3 else logits_w
+    logits_w2 = logits_w[..., 1] if logits_w.ndim == 3 else logits_w
+    logits_w_sc = jnp.min(logits_w, axis=-1)
+    w = jax.nn.softmax(logits_w_sc, axis=1)
+    w_diag_vals = jnp.diag(w)
+
+    # Note that we remove the multiplier N for w to balance
+    # one term of loss1 with N terms of loss2 in each row.
+    w = jax.lax.stop_gradient(w)  # (N, N)
+    loss2 = jax.vmap(optax.softmax_cross_entropy, -1, -1)(
+        neg_logits,
+        w[:, :, None].repeat(neg_logits.shape[-1], axis=-1)
+    )
+
+    loss = (1 - discount) * loss1 + discount * loss2
+    loss = jnp.mean(loss)
+
+    logits_pos_entropy = -jnp.sum(
+        jax.nn.softmax(pos_logits, axis=1) * jax.nn.log_softmax(pos_logits, axis=1), axis=1)
+    logits_neg_entropy = -jnp.sum(
+        jax.nn.softmax(neg_logits, axis=1) * jax.nn.log_softmax(neg_logits, axis=1), axis=1)
+    logits_w_entropy = -jnp.sum(
+        jax.nn.softmax(logits_w_sc, axis=1) * jax.nn.log_softmax(logits_w_sc, axis=1), axis=1)
+
+    metrics = {
+        'crl_loss': loss,
+        'td_loss1': jnp.mean(loss1),
+        'td_loss2': jnp.mean(loss2),
+        'categorical_accuracy': jnp.mean(
+            jnp.argmax(jnp.min(pos_logits, axis=-1), axis=1) == jnp.arange(batch_size)),
+        'binary_accuracy': jnp.mean((jnp.min(pos_logits, axis=-1) > 0) == jnp.eye(batch_size)),
+        'logits_pos': jnp.mean(jax.vmap(jnp.diag, -1, -1)(pos_logits)),
+        'logits_pos1': jnp.mean(jnp.diag(pos_logits[..., 0])),
+        'logits_pos2': jnp.mean(jnp.diag(pos_logits[..., 1])),
+        'logits_pos_entropy': jnp.mean(logits_pos_entropy),
+        'logits_neg': jnp.mean(neg_logits),
+        'logits_neg1': jnp.mean(neg_logits[..., 0]),
+        'logits_neg2': jnp.mean(neg_logits[..., 1]),
+        'logits_neg_entropy': jnp.mean(logits_neg_entropy),
+        'logits_w1': jnp.mean(jnp.diag(logits_w1)),
+        'logits_w2': jnp.mean(jnp.diag(logits_w2)),
+        'w_diag': jnp.mean(w_diag_vals),
+        'w_diag_std': jnp.std(w_diag_vals),
+        'w_diag_min': jnp.min(w_diag_vals),
+        'w_diag_max': jnp.max(w_diag_vals),
+        'w_diag_vec': w_diag_vals,
+        'a_prime_mean': jnp.mean(next_action),
+        'a_prime_std': jnp.std(next_action),
+        'a_prime_hist': a_prime_hist,
+        'w': jnp.mean(w),
+        'logits_w_entropy': jnp.mean(logits_w_entropy),
+    }
+
+    return loss, metrics     # column goal pool (hindsight / random_goal)
+
+
+
+  def _make_jitted_update(use_uniform_bootstrap: bool):
+    def _loss(q_params, target_q_params, policy_params, batch, key):
+      return critic_loss(
+          q_params, target_q_params, policy_params, batch, key,
+          use_uniform_bootstrap)
+
+    grad_fn = jax.value_and_grad(_loss, has_aux=True)
+
+    @jax.jit
+    def update(q_params, q_opt_state, target_q_params, policy_params, batch, key):
+      (_, metrics), grads = grad_fn(
+          q_params, target_q_params, policy_params, batch, key)
+
+      grads_finite = jnp.all(jnp.asarray(jax.tree_util.tree_leaves(
+          jax.tree_util.tree_map(lambda x: jnp.all(jnp.isfinite(x)), grads))))
+      loss_finite  = jnp.isfinite(metrics['crl_loss'])
+      do_update    = jnp.logical_and(grads_finite, loss_finite)
+
+      def _apply(_):
+        updates, new_opt_state = q_optimizer.update(grads, q_opt_state, q_params)
+        return optax.apply_updates(q_params, updates), new_opt_state
+
+      def _skip(_):
+        return q_params, q_opt_state
+
+      new_q_params, new_opt_state = jax.lax.cond(
+          do_update, _apply, _skip, operand=None)
+
+      new_target = jax.tree_util.tree_map(
+          lambda t, o: target_tau * t + (1.0 - target_tau) * o,
+          target_q_params, new_q_params)
+
+      metrics = dict(metrics)
+      metrics['update_skipped_nonfinite'] = 1.0 - do_update.astype(jnp.float32)
+      return new_q_params, new_opt_state, new_target, metrics
+
+    return update
+
+  return _make_jitted_update(False), _make_jitted_update(True)
+
+
 # ---------------------------------------------------------------------------
 # Rollout collection (env stepping — runs in host/numpy, not jitted).
 # ---------------------------------------------------------------------------
@@ -966,7 +1228,9 @@ def _save_checkpoint(path: str,
                      policy_params, value_params, q_params,
                      ppo_opt_state, q_opt_state,
                      iteration: int, global_step: int, key,
-                     q_params_ema=None):
+                     q_params_ema=None,
+                     td_target_q_params=None,
+                     initial_crl_warmup_done: bool = False):
   """Write a pickle checkpoint atomically (write to tmp → rename)."""
   import pickle as _pkl
   import os as _os
@@ -980,9 +1244,12 @@ def _save_checkpoint(path: str,
       'iteration':           int(iteration),
       'global_step':         int(global_step),
       'key':                 key,
+      'initial_crl_warmup_done': bool(initial_crl_warmup_done),
   }
   if q_params_ema is not None:
     ckpt['q_params_ema'] = q_params_ema
+  if td_target_q_params is not None:
+    ckpt['td_target_q_params'] = td_target_q_params
   tmp_path = path + '.tmp'
   with open(tmp_path, 'wb') as fh:
     _pkl.dump(ckpt, fh, protocol=_pkl.HIGHEST_PROTOCOL)
@@ -1117,6 +1384,10 @@ def run_ppo_training(
   total_obs_dim = int(np.prod(obs_shape))
   goal_dim_cfg  = total_obs_dim - obs_dim_cfg
   act_dim_cfg   = int(np.prod(act_shape))
+  action_low_np = np.asarray(
+      spec.actions.minimum, dtype=np.float32).reshape(act_shape)
+  action_high_np = np.asarray(
+      spec.actions.maximum, dtype=np.float32).reshape(act_shape)
 
   if use_gaussian:
     density_nets = _gd.make_gaussian_density_networks(
@@ -1171,6 +1442,7 @@ def run_ppo_training(
   ppo_params = {'policy': policy_params, 'value': value_params}
 
   # ---- optimizers -------------------------------------------------------
+  _ppo_lr = float(getattr(config, 'actor_learning_rate', config.learning_rate))
   if config.ppo_anneal_lr:
     total_ppo_updates = (
       num_iterations
@@ -1179,7 +1451,7 @@ def run_ppo_training(
     )
 
     lr_schedule = optax.linear_schedule(
-      init_value=float(config.learning_rate),
+      init_value=_ppo_lr,
       end_value=0.0,
       transition_steps=max(1, total_ppo_updates),
     )
@@ -1191,7 +1463,7 @@ def run_ppo_training(
   else:
     ppo_optimizer = optax.chain(
         optax.clip_by_global_norm(float(config.ppo_max_grad_norm)),
-        optax.adam(float(config.learning_rate), eps=1e-5))
+        optax.adam(_ppo_lr, eps=1e-5))
   ppo_opt_state = ppo_optimizer.init(ppo_params)
 
   if use_nf:
@@ -1212,17 +1484,32 @@ def run_ppo_training(
     q_optimizer = optax.adam(float(config.learning_rate))
   q_opt_state = q_optimizer.init(q_params)
 
-  # ---- optional EMA of φ, ψ for PPO reward (CRL mode only) --------------
+  # ---- detect TD InfoNCE mode early (needed for reward EMA + checkpoints) --
+  _ppo_direction = str(
+      getattr(config, 'ppo_crl_loss_direction', 'forward')).lower()
+  _use_td_infonce = (
+      _ppo_direction == 'td_infonce'
+      and not use_gaussian and not use_nf)
+
+  # ---- optional EMA of φ, ψ for PPO reward (standard CRL only) ------------
+  # TD InfoNCE always uses online φ,ψ for r=φ·ψ; target EMA is separate
+  # (ppo_crl_td_target_tau on td_target_q_params, not q_params_reward).
   _repr_tau = float(getattr(config, 'ppo_crl_repr_tau', 0.0))
   _use_repr_ema = (
-      not use_gaussian and not use_nf
+      not _use_td_infonce
+      and not use_gaussian and not use_nf
       and _repr_tau > 0.0 and _repr_tau < 1.0)
   q_params_reward = _tree_copy(q_params) if _use_repr_ema else q_params
+
+  # Slow-moving target network for TD InfoNCE.  Initialised after checkpoint
+  # loading so a resumed run restores the saved target if present.
+  td_target_q_params: Any = None
 
   # ---- resume from checkpoint if one exists -----------------------------
   start_iteration = 0
   global_step = 0
   ppo_sgd_step = 0
+  _initial_crl_warmup_done = False
   if checkpoint_dir is not None:
     _latest = os.path.join(checkpoint_dir, 'latest.pkl')
     if os.path.exists(_latest):
@@ -1239,10 +1526,15 @@ def run_ppo_training(
       ppo_sgd_step    = (start_iteration
                          * int(config.ppo_num_epochs)
                          * int(config.ppo_num_minibatches))
+      _initial_crl_warmup_done = bool(_ckpt.get('initial_crl_warmup_done', False))
+      if not _initial_crl_warmup_done and ppo_sgd_step > 0:
+        _initial_crl_warmup_done = True
       if _use_repr_ema:
         q_params_reward = (_ckpt['q_params_ema']
                            if 'q_params_ema' in _ckpt
                            else _tree_copy(q_params))
+      if _use_td_infonce and 'td_target_q_params' in _ckpt:
+        td_target_q_params = _ckpt['td_target_q_params']
       print(f'[ppo] resumed from checkpoint: '
             f'start_iteration={start_iteration}, global_step={global_step}')
       # Truncate CSV logs to remove any entries written after the checkpoint
@@ -1285,16 +1577,50 @@ def run_ppo_training(
         nf_density_nets, obs_dim=int(config.obs_dim))
     gaussian_reward_fn = None
   else:
-    _direction = str(getattr(config, 'ppo_crl_loss_direction', 'forward')).lower()
-    _backward = (_direction == 'backward')
-    crl_update = make_crl_update_fn(networks, q_optimizer, backward=_backward)
-    # Scan-based multi-step updater: one JIT dispatch for all CRL steps.
-    crl_scan_update = make_scan_crl_update_fn(
-        networks, q_optimizer, backward=_backward, repr_tau=_repr_tau)
-    print(f'[ppo] CRL loss direction: {_direction}')
-    if _use_repr_ema:
-      print(f'[ppo] CRL reward repr EMA: tau={_repr_tau} '
-            f'(InfoNCE still uses online φ, ψ)')
+    _direction = _ppo_direction  # already parsed above
+    _backward  = (_direction == 'backward')
+    td_infonce_update = None          # π-sampled a′ bootstrap
+    td_infonce_update_uniform = None  # uniform a′ bootstrap (warmup)
+    crl_scan_update   = None      # only set in standard CRL branch below
+
+    if _use_td_infonce:
+      _td_target_tau = float(getattr(config, 'ppo_crl_td_target_tau', 0.995))
+      _hard = getattr(config, 'hard_goal', None)
+      if _hard is not None:
+        _policy_goal = np.asarray(_hard, dtype=np.float32).ravel()
+      else:
+        _probe = np.asarray(
+            vec_env._envs[0].reset().observation, dtype=np.float32)
+        _policy_goal = _probe[int(config.obs_dim):]
+      print(f'[ppo] TD InfoNCE policy_goal (hard env goal)={_policy_goal}')
+      td_infonce_update, td_infonce_update_uniform = make_td_infonce_update_fn(
+          networks, q_optimizer,
+          obs_dim=int(config.obs_dim),
+          discount=float(config.discount),
+          target_tau=_td_target_tau,
+          start_index=int(config.start_index),
+          end_index=int(config.end_index),
+          twin_q=bool(config.twin_q),
+          policy_goal=_policy_goal,
+          action_low=action_low_np.reshape(-1),
+          action_high=action_high_np.reshape(-1),
+          n_action_bins=int(getattr(config, 'td_infonce_action_bins', 100)))
+      if td_target_q_params is None:   # not restored from checkpoint
+        td_target_q_params = _tree_copy(q_params)
+      crl_update = None
+      print(f'[ppo] CRL loss: TD InfoNCE  '
+            f'(target_tau={_td_target_tau}, discount={config.discount}; '
+            f'rewards use online φ,ψ)')
+    else:
+      crl_update = make_crl_update_fn(networks, q_optimizer, backward=_backward)
+      # Scan-based multi-step updater: one JIT dispatch for all CRL steps.
+      crl_scan_update = make_scan_crl_update_fn(
+          networks, q_optimizer, backward=_backward, repr_tau=_repr_tau)
+      print(f'[ppo] CRL loss direction: {_direction}')
+      if _use_repr_ema:
+        print(f'[ppo] CRL reward repr EMA: tau={_repr_tau} '
+              f'(InfoNCE still uses online φ, ψ)')
+
     gaussian_reward_fn = None
     nf_reward_fn = None
 
@@ -1423,11 +1749,93 @@ def run_ppo_training(
     print(f'[ppo] checkpoints → {checkpoint_dir} '
           f'(every {ckpt_interval} iters, {keep_msg})')
 
+  # ---- TD InfoNCE: full-batch w_diag / a' histogram logs ----------------
+  _w_diag_csv_path = None
+  _w_diag_header_written = False
+  _a_prime_hist_csv_path = None
+  _a_prime_hist_header_written = False
+  _n_action_bins_log = int(getattr(config, 'td_infonce_action_bins', 100))
+  if _use_td_infonce and checkpoint_dir is not None:
+    _w_diag_csv_path = os.path.join(
+        os.path.dirname(checkpoint_dir), 'logs', 'w_diag', 'vectors.csv')
+    os.makedirs(os.path.dirname(_w_diag_csv_path), exist_ok=True)
+    _w_diag_header_written = os.path.isfile(_w_diag_csv_path)
+    print(f'[ppo] TD InfoNCE w_diag vector log → {_w_diag_csv_path}')
+    _a_prime_hist_csv_path = os.path.join(
+        os.path.dirname(checkpoint_dir), 'logs', 'a_prime_hist', 'vectors.csv')
+    os.makedirs(os.path.dirname(_a_prime_hist_csv_path), exist_ok=True)
+    _a_prime_hist_header_written = os.path.isfile(_a_prime_hist_csv_path)
+    print(f'[ppo] TD InfoNCE a_prime action hist log → {_a_prime_hist_csv_path} '
+          f'({act_dim_cfg} dims × {_n_action_bins_log} bins)')
+
+  def _append_w_diag_log(iteration: int, crl_step: int, vec) -> None:
+    nonlocal _w_diag_header_written
+    if _w_diag_csv_path is None:
+      return
+    row = np.asarray(vec, dtype=np.float64).ravel()
+    with open(_w_diag_csv_path, 'a', encoding='utf-8') as fh:
+      if not _w_diag_header_written:
+        header = (['iteration', 'crl_step']
+                  + [f'w_{i}' for i in range(row.shape[0])])
+        fh.write(','.join(header) + '\n')
+        _w_diag_header_written = True
+      fh.write(','.join(
+          [str(iteration), str(crl_step)] + [f'{x:.8g}' for x in row]) + '\n')
+
+  def _append_a_prime_hist_log(iteration: int, crl_step: int, hist) -> None:
+    nonlocal _a_prime_hist_header_written
+    if _a_prime_hist_csv_path is None:
+      return
+    mat = np.asarray(hist, dtype=np.int64)
+    flat = mat.ravel()
+    with open(_a_prime_hist_csv_path, 'a', encoding='utf-8') as fh:
+      if not _a_prime_hist_header_written:
+        header = (['iteration', 'crl_step']
+                  + [f'd{d}_b{b}' for d in range(mat.shape[0])
+                     for b in range(mat.shape[1])])
+        fh.write(','.join(header) + '\n')
+        _a_prime_hist_header_written = True
+      fh.write(','.join(
+          [str(iteration), str(crl_step)] + [str(int(x)) for x in flat]) + '\n')
+
+  _random_warmup = (
+      bool(getattr(config, 'ppo_random_warmup_before_policy', False))
+      and _use_td_infonce)
+  _min_replay = int(config.ppo_min_replay_size)
+  _phase2_announced = False
+  if _random_warmup:
+    print('[ppo] random warmup schedule (TD InfoNCE):')
+    print(f'  phase 1 — uniform env rollouts, no PPO/CRL until replay >= {_min_replay}')
+    print(f'  phase 2 — one CRL block ({int(config.ppo_crl_steps_per_iter)} steps) '
+          f'with uniform a′, still no PPO')
+    print('  phase 3 — π rollouts + PPO + CRL with a′ ~ π(·|s′, g_task)')
+
   start_time = time.time()
   # global_step, ppo_sgd_step, start_iteration set above (0 for fresh runs,
   # restored from checkpoint on resume).
 
   for iteration in range(start_iteration, num_iterations):
+    _roll_q1_mean = float('nan')
+    _roll_q2_mean = float('nan')
+    _roll_qmin_mean = float('nan')
+    _policy_updates_enabled = (
+        (not _random_warmup) or _initial_crl_warmup_done)
+    _use_random_rollout = _random_warmup and not _initial_crl_warmup_done
+    _use_uniform_bootstrap = _random_warmup and not _initial_crl_warmup_done
+    if _random_warmup:
+      if replay.size < _min_replay:
+        _warmup_phase = 1
+      elif not _initial_crl_warmup_done:
+        _warmup_phase = 2
+      else:
+        _warmup_phase = 3
+    else:
+      _warmup_phase = 0
+    if _warmup_phase == 2 and not _phase2_announced:
+      print(f'[ppo] random warmup phase 2 at iteration={iteration}: '
+            f'replay={replay.size} — running '
+            f'{int(config.ppo_crl_steps_per_iter)} CRL steps with uniform a′ (no PPO)')
+      _phase2_announced = True
     # =================================================================
     # 1. Rollout (on-policy, CleanRL convention)
     # =================================================================
@@ -1436,10 +1844,18 @@ def run_ppo_training(
       roll_dones[t] = next_done
 
       key, k_act = jax.random.split(key)
-      action_j, logprob_j, value_j = act_and_value(
-          ppo_params['policy'], ppo_params['value'],
-          jnp.asarray(obs), k_act)
-      action = np.asarray(action_j)
+      if _use_random_rollout:
+        action = np_rng.uniform(
+            low=action_low_np, high=action_high_np,
+            size=(E,) + act_shape).astype(np.float32)
+        # PPO is off during uniform warmup — only need values for logging/GAE.
+        value_j = value_only(ppo_params['value'], jnp.asarray(obs))
+        logprob_j = jnp.zeros((E,), dtype=jnp.float32)
+      else:
+        action_j, logprob_j, value_j = act_and_value(
+            ppo_params['policy'], ppo_params['value'],
+            jnp.asarray(obs), k_act)
+        action = np.asarray(action_j)
       roll_acts[t] = action
       roll_logp[t] = np.asarray(logprob_j)
       roll_vals[t] = np.asarray(value_j)
@@ -1517,9 +1933,21 @@ def run_ppo_training(
         _rew_flat  = np.asarray(
             reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j, _flat_s0_j))
       else:
-        # Default CRL: r = φ(s,a)·ψ(g)
-        _rew_flat = np.asarray(
-            reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
+        # Default CRL: r = φ(s,a)·ψ(g); twin_q logs both heads + min.
+        _q_params = _reward_q_params()
+        if bool(config.twin_q):
+          _logits, _, _ = networks.q_network.apply(
+              _q_params, _flat_obs_j, _flat_acts_j)
+          _q1 = jnp.diagonal(_logits[..., 0])
+          _q2 = jnp.diagonal(_logits[..., 1])
+          _roll_q1_mean = float(jnp.mean(_q1))
+          _roll_q2_mean = float(jnp.mean(_q2))
+          _roll_qmin_mean = float(jnp.mean(jnp.minimum(_q1, _q2)))
+          _rew_flat = np.asarray(jnp.mean(jnp.stack([_q1, _q2], axis=-1), axis=-1))
+        else:
+          _roll_q1_mean = _roll_q2_mean = _roll_qmin_mean = float('nan')
+          _rew_flat = np.asarray(
+              reward_fn(_q_params, _flat_obs_j, _flat_acts_j))
       roll_rew_raw[:] = _rew_flat.reshape(T, E)
 
     # Apply reward normalisation (cheap NumPy loop; normalizer state is shared
@@ -1544,39 +1972,40 @@ def run_ppo_training(
     # =================================================================
     # 3. PPO updates (epochs × minibatches over flat T·E batch)
     # =================================================================
-    flat_obs = roll_obs.reshape((batch_per_iter,) + obs_shape)
-    flat_acts = roll_acts.reshape((batch_per_iter,) + act_shape)
-    flat_logp = roll_logp.reshape(batch_per_iter)
-    flat_adv = adv.reshape(batch_per_iter)
-    flat_ret = ret.reshape(batch_per_iter)
-    flat_vals = roll_vals.reshape(batch_per_iter)
-
     ppo_metrics_agg: Dict[str, list] = {}
     early_stop = False
-    for epoch in range(int(config.ppo_num_epochs)):
-      perm = np_rng.permutation(batch_per_iter)
-      last_kl = None
-      for start in range(0, batch_per_iter, mb_size):
-        mb = perm[start:start + mb_size]
-        batch = {
-            'obs':          jnp.asarray(flat_obs[mb]),
-            'actions':      jnp.asarray(flat_acts[mb]),
-            'old_logprobs': jnp.asarray(flat_logp[mb]),
-            'advantages':   jnp.asarray(flat_adv[mb]),
-            'returns':      jnp.asarray(flat_ret[mb]),
-            'old_values':   jnp.asarray(flat_vals[mb]),
-        }
-        key, k_mb = jax.random.split(key)
-        ppo_params, ppo_opt_state, m = ppo_update(
-            ppo_params, ppo_opt_state, batch, k_mb)
-        ppo_sgd_step += 1
-        last_kl = float(m['approx_kl'])
-        for k_, v in m.items():
-          ppo_metrics_agg.setdefault(k_, []).append(float(v))
-      if (config.ppo_target_kl is not None and last_kl is not None
-          and last_kl > float(config.ppo_target_kl)):
-        early_stop = True
-        break
+    if _policy_updates_enabled:
+      flat_obs = roll_obs.reshape((batch_per_iter,) + obs_shape)
+      flat_acts = roll_acts.reshape((batch_per_iter,) + act_shape)
+      flat_logp = roll_logp.reshape(batch_per_iter)
+      flat_adv = adv.reshape(batch_per_iter)
+      flat_ret = ret.reshape(batch_per_iter)
+      flat_vals = roll_vals.reshape(batch_per_iter)
+
+      for epoch in range(int(config.ppo_num_epochs)):
+        perm = np_rng.permutation(batch_per_iter)
+        last_kl = None
+        for start in range(0, batch_per_iter, mb_size):
+          mb = perm[start:start + mb_size]
+          batch = {
+              'obs':          jnp.asarray(flat_obs[mb]),
+              'actions':      jnp.asarray(flat_acts[mb]),
+              'old_logprobs': jnp.asarray(flat_logp[mb]),
+              'advantages':   jnp.asarray(flat_adv[mb]),
+              'returns':      jnp.asarray(flat_ret[mb]),
+              'old_values':   jnp.asarray(flat_vals[mb]),
+          }
+          key, k_mb = jax.random.split(key)
+          ppo_params, ppo_opt_state, m = ppo_update(
+              ppo_params, ppo_opt_state, batch, k_mb)
+          ppo_sgd_step += 1
+          last_kl = float(m['approx_kl'])
+          for k_, v in m.items():
+            ppo_metrics_agg.setdefault(k_, []).append(float(v))
+        if (config.ppo_target_kl is not None and last_kl is not None
+            and last_kl > float(config.ppo_target_kl)):
+          early_stop = True
+          break
 
     pg_vals = ppo_metrics_agg.get('pg_loss', [])
     mean_pg = float(np.mean(pg_vals)) if pg_vals else float('inf')
@@ -1584,13 +2013,11 @@ def run_ppo_training(
     # =================================================================
     # 4. CRL updates (off-policy, from replay)
     # =================================================================
+    _n_crl = int(config.ppo_crl_steps_per_iter)
     crl_metrics_agg: Dict[str, list] = {}
-    if replay.size >= int(config.ppo_min_replay_size):
+    if replay.size >= _min_replay:
       # Update goal normalisation stats from a fresh replay sample (NF only).
       if use_nf and not _nf_normalizer_reset_done:
-        # First time NF activates: reset the return normalizer so the extreme
-        # rewards from the untrained flow don't permanently corrupt the running
-        # std that PPO uses to scale advantages.
         if reward_normalizer is not None:
           reward_normalizer._rms = RunningMeanStd(shape=())
           reward_normalizer._returns = np.zeros(E, dtype=np.float64)
@@ -1599,8 +2026,6 @@ def run_ppo_training(
         _std_floor = float(getattr(config, 'nf_goal_std_min', 0.02))
         _stat_batch = replay.sample(min(2048, replay.size), np_rng)
         _goals = _stat_batch['obs'][:, int(config.obs_dim):]
-        # Optionally mix in the actual env goals from the current rollout so
-        # that the running stats cover both hindsight goals AND reward goals.
         if bool(getattr(config, 'nf_mix_env_goal_stats', False)):
           _env_goals = roll_obs.reshape(-1, roll_obs.shape[-1])[:, int(config.obs_dim):]
           _goals = np.concatenate([_goals, _env_goals], axis=0)
@@ -1611,9 +2036,37 @@ def run_ppo_training(
           _nf_stat_log[f'nf/goal_mean_{_di}'] = float(_gm)
           _nf_stat_log[f'nf/goal_std_{_di}']  = float(_gs)
 
-      _n_crl = int(config.ppo_crl_steps_per_iter)
-      if use_nf or use_gaussian:
-        # NF / Gaussian loops take extra args — keep the Python loop for now.
+      if _use_td_infonce:
+        # --- Synchronous TD InfoNCE (needs policy_params, target network) ---
+        for _crl_step in range(_n_crl):
+          crl_batch_np = (
+              replay.sample_with_uniform_negatives(
+                  int(config.batch_size), np_rng, goal_low, goal_high)
+              if uniform_sampling
+              else replay.sample(int(config.batch_size), np_rng))
+          crl_batch = {k_: jnp.asarray(v) for k_, v in crl_batch_np.items()}
+          key, k_crl = jax.random.split(key)
+          _td_update = (
+              td_infonce_update_uniform if _use_uniform_bootstrap
+              else td_infonce_update)
+          q_params, q_opt_state, td_target_q_params, m = _td_update(
+              q_params, q_opt_state, td_target_q_params,
+              ppo_params['policy'], crl_batch, k_crl)
+          _w_diag_vec = m.pop('w_diag_vec', None)
+          if _w_diag_vec is not None:
+            _append_w_diag_log(iteration, _crl_step, _w_diag_vec)
+          _a_prime_hist = m.pop('a_prime_hist', None)
+          if _a_prime_hist is not None:
+            _append_a_prime_hist_log(iteration, _crl_step, _a_prime_hist)
+          for k_, v in m.items():
+            crl_metrics_agg.setdefault(k_, []).append(float(v))
+        if _random_warmup and not _initial_crl_warmup_done:
+          _initial_crl_warmup_done = True
+          print(f'[ppo] random warmup complete at iteration={iteration}: '
+                f'finished initial CRL block ({_n_crl} steps); '
+                f'next iteration uses π rollouts + PPO + π bootstrap a′')
+      elif use_nf or use_gaussian:
+        # NF / Gaussian loops take extra args — synchronous Python loop.
         for _ in range(_n_crl):
           if uniform_sampling:
             crl_batch_np = replay.sample_with_uniform_negatives(
@@ -1633,9 +2086,8 @@ def run_ppo_training(
             q_params_reward = _ema_tree(q_params_reward, q_params, _repr_tau)
           for k_, v in m.items():
             crl_metrics_agg.setdefault(k_, []).append(float(v))
-      else:
+      elif crl_scan_update is not None:
         # Standard CRL: pre-sample all batches → one H→D transfer → one JIT.
-        # This eliminates _n_crl rounds of dispatch + host sync.
         _samples = [
             (replay.sample_with_uniform_negatives(
                 int(config.batch_size), np_rng, goal_low, goal_high)
@@ -1675,6 +2127,9 @@ def run_ppo_training(
         'reward_repr_mean':      float(roll_rew.mean()),
         'reward_repr_raw_mean':  float(roll_rew_raw.mean()),
         'reward_repr_raw_std':   float(roll_rew_raw.std()),
+        'reward_repr_q1_mean':   _roll_q1_mean,
+        'reward_repr_q2_mean':   _roll_q2_mean,
+        'reward_repr_qmin_mean': _roll_qmin_mean,
         'reward_return_norm_std': (
             float(reward_normalizer.std) if reward_normalizer is not None
             else float('nan')),
@@ -1684,6 +2139,10 @@ def run_ppo_training(
         'advantage_mean':    float(adv.mean()),
         'advantage_std':     float(adv.std()),
         'early_stop_epochs': int(early_stop),
+        'ppo_policy_updates_enabled': float(_policy_updates_enabled),
+        'ppo_random_rollout': float(_use_random_rollout),
+        'ppo_uniform_bootstrap_a_prime': float(_use_uniform_bootstrap),
+        'ppo_warmup_phase': int(_warmup_phase),
         'ep_return_mean':    float(np.mean(recent_returns)) if recent_returns else float('nan'),
         'ep_length_mean':    float(np.mean(recent_lengths)) if recent_lengths else float('nan'),
         'ppo/mean_pg_loss':  mean_pg,
@@ -1742,7 +2201,7 @@ def run_ppo_training(
     if config.ppo_anneal_lr:
       lr_log = float(lr_schedule(max(0, ppo_sgd_step - 1)))
     else:
-      lr_log = float(config.learning_rate)
+      lr_log = float(config.actor_learning_rate)
     # Seven fractional digits so CSV / terminal show stable small LRs.
     log['ppo/learning_rate'] = round(lr_log, 7)
     log.update(_nf_stat_log)
@@ -1819,7 +2278,10 @@ def run_ppo_training(
           iteration=iteration,
           global_step=global_step,
           key=key,
-          q_params_ema=(q_params_reward if _use_repr_ema else None))
+          q_params_ema=(q_params_reward if _use_repr_ema else None),
+          td_target_q_params=(
+              td_target_q_params if _use_td_infonce else None),
+          initial_crl_warmup_done=_initial_crl_warmup_done)
       milestone_path = os.path.join(
           checkpoint_dir, f'ckpt_iter_{iteration:07d}.pkl')
       _save_checkpoint(milestone_path, **ckpt_kw)

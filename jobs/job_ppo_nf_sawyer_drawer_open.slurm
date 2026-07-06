@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=ppo_nf_drawer
 #SBATCH --output=slurm/ppo_nf_sawyer_drawer_open_%A_%a.out
+#SBATCH --error=slurm/ppo_nf_sawyer_drawer_open_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=wbc_16r4d_nu_loc
 #SBATCH --output=slurm/wbc_sixteenroomsactual4d_nouniform_locclip_%A_%a.out
+#SBATCH --error=slurm/wbc_sixteenroomsactual4d_nouniform_locclip_%A_%a.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
