@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --gres=gpu:1
-#SBATCH --time=48:00:00
+#SBATCH --time=6:00:00
 #SBATCH --account=seas
 
 # 2-cube tilting (creative-2-task3), PD control, filtered high-level obs (xyz+select).

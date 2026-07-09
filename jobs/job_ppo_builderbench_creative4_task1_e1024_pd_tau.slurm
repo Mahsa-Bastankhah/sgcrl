@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=48:00:00
 #SBATCH --account=seas
-#SBATCH --array=0-1
+#SBATCH --array=0-0
 
 # 4-cube stacking (creative-4-task1), PD control (duration=5):
 # 200M env steps, 1024 envs, 10M replay, rollout T=60 (300/5).
@@ -64,8 +64,8 @@ export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 ENV=${ENV:-builderbench_creative_4_task1}
-SEED=${SEED:-0}
-NUM_STEPS=${NUM_STEPS:-200000000}
+SEED=${SEED:-1}
+NUM_STEPS=${NUM_STEPS:-300000000}
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
 MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
 ENT_COEF=0.05
@@ -73,10 +73,10 @@ MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
 
-TAUS=(0 0.5)
+TAUS=(0)
 TAU=${TAUS[$SLURM_ARRAY_TASK_ID]}
 if [ "${TAU}" = "0" ]; then
-  LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative4_task1_e1024_pd/}"
+  LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative4_task1_e1024_pd_new/}"
   TAU_LABEL="tau0"
 else
   TAU_TAG="${TAU//./p}"

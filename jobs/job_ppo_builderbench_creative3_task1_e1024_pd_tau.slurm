@@ -4,12 +4,12 @@
 #SBATCH --error=slurm/ppo_builderbench_creative3_task1_e1024_pd_tau%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --gres=gpu:1
-#SBATCH --time=48:00:00
+#SBATCH --time=10:00:00
 #SBATCH --account=seas
-#SBATCH --array=0-1
+#SBATCH --array=0-0
 
 # 3-cube stacking (creative-3-task1), PD control (duration=5):
 # 200M env steps, 1024 envs, 10M replay, rollout T=50 (250/5).
@@ -73,10 +73,10 @@ MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
 
-TAUS=(0 0.5)
+TAUS=(0)
 TAU=${TAUS[$SLURM_ARRAY_TASK_ID]}
 if [ "${TAU}" = "0" ]; then
-  LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative3_task1_e1024_pd/}"
+  LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative3_task1_e1024_pd_new/}"
   TAU_LABEL="tau0"
 else
   TAU_TAG="${TAU//./p}"
