@@ -72,6 +72,7 @@ class _TrainCtx:
   actor_min_std: float
   start_index: int
   end_index: int
+  obs_space_list: list[str]
 
 
 def _get_video(
@@ -177,6 +178,8 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     with open(cfg_path, 'r', encoding='utf-8') as fh:
       run_cfg: Dict[str, Any] = json.load(fh)
     flags = run_cfg.get('flags', {})
+    obs_space_str = flags.get('obs_space', 'xy,select')
+    obs_space_list = [s.strip() for s in obs_space_str.split(',')]
     resolved = run_cfg.get('resolved_config', {})
     ppo_defaults = run_cfg.get('ppo_env_defaults', {})
     use_pd = bool(flags.get('builderbench_use_pd', False))
@@ -225,6 +228,7 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
       actor_min_std=actor_min_std,
       start_index=start_index,
       end_index=end_index,
+      obs_space_list=obs_space_list,
   )
 
 
@@ -328,11 +332,12 @@ def _make_policy_fn(
     *,
     filter_policy_obs: bool,
     num_cubes: int,
+    obs_space_list: list[str]
 ):
   @jax.jit
   def policy(obs, goals, key):
     if filter_policy_obs:
-      obs = filter_pd_policy_state_obs(obs, num_cubes)
+      obs = filter_pd_policy_state_obs(obs, num_cubes, obs_space_list)
     packed = jnp.concatenate([obs, goals], axis=-1)
     dist = networks.policy_network.apply(policy_params, packed)
     if stochastic:
@@ -427,6 +432,7 @@ def main():
         args.stochastic,
         filter_policy_obs=ctx.filter_policy_obs,
         num_cubes=num_cubes,
+      obs_space_list=ctx.obs_space_list
     )
     key, video_key = jax.random.split(key)
     frames = _get_video(

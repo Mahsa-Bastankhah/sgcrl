@@ -129,15 +129,44 @@ def pd_policy_state_obs_dim(num_cubes: int) -> int:
   return int(num_cubes) * 3 + 1
 
 
-def filter_pd_policy_state_obs(state_obs, num_cubes: int):
-  """Drop quat/linvel/angvel; keep cube positions and select_action."""
-  nc = int(num_cubes)
-  pos = state_obs[..., :3 * nc]
-  select = state_obs[..., -1:]
-  if isinstance(state_obs, np.ndarray):
-    return np.concatenate([pos, select], axis=-1)
-  import jax.numpy as jnp
-  return jnp.concatenate([pos, select], axis=-1)
+def get_filtered_obs_dim(num_cubes: int, obs_space_list: list[str]) -> int:
+    """Calculate the dimension of the filtered observation."""
+    nc = int(num_cubes)
+    dim_map = {
+        "xy": 3 * nc,
+        "quaternions": 4 * nc,
+        "linear_velocity": 3 * nc,
+        "angular_velocity": 3 * nc,
+        "select": 1
+    }
+    requested = ["xy"]
+    requested.extend([s for s in obs_space_list if s in dim_map and s not in requested])
+    if "select" not in requested:
+        requested.append("select")
+    return sum(dim_map[s] for s in requested)
+
+def filter_pd_policy_state_obs(state_obs, num_cubes, obs_space_list: list[str]):
+    """Drop unwanted state components; keep components based on obs_space_list."""
+    nc = int(num_cubes)
+    components = {
+        "xy": state_obs[..., :3 * nc],
+        "quaternions": state_obs[..., 3 * nc : 7 * nc],
+        "linear_velocity": state_obs[..., 7 * nc : 10 * nc],
+        "angular_velocity": state_obs[..., 10 * nc : 13 * nc],
+        "select": state_obs[..., -1:]
+    }
+    
+    requested = ["xy"]
+    requested.extend([s for s in obs_space_list if s in components and s not in requested])
+    if "select" not in requested:
+        requested.append("select")
+        
+    # Support both NumPy (single env) and JAX (batched env) arrays
+    if isinstance(state_obs, np.ndarray):
+        return np.concatenate([components[s] for s in requested], axis=-1)
+    
+    import jax.numpy as jnp
+    return jnp.concatenate([components[s] for s in requested], axis=-1)
 
 
 def pd_run_uses_filtered_policy_obs(run_cfg: dict) -> bool:

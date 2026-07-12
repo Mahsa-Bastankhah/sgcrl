@@ -294,6 +294,7 @@ def load(env_name, fixed_start_end=None, seed=None, **env_kwargs):
         pd_filter_policy_obs=bool(
             env_kwargs.get('builderbench_pd_filter_policy_obs', True)),
         fixed_target_goal=fixed_target,
+        obs_space_list=env_kwargs.get('obs_space_list'),  # <-- ADD THIS
     )
     obs_dim = gym_env.state_obs_dim
     max_episode_steps = gym_env._max_episode_steps

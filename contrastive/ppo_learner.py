@@ -1167,6 +1167,7 @@ def run_ppo_training(
         pd_filter_policy_obs=bool(
             _bb_kw.get('builderbench_pd_filter_policy_obs', True)),
         fixed_target_goal=_bb_kw.get('fixed_target_goal'),
+        obs_space_list=_bb_kw.get('obs_space_list'), # <--- ADD THIS LINE
     )
     print(f'[ppo] using JAX-batched BuilderBench vec env '
           f'(E={config.ppo_num_envs})')
@@ -1570,6 +1571,15 @@ def run_ppo_training(
           jnp.asarray(s0_states),
       )
       roll_obs[:] = np.asarray(_steps_j['obs'], dtype=np.float32)
+      if iteration == start_iteration:
+        print("\n" + "="*80)
+        print(f"[VERIFICATION] PPO Actor Observation Verification")
+        print(f"Requested obs_space_list: {vec_env._obs_space_list}")
+        print(f"Expected state_obs_dim: {vec_env._state_obs_dim}")
+        print(f"Expected goal_dim:      {vec_env._goal_dim}")
+        print(f"Rollout obs matrix shape: {roll_obs.shape} (T, E, total_obs_dim)")
+        print(f"Actual total features fed to actor: {roll_obs.shape[-1]}")
+        print("="*80 + "\n", flush=True)
       roll_dones[:] = np.asarray(_steps_j['roll_dones'], dtype=np.float32)
       roll_acts[:] = np.asarray(_steps_j['actions'], dtype=np.float32)
       roll_logp[:] = np.asarray(_steps_j['logprobs'], dtype=np.float32)

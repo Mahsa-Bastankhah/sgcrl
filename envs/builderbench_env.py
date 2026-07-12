@@ -42,8 +42,8 @@ except Exception as _e:  # noqa: BLE001
 from envs.builderbench_utils import (
     default_fixed_target_goal,
     filter_pd_policy_state_obs,
+    get_filtered_obs_dim,
     parse_bb_env_id,
-    pd_policy_state_obs_dim,
     uniform_goal_obs_bounds as _uniform_goal_obs_bounds,
 )
 
@@ -60,7 +60,7 @@ def _require_builderbench(env_name: str) -> None:
 
 
 def parse_creative_env_id(env_id: str) -> tuple[int, int]:
-  """Parse ``creative-{N}-task{K}`` → (num_cubes, task_id)."""
+  """Parse ``creative-{N}-task{K}`` ΓåÆ (num_cubes, task_id)."""
   return parse_bb_env_id(env_id)
 
 
@@ -84,6 +84,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
       pd_duration: int = 5,
       pd_filter_policy_obs: bool = True,
       fixed_target_goal: Optional[np.ndarray] = None,
+      obs_space_list: Optional[list[str]] = None,
   ):
     super().__init__()
     _require_builderbench(env_id)
@@ -93,6 +94,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     self._use_pd = bool(use_pd)
     self._pd_duration = int(pd_duration)
     self._pd_filter_policy_obs = bool(pd_filter_policy_obs) and self._use_pd
+    self._obs_space_list = obs_space_list or ["xy", "select"]
     self._fixed_target_goal = (
         None if fixed_target_goal is None
         else np.asarray(fixed_target_goal, dtype=np.float32).reshape(-1))
@@ -132,7 +134,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     probe = self._env.reset(jax.random.PRNGKey(0))
     self._full_state_obs_dim = int(np.asarray(probe.obs).shape[-1])
     if self._pd_filter_policy_obs:
-      self._state_obs_dim = pd_policy_state_obs_dim(self._num_cubes)
+      self._state_obs_dim = get_filtered_obs_dim(self._num_cubes, self._obs_space_list)
     else:
       self._state_obs_dim = self._full_state_obs_dim
     self._goal_dim = int(np.asarray(probe.info['target_goal']).shape[-1])
@@ -169,7 +171,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
   def _pack_obs(self, state) -> np.ndarray:
     state_obs = np.asarray(state.obs, dtype=np.float32)
     if self._pd_filter_policy_obs:
-      state_obs = filter_pd_policy_state_obs(state_obs, self._num_cubes)
+      state_obs = filter_pd_policy_state_obs(state_obs, self._num_cubes, self._obs_space_list)
     goal = np.asarray(state.info['target_goal'], dtype=np.float32)
     return np.concatenate([state_obs, goal], axis=0)
 
@@ -223,6 +225,7 @@ def make_builderbench_creative_env(
     pd_duration: int = 5,
     pd_filter_policy_obs: bool = True,
     fixed_target_goal: Optional[np.ndarray] = None,
+    obs_space_list: Optional[list[str]] = None,
 ) -> BuilderBenchCreativeGymEnv:
   return BuilderBenchCreativeGymEnv(
       env_id=env_id,
@@ -231,4 +234,5 @@ def make_builderbench_creative_env(
       pd_duration=pd_duration,
       pd_filter_policy_obs=pd_filter_policy_obs,
       fixed_target_goal=fixed_target_goal,
+      obs_space_list=obs_space_list,
   )

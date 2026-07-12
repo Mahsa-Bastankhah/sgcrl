@@ -198,6 +198,7 @@ flags.DEFINE_string(
     'skip every 2 layers).')
 
 flags.DEFINE_string('exp_name', 'ppo_contrastive.py', 'Experiment name for logging')
+flags.DEFINE_string('obs_space', 'xy,select', 'Comma-separated obs components')
 # ---------------------------------------------------------------------------
 # Fixed-goal lookup reused from lp_contrastive.py.
 # ---------------------------------------------------------------------------
@@ -556,6 +557,9 @@ def main(_):
     print(f'[ppo] builderbench: use_pd={FLAGS.builderbench_use_pd} '
           f'pd_duration={FLAGS.builderbench_pd_duration}'
           + (' pd_policy_obs=pos+select' if FLAGS.builderbench_use_pd else ''))
+
+
+  _env_kwargs['obs_space_list'] = [s.strip() for s in FLAGS.obs_space.split(',')]
 
   def env_factory(s):
     env, _ = contrastive_utils.make_environment(

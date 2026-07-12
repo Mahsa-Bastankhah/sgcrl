@@ -66,8 +66,8 @@ def _require_builderbench(env_name: str) -> None:
 
 from envs.builderbench_utils import (
     filter_pd_policy_state_obs,
+    get_filtered_obs_dim,
     parse_bb_env_id,
-    pd_policy_state_obs_dim,
     sgcrl_env_name_to_bb_env_id,
     uniform_goal_obs_bounds as _uniform_goal_obs_bounds,
 )
@@ -105,9 +105,10 @@ def _pack_obs(
     *,
     num_cubes: int = 0,
     filter_pd_policy: bool = False,
+    obs_space_list: Optional[list[str]] = None,
 ) -> jax.Array:
   if filter_pd_policy:
-    state_obs = filter_pd_policy_state_obs(state_obs, num_cubes)
+    state_obs = filter_pd_policy_state_obs(state_obs, num_cubes, obs_space_list or ["xy", "select"])
   return jnp.concatenate([state_obs, target_goal], axis=-1)
 
 
@@ -141,6 +142,7 @@ class JaxBuilderBenchVecEnv:
       pd_duration: int = 5,
       pd_filter_policy_obs: bool = True,
       fixed_target_goal: Optional[np.ndarray] = None,
+      obs_space_list: Optional[list[str]] = None,
   ):
     _require_builderbench(env_name)
     self._env_name = str(env_name)
@@ -180,12 +182,13 @@ class JaxBuilderBenchVecEnv:
 
     self._env = _wrap_batched_env(inner, episode_length=int(episode_length))
     self._episode_length = int(episode_length)
+    self._obs_space_list = obs_space_list or ["xy", "select"]
 
     probe_key = jax.random.split(jax.random.PRNGKey(0), self._num_envs)
     probe = self._env.reset(probe_key)
     self._full_state_obs_dim = int(probe.obs.shape[-1])
     if self._pd_filter_policy_obs:
-      self._state_obs_dim = pd_policy_state_obs_dim(self._num_cubes)
+      self._state_obs_dim = get_filtered_obs_dim(self._num_cubes, self._obs_space_list)
     else:
       self._state_obs_dim = self._full_state_obs_dim
     self._goal_dim = int(probe.info['target_goal'].shape[-1])
@@ -227,6 +230,7 @@ class JaxBuilderBenchVecEnv:
         state.info['target_goal'],
         num_cubes=self._num_cubes,
         filter_pd_policy=self._pd_filter_policy_obs,
+        obs_space_list=self._obs_space_list,
     )
 
   def compile_generate_unroll(
@@ -238,7 +242,7 @@ class JaxBuilderBenchVecEnv:
     """Build a ``jax.lax.scan`` rollout collector (BuilderBench-style).
 
     ``act_and_value_fn(policy_p, value_p, packed_obs, key)``
-    must return ``(actions, logprobs, values)`` — same contract as
+    must return ``(actions, logprobs, values)`` ΓÇö same contract as
     ``ppo_learner.act_and_value``.
     """
     step_fn = self._step_fn
@@ -246,6 +250,7 @@ class JaxBuilderBenchVecEnv:
     _T = int(unroll_length)
     _num_cubes = self._num_cubes
     _filter_pd = self._pd_filter_policy_obs
+    _obs_space_list = self._obs_space_list
 
     @jax.jit
     def generate_unroll(
@@ -260,7 +265,7 @@ class JaxBuilderBenchVecEnv:
         env_state, key, next_done, s0_states = carry
         packed_obs = _pack_obs(
             env_state.obs, env_state.info['target_goal'],
-            num_cubes=_num_cubes, filter_pd_policy=_filter_pd)
+            num_cubes=_num_cubes, filter_pd_policy=_filter_pd, obs_space_list=_obs_space_list)
         key, k_act = jax.random.split(key)
         actions, logprobs, values = act_and_value_fn(
             policy_params, value_params, packed_obs, k_act)
@@ -269,10 +274,10 @@ class JaxBuilderBenchVecEnv:
         terminal_obs = _pack_obs(
             next_state.info['terminal_obs'],
             next_state.info['terminal_target_goal'],
-            num_cubes=_num_cubes, filter_pd_policy=_filter_pd)
+            num_cubes=_num_cubes, filter_pd_policy=_filter_pd, obs_space_list=_obs_space_list)
         next_packed = _pack_obs(
             next_state.obs, next_state.info['target_goal'],
-            num_cubes=_num_cubes, filter_pd_policy=_filter_pd)
+            num_cubes=_num_cubes, filter_pd_policy=_filter_pd, obs_space_list=_obs_space_list)
         dones = next_state.done
         term_obs = jnp.where(dones[:, None], terminal_obs, next_packed)
 
@@ -318,6 +323,7 @@ class JaxBuilderBenchVecEnv:
     _T = int(unroll_length)
     _num_cubes = self._num_cubes
     _filter_pd = self._pd_filter_policy_obs
+    _obs_space_list = self._obs_space_list
 
     @jax.jit
     def eval_unroll(env_state: State, policy_params: Any):
@@ -325,7 +331,7 @@ class JaxBuilderBenchVecEnv:
         env_state = carry
         packed_obs = _pack_obs(
             env_state.obs, env_state.info['target_goal'],
-            num_cubes=_num_cubes, filter_pd_policy=_filter_pd)
+            num_cubes=_num_cubes, filter_pd_policy=_filter_pd, obs_space_list=_obs_space_list)
         actions = eval_policy_fn(policy_params, packed_obs)
         next_state = step_fn(env_state, actions)
         step_out = {
@@ -377,6 +383,7 @@ class JaxBuilderBenchVecEnv:
         self._state.info['terminal_target_goal'],
         num_cubes=self._num_cubes,
         filter_pd_policy=self._pd_filter_policy_obs,
+        obs_space_list=self._obs_space_list,
     )
     dones = self._state.done.astype(bool)
     env_rewards = self._state.reward.astype(np.float32)

@@ -249,6 +249,7 @@ class CheckpointEvalSession:
         pd_duration=ctx.pd_duration,
         pd_filter_policy_obs=ctx.filter_policy_obs,
         fixed_target_goal=fixed_goal,
+        obs_space_list=ctx.obs_space_list
     )
 
     @jax.jit
