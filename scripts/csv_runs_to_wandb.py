@@ -40,6 +40,16 @@ from pathlib import Path
 # W&B accepts fairly long names; keep UI usable.
 _WANDB_NAME_MAX_LEN = 192
 
+def _flatten_dict(d: dict, parent_key: str = '', sep: str = '/') -> dict:
+    items = []
+    for k, v in d.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.extend(_flatten_dict(v, new_key, sep=sep).items())
+        else:
+            items.append((new_key, v))
+    return dict(items)
+
 
 def _try_float(s: str) -> float | None:
   try:
@@ -151,10 +161,17 @@ def _upload_one_run(
     ) from e
 
   cfg: dict = {}
-  cfg_path = run_dir / "sweep_config.json"
+  # Load run_config.json
+  cfg_path = run_dir / "run_config.json"
   if cfg_path.is_file():
-    with cfg_path.open() as f:
-      cfg = json.load(f)
+      with cfg_path.open() as f:
+          cfg.update(json.load(f))
+
+  # Load metadata.json (the command)
+  meta_path = run_dir / "metadata.json"
+  if meta_path.is_file():
+      with meta_path.open() as f:
+          cfg.update(json.load(f))
 
   run_name = resolved
   tags = [
@@ -166,7 +183,10 @@ def _upload_one_run(
       "learner": run_dir / "logs" / "learner" / "logs.csv",
       "actor": run_dir / "logs" / "actor" / "logs.csv",
       "evaluator": run_dir / "logs" / "evaluator" / "logs.csv",
+      "checkpoint_eval": run_dir / "logs" / "eval" / "logs.csv",
   }
+
+  flat_cfg = _flatten_dict(cfg)
 
   init_kwargs: dict = {
       "project": project,
@@ -174,7 +194,7 @@ def _upload_one_run(
       "config": {
           "run_dir": str(run_dir.resolve()),
           "run_name_style": run_name_style,
-          **{f"cfg/{k}": v for k, v in cfg.items()},
+          **flat_cfg,
       },
   }
   if entity:
@@ -190,6 +210,7 @@ def _upload_one_run(
   wandb.define_metric("learner/*", step_metric="learner_step")
   wandb.define_metric("actor/*", step_metric="actor_step")
   wandb.define_metric("evaluator/*", step_metric="evaluator_step")
+  wandb.define_metric("checkpoint_eval/*", step_metric="checkpoint_eval_step")
 
   for role, csv_path in paths.items():
     if not csv_path.is_file():
@@ -199,6 +220,7 @@ def _upload_one_run(
         "learner": "learner_steps",
         "actor": "actor_steps",
         "evaluator": "evaluator_steps",
+        "checkpoint_eval": "global_step",
     }[role]
     if step_col not in fieldnames:
       print(f"[warn] {csv_path}: missing column {step_col!r}, skip", file=sys.stderr)

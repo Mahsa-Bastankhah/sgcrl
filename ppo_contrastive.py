@@ -196,6 +196,8 @@ flags.DEFINE_string(
     'Empty string keeps the ContrastiveConfig default. '
     'Stacks with >2 layers automatically use ResidualMLP (LayerNorm + Swish, '
     'skip every 2 layers).')
+
+flags.DEFINE_string('exp_name', 'ppo_contrastive.py', 'Experiment name for logging')
 # ---------------------------------------------------------------------------
 # Fixed-goal lookup reused from lp_contrastive.py.
 # ---------------------------------------------------------------------------
