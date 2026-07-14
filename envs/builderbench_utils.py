@@ -170,7 +170,6 @@ def filter_pd_policy_state_obs(state_obs, num_cubes, obs_space_list: list[str]):
 
 
 def pd_run_uses_filtered_policy_obs(run_cfg: dict) -> bool:
-  """True when a PD run trained with xyz+select policy obs (not full state)."""
   flags = run_cfg.get('flags', {})
   if not bool(flags.get('builderbench_use_pd', False)):
     return False
@@ -181,11 +180,15 @@ def pd_run_uses_filtered_policy_obs(run_cfg: dict) -> bool:
   if not m:
     return False
   num_cubes = int(m.group(1))
-  return obs_dim == pd_policy_state_obs_dim(num_cubes)
-
+  
+  # FIX: Calculate based on actual obs_space
+  obs_space_str = flags.get('obs_space', 'xy,select')
+  obs_space_list = [s.strip() for s in obs_space_str.split(',')]
+  expected_dim = get_filtered_obs_dim(num_cubes, obs_space_list)
+  
+  return obs_dim == expected_dim
 
 def video_render_skip_reason(run_cfg_path: str) -> str | None:
-  """Return a skip reason for legacy PD runs; ``None`` if rendering is OK."""
   if not os.path.isfile(run_cfg_path):
     return None
   with open(run_cfg_path, 'r', encoding='utf-8') as fh:
@@ -199,12 +202,16 @@ def video_render_skip_reason(run_cfg_path: str) -> str | None:
   obs_dim = int(resolved.get('obs_dim', -1))
   env = str(run_cfg.get('env', ''))
   m = _SGCRL_CREATIVE_RE.fullmatch(env)
-  pd_dim = pd_policy_state_obs_dim(int(m.group(1))) if m else '?'
+  
+  # FIX: Calculate based on actual obs_space
+  obs_space_str = flags.get('obs_space', 'xy,select')
+  obs_space_list = [s.strip() for s in obs_space_str.split(',')]
+  pd_dim = get_filtered_obs_dim(int(m.group(1)), obs_space_list) if m else '?'
+  
   return (
       f'legacy PD without filtered policy obs '
       f'(obs_dim={obs_dim}, filtered={pd_dim})'
   )
-
 
 def run_config_path(log_dir: str, env: str, seed: int) -> str:
   return os.path.join(

@@ -23,7 +23,7 @@ _BUILDERBENCH_ROOT = os.environ.get(
 if _BUILDERBENCH_ROOT not in sys.path:
   sys.path.insert(0, _BUILDERBENCH_ROOT)
 
-import sgcrl_jax_acme_compat  # noqa: F401 — must precede acme/jax imports
+import sgcrl_jax_acme_compat  # noqa: F401 ΓÇö must precede acme/jax imports
 
 import argparse
 import glob
@@ -43,6 +43,7 @@ from ppo_contrastive import fixed_goal_for_env, ppo_env_defaults_for_env
 from envs.builderbench_utils import (
     creative_cube_full_state_obs_dim,
     filter_pd_policy_state_obs,
+    get_filtered_obs_dim,
     is_builderbench_creative_env,
     parse_bb_env_id,
     pd_policy_state_obs_dim,
@@ -171,7 +172,6 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
   num_cubes, _ = parse_bb_env_id(sgcrl_env_name_to_bb_env_id(env_name))
   mj_ep_len = 100 + num_cubes * 50
   full_obs_dim = creative_cube_full_state_obs_dim(num_cubes)
-  pd_obs_dim = pd_policy_state_obs_dim(num_cubes)
 
   cfg_path = _run_config_path_for_checkpoint(checkpoint_path)
   if cfg_path is not None:
@@ -180,6 +180,7 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     flags = run_cfg.get('flags', {})
     obs_space_str = flags.get('obs_space', 'xy,select')
     obs_space_list = [s.strip() for s in obs_space_str.split(',')]
+    pd_obs_dim = get_filtered_obs_dim(num_cubes, obs_space_list)
     resolved = run_cfg.get('resolved_config', {})
     ppo_defaults = run_cfg.get('ppo_env_defaults', {})
     use_pd = bool(flags.get('builderbench_use_pd', False))
@@ -206,6 +207,8 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     start_index = int(defaults.get('start_index', 0))
     end_index = int(defaults.get('end_index', num_cubes * 3))
     fixed_goal = fixed_goal_for_env(env_name)
+    obs_space_list = ['xy', 'select']
+    pd_obs_dim = pd_policy_state_obs_dim(num_cubes)
 
   if use_pd:
     macro_ep_len = mj_ep_len // pd_duration
@@ -238,6 +241,7 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
     env_kwargs['builderbench_use_pd'] = True
     env_kwargs['builderbench_pd_duration'] = ctx.pd_duration
     env_kwargs['builderbench_pd_filter_policy_obs'] = ctx.filter_policy_obs
+    env_kwargs['obs_space_list'] = ctx.obs_space_list
 
   probe_env, obs_dim = contrastive_utils.make_environment(
       env_name,
