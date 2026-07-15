@@ -36,6 +36,7 @@ from contrastive import networks as contrastive_networks
 from contrastive import gaussian_density as _gd
 from contrastive import nf_density as _nf
 from contrastive.utils import extract_info_reward
+from metrics import compute_analysis_dict
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +691,13 @@ def make_ppo_update_fn(
   @jax.jit
   def update(params, opt_state, batch, key):
     (_, metrics), grads = grad_fn(params, batch, key)
+    print("DEBUG ACTOR GRADS SHAPE:", jax.tree_util.tree_map(lambda x: x.shape, grads['policy']))
+    actor_metrics = compute_analysis_dict(
+        prefix="actor",
+        params=params['policy'],
+        grads=grads['policy']
+    )
+    metrics.update(actor_metrics)
     updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
     new_params = optax.apply_updates(params, updates)
     return new_params, new_opt_state, metrics
@@ -787,6 +795,13 @@ def make_crl_update_fn(
 
   def update(q_params, q_optimizer_state, batch, key):
     (_, metrics), grads = grad_fn(q_params, batch, key)
+    print("DEBUG CRITIC GRADS SHAPE:", jax.tree_util.tree_map(lambda x: x.shape, grads))
+    # critic_metrics = compute_analysis_dict(
+    #       prefix="critic",
+    #       params=q_params,
+    #       grads=grads,
+    # )
+    # metrics.update(critic_metrics)
     grads_finite = jnp.all(jnp.asarray(jax.tree_util.tree_leaves(
         jax.tree_util.tree_map(lambda x: jnp.all(jnp.isfinite(x)), grads))))
     loss_finite = jnp.isfinite(metrics['crl_loss'])
