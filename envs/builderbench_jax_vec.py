@@ -65,6 +65,7 @@ def _require_builderbench(env_name: str) -> None:
 
 
 from envs.builderbench_utils import (
+    creative_cube_mj_episode_length,
     filter_pd_policy_state_obs,
     parse_bb_env_id,
     pd_policy_state_obs_dim,
@@ -159,7 +160,8 @@ class JaxBuilderBenchVecEnv:
     cfg = default_config()
     cfg.num_cubes = num_cubes
     cfg.task_id = task_id
-    cfg.episode_length = 100 + num_cubes * 50
+    cfg.episode_length = creative_cube_mj_episode_length(
+        num_cubes, task_id)
     cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
     if self._bb_env_id in _MJX_PARAMS:
       ncon, njmax = _MJX_PARAMS[self._bb_env_id]

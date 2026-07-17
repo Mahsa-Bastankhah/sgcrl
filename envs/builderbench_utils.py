@@ -117,6 +117,34 @@ def default_fixed_target_goal(num_cubes: int, task_index: int) -> np.ndarray:
   return (_TARGET_SAMPLING_MID.reshape(1, 3) + offsets).reshape(-1)
 
 
+def creative_cube_mj_episode_length(num_cubes: int, task_index: int = 0) -> int:
+  """MuJoCo steps per episode (before PD macro division).
+
+  Default: ``100 + num_cubes * 50``.  creative-4-task1 uses 500 MJ steps
+  (= 100 PD macro steps at ``pd_duration=5``).
+  """
+  nc = int(num_cubes)
+  ti = int(task_index)
+  if nc == 4 and ti == 0:
+    return 500
+  return 100 + nc * 50
+
+
+def creative_cube_pd_macro_episode_length(
+    num_cubes: int,
+    task_index: int = 0,
+    pd_duration: int = 5,
+) -> int:
+  """RL episode length when wrapped in ``PDWrapper``."""
+  mj_len = creative_cube_mj_episode_length(num_cubes, task_index)
+  pd = int(pd_duration)
+  if mj_len % pd != 0:
+    raise ValueError(
+        f'creative_cube_mj_episode_length={mj_len} must divide '
+        f'pd_duration={pd}')
+  return mj_len // pd
+
+
 def creative_cube_full_state_obs_dim(num_cubes: int) -> int:
   """State obs length from ``CreativeCube.get_obs`` (non-delta control)."""
   nc = int(num_cubes)
@@ -193,12 +221,17 @@ def uniform_goal_obs_bounds(
   return low.astype(np.float32), high.astype(np.float32)
 
 
-def ppo_env_defaults(num_cubes: int, use_pd: bool = False) -> dict:
+def ppo_env_defaults(
+    num_cubes: int,
+    use_pd: bool = False,
+    task_index: int = 0,
+    pd_duration: int = 5,
+) -> dict:
   """Rollout / CRL defaults scaled to BuilderBench creative episode length."""
-  episode_length = 100 + num_cubes * 50
+  episode_length = creative_cube_mj_episode_length(num_cubes, task_index)
   goal_dim = num_cubes * 3
   if use_pd:
-    pd_episode_length = episode_length // 5
+    pd_episode_length = episode_length // int(pd_duration)
     return dict(
         rollout_length=max(32, pd_episode_length),
         crl_steps_per_iter=max(16, pd_episode_length // 2),
@@ -235,9 +268,12 @@ def builderbench_training_defaults(
     num_envs: int,
     num_cubes: int,
     use_pd: bool = False,
+    task_index: int = 0,
+    pd_duration: int = 5,
 ) -> dict:
   """PPO / CRL scale defaults for BuilderBench (200M steps, replay ∝ E)."""
-  out = ppo_env_defaults(num_cubes, use_pd=use_pd)
+  out = ppo_env_defaults(
+      num_cubes, use_pd=use_pd, task_index=task_index, pd_duration=pd_duration)
   out['num_steps'] = BUILDERBENCH_NUM_STEPS
   out['max_replay_size'] = builderbench_replay_size(num_envs)
   return out
