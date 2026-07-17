@@ -1,0 +1,148 @@
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ debug python -u ppo_contrastive.py --env=builderbench_creative_3_task1 --seed=0 --log_dir_path=/network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug --exp_name=debug --num_steps=200000000 --ppo_num_envs=1024 --ppo_ent_coef=0.05 --ppo_actor_min_std=0.01 --ppo_discount=0.99 --ppo_clip_coef=0.2 --ppo_checkpoint_interval=150 --builderbench_use_pd=true --builderbench_pd_duration=5 --ppo_skip_first_eval=true --ppo_eval_interval=0 --max_replay_size=10000000 --ppo_crl_repr_tau=0 --hidden_layer_sizes=256,256,256,256,256,256 --obs_space="xy,quaternions,select"
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1783901886.572910 1389846 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1783901891.016962 1389846 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[ppo_contrastive] env=builderbench_creative_3_task1 seed=0
+[ppo] builderbench scale: num_steps=200000000 max_replay_size=1000000 (E=1024)
+[ppo_contrastive] PPO knobs: rollout_length=50, crl_steps_per_iter=25, num_envs=1024, clip_coef=0.2, actor_min_std=0.01, ent_coef=0.05, discount_crl=0.99, discount_ppo=0.99, norm_reward=True, repr_norm=False, ppo_anneal_lr=True  ppo_repr_mode='crl'  ppo_reward_mode=''  ppo_crl_repr_tau=0.0  ppo_dirac_eps=1e-06  max_replay_size=10000000  ppo_min_replay_size=10000  kde_max_points=2000  kde_refit_interval=1  kde_bandwidth=0.0  ckpt_interval=150  ckpt_keep_last=0 (all milestones)  hidden_layers=(256, 256, 256, 256, 256, 256)
+[ppo] builderbench: use_pd=True pd_duration=5 pd_policy_obs=pos+select
+I0712 20:18:17.460193 140564849743680 acceleratesupport.py:24] No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+I0712 20:18:18.987919 140564849743680 xla_bridge.py:822] Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+[ppo_contrastive] wrote run config: /network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug/ppo_builderbench_creative_3_task1_0/run_config.json
+[jax_vec] BuilderBench creative-3-task1: E=1024 obs=31 act=5 ep_len=50 use_pd=True pd_policy_obs=22 (full_state=40)
+[ppo] using JAX-batched BuilderBench vec env (E=1024)
+[ppo] repr_mode=crl (φ·ψ contrastive)
+[ppo] CRL loss direction: forward
+[ppo] BuilderBench rollout: jax.lax.scan (T=50)
+[ppo] BuilderBench: periodic eval disabled; logging train_success_mean / train_success_1000 from rollouts
+I0712 20:18:46.017009 140564849743680 resumable_csv_logger.py:46] Logging to /network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug/ppo_builderbench_creative_3_task1_0/logs/learner/logs.csv
+I0712 20:18:46.018298 140564849743680 resumable_csv_logger.py:46] Logging to /network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug/ppo_builderbench_creative_3_task1_0/logs/eval/logs.csv
+[ppo] checkpoints → /network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug/ppo_builderbench_creative_3_task1_0/checkpoints (every 150 iters, keep all milestones)
+/home/mila/m/mohammad-sami-nur.islam/scratch/conda_envs/envs/sgcrl_builderbench/lib/python3.11/site-packages/jax/_src/abstract_arrays.py:144: RuntimeWarning: overflow encountered in cast
+  return literals.TypedNdArray(np.asarray(x, dtype))
+E0712 20:18:50.675923 1389910 cuda_timer.cc:87] Delay kernel timed out: measured time has sub-optimal accuracy. There may be a missing warmup execution, please investigate in Nsight Systems.
+
+================================================================================
+[VERIFICATION] PPO Actor Observation Verification
+Requested obs_space_list: ['xy', 'quaternions', 'select']
+Expected state_obs_dim: 22
+Expected goal_dim:      9
+Rollout obs matrix shape: (50, 1024, 31) (T, E, total_obs_dim)
+Actual total features fed to actor: 31
+================================================================================
+
+I0712 20:19:28.967170 140564849743680 terminal.py:91] [Learner] Advantage Mean = 1.330 | Advantage Std = 1.226 | Crl/Binary Accuracy = 0.931 | Crl/Categorical Accuracy = 0.005 | Crl/Crl Loss = 10.663 | Crl/Logits Neg = -9.090 | Crl/Logits Pos = -8.780 | Crl/Logsumexp = 73.383 | Crl/Update Skipped Nonfinite = 0.000 | Early Stop Epochs = 0 | Ep Length Mean = 50.000 | Ep Return Mean = 192.338 | Global Step = 51200 | Iteration = 0 | Learner Steps = 0 | Ppo/Approx Kl = 0.038 | Ppo/Clipfrac = 0.315 | Ppo/Entropy = 2.781 | Ppo/Entropy Loss = -0.139 | Ppo/Learning Rate = 2.999e-04 | Ppo/Mean Pg Loss = 0.002 | Ppo/Old Approx Kl = 0.038 | Ppo/Pg Loss = 0.002 | Ppo/Policy Loc Abs Mean = 0.325 | Ppo/Policy Loc Mean = -0.169 | Ppo/Policy Scale Mean = 0.775 | Ppo/Policy Scale Min = 0.519 | Ppo/Ppo Total Loss = 0.570 | Ppo/Ratio Mean = 1.000 | Ppo/V Loss = 1.414 | Replay Size = 51185 | Returns Mean = 1.597 | Reward Env Mean = 3.767 | Reward Repr Mean = 0.171 | Reward Repr Raw Mean = 6.293 | Reward Repr Raw Std = 9.085 | Reward Return Norm Std = 83.349 | Sps = 1201.116 | Train Success 1000 = 0.000 | Train Success Mean = 0.000 | Value Mean = 0.267
+I0712 20:19:41.221569 140564849743680 terminal.py:91] [Learner] Advantage Mean = -0.991 | Advantage Std = 0.323 | Crl/Binary Accuracy = 0.993 | Crl/Categorical Accuracy = 0.015 | Crl/Crl Loss = 5.370 | Crl/Logits Neg = -6.065 | Crl/Logits Pos = -5.391 | Crl/Logsumexp = 2.980 | Crl/Update Skipped Nonfinite = 0.000 | Early Stop Epochs = 0 | Ep Length Mean = 50.000 | Ep Return Mean = 169.638 | Global Step = 102400 | Iteration = 1 | Learner Steps = 1 | Ppo/Approx Kl = 0.016 | Ppo/Clipfrac = 0.205 | Ppo/Entropy = 2.877 | Ppo/Entropy Loss = -0.144 | Ppo/Learning Rate = 2.998e-04 | Ppo/Mean Pg Loss = -0.003 | Ppo/Old Approx Kl = 0.016 | Ppo/Pg Loss = -0.003 | Ppo/Policy Loc Abs Mean = 0.306 | Ppo/Policy Loc Mean = -0.153 | Ppo/Policy Scale Mean = 0.779 | Ppo/Policy Scale Min = 0.536 | Ppo/Ppo Total Loss = 0.040 | Ppo/Ratio Mean = 1.000 | Ppo/V Loss = 0.373 | Replay Size = 102385 | Returns Mean = -0.443 | Reward Env Mean = 3.520 | Reward Repr Mean = -0.068 | Reward Repr Raw Mean = -9.047 | Reward Repr Raw Std = 2.959 | Reward Return Norm Std = 192.404 | Sps = 1855.113 | Train Success 1000 = 0.000 | Train Success Mean = 0.000 | Value Mean = 0.548
+I0712 20:19:53.383449 140564849743680 terminal.py:91] [Learner] Advantage Mean = -0.328 | Advantage Std = 0.217 | Crl/Binary Accuracy = 0.996 | Crl/Categorical Accuracy = 0.031 | Crl/Crl Loss = 4.909 | Crl/Logits Neg = -6.022 | Crl/Logits Pos = -4.854 | Crl/Logsumexp = 1.152 | Crl/Update Skipped Nonfinite = 0.000 | Early Stop Epochs = 0 | Ep Length Mean = 50.000 | Ep Return Mean = 195.474 | Global Step = 153600 | Iteration = 2 | Learner Steps = 2 | Ppo/Approx Kl = 0.008 | Ppo/Clipfrac = 0.110 | Ppo/Entropy = 3.000 | Ppo/Entropy Loss = -0.150 | Ppo/Learning Rate = 2.998e-04 | Ppo/Mean Pg Loss = -4.593e-04 | Ppo/Old Approx Kl = 0.009 | Ppo/Pg Loss = -4.593e-04 | Ppo/Policy Loc Abs Mean = 0.258 | Ppo/Policy Loc Mean = -0.124 | Ppo/Policy Scale Mean = 0.786 | Ppo/Policy Scale Min = 0.526 | Ppo/Ppo Total Loss = -0.132 | Ppo/Ratio Mean = 1.000 | Ppo/V Loss = 0.036 | Replay Size = 153585 | Returns Mean = -0.593 | Reward Env Mean = 3.853 | Reward Repr Mean = -0.037 | Reward Repr Raw Mean = -6.470 | Reward Repr Raw Std = 1.415 | Reward Return Norm Std = 171.443 | Sps = 2280.258 | Train Success 1000 = 0.000 | Train Success Mean = 0.000 | Value Mean = -0.264
+^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ ^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ python scripts/ppo_builderbench_checkpoint_eval.py     --run_dir=/network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug/ppo_builderbench_creative_3_task1_0     --num_eval_episodes=20     --incremental
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1783902014.821717 1391011 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1783902019.200238 1391011 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+[bb_video] WARNING: obs_dim=22 unexpected for PD; assuming filter=False
+[bb_eval] env=builderbench_creative_3_task1  pending=0  existing=2  eval_episodes=20
+[bb_eval] use_pd=True  filter_policy_obs=False  obs_dim=22  ep_len=50
+[bb_eval] wrote csv: /home/mila/m/mohammad-sami-nur.islam/sgcrl/figs/builderbench/checkpoint_eval/ppo_builderbench_creative_3_task1_0_checkpoint_success.csv  (2 row(s))
+[bb_eval] wrote plot: /home/mila/m/mohammad-sami-nur.islam/sgcrl/figs/builderbench/ppo_builderbench_creative_3_task1_0_checkpoint_success.png
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ rm -rf /network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ debug python -u ppo_contrastive.py --env=builderbench_creative_3_task1 --seed=0 --log_dir_path=/network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug --exp_name=debug --num_steps=200000000 --ppo_num_envs=1024 --ppo_ent_coef=0.05 --ppo_actor_min_std=0.01 --ppo_discount=0.99 --ppo_clip_coef=0.2 --ppo_checkpoint_interval=150 --builderbench_use_pd=true --builderbench_pd_duration=5 --ppo_skip_first_eval=true --ppo_eval_interval=0 --max_replay_size=10000000 --ppo_crl_repr_tau=0 --hidden_layer_sizes=256,256,256,256,256,256 --obs_space="xy,select"
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1783902081.463626 1391118 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1783902088.917529 1391118 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[ppo_contrastive] env=builderbench_creative_3_task1 seed=0
+[ppo] builderbench scale: num_steps=200000000 max_replay_size=1000000 (E=1024)
+[ppo_contrastive] PPO knobs: rollout_length=50, crl_steps_per_iter=25, num_envs=1024, clip_coef=0.2, actor_min_std=0.01, ent_coef=0.05, discount_crl=0.99, discount_ppo=0.99, norm_reward=True, repr_norm=False, ppo_anneal_lr=True  ppo_repr_mode='crl'  ppo_reward_mode=''  ppo_crl_repr_tau=0.0  ppo_dirac_eps=1e-06  max_replay_size=10000000  ppo_min_replay_size=10000  kde_max_points=2000  kde_refit_interval=1  kde_bandwidth=0.0  ckpt_interval=150  ckpt_keep_last=0 (all milestones)  hidden_layers=(256, 256, 256, 256, 256, 256)
+[ppo] builderbench: use_pd=True pd_duration=5 pd_policy_obs=pos+select
+I0712 20:21:35.147352 139779181057856 acceleratesupport.py:24] No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+I0712 20:21:37.085077 139779181057856 xla_bridge.py:822] Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+[ppo_contrastive] wrote run config: /network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug/ppo_builderbench_creative_3_task1_0/run_config.json
+[jax_vec] BuilderBench creative-3-task1: E=1024 obs=19 act=5 ep_len=50 use_pd=True pd_policy_obs=10 (full_state=40)
+[ppo] using JAX-batched BuilderBench vec env (E=1024)
+[ppo] repr_mode=crl (φ·ψ contrastive)
+[ppo] CRL loss direction: forward
+[ppo] BuilderBench rollout: jax.lax.scan (T=50)
+[ppo] BuilderBench: periodic eval disabled; logging train_success_mean / train_success_1000 from rollouts
+I0712 20:22:04.077166 139779181057856 resumable_csv_logger.py:46] Logging to /network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug/ppo_builderbench_creative_3_task1_0/logs/learner/logs.csv
+I0712 20:22:04.079380 139779181057856 resumable_csv_logger.py:46] Logging to /network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug/ppo_builderbench_creative_3_task1_0/logs/eval/logs.csv
+[ppo] checkpoints → /network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug/ppo_builderbench_creative_3_task1_0/checkpoints (every 150 iters, keep all milestones)
+/home/mila/m/mohammad-sami-nur.islam/scratch/conda_envs/envs/sgcrl_builderbench/lib/python3.11/site-packages/jax/_src/abstract_arrays.py:144: RuntimeWarning: overflow encountered in cast
+  return literals.TypedNdArray(np.asarray(x, dtype))
+
+================================================================================
+[VERIFICATION] PPO Actor Observation Verification
+Requested obs_space_list: ['xy', 'select']
+Expected state_obs_dim: 10
+Expected goal_dim:      9
+Rollout obs matrix shape: (50, 1024, 19) (T, E, total_obs_dim)
+Actual total features fed to actor: 19
+================================================================================
+
+I0712 20:22:46.358923 139779181057856 terminal.py:91] [Learner] Advantage Mean = 1.357 | Advantage Std = 1.477 | Crl/Binary Accuracy = 0.900 | Crl/Categorical Accuracy = 0.009 | Crl/Crl Loss = 9.480 | Crl/Logits Neg = -8.629 | Crl/Logits Pos = -8.099 | Crl/Logsumexp = 81.244 | Crl/Update Skipped Nonfinite = 0.000 | Early Stop Epochs = 0 | Ep Length Mean = 50.000 | Ep Return Mean = 249.249 | Global Step = 51200 | Iteration = 0 | Learner Steps = 0 | Ppo/Approx Kl = 0.040 | Ppo/Clipfrac = 0.322 | Ppo/Entropy = 3.008 | Ppo/Entropy Loss = -0.150 | Ppo/Learning Rate = 2.999e-04 | Ppo/Mean Pg Loss = 0.007 | Ppo/Old Approx Kl = 0.040 | Ppo/Pg Loss = 0.007 | Ppo/Policy Loc Abs Mean = 0.204 | Ppo/Policy Loc Mean = 0.012 | Ppo/Policy Scale Mean = 0.773 | Ppo/Policy Scale Min = 0.442 | Ppo/Ppo Total Loss = 0.748 | Ppo/Ratio Mean = 1.000 | Ppo/V Loss = 1.782 | Replay Size = 51182 | Returns Mean = 2.075 | Reward Env Mean = 4.894 | Reward Repr Mean = 0.206 | Reward Repr Raw Mean = 15.324 | Reward Repr Raw Std = 15.775 | Reward Return Norm Std = 185.487 | Sps = 1220.609 | Train Success 1000 = 0.000 | Train Success Mean = 0.000 | Value Mean = 0.718
+I0712 20:22:58.746971 139779181057856 terminal.py:91] [Learner] Advantage Mean = -0.710 | Advantage Std = 0.252 | Crl/Binary Accuracy = 0.989 | Crl/Categorical Accuracy = 0.025 | Crl/Crl Loss = 5.176 | Crl/Logits Neg = -6.146 | Crl/Logits Pos = -5.068 | Crl/Logsumexp = 4.222 | Crl/Update Skipped Nonfinite = 0.000 | Early Stop Epochs = 0 | Ep Length Mean = 50.000 | Ep Return Mean = 255.821 | Global Step = 102400 | Iteration = 1 | Learner Steps = 1 | Ppo/Approx Kl = 0.015 | Ppo/Clipfrac = 0.191 | Ppo/Entropy = 3.046 | Ppo/Entropy Loss = -0.152 | Ppo/Learning Rate = 2.998e-04 | Ppo/Mean Pg Loss = -0.002 | Ppo/Old Approx Kl = 0.015 | Ppo/Pg Loss = -0.002 | Ppo/Policy Loc Abs Mean = 0.190 | Ppo/Policy Loc Mean = 0.020 | Ppo/Policy Scale Mean = 0.773 | Ppo/Policy Scale Min = 0.448 | Ppo/Ppo Total Loss = -0.071 | Ppo/Ratio Mean = 1.000 | Ppo/V Loss = 0.167 | Replay Size = 102382 | Returns Mean = 0.297 | Reward Env Mean = 5.192 | Reward Repr Mean = -0.022 | Reward Repr Raw Mean = -5.369 | Reward Repr Raw Std = 2.934 | Reward Return Norm Std = 269.805 | Sps = 1873.309 | Train Success 1000 = 0.000 | Train Success Mean = 0.000 | Value Mean = 1.007
+I0712 20:23:10.849723 139779181057856 terminal.py:91] [Learner] Advantage Mean = -0.492 | Advantage Std = 0.155 | Crl/Binary Accuracy = 0.994 | Crl/Categorical Accuracy = 0.053 | Crl/Crl Loss = 4.672 | Crl/Logits Neg = -6.505 | Crl/Logits Pos = -4.611 | Crl/Logsumexp = 2.261 | Crl/Update Skipped Nonfinite = 0.000 | Early Stop Epochs = 0 | Ep Length Mean = 50.000 | Ep Return Mean = 270.632 | Global Step = 153600 | Iteration = 2 | Learner Steps = 2 | Ppo/Approx Kl = 0.013 | Ppo/Clipfrac = 0.160 | Ppo/Entropy = 3.088 | Ppo/Entropy Loss = -0.154 | Ppo/Learning Rate = 2.998e-04 | Ppo/Mean Pg Loss = -0.003 | Ppo/Old Approx Kl = 0.014 | Ppo/Pg Loss = -0.003 | Ppo/Policy Loc Abs Mean = 0.172 | Ppo/Policy Loc Mean = 0.043 | Ppo/Policy Scale Mean = 0.777 | Ppo/Policy Scale Min = 0.468 | Ppo/Ppo Total Loss = -0.128 | Ppo/Ratio Mean = 0.998 | Ppo/V Loss = 0.058 | Replay Size = 153582 | Returns Mean = -0.067 | Reward Env Mean = 5.261 | Reward Repr Mean = -0.025 | Reward Repr Raw Mean = -6.461 | Reward Repr Raw Std = 1.608 | Reward Return Norm Std = 254.615 | Sps = 2300.589 | Train Success 1000 = 0.000 | Train Success Mean = 0.000 | Value Mean = 0.424
+I0712 20:23:23.103980 139779181057856 terminal.py:91] [Learner] Advantage Mean = -0.279 | Advantage Std = 0.131 | Crl/Binary Accuracy = 0.993 | Crl/Categorical Accuracy = 0.101 | Crl/Crl Loss = 4.316 | Crl/Logits Neg = -7.292 | Crl/Logits Pos = -4.275 | Crl/Logsumexp = 2.766 | Crl/Update Skipped Nonfinite = 0.000 | Early Stop Epochs = 0 | Ep Length Mean = 50.000 | Ep Return Mean = 266.252 | Global Step = 204800 | Iteration = 3 | Learner Steps = 3 | Ppo/Approx Kl = 0.009 | Ppo/Clipfrac = 0.114 | Ppo/Entropy = 3.105 | Ppo/Entropy Loss = -0.155 | Ppo/Learning Rate = 2.997e-04 | Ppo/Mean Pg Loss = -0.002 | Ppo/Old Approx Kl = 0.008 | Ppo/Pg Loss = -0.002 | Ppo/Policy Loc Abs Mean = 0.165 | Ppo/Policy Loc Mean = 0.049 | Ppo/Policy Scale Mean = 0.781 | Ppo/Policy Scale Min = 0.476 | Ppo/Ppo Total Loss = -0.150 | Ppo/Ratio Mean = 1.001 | Ppo/V Loss = 0.015 | Replay Size = 204782 | Returns Mean = -0.322 | Reward Env Mean = 5.346 | Reward Repr Mean = -0.025 | Reward Repr Raw Mean = -6.048 | Reward Repr Raw Std = 1.420 | Reward Return Norm Std = 233.863 | Sps = 2591.764 | Train Success 1000 = 0.000 | Train Success Mean = 0.000 | Value Mean = -0.043
+I0712 20:23:35.502315 139779181057856 terminal.py:91] [Learner] Advantage Mean = -0.185 | Advantage Std = 0.149 | Crl/Binary Accuracy = 0.992 | Crl/Categorical Accuracy = 0.145 | Crl/Crl Loss = 4.033 | Crl/Logits Neg = -8.231 | Crl/Logits Pos = -3.960 | Crl/Logsumexp = 3.627 | Crl/Update Skipped Nonfinite = 0.000 | Early Stop Epochs = 0 | Ep Length Mean = 50.000 | Ep Return Mean = 267.985 | Global Step = 256000 | Iteration = 4 | Learner Steps = 4 | Ppo/Approx Kl = 0.009 | Ppo/Clipfrac = 0.110 | Ppo/Entropy = 3.124 | Ppo/Entropy Loss = -0.156 | Ppo/Learning Rate = 2.996e-04 | Ppo/Mean Pg Loss = -0.002 | Ppo/Old Approx Kl = 0.009 | Ppo/Pg Loss = -0.002 | Ppo/Policy Loc Abs Mean = 0.156 | Ppo/Policy Loc Mean = 0.054 | Ppo/Policy Scale Mean = 0.792 | Ppo/Policy Scale Min = 0.463 | Ppo/Ppo Total Loss = -0.152 | Ppo/Ratio Mean = 1.000 | Ppo/V Loss = 0.012 | Replay Size = 255975 | Returns Mean = -0.444 | Reward Env Mean = 5.366 | Reward Repr Mean = -0.026 | Reward Repr Raw Mean = -5.754 | Reward Repr Raw Std = 1.481 | Reward Return Norm Std = 216.176 | Sps = 2800.335 | Train Success 1000 = 0.000 | Train Success Mean = 0.000 | Value Mean = -0.259
+I0712 20:23:47.820483 139779181057856 terminal.py:91] [Learner] Advantage Mean = -0.161 | Advantage Std = 0.173 | Crl/Binary Accuracy = 0.991 | Crl/Categorical Accuracy = 0.200 | Crl/Crl Loss = 3.766 | Crl/Logits Neg = -9.115 | Crl/Logits Pos = -3.714 | Crl/Logsumexp = 4.229 | Crl/Update Skipped Nonfinite = 0.000 | Early Stop Epochs = 0 | Ep Length Mean = 50.000 | Ep Return Mean = 260.942 | Global Step = 307200 | Iteration = 5 | Learner Steps = 5 | Ppo/Approx Kl = 0.008 | Ppo/Clipfrac = 0.106 | Ppo/Entropy = 3.150 | Ppo/Entropy Loss = -0.157 | Ppo/Learning Rate = 2.995e-04 | Ppo/Mean Pg Loss = -0.004 | Ppo/Old Approx Kl = 0.009 | Ppo/Pg Loss = -0.004 | Ppo/Policy Loc Abs Mean = 0.145 | Ppo/Policy Loc Mean = 0.069 | Ppo/Policy Scale Mean = 0.795 | Ppo/Policy Scale Min = 0.469 | Ppo/Ppo Total Loss = -0.154 | Ppo/Ratio Mean = 0.999 | Ppo/V Loss = 0.015 | Replay Size = 307155 | Returns Mean = -0.569 | Reward Env Mean = 5.406 | Reward Repr Mean = -0.030 | Reward Repr Raw Mean = -6.331 | Reward Repr Raw Std = 1.581 | Reward Return Norm Std = 203.412 | Sps = 2961.359 | Train Success 1000 = 0.000 | Train Success Mean = 0.000 | Value Mean = -0.408
+^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C^C
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$ python scripts/ppo_builderbench_checkpoint_eval.py     --run_dir=/network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs/debug/ppo_builderbench_creative_3_task1_0     --num_eval_episodes=20     --incremental
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1783902258.840255 1392311 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1783902264.774789 1392311 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+[bb_eval] env=builderbench_creative_3_task1  pending=0  existing=2  eval_episodes=20
+[bb_eval] use_pd=True  filter_policy_obs=True  obs_dim=10  ep_len=50
+[bb_eval] wrote csv: /home/mila/m/mohammad-sami-nur.islam/sgcrl/figs/builderbench/checkpoint_eval/ppo_builderbench_creative_3_task1_0_checkpoint_success.csv  (2 row(s))
+[bb_eval] wrote plot: /home/mila/m/mohammad-sami-nur.islam/sgcrl/figs/builderbench/ppo_builderbench_creative_3_task1_0_checkpoint_success.png
+(sgcrl_builderbench) mohammad-sami-nur.islam@cn-a005:~/sgcrl$
+
+
+
+

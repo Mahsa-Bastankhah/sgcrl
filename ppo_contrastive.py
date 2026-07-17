@@ -390,10 +390,9 @@ def ppo_env_defaults_for_env(env_name: str, use_pd: bool = False,
       ppo_env_defaults as builderbench_ppo_defaults,
   )
   if is_builderbench_creative_env(env_name):
-    _, num_cubes, _ = parse_sgcrl_builderbench_env_name(env_name)
+    _, num_cubes, task_index = parse_sgcrl_builderbench_env_name(env_name)
     return builderbench_ppo_defaults(
-        num_cubes, use_pd=use_pd,
-        episode_length_multiplier=episode_length_multiplier)
+        num_cubes, use_pd=use_pd, task_index=task_index, episode_length_multiplier=episode_length_multiplier)
   return None
 
 

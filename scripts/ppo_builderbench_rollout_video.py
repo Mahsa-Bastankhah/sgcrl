@@ -41,6 +41,7 @@ from contrastive import ppo_learner
 from contrastive import utils as contrastive_utils
 from ppo_contrastive import fixed_goal_for_env, ppo_env_defaults_for_env
 from envs.builderbench_utils import (
+    creative_cube_mj_episode_length,
     creative_cube_full_state_obs_dim,
     filter_pd_policy_state_obs,
     get_filtered_obs_dim,
@@ -171,7 +172,8 @@ def _run_config_path_for_checkpoint(checkpoint_path: str) -> Optional[str]:
 
 def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
   """Infer training settings from run_config.json or env defaults."""
-  num_cubes, _ = parse_bb_env_id(sgcrl_env_name_to_bb_env_id(env_name))
+  num_cubes, task_index = parse_bb_env_id(sgcrl_env_name_to_bb_env_id(env_name))
+  mj_ep_len = creative_cube_mj_episode_length(num_cubes, task_index)
   full_obs_dim = creative_cube_full_state_obs_dim(num_cubes)
 
   cfg_path = _run_config_path_for_checkpoint(checkpoint_path)
@@ -315,7 +317,7 @@ def _make_bb_env(env_id: str, ctx: _TrainCtx):
   cfg = default_config()
   cfg.num_cubes = num_cubes
   cfg.task_id = task_id
-  cfg.episode_length = scaled_episode_length(num_cubes, ctx.episode_length_multiplier)
+  cfg.episode_length = creative_cube_mj_episode_length(num_cubes, task_id)
   cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
   if env_id in _MJX_PARAMS:
     cfg.nconmax, cfg.njmax = _MJX_PARAMS[env_id]

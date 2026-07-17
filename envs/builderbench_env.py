@@ -40,6 +40,7 @@ except Exception as _e:  # noqa: BLE001
   _BUILDERBENCH_IMPORT_ERROR = _e
 
 from envs.builderbench_utils import (
+    creative_cube_mj_episode_length,
     default_fixed_target_goal,
     filter_pd_policy_state_obs,
     get_filtered_obs_dim,
@@ -108,8 +109,9 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     cfg = default_config()
     cfg.num_cubes = num_cubes
     cfg.task_id = task_id
-    cfg.episode_length = scaled_episode_length(num_cubes, episode_length_multiplier)
     self._episode_length_multiplier = float(episode_length_multiplier)
+    cfg.episode_length = creative_cube_mj_episode_length(
+        num_cubes, self._task_id)
     # Use JAX MJX backend (no warp-lang required). Set BUILDERBENCH_MJX_IMPL=warp
     # if warp-lang is installed and you want the faster path.
     cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
