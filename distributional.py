@@ -203,6 +203,34 @@ class TanhTransformedDistribution(tfd.TransformedDistribution):
     del td_properties['bijector']
     return td_properties
 
+class StateIndependentNormalTanhDistribution(hk.Module):
+  """CleanRL style actor distribution with state-independent std."""
+
+  def __init__(self,
+               num_dimensions: int,
+               min_scale: float = 1e-3,
+               w_init: hk_init.Initializer = hk_init.Orthogonal(0.01),
+               b_init: hk_init.Initializer = hk_init.Constant(0.)):
+    super().__init__(name='StateIndependentNormal')
+    self._min_scale = min_scale
+    self._loc_layer = hk.Linear(num_dimensions, w_init=w_init, b_init=b_init)
+    self._bijector = tfp.bijectors.Tanh()
+    self._num_dimensions = num_dimensions
+
+  def __call__(self, inputs: jnp.ndarray) -> tfd.Distribution:
+    loc = self._loc_layer(inputs)
+    loc = 10 * self._bijector.forward(loc / 10)
+    
+    # State-independent log standard deviation initialized to 0
+    log_std = hk.get_parameter("log_std", 
+                               shape=[self._num_dimensions], 
+                               dtype=inputs.dtype, 
+                               init=hk.initializers.Constant(0.0))
+    scale = jnp.exp(log_std) + self._min_scale
+    
+    distribution = tfd.Normal(loc=loc, scale=scale)
+    return tfd.Independent(
+        TanhTransformedDistribution(distribution), reinterpreted_batch_ndims=1)
 
 class NormalTanhDistribution(hk.Module):
   """Module that produces a TanhTransformedDistribution distribution."""

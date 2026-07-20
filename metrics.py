@@ -83,7 +83,7 @@ def get_grama(
     grads = flatten_dict(grads)
 
     for sub_layer_name, grad in list(grads.items()):
-        if sub_layer_name.endswith('_b') or sub_layer_name.endswith('_scale') or sub_layer_name.endswith('_offset'):
+        if sub_layer_name.endswith('_b') or sub_layer_name.endswith('_scale') or sub_layer_name.endswith('_offset') or sub_layer_name.endswith('log_std'):
             continue
         # print("DEBUG sub_layer_name ",  sub_layer_name)
         layer_name = f"{prefix}_{sub_layer_name}"

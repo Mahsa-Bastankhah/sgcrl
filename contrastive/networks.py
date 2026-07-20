@@ -15,7 +15,7 @@ from itertools import product
 
 
 # modified Tanh mean to be mapped to tanh(mean) to keep within [-1, 1]
-from distributional import NormalTanhDistribution
+from distributional import NormalTanhDistribution, StateIndependentNormalTanhDistribution
 
 
 def _use_residual_mlp(hidden_layer_sizes: Sequence[int]) -> bool:
@@ -168,7 +168,9 @@ def make_networks(
     hidden_layer_sizes = (256, 256),
     actor_min_std = 1e-6,
     twin_q = False,
-    use_image_obs = False):
+    use_image_obs = False,
+  ppo_cleanrl_actor = False
+):
   """Creates networks used by the agent."""
 
   num_dimensions = np.prod(spec.actions.shape, dtype=int)
@@ -246,16 +248,35 @@ def make_networks(
       state, goal = _unflatten_obs(obs)
       obs = jnp.concatenate([state, goal], axis=-1)
       obs = TORSO()(obs)
+
+
+    print("DEBUG ppo_cleanrl_actor:", ppo_cleanrl_actor)
+
+    activation_fn = jnp.tanh if ppo_cleanrl_actor else jax.nn.relu
+    w_init_fn = hk.initializers.Orthogonal(scale=np.sqrt(2.0)) if ppo_cleanrl_actor else hk.initializers.VarianceScaling(1.0, 'fan_in', 'uniform')
+
+
+    print("DEBUG activation_fn:", activation_fn)
+    print("DEBUG w_init_fn:", w_init_fn)
+
     h = _mlp_or_residual(
         obs,
         list(hidden_layer_sizes),
         hidden_layer_sizes=hidden_layer_sizes,
         name='policy_mlp',
-        activation=jax.nn.relu,
+        activation=activation_fn,
         activate_final=True,
-        w_init=hk.initializers.VarianceScaling(1.0, 'fan_in', 'uniform'),
+        w_init=w_init_fn,
     )
-    return NormalTanhDistribution(num_dimensions, min_scale=actor_min_std)(h)
+
+    if ppo_cleanrl_actor:
+      return StateIndependentNormalTanhDistribution(
+          num_dimensions, 
+          min_scale=actor_min_std,
+          w_init=hk.initializers.Orthogonal(scale=0.01)
+      )(h)
+    else:
+      return NormalTanhDistribution(num_dimensions, min_scale=actor_min_std)(h)
 
   def _value_fn(obs):
     """V(s, g): scalar value network for PPO on r = φ·ψ.

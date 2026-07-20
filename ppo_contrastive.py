@@ -199,6 +199,10 @@ flags.DEFINE_string(
 
 flags.DEFINE_string('exp_name', 'ppo_contrastive.py', 'Experiment name for logging')
 flags.DEFINE_string('obs_space', 'xy,select', 'Comma-separated obs components')
+
+flags.DEFINE_boolean(
+      'ppo_cleanrl_actor', False,
+      'If True, uses Tanh activations, Orthogonal init, and state-independent std for the Actor (Trick 2).')
 # ---------------------------------------------------------------------------
 # Fixed-goal lookup reused from lp_contrastive.py.
 # ---------------------------------------------------------------------------
@@ -596,7 +600,9 @@ def main(_):
       twin_q=config.twin_q,
       use_image_obs=config.use_image_obs,
       hidden_layer_sizes=config.hidden_layer_sizes,
-      actor_min_std=float(config.ppo_actor_min_std))
+      actor_min_std=float(config.ppo_actor_min_std),
+      ppo_cleanrl_actor=bool(FLAGS.ppo_cleanrl_actor)
+  )
 
   # ---- Logger ------------------------------------------------------------
   run_dir = os.path.join(
