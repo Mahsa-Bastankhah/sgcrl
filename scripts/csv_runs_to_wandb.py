@@ -11,14 +11,14 @@ Install and auth (once):
 
 Example — all kappa-bin variant sweeps:
 
-  python scripts/csv_runs_to_wandb.py \\
-    --project sgcrl-kappa-bin \\
-    --group kappa_sweeps \\
+  python scripts/csv_runs_to_wandb.py \
+    --project sgcrl-kappa-bin \
+    --group kappa_sweeps \
     --run-glob 'logs/kappa_gamma_sweep_bin*/**/sweep_config.json'
 
 Example — single run directory:
 
-  python scripts/csv_runs_to_wandb.py --project sgcrl \\
+  python scripts/csv_runs_to_wandb.py --project sgcrl \
     --run-dir logs/kappa_gamma_sweep_bin/gkappa_0p7/kappa_sac_sawyer_bin_62
 
 Large logs: use --subsample 5 to log every 5th row per CSV.
@@ -233,6 +233,24 @@ def _upload_one_run(
       if not payload:
         continue
       wandb.log(payload)
+
+  # --- UPLOAD VIDEOS ---
+  videos_dir = run_dir / "videos"
+  if videos_dir.is_dir():
+    mp4_files = list(videos_dir.glob("*.mp4"))
+    if mp4_files:
+      print(f"Uploading {len(mp4_files)} videos from {videos_dir}...")
+      
+      # 1. Save directly to the WandB 'Files' tab
+      wandb.save(str(videos_dir / "*.mp4"), base_path=str(run_dir), policy="now")
+      
+      # 2. Log to the media workspace so they are playable directly in UI
+      try:
+          wandb.log({
+              "rollout_videos": [wandb.Video(str(v), format="mp4") for v in mp4_files]
+          })
+      except Exception as e:
+          print(f"[warn] Failed to log videos as media to workspace: {e}", file=sys.stderr)
 
   wandb.finish()
   print(f"Uploaded {run_dir}")
