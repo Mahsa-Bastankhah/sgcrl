@@ -796,12 +796,12 @@ def make_crl_update_fn(
   def update(q_params, q_optimizer_state, batch, key):
     (_, metrics), grads = grad_fn(q_params, batch, key)
     print("DEBUG CRITIC GRADS SHAPE:", jax.tree_util.tree_map(lambda x: x.shape, grads))
-    # critic_metrics = compute_analysis_dict(
-    #       prefix="critic",
-    #       params=q_params,
-    #       grads=grads,
-    # )
-    # metrics.update(critic_metrics)
+    critic_metrics = compute_analysis_dict(
+          prefix="critic",
+          params=q_params,
+          grads=grads,
+    )
+    metrics.update(critic_metrics)
     grads_finite = jnp.all(jnp.asarray(jax.tree_util.tree_leaves(
         jax.tree_util.tree_map(lambda x: jnp.all(jnp.isfinite(x)), grads))))
     loss_finite = jnp.isfinite(metrics['crl_loss'])
