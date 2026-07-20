@@ -1567,11 +1567,18 @@ def run_ppo_training(
     print(f'[ppo] checkpoints → {checkpoint_dir} '
           f'(every {ckpt_interval} iters, {keep_msg})')
 
+  warmup_percent = float(getattr(config, 'ppo_warmup_percent', 0.0))
+  warmup_iters = int(num_iterations * warmup_percent)
+  if warmup_iters > 0:
+    print(f'[ppo] Warmup phase: PPO updates delayed for first {warmup_iters} iterations '
+          f'({warmup_percent * 100:.1f}%). CRL will train on random rollouts.')
+
   start_time = time.time()
   # global_step, ppo_sgd_step, start_iteration set above (0 for fresh runs,
   # restored from checkpoint on resume).
 
   for iteration in range(start_iteration, num_iterations):
+    is_warmup = iteration < warmup_iters
     # =================================================================
     # 1. Rollout (on-policy, CleanRL convention)
     # =================================================================
@@ -1723,85 +1730,96 @@ def run_ppo_training(
     # =================================================================
     # 1b. Batched reward computation (single GPU call over full rollout)
     # =================================================================
-    # kde_dirac rewards were already filled per-step above (CPU-only).
-    if not use_kde_dirac:
-      _flat_obs_j  = jnp.asarray(roll_obs.reshape(T * E, -1))
-      _flat_acts_j = jnp.asarray(roll_acts.reshape(T * E, -1))
-      if use_nf:
-        _rew_flat = np.asarray(nf_reward_fn(
-            q_params, _flat_obs_j, _flat_acts_j,
-            jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std)))
-      elif use_gaussian:
-        _rew_flat = np.asarray(
-            gaussian_reward_fn(q_params, _flat_obs_j, _flat_acts_j))
-      elif use_dirac_target:
-        _flat_s0_j = jnp.asarray(roll_s0_states.reshape(T * E, -1))
-        _rew_flat  = np.asarray(
-            reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j, _flat_s0_j))
-      else:
-        # Default CRL: r = φ(s,a)·ψ(g)
-        _rew_flat = np.asarray(
-            reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
-      roll_rew_raw[:] = _rew_flat.reshape(T, E)
+    if not is_warmup:
+      # kde_dirac rewards were already filled per-step above (CPU-only).
+      if not use_kde_dirac:
+        _flat_obs_j  = jnp.asarray(roll_obs.reshape(T * E, -1))
+        _flat_acts_j = jnp.asarray(roll_acts.reshape(T * E, -1))
+        if use_nf:
+          _rew_flat = np.asarray(nf_reward_fn(
+              q_params, _flat_obs_j, _flat_acts_j,
+              jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std)))
+        elif use_gaussian:
+          _rew_flat = np.asarray(
+              gaussian_reward_fn(q_params, _flat_obs_j, _flat_acts_j))
+        elif use_dirac_target:
+          _flat_s0_j = jnp.asarray(roll_s0_states.reshape(T * E, -1))
+          _rew_flat  = np.asarray(
+              reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j, _flat_s0_j))
+        else:
+          # Default CRL: r = φ(s,a)·ψ(g)
+          _rew_flat = np.asarray(
+              reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
+        roll_rew_raw[:] = _rew_flat.reshape(T, E)
 
-    # Apply reward normalisation (cheap NumPy loop; normalizer state is shared
-    # across the rollout, reset on episode boundaries via roll_step_dones).
-    if reward_normalizer is not None:
-      for _t in range(T):
-        roll_rew[_t] = reward_normalizer(roll_rew_raw[_t], roll_step_dones[_t])
+      # Apply reward normalisation
+      if reward_normalizer is not None:
+        for _t in range(T):
+          roll_rew[_t] = reward_normalizer(roll_rew_raw[_t], roll_step_dones[_t])
+      else:
+        roll_rew[:] = roll_rew_raw
     else:
-      roll_rew[:] = roll_rew_raw
+      roll_rew_raw[:] = np.nan
+      roll_rew[:] = np.nan
 
     # =================================================================
     # 2. GAE advantages / returns
     # =================================================================
-    next_val = np.asarray(value_only(ppo_params['value'], jnp.asarray(obs)))
-    adv_j, ret_j = gae_fn(
-        jnp.asarray(roll_rew), jnp.asarray(roll_vals),
-        jnp.asarray(roll_dones),
-        jnp.asarray(next_val), jnp.asarray(next_done))
-    adv = np.asarray(adv_j)
-    ret = np.asarray(ret_j)
+    if not is_warmup:
+      next_val = np.asarray(value_only(ppo_params['value'], jnp.asarray(obs)))
+      adv_j, ret_j = gae_fn(
+          jnp.asarray(roll_rew), jnp.asarray(roll_vals),
+          jnp.asarray(roll_dones),
+          jnp.asarray(next_val), jnp.asarray(next_done))
+      adv = np.asarray(adv_j)
+      ret = np.asarray(ret_j)
+    else:
+      adv = np.full((T, E), np.nan, dtype=np.float32)
+      ret = np.full((T, E), np.nan, dtype=np.float32)
 
     # =================================================================
     # 3. PPO updates (epochs × minibatches over flat T·E batch)
     # =================================================================
-    flat_obs = roll_obs.reshape((batch_per_iter,) + obs_shape)
-    flat_acts = roll_acts.reshape((batch_per_iter,) + act_shape)
-    flat_logp = roll_logp.reshape(batch_per_iter)
-    flat_adv = adv.reshape(batch_per_iter)
-    flat_ret = ret.reshape(batch_per_iter)
-    flat_vals = roll_vals.reshape(batch_per_iter)
-
     ppo_metrics_agg: Dict[str, list] = {}
     early_stop = False
-    for epoch in range(int(config.ppo_num_epochs)):
-      perm = np_rng.permutation(batch_per_iter)
-      last_kl = None
-      for start in range(0, batch_per_iter, mb_size):
-        mb = perm[start:start + mb_size]
-        batch = {
-            'obs':          jnp.asarray(flat_obs[mb]),
-            'actions':      jnp.asarray(flat_acts[mb]),
-            'old_logprobs': jnp.asarray(flat_logp[mb]),
-            'advantages':   jnp.asarray(flat_adv[mb]),
-            'returns':      jnp.asarray(flat_ret[mb]),
-            'old_values':   jnp.asarray(flat_vals[mb]),
-        }
-        key, k_mb = jax.random.split(key)
-        ppo_params, ppo_opt_state, m = ppo_update(
-            ppo_params, ppo_opt_state, batch, k_mb)
-        ppo_sgd_step += 1
-        last_kl = float(m['approx_kl'])
-        for k_, v in m.items():
-          ppo_metrics_agg.setdefault(k_, []).append(float(v))
-      if (config.ppo_target_kl is not None and last_kl is not None
-          and last_kl > float(config.ppo_target_kl)):
-        early_stop = True
-        break
+    
+    if not is_warmup:
+      flat_obs = roll_obs.reshape((batch_per_iter,) + obs_shape)
+      flat_acts = roll_acts.reshape((batch_per_iter,) + act_shape)
+      flat_logp = roll_logp.reshape(batch_per_iter)
+      flat_adv = adv.reshape(batch_per_iter)
+      flat_ret = ret.reshape(batch_per_iter)
+      flat_vals = roll_vals.reshape(batch_per_iter)
 
-    pg_vals = ppo_metrics_agg.get('pg_loss', [])
-    mean_pg = float(np.mean(pg_vals)) if pg_vals else float('inf')
+      for epoch in range(int(config.ppo_num_epochs)):
+        perm = np_rng.permutation(batch_per_iter)
+        last_kl = None
+        for start in range(0, batch_per_iter, mb_size):
+          mb = perm[start:start + mb_size]
+          batch = {
+              'obs':          jnp.asarray(flat_obs[mb]),
+              'actions':      jnp.asarray(flat_acts[mb]),
+              'old_logprobs': jnp.asarray(flat_logp[mb]),
+              'advantages':   jnp.asarray(flat_adv[mb]),
+              'returns':      jnp.asarray(flat_ret[mb]),
+              'old_values':   jnp.asarray(flat_vals[mb]),
+          }
+          key, k_mb = jax.random.split(key)
+          ppo_params, ppo_opt_state, m = ppo_update(
+              ppo_params, ppo_opt_state, batch, k_mb)
+          ppo_sgd_step += 1
+          last_kl = float(m['approx_kl'])
+          for k_, v in m.items():
+            ppo_metrics_agg.setdefault(k_, []).append(float(v))
+        if (config.ppo_target_kl is not None and last_kl is not None
+            and last_kl > float(config.ppo_target_kl)):
+          early_stop = True
+          break
+
+      pg_vals = ppo_metrics_agg.get('pg_loss', [])
+      mean_pg = float(np.mean(pg_vals)) if pg_vals else float('inf')
+    else:
+      mean_pg = float('nan')
 
     # =================================================================
     # 4. CRL updates (off-policy, from replay)
@@ -1894,22 +1912,23 @@ def run_ppo_training(
         'global_step':       global_step,
         'sps':               global_step / max(1e-6, elapsed),
         'replay_size':       int(replay.size),
-        'reward_repr_mean':      float(roll_rew.mean()),
-        'reward_repr_raw_mean':  float(roll_rew_raw.mean()),
-        'reward_repr_raw_std':   float(roll_rew_raw.std()),
+        'reward_repr_mean':      float(np.nanmean(roll_rew)) if not is_warmup else float('nan'),
+        'reward_repr_raw_mean':  float(np.nanmean(roll_rew_raw)) if not is_warmup else float('nan'),
+        'reward_repr_raw_std':   float(np.nanstd(roll_rew_raw)) if not is_warmup else float('nan'),
         'reward_return_norm_std': (
-            float(reward_normalizer.std) if reward_normalizer is not None
+            float(reward_normalizer.std) if reward_normalizer is not None and not is_warmup
             else float('nan')),
         'reward_env_mean':       float(roll_env_rew.mean()),
         'value_mean':        float(roll_vals.mean()),
-        'returns_mean':      float(ret.mean()),
-        'advantage_mean':    float(adv.mean()),
-        'advantage_std':     float(adv.std()),
+        'returns_mean':      float(np.nanmean(ret)) if not is_warmup else float('nan'),
+        'advantage_mean':    float(np.nanmean(adv)) if not is_warmup else float('nan'),
+        'advantage_std':     float(np.nanstd(adv)) if not is_warmup else float('nan'),
         'early_stop_epochs': int(early_stop),
         'ep_return_mean':    float(np.mean(recent_returns)) if recent_returns else float('nan'),
         'ep_length_mean':    float(np.mean(recent_lengths)) if recent_lengths else float('nan'),
         'ppo/mean_pg_loss':  mean_pg,
     }
+
     if _track_train_success:
       log['train_success_mean'] = (
           float(np.mean(recent_success[-100:]))
@@ -1945,9 +1964,17 @@ def run_ppo_training(
           float(np.mean(recent_flow_dense_returns))
           if recent_flow_dense_returns else float('nan'))
 
-    # PPO update metrics (always present).
-    for k_, vs in ppo_metrics_agg.items():
-      log[f'ppo/{k_}'] = float(np.mean(vs))
+    if is_warmup:
+      expected_ppo_keys = [
+          'ppo_total_loss', 'pg_loss', 'v_loss', 'entropy', 'entropy_loss',
+          'approx_kl', 'old_approx_kl', 'clipfrac', 'ratio_mean',
+          'policy_loc_mean', 'policy_loc_abs_mean', 'policy_scale_mean', 'policy_scale_min'
+      ]
+      for k in expected_ppo_keys:
+        log[f'ppo/{k}'] = float('nan')
+    else:
+      for k_, vs in ppo_metrics_agg.items():
+        log[f'ppo/{k_}'] = float(np.mean(vs))
 
     # Density-estimator metrics: only the active mode.
     if use_gaussian:

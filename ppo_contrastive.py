@@ -203,6 +203,12 @@ flags.DEFINE_string('obs_space', 'xy,select', 'Comma-separated obs components')
 flags.DEFINE_boolean(
       'ppo_cleanrl_actor', False,
       'If True, uses Tanh activations, Orthogonal init, and state-independent std for the Actor (Trick 2).')
+
+
+flags.DEFINE_float(
+    'ppo_warmup_percent', 0.0,
+    'Percentage of total iterations to wait before starting PPO actor updates '
+    '(CRL trains during this time).')
 # ---------------------------------------------------------------------------
 # Fixed-goal lookup reused from lp_contrastive.py.
 # ---------------------------------------------------------------------------
@@ -492,6 +498,7 @@ def main(_):
   config.ppo_norm_reward = bool(FLAGS.ppo_norm_reward)
   config.nf_goal_enc_size = int(FLAGS.nf_goal_enc_size)
   config.ppo_return_norm_window = int(FLAGS.ppo_return_norm_window)
+  config.ppo_warmup_percent = float(FLAGS.ppo_warmup_percent)
   config.kde_max_points = int(FLAGS.kde_max_points)
   config.kde_refit_interval = int(FLAGS.kde_refit_interval)
   config.kde_bandwidth = float(FLAGS.kde_bandwidth)
