@@ -47,6 +47,7 @@ from envs.builderbench_utils import (
     is_builderbench_creative_env,
     parse_bb_env_id,
     pd_policy_state_obs_dim,
+    scaled_episode_length,
     sgcrl_env_name_to_bb_env_id,
     video_render_skip_reason,
 )
@@ -74,6 +75,7 @@ class _TrainCtx:
   start_index: int
   end_index: int
   obs_space_list: list[str]
+  episode_length_multiplier: float = 1.0
 
 
 def _get_video(
@@ -170,7 +172,6 @@ def _run_config_path_for_checkpoint(checkpoint_path: str) -> Optional[str]:
 def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
   """Infer training settings from run_config.json or env defaults."""
   num_cubes, _ = parse_bb_env_id(sgcrl_env_name_to_bb_env_id(env_name))
-  mj_ep_len = 100 + num_cubes * 50
   full_obs_dim = creative_cube_full_state_obs_dim(num_cubes)
 
   cfg_path = _run_config_path_for_checkpoint(checkpoint_path)
@@ -180,6 +181,8 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     flags = run_cfg.get('flags', {})
     obs_space_str = flags.get('obs_space', 'xy,select')
     obs_space_list = [s.strip() for s in obs_space_str.split(',')]
+    ep_mult = float(flags.get('builderbench_episode_length_multiplier', 1.0))
+    mj_ep_len = scaled_episode_length(num_cubes, ep_mult)
     pd_obs_dim = get_filtered_obs_dim(num_cubes, obs_space_list)
     resolved = run_cfg.get('resolved_config', {})
     ppo_defaults = run_cfg.get('ppo_env_defaults', {})
@@ -200,6 +203,8 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
   else:
     use_pd = False
     pd_duration = 5
+    ep_mult = 1.0
+    mj_ep_len = scaled_episode_length(num_cubes, ep_mult)
     obs_dim = full_obs_dim
     defaults = ppo_env_defaults_for_env(env_name) or {}
     hidden = tuple(contrastive.ContrastiveConfig().hidden_layer_sizes)
@@ -220,6 +225,14 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     macro_ep_len = mj_ep_len
     filter_policy = False
 
+  print(f'[bb_video] training context: use_pd={use_pd} pd_duration={pd_duration} '
+        f'filter_policy_obs={filter_policy} obs_dim={obs_dim} '
+        f'ep_len={macro_ep_len} hidden={hidden} '
+        f'fixed_goal={fixed_goal is not None} '
+        f'actor_min_std={actor_min_std} '
+        f'start_index={start_index} end_index={end_index} '
+        f'obs_space_list={obs_space_list} ep_mult={ep_mult}')
+
   return _TrainCtx(
       use_pd=use_pd,
       pd_duration=pd_duration,
@@ -232,11 +245,13 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
       start_index=start_index,
       end_index=end_index,
       obs_space_list=obs_space_list,
+      episode_length_multiplier=ep_mult,
   )
 
 
 def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
   env_kwargs: Dict[str, Any] = {}
+  env_kwargs['builderbench_episode_length_multiplier'] = ctx.episode_length_multiplier
   if ctx.use_pd:
     env_kwargs['builderbench_use_pd'] = True
     env_kwargs['builderbench_pd_duration'] = ctx.pd_duration
@@ -300,7 +315,7 @@ def _make_bb_env(env_id: str, ctx: _TrainCtx):
   cfg = default_config()
   cfg.num_cubes = num_cubes
   cfg.task_id = task_id
-  cfg.episode_length = 100 + num_cubes * 50
+  cfg.episode_length = scaled_episode_length(num_cubes, ctx.episode_length_multiplier)
   cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
   if env_id in _MJX_PARAMS:
     cfg.nconmax, cfg.njmax = _MJX_PARAMS[env_id]

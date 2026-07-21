@@ -216,6 +216,13 @@ flags.DEFINE_boolean(
 flags.DEFINE_boolean(
     'crl_on_policy', False,
     'If True, disables the replay buffer and trains CRL strictly on the current (T, E) rollout tensor.')
+flags.DEFINE_float(
+      'builderbench_episode_length_multiplier', 1.0,
+      'BuilderBench: scale factor on the base episode length '
+        '(100 + num_cubes*50 raw MuJoCo steps), applied before optional '
+        'PD-duration division. 1.0 = default; 2.0 = double, etc. Result must '
+        'be divisible by --builderbench_pd_duration when '
+        '--builderbench_use_pd=true.')
 # ---------------------------------------------------------------------------
 # Fixed-goal lookup reused from lp_contrastive.py.
 # ---------------------------------------------------------------------------
@@ -372,7 +379,8 @@ def fixed_goal_for_env(env_name: str) -> np.ndarray:
   raise KeyError(f'No fixed goal configured for env {env_name!r}')
 
 
-def ppo_env_defaults_for_env(env_name: str, use_pd: bool = False):
+def ppo_env_defaults_for_env(env_name: str, use_pd: bool = False,
+                             episode_length_multiplier: float = 1.0):
   """Return per-env PPO defaults, including dynamic BuilderBench creative tasks."""
   if env_name in PPO_ENV_DEFAULTS:
     return PPO_ENV_DEFAULTS[env_name]
@@ -383,7 +391,9 @@ def ppo_env_defaults_for_env(env_name: str, use_pd: bool = False):
   )
   if is_builderbench_creative_env(env_name):
     _, num_cubes, _ = parse_sgcrl_builderbench_env_name(env_name)
-    return builderbench_ppo_defaults(num_cubes, use_pd=use_pd)
+    return builderbench_ppo_defaults(
+        num_cubes, use_pd=use_pd,
+        episode_length_multiplier=episode_length_multiplier)
   return None
 
 
@@ -428,7 +438,8 @@ def main(_):
   # ---- Per-env PPO defaults (CLI flags still override) -------------------
   _use_pd = (bool(FLAGS.builderbench_use_pd)
              if env_name.startswith('builderbench_') else False)
-  env_defaults = ppo_env_defaults_for_env(env_name, use_pd=_use_pd)
+  _ep_mult = float(FLAGS.builderbench_episode_length_multiplier)
+  env_defaults = ppo_env_defaults_for_env(env_name, use_pd=_use_pd, episode_length_multiplier=_ep_mult)
   if env_defaults is None:
     print(f'[ppo_contrastive] WARNING: no PPO_ENV_DEFAULTS entry for '
           f'{env_name!r}; falling back to ContrastiveConfig defaults '
@@ -511,6 +522,7 @@ def main(_):
   config.kde_max_points = int(FLAGS.kde_max_points)
   config.kde_refit_interval = int(FLAGS.kde_refit_interval)
   config.kde_bandwidth = float(FLAGS.kde_bandwidth)
+  config.builderbench_episode_length_multiplier = float(FLAGS.builderbench_episode_length_multiplier)
   if FLAGS.max_replay_size >= 0:
     config.max_replay_size = int(FLAGS.max_replay_size)
   if FLAGS.ppo_min_replay_size >= 0:
@@ -569,13 +581,16 @@ def main(_):
   if env_name.startswith('builderbench_'):
     _env_kwargs['builderbench_use_pd'] = bool(FLAGS.builderbench_use_pd)
     _env_kwargs['builderbench_pd_duration'] = int(FLAGS.builderbench_pd_duration)
+    _env_kwargs['builderbench_episode_length_multiplier'] = _ep_mult
     if FLAGS.builderbench_use_pd and FLAGS.ppo_rollout_length < 0:
-      pd_defaults = ppo_env_defaults_for_env(env_name, use_pd=True)
+      pd_defaults = ppo_env_defaults_for_env(
+          env_name, use_pd=True, episode_length_multiplier=_ep_mult)
       if pd_defaults is not None:
         config.ppo_rollout_length = int(pd_defaults['rollout_length'])
         config.ppo_crl_steps_per_iter = int(pd_defaults['crl_steps_per_iter'])
     print(f'[ppo] builderbench: use_pd={FLAGS.builderbench_use_pd} '
-          f'pd_duration={FLAGS.builderbench_pd_duration}'
+          f'pd_duration={FLAGS.builderbench_pd_duration} '
+          f'episode_length_multiplier={_ep_mult}'
           + (' pd_policy_obs=pos+select' if FLAGS.builderbench_use_pd else ''))
 
 

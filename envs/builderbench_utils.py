@@ -22,6 +22,27 @@ _TARGET_SAMPLING_HIGH = np.array([0.32, 0.10, 0.02], dtype=np.float32)
 _TARGET_SAMPLING_MID = (_TARGET_SAMPLING_LOW + _TARGET_SAMPLING_HIGH) / 2
 
 
+def scaled_episode_length(num_cubes: int, multiplier: float = 1.0) -> int:
+  """Base creative-cube episode length (100 + num_cubes*50 raw MuJoCo
+  steps), optionally scaled. Rounds to the nearest int.
+
+  Callers using PDWrapper must ensure the result divides evenly by
+  pd_duration -- see validate_pd_episode_length.
+  """
+  base = 100 + int(num_cubes) * 50
+  return int(round(base * float(multiplier)))
+
+
+def validate_pd_episode_length(episode_length: int, pd_duration: int) -> None:
+  if episode_length % pd_duration != 0:
+    raise ValueError(
+        f'episode_length={episode_length} is not divisible by '
+        f'pd_duration={pd_duration}. Choose a '
+        f'--builderbench_episode_length_multiplier such that '
+        f'(100 + num_cubes*50) * multiplier is a multiple of {pd_duration}, '
+        f'or change --builderbench_pd_duration.')
+
+
 def is_builderbench_creative_env(env_name: str) -> bool:
   return bool(_SGCRL_CREATIVE_RE.fullmatch(str(env_name)))
 
@@ -229,9 +250,10 @@ def uniform_goal_obs_bounds(
   return low.astype(np.float32), high.astype(np.float32)
 
 
-def ppo_env_defaults(num_cubes: int, use_pd: bool = False) -> dict:
+def ppo_env_defaults(num_cubes: int, use_pd: bool = False,
+                     episode_length_multiplier: float = 1.0) -> dict:
   """Rollout / CRL defaults scaled to BuilderBench creative episode length."""
-  episode_length = 100 + num_cubes * 50
+  episode_length = scaled_episode_length(num_cubes, episode_length_multiplier)
   goal_dim = num_cubes * 3
   if use_pd:
     pd_episode_length = episode_length // 5
@@ -271,9 +293,11 @@ def builderbench_training_defaults(
     num_envs: int,
     num_cubes: int,
     use_pd: bool = False,
+    episode_length_multiplier: float = 1.0,
 ) -> dict:
-  """PPO / CRL scale defaults for BuilderBench (200M steps, replay ∝ E)."""
-  out = ppo_env_defaults(num_cubes, use_pd=use_pd)
+  """PPO / CRL scale defaults for BuilderBench (200M steps, replay ≥ E)."""
+  out = ppo_env_defaults(num_cubes, use_pd=use_pd,
+                         episode_length_multiplier=episode_length_multiplier)
   out['num_steps'] = BUILDERBENCH_NUM_STEPS
   out['max_replay_size'] = builderbench_replay_size(num_envs)
   return out

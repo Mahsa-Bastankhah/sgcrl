@@ -39,6 +39,15 @@ try:
       VmapWrapper,
       Wrapper,
   )
+  from envs.builderbench_utils import (
+      filter_pd_policy_state_obs,
+      get_filtered_obs_dim,
+      parse_bb_env_id,
+      scaled_episode_length,
+      validate_pd_episode_length,
+      sgcrl_env_name_to_bb_env_id,
+      uniform_goal_obs_bounds as _uniform_goal_obs_bounds,
+  )
 except Exception as _e:  # noqa: BLE001
   jax = None  # type: ignore
   jnp = None  # type: ignore
@@ -143,6 +152,8 @@ class JaxBuilderBenchVecEnv:
       pd_filter_policy_obs: bool = True,
       fixed_target_goal: Optional[np.ndarray] = None,
       obs_space_list: Optional[list[str]] = None,
+    episode_length_multiplier: float = 1.0,
+
   ):
     _require_builderbench(env_name)
     self._env_name = str(env_name)
@@ -161,7 +172,9 @@ class JaxBuilderBenchVecEnv:
     cfg = default_config()
     cfg.num_cubes = num_cubes
     cfg.task_id = task_id
-    cfg.episode_length = 100 + num_cubes * 50
+    cfg.episode_length = scaled_episode_length(
+              num_cubes, episode_length_multiplier)
+    self._episode_length_multiplier = float(episode_length_multiplier)
     cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
     if self._bb_env_id in _MJX_PARAMS:
       ncon, njmax = _MJX_PARAMS[self._bb_env_id]
@@ -171,9 +184,7 @@ class JaxBuilderBenchVecEnv:
     base = CreativeCube(config=cfg)
     self._mocap_targets = base._mocap_targets
     if self._use_pd:
-      assert cfg.episode_length % self._pd_duration == 0, (
-          f'episode_length {cfg.episode_length} must divide pd_duration '
-          f'{self._pd_duration}')
+      validate_pd_episode_length(cfg.episode_length, self._pd_duration)
       inner = PDWrapper(base, duration=self._pd_duration)
       episode_length = cfg.episode_length // self._pd_duration
     else:
@@ -206,9 +217,10 @@ class JaxBuilderBenchVecEnv:
         f' (full_state={self._full_state_obs_dim})'
         if self._pd_filter_policy_obs else '')
     print(f'[jax_vec] BuilderBench {self._bb_env_id}: '
-          f'E={self._num_envs} obs={self._obs_dim_total} '
-          f'act={self._action_dim} ep_len={self._episode_length} '
-          f'use_pd={self._use_pd}{_pd_obs_msg}')
+            f'E={self._num_envs} obs={self._obs_dim_total} '
+            f'act={self._action_dim} ep_len={self._episode_length} '
+            f'use_pd={self._use_pd}{_pd_obs_msg} '
+            f'ep_len_mult={self._episode_length_multiplier}')
 
   def _reset_impl(self, rng: jax.Array) -> State:
     state = self._env.reset(rng)

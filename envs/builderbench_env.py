@@ -44,6 +44,8 @@ from envs.builderbench_utils import (
     filter_pd_policy_state_obs,
     get_filtered_obs_dim,
     parse_bb_env_id,
+    scaled_episode_length,
+    validate_pd_episode_length,
     uniform_goal_obs_bounds as _uniform_goal_obs_bounds,
 )
 
@@ -85,6 +87,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
       pd_filter_policy_obs: bool = True,
       fixed_target_goal: Optional[np.ndarray] = None,
       obs_space_list: Optional[list[str]] = None,
+      episode_length_multiplier: float = 1.0,
   ):
     super().__init__()
     _require_builderbench(env_id)
@@ -105,7 +108,8 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     cfg = default_config()
     cfg.num_cubes = num_cubes
     cfg.task_id = task_id
-    cfg.episode_length = 100 + num_cubes * 50
+    cfg.episode_length = scaled_episode_length(num_cubes, episode_length_multiplier)
+    self._episode_length_multiplier = float(episode_length_multiplier)
     # Use JAX MJX backend (no warp-lang required). Set BUILDERBENCH_MJX_IMPL=warp
     # if warp-lang is installed and you want the faster path.
     cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
@@ -114,9 +118,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
 
     base = CreativeCube(config=cfg)
     if self._use_pd:
-      assert cfg.episode_length % self._pd_duration == 0, (
-          f'episode_length {cfg.episode_length} must divide pd_duration '
-          f'{self._pd_duration}')
+      validate_pd_episode_length(cfg.episode_length, self._pd_duration)
       inner = PDWrapper(base, duration=self._pd_duration)
       episode_length = cfg.episode_length // self._pd_duration
     else:
@@ -226,6 +228,7 @@ def make_builderbench_creative_env(
     pd_filter_policy_obs: bool = True,
     fixed_target_goal: Optional[np.ndarray] = None,
     obs_space_list: Optional[list[str]] = None,
+    episode_length_multiplier: float = 1.0,
 ) -> BuilderBenchCreativeGymEnv:
   return BuilderBenchCreativeGymEnv(
       env_id=env_id,
@@ -235,4 +238,5 @@ def make_builderbench_creative_env(
       pd_filter_policy_obs=pd_filter_policy_obs,
       fixed_target_goal=fixed_target_goal,
       obs_space_list=obs_space_list,
+      episode_length_multiplier=episode_length_multiplier
   )

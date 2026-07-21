@@ -1258,6 +1258,9 @@ def run_ppo_training(
             _bb_kw.get('builderbench_pd_filter_policy_obs', True)),
         fixed_target_goal=_bb_kw.get('fixed_target_goal'),
         obs_space_list=_bb_kw.get('obs_space_list'), # <--- ADD THIS LINE
+        episode_length_multiplier=float(
+                _bb_kw.get('builderbench_episode_length_multiplier', 1.0)),
+
     )
     print(f'[ppo] using JAX-batched BuilderBench vec env '
           f'(E={config.ppo_num_envs})')
@@ -1500,6 +1503,9 @@ def run_ppo_training(
           use_pd=bool(_bb_kw.get('builderbench_use_pd', False)),
           pd_duration=int(_bb_kw.get('builderbench_pd_duration', 5)),
           fixed_target_goal=_bb_kw.get('fixed_target_goal'),
+          episode_length_multiplier=float(
+                  _bb_kw.get('builderbench_episode_length_multiplier', 1.0)),
+          obs_space_list=_bb_kw.get('obs_space_list')
       )
 
       @jax.jit
