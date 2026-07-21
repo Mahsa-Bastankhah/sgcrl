@@ -183,11 +183,11 @@ def main() -> None:
       help='Repo root (default: cwd).')
   ap.add_argument(
       '--output_base',
-      default='videos/ppo_sawyer_bin_all_ckpts',
+      default='videos/sawyer_bin/ppo_sawyer_bin_all_ckpts',
       help='MP4 output root (subdirs: default/, dirac_baseline/).')
   ap.add_argument(
       '--state_file',
-      default='videos/.watch_sawyer_bin_videos_state.json',
+      default='videos/sawyer_bin/.watch_sawyer_bin_videos_state.json',
       help='JSON tracking rendered checkpoint mtimes.')
   ap.add_argument(
       '--seeds',

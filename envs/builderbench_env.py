@@ -89,6 +89,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
       fixed_target_goal: Optional[np.ndarray] = None,
       obs_space_list: Optional[list[str]] = None,
       episode_length_multiplier: float = 1.0,
+      permute_start_boxes: bool = True,
   ):
     super().__init__()
     _require_builderbench(env_id)
@@ -102,6 +103,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     self._fixed_target_goal = (
         None if fixed_target_goal is None
         else np.asarray(fixed_target_goal, dtype=np.float32).reshape(-1))
+    self._permute_start_boxes = bool(permute_start_boxes)
 
     num_cubes, task_id = parse_creative_env_id(env_id)
     self._num_cubes = num_cubes
@@ -112,6 +114,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     self._episode_length_multiplier = float(episode_length_multiplier)
     cfg.episode_length = creative_cube_mj_episode_length(
         num_cubes, self._task_id)
+    cfg.permute_start_boxes = self._permute_start_boxes
     # Use JAX MJX backend (no warp-lang required). Set BUILDERBENCH_MJX_IMPL=warp
     # if warp-lang is installed and you want the faster path.
     cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
@@ -187,6 +190,8 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     fixed_pos = fixed.reshape(num_cubes, 3)
     info = dict(state.info)
     info['target_goal'] = fixed
+    # Video / render_from_info reads info['target_mocap_pos'], not data.mocap_pos.
+    info['target_mocap_pos'] = fixed_pos
     mocap_pos = state.data.mocap_pos.at[self._base_env._mocap_targets].set(
         fixed_pos)
     data = state.data.replace(mocap_pos=mocap_pos)
@@ -231,6 +236,7 @@ def make_builderbench_creative_env(
     fixed_target_goal: Optional[np.ndarray] = None,
     obs_space_list: Optional[list[str]] = None,
     episode_length_multiplier: float = 1.0,
+    permute_start_boxes: bool = True,
 ) -> BuilderBenchCreativeGymEnv:
   return BuilderBenchCreativeGymEnv(
       env_id=env_id,
@@ -240,5 +246,6 @@ def make_builderbench_creative_env(
       pd_filter_policy_obs=pd_filter_policy_obs,
       fixed_target_goal=fixed_target_goal,
       obs_space_list=obs_space_list,
-      episode_length_multiplier=episode_length_multiplier
+      episode_length_multiplier=episode_length_multiplier,
+      permute_start_boxes=permute_start_boxes,
   )

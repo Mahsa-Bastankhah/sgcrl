@@ -35,6 +35,7 @@ from contrastive import config as contrastive_config
 from contrastive import networks as contrastive_networks
 from contrastive import gaussian_density as _gd
 from contrastive import nf_density as _nf
+from contrastive import td3_density as _td3
 from contrastive.utils import extract_info_reward
 from metrics import compute_analysis_dict
 
@@ -329,16 +330,19 @@ class EpisodeReplay:
         goal_dim = goal.shape[0]
         obs_out = np.empty((B, self._obs_dim + goal_dim), dtype=np.float32)
         next_obs_out = np.empty_like(obs_out)
+        future_state_out = np.empty((B, self._obs_dim), dtype=np.float32)
       obs_out[i, :self._obs_dim] = s_t
       obs_out[i,  self._obs_dim:] = goal
       next_obs_out[i, :self._obs_dim] = s_tp1
       next_obs_out[i,  self._obs_dim:] = goal
+      future_state_out[i] = s_j
       act_out[i] = act[ti]
 
     return {
         'obs': obs_out,
         'action': act_out,
         'next_obs': next_obs_out,
+        'future_state': future_state_out,  # s_j (full state); used by TD3
     }
 
   def sample_states(self, n: int,
@@ -371,7 +375,10 @@ class EpisodeReplay:
     next_obs = batch['next_obs'].copy()
     obs[half:, self._obs_dim:] = uniform_goals
     next_obs[half:, self._obs_dim:] = uniform_goals
-    return {'obs': obs, 'action': batch['action'], 'next_obs': next_obs}
+    out = {'obs': obs, 'action': batch['action'], 'next_obs': next_obs}
+    if 'future_state' in batch:
+      out['future_state'] = batch['future_state']
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +603,7 @@ def make_ppo_update_fn(
     networks: contrastive_networks.ContrastiveNetworks,
     config: contrastive_config.ContrastiveConfig,
     ppo_optimizer: optax.GradientTransformation,
+    ent_coef_schedule: Optional[Callable[[jax.Array], jax.Array]] = None,
 ):
   """Returns a jitted one-minibatch PPO update.
 
@@ -609,16 +617,25 @@ def make_ppo_update_fn(
   * v_loss:    clipped MSE (optional) against `returns`
   * entropy:   single-sample MC estimate  -log π(ã|s) with ã ~ π(·|s)
 
-  Returns a function `update(params, opt_state, batch, key)` that does
-  one SGD step and returns (new_params, new_opt_state, metrics_dict).
+  Args:
+    ent_coef_schedule: if given, an optax-style schedule `step -> ent_coef`
+      evaluated on the running SGD-step counter (see `ppo_anneal_ent_coef`);
+      `update()` then takes an extra `step` argument. If None (default),
+      `ent_coef` is the static `config.ppo_ent_coef` and `update()` keeps its
+      original 4-argument signature.
+
+  Returns a function `update(params, opt_state, batch, key[, step])` that
+  does one SGD step and returns (new_params, new_opt_state, metrics_dict).
   """
   clip_coef = float(config.ppo_clip_coef)
   vf_coef = float(config.ppo_vf_coef)
-  ent_coef = float(config.ppo_ent_coef)
+  ent_coef_const = float(config.ppo_ent_coef)
   clip_vloss = bool(config.ppo_clip_vloss)
   norm_adv = bool(config.ppo_norm_adv)
 
-  def ppo_loss(params, batch, key):
+  def ppo_loss(params, batch, key, step=None):
+    ent_coef = (ent_coef_schedule(step) if ent_coef_schedule is not None
+                else ent_coef_const)
     # ---- policy forward ----
     dist = networks.policy_network.apply(params['policy'], batch['obs'])
     new_logprob = networks.log_prob(dist, batch['actions'])         # (B,)
@@ -683,24 +700,37 @@ def make_ppo_update_fn(
         'policy_loc_abs_mean': jnp.mean(jnp.abs(policy_loc)),
         'policy_scale_mean': jnp.mean(policy_scale),
         'policy_scale_min': jnp.min(policy_scale),
+        'ent_coef': jnp.asarray(ent_coef, dtype=jnp.float32),
     }
     return total, metrics
 
   grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
-
-  @jax.jit
-  def update(params, opt_state, batch, key):
-    (_, metrics), grads = grad_fn(params, batch, key)
-    print("DEBUG ACTOR GRADS SHAPE:", jax.tree_util.tree_map(lambda x: x.shape, grads['policy']))
-    actor_metrics = compute_analysis_dict(
-        prefix="actor",
-        params=params['policy'],
-        grads=grads['policy']
-    )
-    metrics.update(actor_metrics)
-    updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
-    new_params = optax.apply_updates(params, updates)
-    return new_params, new_opt_state, metrics
+  if ent_coef_schedule is not None:
+    @jax.jit
+    def update(params, opt_state, batch, key, step):
+      (_, metrics), grads = grad_fn(params, batch, key, step)
+      actor_metrics = compute_analysis_dict(
+          prefix="actor",
+          params=params['policy'],
+          grads=grads['policy']
+      )
+      metrics.update(actor_metrics)
+      updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
+      new_params = optax.apply_updates(params, updates)
+      return new_params, new_opt_state, metrics
+  else:
+    @jax.jit
+    def update(params, opt_state, batch, key):
+      (_, metrics), grads = grad_fn(params, batch, key)
+      actor_metrics = compute_analysis_dict(
+          prefix="actor",
+          params=params['policy'],
+          grads=grads['policy']
+      )
+      metrics.update(actor_metrics)
+      updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
+      new_params = optax.apply_updates(params, updates)
+      return new_params, new_opt_state, metrics
 
   return update
 
@@ -1056,7 +1086,8 @@ def _save_checkpoint(path: str,
                      policy_params, value_params, q_params,
                      ppo_opt_state, q_opt_state,
                      iteration: int, global_step: int, key,
-                     q_params_ema=None):
+                     q_params_ema=None,
+                     td3_policy_target=None):
   """Write a pickle checkpoint atomically (write to tmp → rename)."""
   import pickle as _pkl
   import os as _os
@@ -1073,6 +1104,8 @@ def _save_checkpoint(path: str,
   }
   if q_params_ema is not None:
     ckpt['q_params_ema'] = q_params_ema
+  if td3_policy_target is not None:
+    ckpt['td3_policy_target'] = td3_policy_target
   tmp_path = path + '.tmp'
   with open(tmp_path, 'wb') as fh:
     _pkl.dump(ckpt, fh, protocol=_pkl.HIGHEST_PROTOCOL)
@@ -1260,7 +1293,8 @@ def run_ppo_training(
         obs_space_list=_bb_kw.get('obs_space_list'), # <--- ADD THIS LINE
         episode_length_multiplier=float(
                 _bb_kw.get('builderbench_episode_length_multiplier', 1.0)),
-
+        permute_start_boxes=bool(
+            _bb_kw.get('builderbench_permute_start_boxes', True)),
     )
     print(f'[ppo] using JAX-batched BuilderBench vec env '
           f'(E={config.ppo_num_envs})')
@@ -1280,11 +1314,14 @@ def run_ppo_training(
   # 'crl'      (default) — φ(s,a)·ψ(g) contrastive representations.
   # 'gaussian' — diagonal Gaussian p_θ(g|s,a);  reward = log p_θ(g|s_t,a_t).
   # 'nf'       — conditional RealNVP  log p_NF(g|s,a).
+  # 'td3'      — twin Q(s,a,s_f) TD3-style; reward = Q1(s,a,g).
   repr_mode    = (getattr(config, 'ppo_repr_mode', 'crl') or 'crl').strip().lower()
   use_gaussian = repr_mode == 'gaussian'
   use_nf       = repr_mode == 'nf'
+  use_td3      = repr_mode == 'td3'
   density_nets    = None
   nf_density_nets = None
+  td3_density_nets = None
 
   obs_dim_cfg   = int(config.obs_dim)
   total_obs_dim = int(np.prod(obs_shape))
@@ -1323,6 +1360,31 @@ def run_ppo_training(
           f'rep_size={nf_rep_size}  num_blocks={nf_num_blocks}  '
           f'coupling_width={nf_coupling_w}  flow_dim={nf_density_nets.flow_dim}  '
           f'sa_encoder=4x1024+swish  {_goal_enc_desc}')
+  elif use_td3:
+    _td3_bilinear = bool(getattr(config, 'ppo_td3_bilinear', False))
+    td3_density_nets = _td3.make_td3_density_networks(
+        obs_dim=obs_dim_cfg,
+        act_dim=act_dim_cfg,
+        goal_dim=goal_dim_cfg,
+        hidden_layer_sizes=config.hidden_layer_sizes,
+        repr_dim=int(config.repr_dim),
+        bilinear=_td3_bilinear,
+        repr_norm=bool(config.repr_norm) if _td3_bilinear else False,
+    )
+    _td3_tau_cfg = float(getattr(config, 'ppo_td3_tau', -1.0))
+    _td3_tau = (_td3_tau_cfg if _td3_tau_cfg >= 0.0
+                else float(config.tau))
+    _q_param = (
+        f'bilinear x(s,a)·y(g) repr_dim={config.repr_dim}'
+        if _td3_bilinear else 'mlp([s;g;a])')
+    print(f'[ppo] repr_mode=td3 (twin Q(s,a,s_f))  obs_dim={obs_dim_cfg}  '
+          f'act_dim={act_dim_cfg}  goal_dim={goal_dim_cfg}  '
+          f'hidden_layers={config.hidden_layer_sizes}  '
+          f'q_param={_q_param}  '
+          f'target_tau={_td3_tau} (≠ ppo_crl_repr_tau)  '
+          f'goal_tol={getattr(config, "ppo_td3_goal_tol", 1e-2)}  '
+          f'cross_batch_goals={getattr(config, "ppo_td3_cross_batch_goals", False)}  '
+          f'discount={config.discount}')
   else:
     print(f'[ppo] repr_mode=crl (φ·ψ contrastive)')
 
@@ -1335,22 +1397,27 @@ def run_ppo_training(
   #   crl mode      → CRL (φ, ψ) contrastive params from networks.q_network
   #   gaussian mode → Gaussian density p_θ(g|s,a) params from density_nets
   #   nf mode       → RealNVP log p_NF(g|s,a) params from nf_density_nets
+  #   td3 mode      → twin Q + Polyak targets from td3_density_nets
   if use_gaussian:
     q_params = density_nets.density_net.init(k_q)
   elif use_nf:
     q_params = _nf.init_nf_params(nf_density_nets, k_q)
+  elif use_td3:
+    q_params = _td3.init_td3_params(td3_density_nets, k_q)
   else:
     q_params = networks.q_network.init(k_q)
   ppo_params = {'policy': policy_params, 'value': value_params}
 
   # ---- optimizers -------------------------------------------------------
-  if config.ppo_anneal_lr:
-    total_ppo_updates = (
+  # Total PPO SGD steps over the whole run; used by both the LR anneal and
+  # the (optional) entropy-coefficient anneal below.
+  total_ppo_updates = (
       num_iterations
       * int(config.ppo_num_epochs)
       * int(config.ppo_num_minibatches)
-    )
+  )
 
+  if config.ppo_anneal_lr:
     lr_schedule = optax.linear_schedule(
       init_value=float(config.learning_rate),
       end_value=0.0,
@@ -1366,6 +1433,19 @@ def run_ppo_training(
         optax.clip_by_global_norm(float(config.ppo_max_grad_norm)),
         optax.adam(float(config.learning_rate), eps=1e-5))
   ppo_opt_state = ppo_optimizer.init(ppo_params)
+
+  # Optional linear anneal of the PPO entropy-bonus coefficient, mirroring
+  # the LR schedule above. Off unless --ppo_anneal_ent_coef is set.
+  ent_coef_schedule = None
+  if bool(getattr(config, 'ppo_anneal_ent_coef', False)):
+    ent_coef_schedule = optax.linear_schedule(
+        init_value=float(config.ppo_ent_coef),
+        end_value=float(getattr(config, 'ppo_ent_coef_final', 0.0)),
+        transition_steps=max(1, total_ppo_updates),
+    )
+    print(f'[ppo] entropy anneal: ent_coef {config.ppo_ent_coef} -> '
+          f'{getattr(config, "ppo_ent_coef_final", 0.0)} over '
+          f'{total_ppo_updates} SGD steps')
 
   if use_nf:
     q_optimizer = _nf.make_nf_optimizers(
@@ -1383,19 +1463,39 @@ def run_ppo_training(
           f'grad_clip={getattr(config, "nf_grad_clip", 1.0)}')
   else:
     q_optimizer = optax.adam(float(config.learning_rate))
-  q_opt_state = q_optimizer.init(q_params)
+  if use_td3:
+    # Optimizer tracks online Q1/Q2 only; targets are Polyak-updated outside Adam.
+    q_opt_state = q_optimizer.init(_td3.online_td3_params(q_params))
+  else:
+    q_opt_state = q_optimizer.init(q_params)
 
-  # ---- optional EMA of φ, ψ for PPO reward (CRL mode only) --------------
-  _repr_tau = float(getattr(config, 'ppo_crl_repr_tau', 0.0))
-  _use_repr_ema = (
-      not use_gaussian and not use_nf
-      and _repr_tau > 0.0 and _repr_tau < 1.0)
+  # ---- optional EMA of reward-network params ----------------------------
+  # CRL: EMA of φ, ψ for r = φ·ψ (ppo_crl_repr_tau).
+  # NF:  EMA of flow/encoder params for r = log p_NF (ppo_nf_reward_tau).
+  # Gaussian: EMA of density params for r = log p_θ (ppo_gaussian_reward_tau).
+  # TD3: EMA of twin-Q params for r = Q1(s,a,g) or log((1−γ)Q1)
+  #       (ppo_td3_reward_tau).
+  # Density / critic training always uses online params; only PPO reward
+  # reads the EMA copy.  Independent of TD3 Polyak target τ (ppo_td3_tau).
+  if use_nf:
+    _repr_tau = float(getattr(config, 'ppo_nf_reward_tau', 0.0))
+    _use_repr_ema = 0.0 < _repr_tau < 1.0
+  elif use_gaussian:
+    _repr_tau = float(getattr(config, 'ppo_gaussian_reward_tau', 0.0))
+    _use_repr_ema = 0.0 < _repr_tau < 1.0
+  elif use_td3:
+    _repr_tau = float(getattr(config, 'ppo_td3_reward_tau', 0.0))
+    _use_repr_ema = 0.0 < _repr_tau < 1.0
+  else:
+    _repr_tau = float(getattr(config, 'ppo_crl_repr_tau', 0.0))
+    _use_repr_ema = 0.0 < _repr_tau < 1.0
   q_params_reward = _tree_copy(q_params) if _use_repr_ema else q_params
 
   # ---- resume from checkpoint if one exists -----------------------------
   start_iteration = 0
   global_step = 0
   ppo_sgd_step = 0
+  _td3_policy_target_from_ckpt = None
   if checkpoint_dir is not None:
     _latest = os.path.join(checkpoint_dir, 'latest.pkl')
     if os.path.exists(_latest):
@@ -1416,6 +1516,10 @@ def run_ppo_training(
         q_params_reward = (_ckpt['q_params_ema']
                            if 'q_params_ema' in _ckpt
                            else _tree_copy(q_params))
+      if (use_td3
+          and bool(getattr(config, 'ppo_td3_use_target_policy', False))
+          and 'td3_policy_target' in _ckpt):
+        _td3_policy_target_from_ckpt = _ckpt['td3_policy_target']
       print(f'[ppo] resumed from checkpoint: '
             f'start_iteration={start_iteration}, global_step={global_step}')
       # Truncate CSV logs to remove any entries written after the checkpoint
@@ -1424,6 +1528,17 @@ def run_ppo_training(
       for _label in ('learner', 'eval'):
         _csv_path = os.path.join(_run_dir, 'logs', _label, 'logs.csv')
         _truncate_csv_to_iteration(_csv_path, int(_ckpt['iteration']))
+
+  # TD3 optional Polyak target policy for bootstrap a' ~ π̄(·|s',g).
+  _use_td3_target_policy = (
+      use_td3 and bool(getattr(config, 'ppo_td3_use_target_policy', False)))
+  if _use_td3_target_policy:
+    td3_policy_target = (
+        _td3_policy_target_from_ckpt
+        if _td3_policy_target_from_ckpt is not None
+        else _tree_copy(ppo_params['policy']))
+  else:
+    td3_policy_target = ppo_params['policy']  # unused; keeps update signature stable
 
   # ---- jitted helpers ---------------------------------------------------
   reward_mode = (getattr(config, 'ppo_reward_mode', '') or '').strip().lower()
@@ -1442,7 +1557,8 @@ def run_ppo_training(
           f'max_points={kde_max_points}, refit_interval={kde_refit_interval}, '
           f'bandwidth={"Scott" if kde_bandwidth_arg is None else kde_bandwidth_cfg})')
   gae_fn = make_gae_fn(config)
-  ppo_update = make_ppo_update_fn(networks, config, ppo_optimizer)
+  ppo_update = make_ppo_update_fn(
+      networks, config, ppo_optimizer, ent_coef_schedule=ent_coef_schedule)
 
   if use_gaussian:
     crl_update = _gd.make_gaussian_density_update_fn(
@@ -1450,6 +1566,10 @@ def run_ppo_training(
     gaussian_reward_fn = _gd.make_gaussian_reward_fn(
         density_nets, obs_dim=int(config.obs_dim))
     nf_reward_fn = None
+    td3_reward_fn = None
+    if _use_repr_ema:
+      print(f'[ppo] Gaussian reward param EMA: tau={_repr_tau} '
+            f'(density training still uses online Gaussian params)')
   elif use_nf:
     crl_update = _nf.make_nf_density_update_fn(
         nf_density_nets, q_optimizer, obs_dim=int(config.obs_dim),
@@ -1457,6 +1577,53 @@ def run_ppo_training(
     nf_reward_fn = _nf.make_nf_reward_fn(
         nf_density_nets, obs_dim=int(config.obs_dim))
     gaussian_reward_fn = None
+    td3_reward_fn = None
+    if _use_repr_ema:
+      print(f'[ppo] NF reward param EMA: tau={_repr_tau} '
+            f'(density training still uses online NF params)')
+  elif use_td3:
+    _td3_tau_cfg = float(getattr(config, 'ppo_td3_tau', -1.0))
+    _td3_tau = (_td3_tau_cfg if _td3_tau_cfg >= 0.0
+                else float(config.tau))
+    crl_update = _td3.make_td3_density_update_fn(
+        td3_density_nets,
+        policy_network=networks.policy_network,
+        sample_fn=networks.sample,
+        optimizer=q_optimizer,
+        obs_dim=int(config.obs_dim),
+        start_index=int(config.start_index),
+        end_index=int(config.end_index),
+        discount=float(config.discount),
+        tau=_td3_tau,
+        goal_tol=float(getattr(config, 'ppo_td3_goal_tol', 1e-2)),
+        use_target_policy=_use_td3_target_policy,
+        cross_batch_goals=bool(
+            getattr(config, 'ppo_td3_cross_batch_goals', False)),
+    )
+    td3_reward_fn = _td3.make_td3_reward_fn(
+        td3_density_nets,
+        obs_dim=int(config.obs_dim),
+        discount=float(config.discount),
+        log_reward=bool(getattr(config, 'ppo_td3_log_reward', False)),
+    )
+    gaussian_reward_fn = None
+    nf_reward_fn = None
+    _pi_src = 'target_policy' if _use_td3_target_policy else 'online_policy'
+    _cross = bool(getattr(config, 'ppo_td3_cross_batch_goals', False))
+    _bilin = bool(getattr(config, 'ppo_td3_bilinear', False))
+    _use_log_r = bool(getattr(config, 'ppo_td3_log_reward', False))
+    _q_src = (
+        f'Q1_ema(tau={_repr_tau})' if _use_repr_ema else 'Q1_online')
+    _rew_src = (
+        f'log((1-γ)·{_q_src})' if _use_log_r else _q_src)
+    print(f'[ppo] TD3 Q update: discount={config.discount}, '
+          f'target_tau={_td3_tau}, '
+          f'goal_tol={getattr(config, "ppo_td3_goal_tol", 1e-2)}, '
+          f'reward={_rew_src}, a\'={_pi_src}, '
+          f'cross_batch_goals={_cross}, bilinear={_bilin}')
+    if _use_repr_ema:
+      print(f'[ppo] TD3 reward Q EMA: tau={_repr_tau} '
+            f'(critic TD still uses online Q + Polyak targets)')
   else:
     _direction = str(getattr(config, 'ppo_crl_loss_direction', 'forward')).lower()
     _backward = (_direction == 'backward')
@@ -1472,6 +1639,7 @@ def run_ppo_training(
             f'(InfoNCE still uses online ╧å, ╧ê)')
     gaussian_reward_fn = None
     nf_reward_fn = None
+    td3_reward_fn = None
 
   def _reward_q_params():
     return q_params_reward if _use_repr_ema else q_params
@@ -1505,7 +1673,9 @@ def run_ppo_training(
           fixed_target_goal=_bb_kw.get('fixed_target_goal'),
           episode_length_multiplier=float(
                   _bb_kw.get('builderbench_episode_length_multiplier', 1.0)),
-          obs_space_list=_bb_kw.get('obs_space_list')
+          obs_space_list=_bb_kw.get('obs_space_list'),
+          permute_start_boxes=bool(
+              _bb_kw.get('builderbench_permute_start_boxes', True)),
       )
 
       @jax.jit
@@ -1823,27 +1993,30 @@ def run_ppo_training(
     # =================================================================
     # 1b. Batched reward computation (single GPU call over full rollout)
     # =================================================================
-    if not is_warmup:
-      # kde_dirac rewards were already filled per-step above (CPU-only).
-      if not use_kde_dirac:
-        _flat_obs_j  = jnp.asarray(roll_obs.reshape(T * E, -1))
-        _flat_acts_j = jnp.asarray(roll_acts.reshape(T * E, -1))
-        if use_nf:
-          _rew_flat = np.asarray(nf_reward_fn(
-              q_params, _flat_obs_j, _flat_acts_j,
-              jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std)))
-        elif use_gaussian:
-          _rew_flat = np.asarray(
-              gaussian_reward_fn(q_params, _flat_obs_j, _flat_acts_j))
-        elif use_dirac_target:
-          _flat_s0_j = jnp.asarray(roll_s0_states.reshape(T * E, -1))
-          _rew_flat  = np.asarray(
-              reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j, _flat_s0_j))
-        else:
-          # Default CRL: r = ╧å(s,a)┬╖╧ê(g)
-          _rew_flat = np.asarray(
-              reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
-        roll_rew_raw[:] = _rew_flat.reshape(T, E)
+    # kde_dirac rewards were already filled per-step above (CPU-only).
+    if not use_kde_dirac:
+      _flat_obs_j  = jnp.asarray(roll_obs.reshape(T * E, -1))
+      _flat_acts_j = jnp.asarray(roll_acts.reshape(T * E, -1))
+      if use_nf:
+        _rew_flat = np.asarray(nf_reward_fn(
+            _reward_q_params(), _flat_obs_j, _flat_acts_j,
+            jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std)))
+      elif use_gaussian:
+        _rew_flat = np.asarray(
+            gaussian_reward_fn(
+                _reward_q_params(), _flat_obs_j, _flat_acts_j))
+      elif use_td3:
+        _rew_flat = np.asarray(
+            td3_reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
+      elif use_dirac_target:
+        _flat_s0_j = jnp.asarray(roll_s0_states.reshape(T * E, -1))
+        _rew_flat  = np.asarray(
+            reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j, _flat_s0_j))
+      else:
+        # Default CRL: r = φ(s,a)·ψ(g)
+        _rew_flat = np.asarray(
+            reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
+      roll_rew_raw[:] = _rew_flat.reshape(T, E)
 
       # Apply reward normalisation
       if reward_normalizer is not None:
@@ -1875,14 +2048,35 @@ def run_ppo_training(
     # =================================================================
     ppo_metrics_agg: Dict[str, list] = {}
     early_stop = False
-    
-    if not is_warmup:
-      flat_obs = roll_obs.reshape((batch_per_iter,) + obs_shape)
-      flat_acts = roll_acts.reshape((batch_per_iter,) + act_shape)
-      flat_logp = roll_logp.reshape(batch_per_iter)
-      flat_adv = adv.reshape(batch_per_iter)
-      flat_ret = ret.reshape(batch_per_iter)
-      flat_vals = roll_vals.reshape(batch_per_iter)
+    for epoch in range(int(config.ppo_num_epochs)):
+      perm = np_rng.permutation(batch_per_iter)
+      last_kl = None
+      for start in range(0, batch_per_iter, mb_size):
+        mb = perm[start:start + mb_size]
+        batch = {
+            'obs':          jnp.asarray(flat_obs[mb]),
+            'actions':      jnp.asarray(flat_acts[mb]),
+            'old_logprobs': jnp.asarray(flat_logp[mb]),
+            'advantages':   jnp.asarray(flat_adv[mb]),
+            'returns':      jnp.asarray(flat_ret[mb]),
+            'old_values':   jnp.asarray(flat_vals[mb]),
+        }
+        key, k_mb = jax.random.split(key)
+        if ent_coef_schedule is not None:
+          ppo_params, ppo_opt_state, m = ppo_update(
+              ppo_params, ppo_opt_state, batch, k_mb,
+              jnp.asarray(ppo_sgd_step, dtype=jnp.int32))
+        else:
+          ppo_params, ppo_opt_state, m = ppo_update(
+              ppo_params, ppo_opt_state, batch, k_mb)
+        ppo_sgd_step += 1
+        last_kl = float(m['approx_kl'])
+        for k_, v in m.items():
+          ppo_metrics_agg.setdefault(k_, []).append(float(v))
+      if (config.ppo_target_kl is not None and last_kl is not None
+          and last_kl > float(config.ppo_target_kl)):
+        early_stop = True
+        break
 
       for epoch in range(int(config.ppo_num_epochs)):
         perm = np_rng.permutation(batch_per_iter)
@@ -1957,8 +2151,9 @@ def run_ppo_training(
           _nf_stat_log[f'nf/goal_mean_{_di}'] = float(_gm)
           _nf_stat_log[f'nf/goal_std_{_di}']  = float(_gs)
 
-      if use_nf or use_gaussian:
-        # NF / Gaussian loops take extra args — keep the Python loop for now.
+      _n_crl = int(config.ppo_crl_steps_per_iter)
+      if use_nf or use_gaussian or use_td3:
+        # NF / Gaussian / TD3 loops take extra args — keep the Python loop.
         for _ in range(_n_crl):
           if uniform_sampling:
             crl_batch_np = replay.sample_with_uniform_negatives(
@@ -1971,6 +2166,10 @@ def run_ppo_training(
             q_params, q_opt_state, m = crl_update(
                 q_params, q_opt_state, crl_batch, k_crl,
                 jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std))
+          elif use_td3:
+            q_params, q_opt_state, m, td3_policy_target = crl_update(
+                q_params, q_opt_state, crl_batch, k_crl,
+                ppo_params['policy'], td3_policy_target)
           else:
             q_params, q_opt_state, m = crl_update(
                 q_params, q_opt_state, crl_batch, k_crl)
@@ -2097,6 +2296,9 @@ def run_ppo_training(
           prefix = 'nf'
         log[f'{prefix}/{k_}'] = float(np.mean(vs))
       log['nf/update_steps'] = len(crl_metrics_agg.get('density_loss', []))
+    elif use_td3:
+      for k_, vs in crl_metrics_agg.items():
+        log[f'td3/{k_}'] = float(np.mean(vs))
     else:
       for k_, vs in crl_metrics_agg.items():
         log[f'crl/{k_}'] = float(np.mean(vs))
@@ -2186,7 +2388,9 @@ def run_ppo_training(
           iteration=iteration,
           global_step=global_step,
           key=key,
-          q_params_ema=(q_params_reward if _use_repr_ema else None))
+          q_params_ema=(q_params_reward if _use_repr_ema else None),
+          td3_policy_target=(
+              td3_policy_target if _use_td3_target_policy else None))
       milestone_path = os.path.join(
           checkpoint_dir, f'ckpt_iter_{iteration:07d}.pkl')
       _save_checkpoint(milestone_path, **ckpt_kw)

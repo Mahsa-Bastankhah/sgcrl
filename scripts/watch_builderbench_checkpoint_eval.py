@@ -2,24 +2,18 @@
 """Incrementally eval BuilderBench checkpoints and refresh the success plot.
 
 Polls ``logs/<log_root>/ppo_<env>_<seed>/checkpoints/ckpt_iter_*.pkl``.
-For each new checkpoint, runs 20 deterministic eval episodes, appends the
-row to a CSV, and rewrites the plot so it is up to date when training ends.
+For each new checkpoint, runs deterministic eval episodes, appends the row
+to a per-seed CSV, then rewrites an aggregated mean ± SE plot across seeds
+(shaded band).
 
 State: ``figs/builderbench/checkpoint_eval/.watch_eval_state.json``
 
 Examples::
 
   python scripts/watch_builderbench_checkpoint_eval.py \\
-      --log_dir logs/ppo_builderbench_creative3_task1_e1024_pd_new \\
+      --log_dir logs/ppo_builderbench_creative3_task1_e1024_pd_nf_tau05 \\
       --env builderbench_creative_3_task1 \\
-      --plot_tag creative3_task1_pd_new \\
-      --once
-
-  # Long-running (submit via slurm):
-  python scripts/watch_builderbench_checkpoint_eval.py \\
-      --log_dir logs/ppo_builderbench_creative3_task1_e1024_pd_new \\
-      --env builderbench_creative_3_task1 \\
-      --plot_tag creative3_task1_pd_new \\
+      --plot_tag creative3_task1_pd_nf_tau05 \\
       --watch_interval 300
 """
 from __future__ import annotations
@@ -30,7 +24,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, List, Optional
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO not in sys.path:
@@ -49,11 +43,12 @@ _eval_spec = importlib.util.spec_from_file_location('bb_ckpt_eval', _eval_path)
 _bb_eval = importlib.util.module_from_spec(_eval_spec)
 sys.modules['bb_ckpt_eval'] = _bb_eval
 _eval_spec.loader.exec_module(_bb_eval)
-default_output_paths = _bb_eval.default_output_paths
 discover_run_dirs = _bb_eval.discover_run_dirs
 eval_run = _bb_eval.eval_run
 list_checkpoint_files = _bb_eval.list_checkpoint_files
+plot_multi_seed_results = _bb_eval.plot_multi_seed_results
 read_csv_results = _bb_eval.read_csv_results
+seed_csv_path = _bb_eval.seed_csv_path
 
 
 def _state_key(run_dir: str, label: str) -> str:
@@ -79,6 +74,7 @@ class _WatchSpec:
   env: str
   plot_tag: str
   seeds: Optional[set[int]]
+  plot_path: str
 
 
 def _parse_seeds(s: str | None) -> set[int] | None:
@@ -95,7 +91,48 @@ def _resolve_spec(args, repo: str) -> _WatchSpec:
   plot_tag = args.plot_tag or os.path.basename(os.path.normpath(log_dir))
   if not args.env:
     raise SystemExit('--env is required')
-  return _WatchSpec(log_dir=log_dir, env=args.env, plot_tag=plot_tag, seeds=seeds)
+  if args.output:
+    plot_path = (args.output if os.path.isabs(args.output)
+                 else os.path.join(repo, args.output))
+  else:
+    plot_path = os.path.join(
+        repo, 'figs', 'builderbench', f'{plot_tag}_checkpoint_success.png')
+  return _WatchSpec(
+      log_dir=log_dir, env=args.env, plot_tag=plot_tag, seeds=seeds,
+      plot_path=plot_path)
+
+
+def _csv_for_seed(spec: _WatchSpec, seed: int, args) -> str:
+  """Per-seed CSV. Shared --csv_output is only used when watching one seed."""
+  if args.csv_output and spec.seeds is not None and len(spec.seeds) == 1:
+    return (args.csv_output if os.path.isabs(args.csv_output)
+            else os.path.join(_REPO, args.csv_output))
+  return seed_csv_path(spec.plot_tag, seed)
+
+
+def _write_aggregate_plot(spec: _WatchSpec, args) -> None:
+  results_by_seed: Dict[int, List] = {}
+  for seed, run_dir, _ckpt_dir in discover_run_dirs(
+      spec.log_dir, spec.env, spec.seeds):
+    csv_path = _csv_for_seed(spec, seed, args)
+    rows = read_csv_results(csv_path)
+    if rows:
+      results_by_seed[seed] = rows
+  if not results_by_seed:
+    return
+  seed_list = sorted(results_by_seed)
+  title = (
+      f'BuilderBench eval success — {spec.env} '
+      f'({spec.plot_tag}, seeds {seed_list})')
+  n = plot_multi_seed_results(
+      results_by_seed,
+      title=title,
+      output_path=spec.plot_path,
+      x_axis=args.x_axis,
+  )
+  if n:
+    print(f'[watch_bb_eval] wrote aggregate plot (n={n}): {spec.plot_path}',
+          flush=True)
 
 
 def _scan_and_eval(spec: _WatchSpec, args, state: dict, state_path: str) -> int:
@@ -111,13 +148,11 @@ def _scan_and_eval(spec: _WatchSpec, args, state: dict, state_path: str) -> int:
             flush=True)
       continue
 
-    plot_path, csv_path = default_output_paths(run_dir, plot_tag=spec.plot_tag)
-    if args.csv_output:
-      csv_path = args.csv_output if os.path.isabs(args.csv_output) else (
-          os.path.join(_REPO, args.csv_output))
-    if args.output:
-      plot_path = args.output if os.path.isabs(args.output) else (
-          os.path.join(_REPO, args.output))
+    csv_path = _csv_for_seed(spec, seed, args)
+    # Per-seed plot is skipped; aggregate plot is written after the loop.
+    per_seed_plot = os.path.join(
+        _REPO, 'figs', 'builderbench',
+        f'{spec.plot_tag}_seed{seed}_checkpoint_success.png')
 
     pending = []
     for label, path, mtime in list_checkpoint_files(ckpt_dir):
@@ -128,16 +163,6 @@ def _scan_and_eval(spec: _WatchSpec, args, state: dict, state_path: str) -> int:
       pending.append((label, path, mtime))
 
     if not pending and os.path.isfile(csv_path):
-      # Still refresh plot from CSV in case plot was deleted.
-      eval_run(
-          run_dir,
-          spec.env,
-          plot_only=True,
-          csv_path=csv_path,
-          plot_path=plot_path,
-          plot_tag=spec.plot_tag,
-          x_axis=args.x_axis,
-      )
       continue
 
     if not pending:
@@ -157,7 +182,7 @@ def _scan_and_eval(spec: _WatchSpec, args, state: dict, state_path: str) -> int:
         network_seed=args.seed,
         incremental=True,
         csv_path=csv_path,
-        plot_path=plot_path,
+        plot_path=per_seed_plot,
         plot_tag=spec.plot_tag,
         x_axis=args.x_axis,
         only_labels=[x[0] for x in pending],
@@ -167,11 +192,11 @@ def _scan_and_eval(spec: _WatchSpec, args, state: dict, state_path: str) -> int:
       state[_state_key(run_dir, label)] = mtime
       n_evaluated += 1
 
-    # Sync state with CSV so re-runs stay idempotent.
     for row in read_csv_results(csv_path):
       if os.path.isfile(row.path):
         state[_state_key(run_dir, row.label)] = os.path.getmtime(row.path)
 
+  _write_aggregate_plot(spec, args)
   _save_state(state_path, state)
   return n_evaluated
 
@@ -184,8 +209,11 @@ def main() -> None:
   ap.add_argument('--env', required=True, help='sgcrl env name.')
   ap.add_argument('--plot_tag', default=None,
                   help='Plot filename stem (default: log_dir basename).')
-  ap.add_argument('--output', default=None, help='Override plot PNG path.')
-  ap.add_argument('--csv_output', default=None, help='Override CSV path.')
+  ap.add_argument('--output', default=None,
+                  help='Aggregated mean±SE plot PNG path.')
+  ap.add_argument('--csv_output', default=None,
+                  help='Only used when watching a single --seeds value; '
+                       'otherwise per-seed CSVs are used.')
   ap.add_argument('--seeds', default=None,
                   help='Comma-separated seeds (default: all found).')
   ap.add_argument('--num_eval_episodes', type=int, default=20)
@@ -212,8 +240,7 @@ def main() -> None:
   print(f'[watch_bb_eval] log_dir={spec.log_dir}  env={spec.env}  '
         f'plot_tag={spec.plot_tag}  episodes={args.num_eval_episodes}',
         flush=True)
-  print(f'[watch_bb_eval] plot → figs/builderbench/{spec.plot_tag}_checkpoint_success.png',
-        flush=True)
+  print(f'[watch_bb_eval] aggregate plot → {spec.plot_path}', flush=True)
 
   try:
     while True:

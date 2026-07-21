@@ -168,6 +168,12 @@ def _scan_and_render(
       key = _state_key(log_tag, seed, label)
       prev = state.get(key)
       out_mp4 = _expected_mp4(out_dir, run.run_tag, label)
+      # Skip if an up-to-date mp4 already exists (unless --force).
+      if (not force and os.path.isfile(out_mp4)
+          and os.path.getmtime(out_mp4) >= mtime):
+        if prev is None or float(prev) < mtime:
+          state[key] = mtime
+        continue
       needs = force or prev is None or float(prev) < mtime
       if not needs and os.path.isfile(out_mp4):
         continue

@@ -133,9 +133,10 @@ def load_task_goal_offsets(num_cubes: int, task_index: int) -> np.ndarray:
 
 
 def default_fixed_target_goal(num_cubes: int, task_index: int) -> np.ndarray:
-  """Nominal fixed ``target_goal`` at the sampling midpoint + task offsets."""
+  """Fixed ``target_goal`` = sampling midpoint + task offsets (all creative tasks)."""
   offsets = load_task_goal_offsets(num_cubes, task_index)
-  return (_TARGET_SAMPLING_MID.reshape(1, 3) + offsets).reshape(-1)
+  return (_TARGET_SAMPLING_MID.reshape(1, 3) + offsets).reshape(-1).astype(
+      np.float32)
 
 
 def creative_cube_mj_episode_length(num_cubes: int, task_index: int = 0) -> int:
@@ -285,14 +286,21 @@ def ppo_env_defaults(
     pd_duration: int = 5,
     episode_length_multiplier: float = 1.0,
 ) -> dict:
-  """Rollout / CRL defaults scaled to BuilderBench creative episode length."""
+  """Non-rollout/CRL PPO defaults scaled to BuilderBench creative episode length.
+
+  NOTE: for PD mode (``use_pd=True``), this deliberately does NOT return
+  ``rollout_length``/``crl_steps_per_iter`` any more. Those used to be
+  silently auto-computed here (``rollout_length // 2``-style formula
+  copy-pasted from the point-maze defaults) and would override whatever a
+  job script implied, with no visible flag. Every BuilderBench PD job must
+  now pass ``--ppo_rollout_length`` and ``--ppo_crl_steps_per_iter``
+  explicitly; see ``contrastive.config.ContrastiveConfig`` for the raw
+  fallback defaults if neither is a passed.
+  """
   episode_length = creative_cube_mj_episode_length(num_cubes, task_index)
   goal_dim = num_cubes * 3
   if use_pd:
-    pd_episode_length = episode_length // int(pd_duration)
     return dict(
-        rollout_length=max(32, pd_episode_length),
-        crl_steps_per_iter=max(16, pd_episode_length // 2),
         start_index=0,
         end_index=goal_dim,
         checkpoint_interval=150,

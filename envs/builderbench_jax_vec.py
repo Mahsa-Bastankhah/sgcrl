@@ -135,6 +135,9 @@ def _maybe_fix_target(
   goal = jnp.broadcast_to(fixed, state.info['target_goal'].shape)
   info = dict(state.info)
   info['target_goal'] = goal
+  # Keep render key in sync (video uses info['target_mocap_pos']).
+  info['target_mocap_pos'] = jnp.broadcast_to(
+      fixed_pos, state.info['target_mocap_pos'].shape)
   mocap_pos = state.data.mocap_pos.at[mocap_targets].set(fixed_pos)
   data = state.data.replace(mocap_pos=mocap_pos)
   return state.replace(data=data, info=info)
@@ -153,8 +156,8 @@ class JaxBuilderBenchVecEnv:
       pd_filter_policy_obs: bool = True,
       fixed_target_goal: Optional[np.ndarray] = None,
       obs_space_list: Optional[list[str]] = None,
-    episode_length_multiplier: float = 1.0,
-
+      episode_length_multiplier: float = 1.0,
+      permute_start_boxes: bool = True,
   ):
     _require_builderbench(env_name)
     self._env_name = str(env_name)
@@ -168,6 +171,7 @@ class JaxBuilderBenchVecEnv:
     self._fixed_target_goal = (
         None if fixed_target_goal is None
         else jnp.asarray(fixed_target_goal, dtype=jnp.float32).reshape(-1))
+    self._permute_start_boxes = bool(permute_start_boxes)
 
     num_cubes, task_id = self._num_cubes, self._task_id
     cfg = default_config()
@@ -176,6 +180,7 @@ class JaxBuilderBenchVecEnv:
     self._episode_length_multiplier = float(episode_length_multiplier)
     cfg.episode_length = creative_cube_mj_episode_length(
         num_cubes, task_id)
+    cfg.permute_start_boxes = self._permute_start_boxes
     cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
     if self._bb_env_id in _MJX_PARAMS:
       ncon, njmax = _MJX_PARAMS[self._bb_env_id]
@@ -218,10 +223,12 @@ class JaxBuilderBenchVecEnv:
         f' (full_state={self._full_state_obs_dim})'
         if self._pd_filter_policy_obs else '')
     print(f'[jax_vec] BuilderBench {self._bb_env_id}: '
-            f'E={self._num_envs} obs={self._obs_dim_total} '
-            f'act={self._action_dim} ep_len={self._episode_length} '
-            f'use_pd={self._use_pd}{_pd_obs_msg} '
-            f'ep_len_mult={self._episode_length_multiplier}')
+          f'E={self._num_envs} obs={self._obs_dim_total} '
+          f'act={self._action_dim} ep_len={self._episode_length} '
+          f'use_pd={self._use_pd} '
+          f'pd_duration={self._pd_duration} '
+          f'permute_start_boxes={self._permute_start_boxes}'
+          f'{_pd_obs_msg}')
 
   def _reset_impl(self, rng: jax.Array) -> State:
     state = self._env.reset(rng)
@@ -414,6 +421,13 @@ class JaxBuilderBenchVecEnv:
         term_np,
         info_rewards,
     )
+
+  @property
+  def last_success(self) -> np.ndarray:
+    """Per-env success flags from the most recent ``step`` (BuilderBench metrics)."""
+    if self._state is None:
+      return np.zeros(self._num_envs, dtype=np.float32)
+    return np.asarray(self._state.metrics['success'], dtype=np.float32)
 
   @property
   def num_envs(self) -> int:

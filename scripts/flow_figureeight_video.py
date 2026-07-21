@@ -13,15 +13,15 @@ Produces a two-panel animation:
 Usage:
   python flow_figureeight_video.py \
       --checkpoint logs/ppo_flow_test2/ppo_flow_figureeight_0/checkpoints/latest.pkl \
-      --steps 300 --output videos/figureeight_ppo.gif
+      --steps 300 --output videos/figureeight/figureeight_ppo.gif
 
   # No checkpoint → random (untrained) policy
-  python flow_figureeight_video.py --steps 1500 --output videos/figureeight_random_full.mp4
+  python flow_figureeight_video.py --steps 1500 --output videos/figureeight/figureeight_random_full.mp4
 
   # Full episode with iter-0 checkpoint (if saved):
   python flow_figureeight_video.py \\
       --checkpoint logs/ppo/ppo_flow_figureeight_0/checkpoints/ckpt_iter_0000000.pkl \\
-      --steps 1500 --output videos/figureeight_iter0_full.mp4
+      --steps 1500 --output videos/figureeight/figureeight_iter0_full.mp4
 """
 from __future__ import annotations
 
@@ -436,7 +436,7 @@ def main():
     parser.add_argument('--frame_skip', type=int, default=1,
                         help='Keep every Nth frame (default 1 = all frames). '
                              'Use 2+ to reduce memory when saving long GIFs.')
-    parser.add_argument('--output', default='videos/figureeight_random_full.mp4',
+    parser.add_argument('--output', default='videos/figureeight/figureeight_random_full.mp4',
                         help='Output file path (.gif or .mp4).')
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
