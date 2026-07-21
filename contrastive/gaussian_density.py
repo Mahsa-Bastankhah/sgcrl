@@ -22,8 +22,9 @@ We reuse the same  (s, s_f)  pairs that CRL draws from EpisodeReplay:
              = mean_i[ 0.5·‖(g_i − μ_i)/σ_i‖² + Σ_k log σ_ik
                        + 0.5·goal_dim·log(2π) ]
 
-   The log(2π) term is constant and dropped from the gradient; σ is
-   clamped to [exp(-5), exp(2)] ≈ [0.007, 7.4] for numerical safety.
+   Includes the full −0.5·D·log(2π) normalizing constant (does not
+   change gradients wrt μ/σ, but shifts the absolute log-p / PPO reward
+   scale).  σ is clamped to [exp(-5), exp(2)] ≈ [0.007, 7.4].
 
 Reward
 ------
@@ -178,13 +179,13 @@ def _diagonal_gaussian_log_prob(
 
     log p(x) = -0.5·‖z‖² − Σ_k log σ_k − 0.5·D·log(2π)
     where z_k = (x_k − μ_k) / exp(log_std_k)
-
-    The constant −0.5·D·log(2π) does not affect gradients and is omitted.
     """
     std = jnp.exp(log_std)                          # (B, goal_dim)
     z = (x - mu) / std                              # (B, goal_dim)
+    d = log_std.shape[-1]
     log_p = -0.5 * jnp.sum(z ** 2, axis=-1) \
-            - jnp.sum(log_std, axis=-1)             # (B,)
+            - jnp.sum(log_std, axis=-1) \
+            - 0.5 * d * jnp.log(2.0 * jnp.pi)       # (B,)
     return log_p
 
 
@@ -304,11 +305,7 @@ def make_gaussian_reward_fn(
     Reward:
         r_t = log p_θ(g | s_t, a_t)
             = -0.5·‖(g − μ_θ(s_t,a_t)) / σ_θ(s_t,a_t)‖²
-              − Σ_k log σ_θk(s_t,a_t) + const
-
-    The constant −0.5·D·log(2π) is omitted (doesn't affect gradients).
-    The reward is negative everywhere; its maximum (0 − const) is achieved
-    when g lies exactly at the predicted mean with unit variance.
+              − Σ_k log σ_θk(s_t,a_t) − 0.5·D·log(2π)
 
     Returns:
         A jitted callable:

@@ -249,6 +249,8 @@ class CheckpointEvalSession:
         pd_duration=ctx.pd_duration,
         pd_filter_policy_obs=ctx.filter_policy_obs,
         fixed_target_goal=fixed_goal,
+        permute_start_boxes=bool(
+            getattr(ctx, 'permute_start_boxes', True)),
     )
 
     @jax.jit
@@ -297,32 +299,72 @@ def format_steps(v, _):
   return str(int(v))
 
 
-def plot_results(
-    results: Sequence[CheckpointEvalResult],
+def aggregate_seed_curves(
+    results_by_seed: Dict[int, Sequence[CheckpointEvalResult]],
+    *,
+    x_axis: str = 'global_step',
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+  """Average success across seeds at shared x; SE = std / sqrt(n).
+
+  When only one seed has a point at ``x``, SE falls back to that row's
+  episode-level SE (``success_std``).
+  """
+  by_x: Dict[int, List[Tuple[float, float]]] = {}
+  n_seeds = 0
+  for _seed, results in results_by_seed.items():
+    if not results:
+      continue
+    n_seeds += 1
+    for r in results:
+      x = int(r.iteration if x_axis == 'iteration' else r.global_step)
+      by_x.setdefault(x, []).append(
+          (float(r.success_mean), float(r.success_std)))
+  if not by_x:
+    empty = np.asarray([], dtype=np.float64)
+    return empty, empty, empty, 0
+
+  xs = np.asarray(sorted(by_x), dtype=np.float64)
+  means = np.empty_like(xs)
+  ses = np.empty_like(xs)
+  for i, x in enumerate(xs):
+    vals = by_x[int(x)]
+    ys = np.asarray([v[0] for v in vals], dtype=np.float64)
+    means[i] = float(ys.mean())
+    if ys.size > 1:
+      ses[i] = float(ys.std(ddof=1) / math.sqrt(ys.size))
+    else:
+      ses[i] = float(vals[0][1])
+  return xs, means, ses, n_seeds
+
+
+def plot_mean_se(
+    xs: Sequence[float],
+    means: Sequence[float],
+    ses: Sequence[float],
     *,
     title: str,
     output_path: str,
     x_axis: str = 'global_step',
+    label: Optional[str] = None,
 ) -> None:
-  if not results:
+  """Line plot of mean success with shaded ± SE band."""
+  xs_a = np.asarray(xs, dtype=np.float64)
+  mean_a = np.asarray(means, dtype=np.float64)
+  se_a = np.asarray(ses, dtype=np.float64)
+  if xs_a.size == 0:
     print('[bb_eval] no rows to plot')
     return
 
-  if x_axis == 'iteration':
-    xs = [r.iteration for r in results]
-    xlabel = 'Training iteration'
-  else:
-    xs = [r.global_step for r in results]
-    xlabel = 'Global env steps'
-
-  ys = [r.success_mean for r in results]
-  yerr = [r.success_std for r in results]
+  xlabel = 'Training iteration' if x_axis == 'iteration' else 'Global env steps'
+  if label is None:
+    label = 'eval success (mean ± SE)'
 
   fig, ax = plt.subplots(figsize=(8, 4))
-  ax.errorbar(
-      xs, ys, yerr=yerr, fmt='-o', color='#4C9BE8', linewidth=1.8,
-      markersize=4, capsize=3, elinewidth=1.0,
-      label='eval success (mean ± SE)')
+  color = '#4C9BE8'
+  ax.plot(xs_a, mean_a, color=color, linewidth=1.8, marker='o', markersize=4,
+          label=label)
+  ax.fill_between(
+      xs_a, mean_a - se_a, mean_a + se_a, color=color, alpha=0.25, linewidth=0)
   ax.set_title(title, fontsize=13, fontweight='bold')
   ax.set_xlabel(xlabel, fontsize=11)
   ax.xaxis.set_major_formatter(mticker.FuncFormatter(format_steps))
@@ -338,6 +380,55 @@ def plot_results(
   fig.tight_layout()
   fig.savefig(output_path, dpi=150, bbox_inches='tight')
   plt.close(fig)
+
+
+def plot_results(
+    results: Sequence[CheckpointEvalResult],
+    *,
+    title: str,
+    output_path: str,
+    x_axis: str = 'global_step',
+) -> None:
+  if not results:
+    print('[bb_eval] no rows to plot')
+    return
+  if x_axis == 'iteration':
+    xs = [r.iteration for r in results]
+  else:
+    xs = [r.global_step for r in results]
+  ys = [r.success_mean for r in results]
+  yerr = [r.success_std for r in results]
+  plot_mean_se(
+      xs, ys, yerr, title=title, output_path=output_path, x_axis=x_axis)
+
+
+def plot_multi_seed_results(
+    results_by_seed: Dict[int, Sequence[CheckpointEvalResult]],
+    *,
+    title: str,
+    output_path: str,
+    x_axis: str = 'global_step',
+) -> int:
+  """Plot mean ± SE across seeds (shaded). Returns number of seeds used."""
+  xs, means, ses, n_seeds = aggregate_seed_curves(
+      results_by_seed, x_axis=x_axis)
+  if n_seeds == 0 or xs.size == 0:
+    print('[bb_eval] no rows to plot')
+    return 0
+  label = (
+      f'eval success (mean ± SE, n={n_seeds} seed'
+      f'{"s" if n_seeds != 1 else ""})')
+  plot_mean_se(
+      xs, means, ses, title=title, output_path=output_path, x_axis=x_axis,
+      label=label)
+  return n_seeds
+
+
+def seed_csv_path(plot_tag: str, seed: int) -> str:
+  """Canonical per-seed CSV under figs/builderbench/checkpoint_eval/."""
+  return os.path.join(
+      _REPO, 'figs', 'builderbench', 'checkpoint_eval',
+      f'{plot_tag}_seed{seed}_checkpoint_success.csv')
 
 
 def default_output_paths(run_dir: str, plot_tag: Optional[str] = None):

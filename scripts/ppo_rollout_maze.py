@@ -27,13 +27,22 @@ Examples:
 
 When a checkpoint is loaded, each PNG defaults to a **1×2** figure: the
 left panel overlays a scalar field over every free cell — **φ(s,a)·ψ(g)**
-for default runs, or the **dirac_target PPO reward** when
-``run_config.json`` has ``ppo_reward_mode=dirac_target`` (or the
-checkpoint path contains ``dirac_baseline``).  ``a`` is the policy's
-deterministic action at ``concat([s,g])``; dirac uses ``s0`` from the
-plotted rollout's start state.  The right panel is always **V(s,g)**.
+for CRL runs, **Q₁(s,a,g)** when ``ppo_repr_mode=td3``, or the
+**dirac_target PPO reward** when ``run_config.json`` has
+``ppo_reward_mode=dirac_target`` (or the checkpoint path contains
+``dirac_baseline``).  ``a`` is the policy's deterministic action at
+``concat([s,g])``; dirac uses ``s0`` from the plotted rollout's start
+state.  The right panel is always **V(s,g)**.
 Use ``--no_repr_overlay`` to skip the heatmaps and recover a single
 trajectory panel.
+
+When the overlay is TD3 (``ppo_repr_mode=td3``), an additional standalone
+PNG (suffix ``_Qs0a_sf``) is written by default: it fixes ``s0`` (the
+rollout start) and ``a`` (the policy's action at ``(s0, g)``), then sweeps
+the **third** Q argument — here called ``sf`` — over every free cell,
+plotting **Q₁(s0, a, sf)**.  This is the transpose of the main heatmap,
+which fixes the goal and sweeps the *first* argument ``s``.  Disable with
+``--no_s0a_sf_heatmap``.
 
 Y-axis convention
 -----------------
@@ -170,7 +179,11 @@ def _infer_repr_norm_from_checkpoint(ckpt_path: str) -> Optional[bool]:
 def _resolve_ppo_reward_overlay(ckpt_path: str,
                                 cli_reward_mode: str,
                                 cli_dirac_eps: float) -> Tuple[str, float]:
-  """Return (overlay_mode, dirac_eps) for heatmap left panel."""
+  """Return (overlay_mode, dirac_eps) for heatmap left panel.
+
+  overlay_mode is one of: ``''`` / phi·ψ (CRL default), ``dirac_target``,
+  ``kde_dirac``, or ``td3`` (Q₁ from twin critic).
+  """
   resolved = _infer_run_config_from_checkpoint(ckpt_path)
   mode = (cli_reward_mode or resolved.get('ppo_reward_mode', '') or '').strip().lower()
   abs_path = os.path.abspath(ckpt_path)
@@ -178,6 +191,8 @@ def _resolve_ppo_reward_overlay(ckpt_path: str,
     mode = 'kde_dirac'
   elif not mode and 'dirac_baseline' in abs_path:
     mode = 'dirac_target'
+  elif not mode and str(resolved.get('ppo_repr_mode', '')).strip().lower() == 'td3':
+    mode = 'td3'
   eps = float(cli_dirac_eps) if cli_dirac_eps > 0 else float(
       resolved.get('ppo_dirac_eps', 1e-6))
   return mode, eps
@@ -368,6 +383,78 @@ def _make_maze_repr_field_fn(
     return phi_dot, v
 
   return _eval
+
+
+def _make_maze_td3_q_field_fn(
+    td3_nets,
+    networks,
+    state_dim: int,
+):
+  """Jitted TD3 overlay: left = Q₁(s,a,g), right = V(s,g).
+
+  ``q_p`` is expected to be the online (or EMA) twin-Q param dict with a
+  ``qf1`` key — same layout as ``contrastive.td3_density.init_td3_params``.
+  """
+
+  @jax.jit
+  def _eval(policy_p, q_p, value_p, pos_batch: jnp.ndarray, goal_vec: jnp.ndarray,
+            s0_vec: jnp.ndarray):
+    del s0_vec
+    g = jnp.broadcast_to(goal_vec[None, :], (pos_batch.shape[0], state_dim))
+    obs_pg = jnp.concatenate([pos_batch, g], axis=-1)
+    dist = networks.policy_network.apply(policy_p, obs_pg)
+    act = networks.sample_eval(dist, jax.random.PRNGKey(0))
+    q1 = td3_nets.qf1_net.apply(q_p['qf1'], obs_pg, act)
+    v = networks.value_network.apply(value_p, obs_pg)
+    return q1, v
+
+  return _eval
+
+
+def _make_maze_td3_q_s0a_sf_field_fn(
+    td3_nets,
+    networks,
+    state_dim: int,
+):
+  """Jitted TD3 overlay with *s0, a fixed* and *sf swept over the map*.
+
+  Complement to ``_make_maze_td3_q_field_fn``: instead of fixing the goal
+  and varying the (state, action) input, this fixes ``s0`` (the rollout
+  start) and evaluates a *single* action ``a = policy(s0, g)`` once, then
+  reuses that same ``s0, a`` pair against every candidate ``sf`` (swept over
+  ``pos_batch``, i.e. every free maze cell).  This shows
+  ``Q1(s0, a, sf)`` — how the critic values *reaching* each possible final
+  state from the one fixed (state, action) pair — as opposed to the usual
+  ``Q1(s, a(s), g)`` heatmap where ``g`` is fixed and ``s`` varies.
+
+  Right field reuses the value network as ``V(s0, sf)`` for reference,
+  though it is not plotted by default.
+  """
+
+  @jax.jit
+  def _eval(policy_p, q_p, value_p, pos_batch: jnp.ndarray, goal_vec: jnp.ndarray,
+            s0_vec: jnp.ndarray):
+    obs_s0g = jnp.concatenate([s0_vec, goal_vec], axis=-1)[None, :]
+    dist = networks.policy_network.apply(policy_p, obs_s0g)
+    act = networks.sample_eval(dist, jax.random.PRNGKey(0))   # (1, act_dim)
+    n = pos_batch.shape[0]
+    act_b = jnp.broadcast_to(act, (n, act.shape[-1]))
+    s0_b = jnp.broadcast_to(s0_vec[None, :], (n, state_dim))
+    obs_s0_sf = jnp.concatenate([s0_b, pos_batch], axis=-1)   # sf = pos_batch
+    q1 = td3_nets.qf1_net.apply(q_p['qf1'], obs_s0_sf, act_b)
+    v = networks.value_network.apply(value_p, obs_s0_sf)
+    return q1, v
+
+  return _eval
+
+
+def _td3_q_params_for_heatmap(ckpt: dict, resolved: dict) -> Tuple[dict, str]:
+  """Prefer reward-EMA Q params when the run used ``ppo_td3_reward_tau>0``."""
+  tau = float(resolved.get('ppo_td3_reward_tau', 0.0) or 0.0)
+  ema = ckpt.get('q_params_ema')
+  if tau > 0.0 and ema is not None and 'qf1' in ema:
+    return ema, f'Q1_ema(tau={tau:g})'
+  return ckpt['q_params'], 'Q1_online'
 
 
 def _make_maze_dirac_reward_field_fn(
@@ -659,6 +746,9 @@ def _plot_trajectory(
              r'(off-goal: $\log\epsilon - \log p_{\mathrm{kde}}(s)$; '
              r'at $g$: $-\log p_{\mathrm{kde}}(g)$)')
     ax0_title = f'{heat0}  ($\\epsilon$={dirac_eps:g}, KDE on policy rollouts)'
+  elif overlay_mode == 'td3':
+    heat0 = r'$Q_1(s,a,g)$'
+    ax0_title = f'{heat0}  (TD3 critic, policy mode $a$)'
   else:
     heat0 = (r'$\cos(\phi(s,a), \psi(g))$'
            if normalize_repr else r'$\phi(s,a)\cdot\psi(g)$')
@@ -725,6 +815,40 @@ def _plot_trajectory(
     ax_ts.legend(fontsize=7, framealpha=0.8)
     ax_ts.grid(True, alpha=0.3)
 
+  out_dir = os.path.dirname(os.path.abspath(out_path))
+  if out_dir:
+    os.makedirs(out_dir, exist_ok=True)
+  fig.savefig(out_path, dpi=150)
+  plt.close(fig)
+
+
+def _plot_s0a_sf_heatmap(
+    walls: np.ndarray,
+    s0: np.ndarray,
+    goal: np.ndarray,
+    trajectories: Optional[list[np.ndarray]],
+    heatmap: np.ndarray,
+    heat_label: str,
+    title: str,
+    out_path: str,
+    fig_scale: float = 1.0,
+):
+  """Single-panel PNG: Q1(s0, a, sf) with s0 fixed & marked, sf swept.
+
+  ``trajectories`` are drawn only for context (to show where ``s0`` sits
+  relative to the policy's actual rollout(s)); they play no role in the
+  heatmap computation itself, which holds ``s0, a`` fixed and evaluates the
+  critic at every free cell used as the ``sf`` input.
+  """
+  H, W = walls.shape
+  h_in = (6 * H / max(W, 1)) * float(fig_scale)
+  fig, ax = plt.subplots(1, 1, figsize=(7 * float(fig_scale), h_in),
+                         layout='constrained')
+  _draw_maze_panel(ax, walls, None, trajectories, goal, heatmap, heat_label)
+  ax.plot(s0[1], s0[0], marker='D', color='cyan', markersize=11,
+          markeredgecolor='black', linewidth=0, label='$s_0$ (fixed)', zorder=6)
+  ax.legend(loc='upper right', fontsize=8, framealpha=0.8)
+  ax.set_title(title, fontsize=10)
   out_dir = os.path.dirname(os.path.abspath(out_path))
   if out_dir:
     os.makedirs(out_dir, exist_ok=True)
@@ -817,15 +941,23 @@ def main():
       help='Print per-step Gaussian loc/scale and tanh-mode during rollout.')
   parser.add_argument(
       '--ppo_reward_mode', default='',
-      help='Override left heatmap: "" uses run_config (phi·psi); '
+      help='Override left heatmap: "" uses run_config '
+           '(phi·psi / TD3 Q1 / dirac); '
            '"dirac_target" plots PPO dirac reward; '
-           '"kde_dirac" plots KDE reward fitted on policy rollouts.')
+           '"kde_dirac" plots KDE reward fitted on policy rollouts; '
+           '"td3" plots TD3 Q1(s,a,g).')
   parser.add_argument(
       '--ppo_dirac_eps', type=float, default=-1.0,
       help='Epsilon for dirac/kde_dirac heatmap; <0 uses run_config default.')
   parser.add_argument(
       '--kde_num_rollouts', type=int, default=20,
       help='Number of policy rollouts used to fit the KDE (kde_dirac mode).')
+  parser.add_argument(
+      '--no_s0a_sf_heatmap', action='store_true',
+      help='Skip the extra Q1(s0,a,sf) heatmap (TD3 overlay only), which '
+           'fixes s0=rollout start and a=policy(s0,g) and sweeps sf over '
+           'every free cell, complementing the usual Q1(s,a(s),g) map '
+           '(fixed goal, s swept).')
   args = parser.parse_args()
   if args.num_trajectories < 1:
     parser.error('--num_trajectories must be >= 1')
@@ -851,9 +983,10 @@ def main():
 
   # ----- 2. Build networks + env ONCE and reuse ---------------------------
   print('[maze] building networks and loading env...')
-  networks, _ = _build_networks(args.env, seed=args.seed)
+  networks, obs_dim = _build_networks(args.env, seed=args.seed)
   gym_env, _, env_max_steps, walls = _get_raw_point_env(args.env)
   state_dim = _point_state_goal_dim(gym_env)
+  act_dim = int(np.prod(gym_env.action_space.shape))
   n_extra_dims = state_dim - 2  # 0 for standard 2D mazes, 2 for SixteenRooms4D
   force_repr_normalize = bool(args.repr_normalize and not args.no_repr_normalize)
   force_no_repr_normalize = bool(args.no_repr_normalize)
@@ -861,9 +994,12 @@ def main():
       networks, state_dim, normalize_repr=False)
   eval_fields_norm = _make_maze_repr_field_fn(
       networks, state_dim, normalize_repr=True)
+  # TD3 Q1 overlay nets (built lazily if any checkpoint needs them).
+  td3_density_nets = None
   max_steps = env_max_steps if args.max_steps < 0 else int(args.max_steps)
   print(f'[maze] env={args.env}  max_steps={max_steps}  '
         f'walls shape={walls.shape} (rows, cols)  state_dim={state_dim}  '
+        f'obs_dim={obs_dim}  act_dim={act_dim}  '
         f'n_extra_dims={n_extra_dims}  '
         f'force_repr_normalize={force_repr_normalize}  '
         f'force_no_repr_normalize={force_no_repr_normalize}')
@@ -897,13 +1033,15 @@ def main():
         path, args.ppo_reward_mode, float(args.ppo_dirac_eps))
     use_dirac_overlay = overlay_mode == 'dirac_target'
     use_kde_overlay   = overlay_mode == 'kde_dirac'
+    use_td3_overlay   = overlay_mode == 'td3'
+    resolved_cfg = _infer_run_config_from_checkpoint(path)
     if use_dirac_overlay:
       eval_fields = _make_maze_dirac_reward_field_fn(
           networks, state_dim, dirac_eps)
       overlay_src = 'dirac_target'
       if args.ppo_reward_mode:
         overlay_src += ' (cli)'
-      elif _infer_run_config_from_checkpoint(path).get('ppo_reward_mode'):
+      elif resolved_cfg.get('ppo_reward_mode'):
         overlay_src += ' (run_config.json)'
       else:
         overlay_src += ' (path dirac_baseline)'
@@ -919,12 +1057,37 @@ def main():
       eval_fields = _make_maze_kde_reward_field_fn(
           kde, networks, state_dim, dirac_eps)
       overlay_src = f'kde_dirac (N={len(kde_states)}, bw={bw:.4f})'
+    elif use_td3_overlay:
+      if td3_density_nets is None:
+        from contrastive import td3_density as _td3
+        cfg = contrastive.ContrastiveConfig()
+        hidden = tuple(resolved_cfg.get(
+            'hidden_layer_sizes', cfg.hidden_layer_sizes))
+        bilinear = bool(resolved_cfg.get('ppo_td3_bilinear', False))
+        td3_density_nets = _td3.make_td3_density_networks(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            goal_dim=state_dim,
+            hidden_layer_sizes=hidden,
+            repr_dim=int(resolved_cfg.get('repr_dim', cfg.repr_dim)),
+            bilinear=bilinear,
+            repr_norm=bool(resolved_cfg.get('repr_norm', False)) if bilinear else False,
+        )
+        print(f'[maze]   built TD3 Q nets  bilinear={bilinear}  '
+              f'hidden={hidden}', flush=True)
+      eval_fields = _make_maze_td3_q_field_fn(
+          td3_density_nets, networks, state_dim)
+      overlay_src = 'td3 Q1'
+      if args.ppo_reward_mode == 'td3':
+        overlay_src += ' (cli)'
+      else:
+        overlay_src += ' (run_config ppo_repr_mode=td3)'
     else:
       eval_fields = eval_fields_norm if use_repr_normalize else eval_fields_raw
       overlay_src = repr_src
     print(f'[maze]   left_heatmap={overlay_src}  '
           f'repr_normalize='
-          f'{use_repr_normalize if not (use_dirac_overlay or use_kde_overlay) else "n/a"}')
+          f'{use_repr_normalize if not (use_dirac_overlay or use_kde_overlay or use_td3_overlay) else "n/a"}')
 
     # Build overlays once per checkpoint (goal is fixed-goal in point envs).
     states0, goal0, reward_sum0, success0 = _rollout_one(
@@ -939,7 +1102,7 @@ def main():
         log_policy_stats=bool(args.log_policy_stats),
         log_prefix=f'[{label}] traj=0 ',
     )
-    h_phi = h_value = None
+    h_phi = h_value = h_q_s0a_sf = None
     if not args.no_repr_overlay:
       q_params = ckpt.get('q_params')
       value_params = ckpt.get('value_params')
@@ -947,11 +1110,24 @@ def main():
         print('[maze]   warning: checkpoint missing q_params/value_params; '
               'skipping overlays (use --no_repr_overlay to silence).')
       else:
+        q_for_grid = q_params
+        if use_td3_overlay:
+          q_for_grid, q_src = _td3_q_params_for_heatmap(ckpt, resolved_cfg)
+          print(f'[maze]   td3 heatmap params={q_src}', flush=True)
         h_phi, h_value = _repr_grids_over_maze(
-            walls, goal0, policy_params, q_params, value_params, eval_fields,
+            walls, goal0, policy_params, q_for_grid, value_params, eval_fields,
             subcells=int(args.heatmap_subcells),
             s0_state=states0[0] if use_dirac_overlay else None,
             state_dim=state_dim)
+        if use_td3_overlay and not args.no_s0a_sf_heatmap:
+          eval_fields_s0a_sf = _make_maze_td3_q_s0a_sf_field_fn(
+              td3_density_nets, networks, state_dim)
+          h_q_s0a_sf, _ = _repr_grids_over_maze(
+              walls, goal0, policy_params, q_for_grid, value_params,
+              eval_fields_s0a_sf,
+              subcells=int(args.heatmap_subcells),
+              s0_state=states0[0],
+              state_dim=state_dim)
 
     trjs = []       # list of (T, 2) maze-coords arrays
     extra_trjs = [] # list of (T, n_extra) extra-dim arrays (empty for 2D envs)
@@ -1000,6 +1176,19 @@ def main():
         fig_scale=float(max(0.5, args.fig_scale)),
         extra_dims_trajs=extra_trjs if n_extra_dims > 0 else None)
     print(f'[maze]   wrote {out_path}')
+
+    if h_q_s0a_sf is not None:
+      sf_out_path = _append_suffix_to_path(out_path, 'Qs0a_sf')
+      sf_title = (f'{args.env}  seed={args.seed}  ckpt={label}\n'
+                  r'$Q_1(s_0, a, s_f)$   ($s_0$=rollout start, '
+                  r'$a$=policy mode at $(s_0,g)$, $s_f$ swept over all free cells)')
+      _plot_s0a_sf_heatmap(
+          walls=walls, s0=states0[0][:2], goal=goal0[:2],
+          trajectories=trjs if n_traj > 1 else [trjs[0]],
+          heatmap=h_q_s0a_sf, heat_label=r'$Q_1(s_0,a,s_f)$',
+          title=sf_title, out_path=sf_out_path,
+          fig_scale=float(max(0.5, args.fig_scale)))
+      print(f'[maze]   wrote {sf_out_path}')
 
 
 if __name__ == '__main__':

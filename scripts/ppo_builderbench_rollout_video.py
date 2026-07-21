@@ -73,6 +73,7 @@ class _TrainCtx:
   actor_min_std: float
   start_index: int
   end_index: int
+  permute_start_boxes: bool
 
 
 def _get_video(
@@ -121,6 +122,9 @@ def _maybe_fix_target(
   info = dict(state.info)
   info['target_goal'] = jnp.broadcast_to(
       fixed, state.info['target_goal'].shape)
+  # render_from_info draws translucent targets from this info field.
+  info['target_mocap_pos'] = jnp.broadcast_to(
+      fixed_pos, state.info['target_mocap_pos'].shape)
   mocap_pos = state.data.mocap_pos.at[mocap_targets].set(fixed_pos)
   data = state.data.replace(mocap_pos=mocap_pos)
   return state.replace(data=data, info=info)
@@ -148,6 +152,9 @@ def _get_trajectory(
       key, act_key = jax.random.split(key)
       action, _ = policy(state.obs, state.info['target_goal'], act_key)
       next_state = env.step(state, action)
+      # Re-pin after step (AutoReset can reintroduce randomized goals).
+      next_state = _maybe_fix_target(
+          next_state, fixed_target_goal, mocap_targets, num_cubes)
       return (next_state, key), next_state
 
     _, states = jax.lax.scan(f, (state, key), (), length=unroll_length)
@@ -194,6 +201,8 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     fixed = run_cfg.get('fixed_start_end')
     fixed_goal = (None if fixed is None
                   else np.asarray(fixed, dtype=np.float32))
+    permute_start_boxes = bool(
+        flags.get('builderbench_permute_start_boxes', True))
   else:
     use_pd = False
     pd_duration = 5
@@ -204,6 +213,7 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     start_index = int(defaults.get('start_index', 0))
     end_index = int(defaults.get('end_index', num_cubes * 3))
     fixed_goal = fixed_goal_for_env(env_name)
+    permute_start_boxes = True
 
   if use_pd:
     macro_ep_len = mj_ep_len // pd_duration
@@ -226,6 +236,7 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
       actor_min_std=actor_min_std,
       start_index=start_index,
       end_index=end_index,
+      permute_start_boxes=permute_start_boxes,
   )
 
 
@@ -235,6 +246,7 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
     env_kwargs['builderbench_use_pd'] = True
     env_kwargs['builderbench_pd_duration'] = ctx.pd_duration
     env_kwargs['builderbench_pd_filter_policy_obs'] = ctx.filter_policy_obs
+  env_kwargs['builderbench_permute_start_boxes'] = ctx.permute_start_boxes
 
   probe_env, obs_dim = contrastive_utils.make_environment(
       env_name,
@@ -294,6 +306,7 @@ def _make_bb_env(env_id: str, ctx: _TrainCtx):
   cfg.num_cubes = num_cubes
   cfg.task_id = task_id
   cfg.episode_length = creative_cube_mj_episode_length(num_cubes, task_id)
+  cfg.permute_start_boxes = bool(ctx.permute_start_boxes)
   cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
   if env_id in _MJX_PARAMS:
     cfg.nconmax, cfg.njmax = _MJX_PARAMS[env_id]
@@ -375,6 +388,9 @@ def main():
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--run_tag', default=None,
                       help='Prefix for output filenames (default: env name).')
+  parser.add_argument(
+      '--skip_existing', action='store_true',
+      help='Skip checkpoints whose output mp4 already exists.')
   args = parser.parse_args()
 
   if not is_builderbench_creative_env(args.env):
@@ -416,6 +432,10 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
   for label, path in ckpt_entries:
+    out_path = _resolve_output_path(out_dir, run_tag, label, multi)
+    if args.skip_existing and os.path.isfile(out_path):
+      print(f'[bb_video] skip existing {out_path}', flush=True)
+      continue
     print(f'[bb_video] === {label}  ({path}) ===')
     ckpt = ppo_learner.load_checkpoint(path)
     policy_params = ckpt['policy_params']
@@ -441,7 +461,6 @@ def main():
     )
     print(f'[bb_video]   frames={len(frames)}')
 
-    out_path = _resolve_output_path(out_dir, run_tag, label, multi)
     _write_video(frames, out_path, args.fps)
     print(f'[bb_video]   wrote {out_path}')
 

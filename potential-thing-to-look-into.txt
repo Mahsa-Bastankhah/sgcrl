@@ -1,0 +1,91 @@
+The shaped PPO uses standard GAE:
+
+δ
+t
+	​
+
+=r
+t
+	​
+
++γ(1−d
+t+1
+	​
+
+)V
+t+1
+	​
+
+−V
+t
+	​
+
+,
+A
+t
+	​
+
+=δ
+t
+	​
+
++γλ(1−d
+t+1
+	​
+
+)A
+t+1
+	​
+
+,
+R
+t
+	​
+
+=A
+t
+	​
+
++V
+t
+	​
+
+.
+
+The baseline first constructs a lambda-return-like value target v
+t
+λ
+	​
+
+, but then computes the policy advantage as:
+
+A
+t
+baseline
+	​
+
+=r
+t
+	​
+
++γv
+t+1
+λ
+	​
+
+−V
+t
+	​
+
+.
+
+This is a Brax-style estimator, but it is not numerically identical to using the GAE accumulator directly as the policy advantage. Therefore, matching gae_lambda=0.95 does not make the two advantage estimators identical.
+
+There is also a termination difference:
+
+Baseline separately represents environment termination and truncation.
+Shaped PPO places termination and truncation into one done mask.
+Shaped PPO therefore does not distinguish a true terminal state from a time-limit truncation in GAE.
+Baseline masks truncation transitions rather than handling them exactly like ordinary terminal transitions.
+
+For a controlled comparison, both should use the same timeout convention and the same advantage

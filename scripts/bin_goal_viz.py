@@ -4,7 +4,7 @@
 
 Usage:
     python scripts/bin_goal_viz.py
-    python scripts/bin_goal_viz.py --output figs/bin_goal_render.png
+    python scripts/bin_goal_viz.py --output figs/sawyer_bin/bin_goal_render.png
 """
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ def _render(env, camera: str, width: int, height: int) -> np.ndarray:
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument('--output', default='figs/bin_goal_render.png')
+  parser.add_argument('--output', default='figs/sawyer_bin/bin_goal_render.png')
   parser.add_argument('--width',  type=int, default=640)
   parser.add_argument('--height', type=int, default=480)
   args = parser.parse_args()

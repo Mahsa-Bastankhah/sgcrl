@@ -74,6 +74,7 @@ MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
 ROLLOUT_T=100
+CRL_STEPS_PER_ITER=50
 
 TAUS=(0)
 TAU=${TAUS[$SLURM_ARRAY_TASK_ID]}
@@ -105,6 +106,8 @@ python -u ppo_contrastive.py \
   --ppo_checkpoint_interval=150 \
   --builderbench_use_pd=true \
   --builderbench_pd_duration=5 \
+  --ppo_rollout_length="${ROLLOUT_T}" \
+  --ppo_crl_steps_per_iter="${CRL_STEPS_PER_ITER}" \
   --ppo_skip_first_eval=true \
   --ppo_eval_interval=0 \
   --max_replay_size="${MAX_REPLAY_SIZE}" \

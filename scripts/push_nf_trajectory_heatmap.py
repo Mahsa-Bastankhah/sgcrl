@@ -13,12 +13,12 @@ Example::
   # 2) Heatmaps for every checkpoint in a run
   python scripts/push_nf_trajectory_heatmap.py --mode heatmaps \\
       --checkpoint=logs/ppo_nf_push_v4/ppo_sawyer_push_0/checkpoints \\
-      --output=figs/push_nf_traj_hm/seed0/
+      --output=figs/sawyer_push/push_nf_traj_hm/seed0/
 
   # 3) Both
   python scripts/push_nf_trajectory_heatmap.py --mode all \\
       --checkpoint=logs/ppo_nf_push_v4/ppo_sawyer_push_0/checkpoints \\
-      --output=figs/push_nf_traj_hm/seed0/
+      --output=figs/sawyer_push/push_nf_traj_hm/seed0/
 """
 from __future__ import annotations
 
@@ -617,7 +617,7 @@ def main():
     ap.add_argument('--mode', choices=['preview', 'heatmaps', 'all'], default='all')
     ap.add_argument('--checkpoint', default='',
                     help='Checkpoint dir or .pkl (required for heatmaps/all)')
-    ap.add_argument('--output', default='figs/push_nf_traj_hm',
+    ap.add_argument('--output', default='figs/sawyer_push/push_nf_traj_hm',
                     help='Output directory')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--n_along', type=int, default=9,

@@ -158,7 +158,15 @@ if not hasattr(_jax_xla, 'pytype_aval_mappings'):
 #   `tfp = tensorflow_probability.substrates.jax` at import time.
 # TFP 0.25 only attaches `.substrates` after the jax submodule is imported,
 # and its jax backend expects TF + tf_keras to be present.
+#
+# tf_keras is only a separate pip package (needed for Keras-3 TF releases,
+# e.g. the sgcrl_builderbench env's TF 2.21). Older envs (e.g. sgcrl_flow's
+# TF 2.8) ship Keras built into `tf.keras` and never had tf_keras installed,
+# nor do they need it — so this import is optional.
 # ---------------------------------------------------------------------------
 import tensorflow as _tf  # noqa: F401
-import tf_keras as _tf_keras  # noqa: F401
+try:
+    import tf_keras as _tf_keras  # noqa: F401
+except ImportError:
+    pass
 import tensorflow_probability.substrates.jax as _tfp_jax  # noqa: F401

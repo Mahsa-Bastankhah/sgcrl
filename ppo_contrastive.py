@@ -54,6 +54,15 @@ flags.DEFINE_integer('ppo_crl_steps_per_iter', -1,
                      'If >=0, overrides the per-env CRL-steps default.')
 flags.DEFINE_integer('ppo_num_envs', -1,
                      'If >=0, overrides the number of parallel env rollouts.')
+flags.DEFINE_integer(
+    'ppo_num_epochs', -1,
+    'If >=0, overrides PPO update epochs over each rollout batch '
+    '(ContrastiveConfig.ppo_num_epochs default=10).')
+flags.DEFINE_integer(
+    'ppo_num_minibatches', -1,
+    'If >=0, overrides minibatches per PPO epoch '
+    '(ContrastiveConfig.ppo_num_minibatches default=4). '
+    'Must divide rollout_length * num_envs evenly.')
 flags.DEFINE_float(
     'discount', -1.0,
     'If >=0, overrides ContrastiveConfig.discount (CRL discount).')
@@ -76,6 +85,14 @@ flags.DEFINE_bool(
     'If True, linearly decay PPO Adam learning rate to 0 over training; '
     'if False, use a fixed learning_rate.  Pass --noppo_anneal_lr to disable.')
 flags.DEFINE_bool(
+    'ppo_anneal_ent_coef', False,
+    'If True, linearly decay the PPO entropy-bonus coefficient from '
+    'ppo_ent_coef down to ppo_ent_coef_final over training (mirrors '
+    'ppo_anneal_lr). Off by default (fixed ent_coef).')
+flags.DEFINE_float(
+    'ppo_ent_coef_final', 0.0,
+    'Final entropy coefficient when --ppo_anneal_ent_coef is set.')
+flags.DEFINE_bool(
     'uniform_sampling', False,
     'If True, mix 50% uniformly sampled goals into each CRL replay batch. '
     'Half the in-batch InfoNCE negatives come from the uniform goal '
@@ -91,7 +108,46 @@ flags.DEFINE_string(
     "Density estimator for the PPO shaped reward. "
     "'crl' (default) = contrastive φ(s,a)·ψ(g) representations; "
     "'gaussian' = diagonal Gaussian p_θ(g|s), reward = log p_θ(g|s_t); "
-    "'nf' = conditional RealNVP log p_NF(g|s,a), reward = log p_NF.")
+    "'nf' = conditional RealNVP log p_NF(g|s,a), reward = log p_NF; "
+    "'td3' = twin Q(s,a,s_f) TD3-style on r=1{s≈s_f}, reward = Q1(s,a,g) "
+    "(or log((1−γ)Q1) with --ppo_td3_log_reward).")
+flags.DEFINE_float(
+    'ppo_td3_tau', -1.0,
+    'TD3 mode: Polyak τ for target Q networks. '
+    'Independent of ppo_crl_repr_tau. <0 keeps config default '
+    '(falls back to ContrastiveConfig.tau=0.005).')
+flags.DEFINE_float(
+    'ppo_td3_goal_tol', -1.0,
+    'TD3 mode: L2 tolerance for indicator 1{s≈s_f}. '
+    '<0 keeps config default (1e-2).')
+flags.DEFINE_boolean(
+    'ppo_td3_use_target_policy', False,
+    'TD3 mode: if True, sample a\' for Q(s\',a\',s_f) from a Polyak '
+    'target policy (same τ as Q targets); if False (default), use online '
+    'PPO policy.  PPO reward always uses online Q1.')
+flags.DEFINE_boolean(
+    'ppo_td3_cross_batch_goals', False,
+    'TD3 mode: if True, train Q(s_i,a_i,g_j) for every batch '
+    'goal g_j (B² backups); if False (default), only the paired g_i.')
+flags.DEFINE_boolean(
+    'ppo_td3_bilinear', False,
+    'TD3 mode: if True, Q(s,a,g)=x(s,a)·y(g) with x/y matching CRL φ/ψ '
+    '(repr_dim); if False (default), MLP on concat([s;g;a]).')
+flags.DEFINE_float(
+    'ppo_td3_reward_tau', -1.0,
+    'TD3 mode: EMA decay τ for Q params used in PPO reward r=Q1(s,a,g). '
+    'ema ← τ·ema + (1−τ)·online after each TD3 critic step. '
+    '0 = use online Q1 (default). Independent of ppo_td3_tau (Polyak). '
+    '<0 keeps config default.')
+flags.DEFINE_boolean(
+    'ppo_td3_log_reward', False,
+    'TD3 mode: if True, PPO reward is log((1−γ)·max(Q1, ε)) instead of '
+    'raw Q1 (log-occupancy / log-density scale).')
+flags.DEFINE_float(
+    'ppo_gaussian_reward_tau', -1.0,
+    'Gaussian mode: EMA decay τ for density params used in PPO reward '
+    'r=log p_θ(g|s,a). ema ← τ·ema + (1−τ)·online after each density step. '
+    '0 = use online params (default). <0 keeps config default.')
 flags.DEFINE_integer(
     'nf_rep_size', 64,
     'NF mode: SA encoder output dim (conditioning vector size).')
@@ -181,6 +237,12 @@ flags.DEFINE_float(
     'ema ← τ·ema + (1−τ)·online after each CRL step. '
     '0 = use online params (default). Higher τ = slower reward tracking. '
     '<0 keeps config default.')
+flags.DEFINE_float(
+    'ppo_nf_reward_tau', -1.0,
+    'NF mode: EMA decay τ for NF params used in PPO reward r=log p_NF(g|s,a). '
+    'ema ← τ·ema + (1−τ)·online after each NF density step. '
+    '0 = use online params (default). Higher τ = slower / smoother reward. '
+    'Independent of ppo_crl_repr_tau. <0 keeps config default.')
 flags.DEFINE_boolean(
     'bin_randomize_gripper_init', False,
     'SawyerBin: randomize initial gripper TCP offset around the object at reset.')
@@ -190,6 +252,11 @@ flags.DEFINE_boolean(
 flags.DEFINE_integer(
     'builderbench_pd_duration', 5,
     'BuilderBench PDWrapper: low-level MuJoCo steps per RL step when use_pd=True.')
+flags.DEFINE_boolean(
+    'builderbench_permute_start_boxes', True,
+    'BuilderBench: if True (default), randomly permute which cube gets which '
+    'start-box lane (y assignment) at reset. Set False to freeze lane order '
+    'from the task file (still samples x within each lane box).')
 flags.DEFINE_string(
     'hidden_layer_sizes', '',
     'Comma-separated hidden layer widths, e.g. "256,256,256,256,256,256". '
@@ -416,8 +483,16 @@ def main(_):
           f'(T={config.ppo_rollout_length}, '
           f'crl_steps={config.ppo_crl_steps_per_iter}).')
   else:
-    config.ppo_rollout_length = int(env_defaults['rollout_length'])
-    config.ppo_crl_steps_per_iter = int(env_defaults['crl_steps_per_iter'])
+    # BuilderBench PD mode deliberately omits these two keys now (see
+    # envs/builderbench_utils.ppo_env_defaults docstring): rollout_length
+    # and crl_steps_per_iter must always come from an explicit
+    # --ppo_rollout_length / --ppo_crl_steps_per_iter flag for PD jobs, not
+    # a hidden per-env formula. Non-PD envs still get them from
+    # PPO_ENV_DEFAULTS above.
+    if 'rollout_length' in env_defaults:
+      config.ppo_rollout_length = int(env_defaults['rollout_length'])
+    if 'crl_steps_per_iter' in env_defaults:
+      config.ppo_crl_steps_per_iter = int(env_defaults['crl_steps_per_iter'])
     if 'start_index' in env_defaults:
       config.start_index = int(env_defaults['start_index'])
     if 'end_index' in env_defaults:
@@ -437,6 +512,10 @@ def main(_):
     config.ppo_crl_steps_per_iter = int(FLAGS.ppo_crl_steps_per_iter)
   if FLAGS.ppo_num_envs >= 0:
     config.ppo_num_envs = int(FLAGS.ppo_num_envs)
+  if FLAGS.ppo_num_epochs >= 0:
+    config.ppo_num_epochs = int(FLAGS.ppo_num_epochs)
+  if FLAGS.ppo_num_minibatches >= 0:
+    config.ppo_num_minibatches = int(FLAGS.ppo_num_minibatches)
 
   total_steps = int(FLAGS.num_steps)
   if env_name.startswith('builderbench_'):
@@ -464,9 +543,23 @@ def main(_):
   if FLAGS.ppo_ent_coef >= 0.0:
     config.ppo_ent_coef = float(FLAGS.ppo_ent_coef)
   config.ppo_anneal_lr = bool(FLAGS.ppo_anneal_lr)
+  config.ppo_anneal_ent_coef = bool(FLAGS.ppo_anneal_ent_coef)
+  config.ppo_ent_coef_final = float(FLAGS.ppo_ent_coef_final)
   config.uniform_sampling = bool(FLAGS.uniform_sampling)
   config.ppo_reward_mode = str(FLAGS.ppo_reward_mode).strip()
   config.ppo_repr_mode = str(FLAGS.ppo_repr_mode).strip()
+  if FLAGS.ppo_td3_tau >= 0.0:
+    config.ppo_td3_tau = float(FLAGS.ppo_td3_tau)
+  if FLAGS.ppo_td3_goal_tol >= 0.0:
+    config.ppo_td3_goal_tol = float(FLAGS.ppo_td3_goal_tol)
+  config.ppo_td3_use_target_policy = bool(FLAGS.ppo_td3_use_target_policy)
+  config.ppo_td3_cross_batch_goals = bool(FLAGS.ppo_td3_cross_batch_goals)
+  config.ppo_td3_bilinear = bool(FLAGS.ppo_td3_bilinear)
+  if FLAGS.ppo_td3_reward_tau >= 0.0:
+    config.ppo_td3_reward_tau = float(FLAGS.ppo_td3_reward_tau)
+  config.ppo_td3_log_reward = bool(FLAGS.ppo_td3_log_reward)
+  if FLAGS.ppo_gaussian_reward_tau >= 0.0:
+    config.ppo_gaussian_reward_tau = float(FLAGS.ppo_gaussian_reward_tau)
   config.ppo_dirac_eps = float(FLAGS.ppo_dirac_eps)
   config.nf_rep_size = int(FLAGS.nf_rep_size)
   config.nf_num_blocks = int(FLAGS.nf_num_blocks)
@@ -501,6 +594,8 @@ def main(_):
     config.ppo_crl_loss_direction = FLAGS.ppo_crl_loss_direction.strip().lower()
   if FLAGS.ppo_crl_repr_tau >= 0.0:
     config.ppo_crl_repr_tau = float(FLAGS.ppo_crl_repr_tau)
+  if FLAGS.ppo_nf_reward_tau >= 0.0:
+    config.ppo_nf_reward_tau = float(FLAGS.ppo_nf_reward_tau)
   if FLAGS.hidden_layer_sizes.strip():
     config.hidden_layer_sizes = tuple(
         int(x) for x in FLAGS.hidden_layer_sizes.split(',') if x.strip())
@@ -509,9 +604,13 @@ def main(_):
         f'rollout_length={config.ppo_rollout_length}, '
         f'crl_steps_per_iter={config.ppo_crl_steps_per_iter}, '
         f'num_envs={config.ppo_num_envs}, '
+        f'num_epochs={config.ppo_num_epochs}, '
+        f'num_minibatches={config.ppo_num_minibatches}, '
         f'clip_coef={config.ppo_clip_coef}, '
         f'actor_min_std={config.ppo_actor_min_std}, '
         f'ent_coef={config.ppo_ent_coef}, '
+        f'anneal_ent_coef={config.ppo_anneal_ent_coef}'
+        f'{f"->{config.ppo_ent_coef_final}" if config.ppo_anneal_ent_coef else ""}, '
         f'discount_crl={config.discount}, '
         f'discount_ppo={config.ppo_discount if config.ppo_discount > 0 else config.discount}, '
         f'norm_reward={config.ppo_norm_reward}, '
@@ -520,6 +619,15 @@ def main(_):
         f'ppo_repr_mode={config.ppo_repr_mode!r}  '
         f'ppo_reward_mode={config.ppo_reward_mode!r}  '
         f'ppo_crl_repr_tau={config.ppo_crl_repr_tau}  '
+        f'ppo_nf_reward_tau={config.ppo_nf_reward_tau}  '
+        f'ppo_gaussian_reward_tau={config.ppo_gaussian_reward_tau}  '
+        f'ppo_td3_tau={config.ppo_td3_tau if config.ppo_td3_tau >= 0 else config.tau}  '
+        f'ppo_td3_goal_tol={config.ppo_td3_goal_tol}  '
+        f'ppo_td3_use_target_policy={config.ppo_td3_use_target_policy}  '
+        f'ppo_td3_cross_batch_goals={config.ppo_td3_cross_batch_goals}  '
+        f'ppo_td3_bilinear={config.ppo_td3_bilinear}  '
+        f'ppo_td3_reward_tau={config.ppo_td3_reward_tau}  '
+        f'ppo_td3_log_reward={config.ppo_td3_log_reward}  '
         f'ppo_dirac_eps={config.ppo_dirac_eps}  '
         f'max_replay_size={config.max_replay_size}  '
         f'ppo_min_replay_size={config.ppo_min_replay_size}  '
@@ -534,6 +642,10 @@ def main(_):
   # ---- Build env factories ----------------------------------------------
   fixed_start_end = (fixed_goal_for_env(env_name)
                      if config.fix_goals else None)
+  _hard_goal_print = (
+      fixed_start_end if fixed_start_end is not None
+      else fixed_goal_for_env(env_name))
+  print(f'[ppo_contrastive] hard_goal=\n{_hard_goal_print}')
 
   # NF push: start episodes with gripper closed (does not affect CRL/Gaussian).
   _env_kwargs = {}
@@ -547,13 +659,16 @@ def main(_):
   if env_name.startswith('builderbench_'):
     _env_kwargs['builderbench_use_pd'] = bool(FLAGS.builderbench_use_pd)
     _env_kwargs['builderbench_pd_duration'] = int(FLAGS.builderbench_pd_duration)
-    if FLAGS.builderbench_use_pd and FLAGS.ppo_rollout_length < 0:
-      pd_defaults = ppo_env_defaults_for_env(env_name, use_pd=True)
-      if pd_defaults is not None:
-        config.ppo_rollout_length = int(pd_defaults['rollout_length'])
-        config.ppo_crl_steps_per_iter = int(pd_defaults['crl_steps_per_iter'])
+    _env_kwargs['builderbench_permute_start_boxes'] = bool(
+        FLAGS.builderbench_permute_start_boxes)
+    # NOTE: this used to silently recompute ppo_rollout_length /
+    # ppo_crl_steps_per_iter a second time (duplicating the block above at
+    # ~line 476) whenever the flags were left unset. Removed: for PD mode
+    # these must always be explicit --ppo_rollout_length /
+    # --ppo_crl_steps_per_iter flags now.
     print(f'[ppo] builderbench: use_pd={FLAGS.builderbench_use_pd} '
-          f'pd_duration={FLAGS.builderbench_pd_duration}'
+          f'pd_duration={FLAGS.builderbench_pd_duration} '
+          f'permute_start_boxes={FLAGS.builderbench_permute_start_boxes}'
           + (' pd_policy_obs=pos+select' if FLAGS.builderbench_use_pd else ''))
 
   def env_factory(s):

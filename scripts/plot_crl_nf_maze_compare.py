@@ -13,7 +13,7 @@ Example::
       --env point_SixteenRoomsActual4D \\
       --crl_ckpt logs/ppo_sixteenroomsactual4d/ppo_point_SixteenRoomsActual4D_120/checkpoints/ckpt_iter_0000000.pkl \\
       --nf_ckpt logs/ppo_nf_sixteenroomsactual4d/ppo_point_SixteenRoomsActual4D_0/checkpoints/ckpt_iter_0000000.pkl \\
-      --output figs/sixteenrooms_crl_nf_iter0.png
+      --output figs/sixteenrooms/sixteenrooms_crl_nf_iter0.png
 """
 from __future__ import annotations
 

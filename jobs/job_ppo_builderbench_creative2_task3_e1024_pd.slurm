@@ -90,6 +90,8 @@ python -u ppo_contrastive.py \
   --ppo_checkpoint_interval=150 \
   --builderbench_use_pd=true \
   --builderbench_pd_duration=5 \
+  --ppo_rollout_length=40 \
+  --ppo_crl_steps_per_iter=20 \
   --ppo_skip_first_eval=true \
   --ppo_eval_interval=0 \
   --hidden_layer_sizes="256,256,256,256,256,256"

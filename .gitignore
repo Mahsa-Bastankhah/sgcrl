@@ -20,4 +20,6 @@ figs/
 .pip_cache/
 .slurm
 /slurm
+checkpoints/
+
 

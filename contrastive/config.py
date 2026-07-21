@@ -171,6 +171,11 @@ class ContrastiveConfig:
   # the policy to collapse after a few PPO epochs.
   ppo_norm_reward: bool = True
   ppo_anneal_lr: bool = True
+  # If True, linearly anneal ppo_ent_coef -> ppo_ent_coef_final over all PPO
+  # SGD updates (mirrors ppo_anneal_lr's schedule). Off by default so existing
+  # runs keep a fixed entropy bonus unless explicitly opted in.
+  ppo_anneal_ent_coef: bool = False
+  ppo_ent_coef_final: float = 0.0
   ppo_target_kl: Optional[float] = None
   # Minimum policy std for the PPO actor.  The shared `make_networks`
   # floor is 1e-6 (fine for SAC where adaptive-α controls entropy); PPO
@@ -187,6 +192,16 @@ class ContrastiveConfig:
   # Reward uses EMA params: ema ← τ·ema + (1−τ)·online after each CRL step.
   # τ=0 uses online params directly (no EMA).  Higher τ = slower / smoother reward.
   ppo_crl_repr_tau: float = 0.0
+  # EMA decay τ for NF params used in the PPO reward r = log p_NF(g|s,a)
+  # (NF mode only).  Same update: ema ← τ·ema + (1−τ)·online after each NF
+  # density step.  τ=0 uses online NF params (default).  Independent of
+  # ppo_crl_repr_tau.
+  ppo_nf_reward_tau: float = 0.0
+  # EMA decay τ for Gaussian density params used in PPO reward
+  # r = log p_θ(g|s,a) (gaussian mode only).  Same update as NF:
+  # ema ← τ·ema + (1−τ)·online after each density step.  τ=0 uses online
+  # params (default).  Independent of ppo_crl_repr_tau / ppo_nf_reward_tau.
+  ppo_gaussian_reward_tau: float = 0.0
   # Minimum replay size before CRL updates start.
   ppo_min_replay_size: int = 10_000
   # Checkpointing: save policy/value/CRL params every N PPO iterations.
@@ -212,7 +227,31 @@ class ContrastiveConfig:
   #   'crl'      (default) — φ(s,a)·ψ(g) contrastive representations.
   #   'gaussian' — diagonal Gaussian  p_θ(g|s); reward = log p_θ(g|s_t).
   #   'nf'       — conditional RealNVP  log p_NF(g|s,a); reward = log p_NF.
+  #   'td3'      — twin Q(s,a,s_f) with TD3 backup on r=1{s≈s_f};
+  #                PPO reward = Q1(s,a,g) (or log((1−γ)Q) if
+  #                ppo_td3_log_reward).  Target Polyak uses ppo_td3_tau
+  #                (falls back to `tau`); NOT ppo_crl_repr_tau.
   ppo_repr_mode: str = 'crl'
+  # Polyak τ for TD3 target Q networks when ppo_repr_mode='td3'.
+  # Independent of ppo_crl_repr_tau (CRL reward EMA).  <0 → use `tau`.
+  ppo_td3_tau: float = -1.0
+  # Goal-hit tolerance for the sparse indicator 1{‖obs_to_goal(s')−g‖ < tol}.
+  ppo_td3_goal_tol: float = 1e-2
+  # If True, TD3 backup samples a' from a Polyak target policy π̄
+  # (same τ as Q targets) instead of the online PPO policy.  Default off.
+  ppo_td3_use_target_policy: bool = False
+  # If True, each (s_i,a_i,s'_i) is trained vs every batch goal g_j
+  # (B² TD backups).  If False (default), only the paired g_i is used.
+  ppo_td3_cross_batch_goals: bool = False
+  # If True, Q(s,a,g)=x(s,a)·y(g) with x/y matching CRL φ/ψ; else MLP([s;g;a]).
+  ppo_td3_bilinear: bool = False
+  # EMA decay τ for TD3 Q params used in the PPO reward r = Q1(s,a,g).
+  # Same update as NF: ema ← τ·ema + (1−τ)·online after each critic step.
+  # τ=0 uses online Q1 (default).  Independent of ppo_td3_tau (Polyak targets).
+  ppo_td3_reward_tau: float = 0.0
+  # If True, PPO reward is log((1−γ)·max(Q1, ε)) instead of raw Q1
+  # (log-occupancy scale, comparable to Gaussian/NF log p).
+  ppo_td3_log_reward: bool = False
   # NF-specific options (only used when ppo_repr_mode == 'nf').
   nf_rep_size: int = 256       # SA encoder output dim (conditioning vector)
   nf_num_blocks: int = 12      # number of affine coupling blocks
