@@ -876,6 +876,81 @@ def make_scan_crl_update_fn(
   return multi_update
 
 
+def make_onpolicy_crl_update_fn(
+    networks: contrastive_networks.ContrastiveNetworks,
+    q_optimizer: optax.GradientTransformation,
+    config: contrastive_config.ContrastiveConfig,
+    backward: bool = False,
+    repr_tau: float = 0.0,
+):
+  """Pure on-policy CRL updater over fresh (T, E, ...) rollout tensors."""
+  _, raw_update = make_crl_update_fn(
+      networks, q_optimizer, backward=backward, _return_raw=True)
+
+  obs_dim = int(config.obs_dim)
+  start_index = int(config.start_index)
+  end_index = int(config.end_index)
+  discount = float(config.discount)
+  batch_size = int(config.batch_size)
+  use_ema = 0.0 < float(repr_tau) < 1.0
+  _tau = float(repr_tau)
+
+  @jax.jit
+  def onpolicy_update(q_params, q_opt_state, q_params_ema, roll_obs, roll_acts, roll_dones, key):
+    T, E, _ = roll_obs.shape
+
+    # Reverse scan to compute distance to episode done boundary
+    def rev_scan(carry, done_t):
+      val = jnp.where(done_t, 0, carry + 1)
+      return val, val
+
+    _, dist_to_done = jax.lax.scan(rev_scan, jnp.zeros(E, dtype=jnp.int32), roll_dones[::-1])
+    dist_to_done = dist_to_done[::-1]
+
+    # Upper bound future distance by current tensor dimensions
+    t_indices = jnp.arange(T)[:, None]
+    max_d_tensor = jnp.minimum(dist_to_done, T - 1 - t_indices)
+
+    # Sample anchors (t, e)
+    key, k_t, k_e, k_d, k_crl = jax.random.split(key, 5)
+    t_samp = jax.random.randint(k_t, (batch_size,), 0, T)
+    e_samp = jax.random.randint(k_e, (batch_size,), 0, E)
+    max_d_samp = max_d_tensor[t_samp, e_samp]
+
+    # Sample offset d using truncated geometric distribution
+    trunc_cdf = 1.0 - jnp.power(discount, max_d_samp.astype(jnp.float32))
+    u_d = jax.random.uniform(k_d, (batch_size,)) * trunc_cdf
+    d_samp = 1 + jnp.floor(jnp.log1p(-u_d) / jnp.log(discount)).astype(jnp.int32)
+    d_samp = jnp.clip(d_samp, 1, jnp.maximum(1, max_d_samp))
+    d_samp = jnp.where(max_d_samp == 0, 0, d_samp)
+
+    j_samp = t_samp + d_samp
+
+    s_t = roll_obs[t_samp, e_samp, :obs_dim]
+    a_t = roll_acts[t_samp, e_samp]
+    s_j = roll_obs[j_samp, e_samp, :obs_dim]
+
+    if end_index == -1:
+      goal_j = s_j[:, start_index:]
+    else:
+      goal_j = s_j[:, start_index:end_index]
+
+    crl_obs = jnp.concatenate([s_t, goal_j], axis=-1)
+    batch = {'obs': crl_obs, 'action': a_t}
+
+    q_params, q_opt_state, metrics = raw_update(q_params, q_opt_state, batch, k_crl)
+
+    if use_ema:
+      q_params_ema = jax.tree_util.tree_map(
+          lambda t_val, o_val: _tau * t_val + (1.0 - _tau) * o_val, q_params_ema, q_params)
+    else:
+      q_params_ema = q_params
+
+    return q_params, q_opt_state, q_params_ema, key, metrics
+
+  return onpolicy_update
+
+
 # ---------------------------------------------------------------------------
 # Rollout collection (env stepping — runs in host/numpy, not jitted).
 # ---------------------------------------------------------------------------
@@ -1386,10 +1461,12 @@ def run_ppo_training(
     # Scan-based multi-step updater: one JIT dispatch for all CRL steps.
     crl_scan_update = make_scan_crl_update_fn(
         networks, q_optimizer, backward=_backward, repr_tau=_repr_tau)
+    onpolicy_crl_update = make_onpolicy_crl_update_fn(
+        networks, q_optimizer, config, backward=_backward, repr_tau=_repr_tau)
     print(f'[ppo] CRL loss direction: {_direction}')
     if _use_repr_ema:
       print(f'[ppo] CRL reward repr EMA: tau={_repr_tau} '
-            f'(InfoNCE still uses online φ, ψ)')
+            f'(InfoNCE still uses online ╧å, ╧ê)')
     gaussian_reward_fn = None
     nf_reward_fn = None
 
@@ -1502,11 +1579,19 @@ def run_ppo_training(
   for i in range(E):
     ep_obs[i].append(obs[i].copy())
 
+  if getattr(config, 'staggered_resets', False) and hasattr(vec_env, 'stagger_resets'):
+    print(f'[ppo] Applying staggered resets to {E} environments...')
+    vec_env.stagger_resets()
+    if _use_jax_bb_vec:
+      obs_packed = vec_env.pack_obs_from_state(vec_env._state)
+      obs = np.asarray(obs_packed, dtype=np.float32)
+      s0_states = np.asarray(obs[:, :int(config.obs_dim)], dtype=np.float32).copy()
+
   # ---- loggers ----------------------------------------------------------
   learner_logger = logger_fn(label='learner')
   eval_logger = logger_fn(label='eval')
 
-  # Persistent eval observers (mirrors Acme's evaluator loop).  Keeping
+  # Persistent eval observers (mirrors Acme's evaluator loop). Keeping
   # them alive across iterations is what lets `success_1000` and
   # `*_dist_{10,100,1000}` smooth over eval history.
   # RiverSwim: success = visited goal cell at least once (not env +1 reward).
@@ -1541,7 +1626,7 @@ def run_ppo_training(
 
   # ---- reward normalizer (CleanRL NormalizeReward) ----------------------
   # Normalizes the reps-based reward by the running std of discounted
-  # returns.  Critical for PPO with learned rewards — raw φ·ψ values can
+  # returns. Critical for PPO with learned rewards — raw ╧å┬╖╧ê values can
   # be O(10) and non-stationary, leading to unbounded advantages and
   # policy collapse within a handful of updates.
   norm_reward = bool(getattr(config, 'ppo_norm_reward', True))
@@ -1564,7 +1649,7 @@ def run_ppo_training(
     keep_msg = ('keep all milestones'
                 if ckpt_keep_last <= 0
                 else f'keep last {ckpt_keep_last} milestones')
-    print(f'[ppo] checkpoints → {checkpoint_dir} '
+    print(f'[ppo] checkpoints -> {checkpoint_dir} '
           f'(every {ckpt_interval} iters, {keep_msg})')
 
   warmup_percent = float(getattr(config, 'ppo_warmup_percent', 0.0))
@@ -1635,12 +1720,13 @@ def run_ppo_training(
                 ep_success_max[i], float(_roll_success[_t, i]))
           if _dones_t[i]:
             ep_obs[i].append(_term_t[i].copy())
-            try:
-              replay.add_episode(
-                  np.stack(ep_obs[i], axis=0),
-                  np.stack(ep_act[i], axis=0))
-            except AssertionError:
-              pass
+            if not getattr(config, 'crl_on_policy', False):
+              try:
+                replay.add_episode(
+                    np.stack(ep_obs[i], axis=0),
+                    np.stack(ep_act[i], axis=0))
+              except AssertionError:
+                pass
             ep_obs[i] = [_next_t[i].copy()]
             s0_states[i] = _next_t[i, :int(config.obs_dim)].copy()
             ep_act[i] = []
@@ -1698,12 +1784,13 @@ def run_ppo_training(
           ep_len[i] += 1
           if dones[i]:
             ep_obs[i].append(terminal_obs[i].copy())
-            try:
-              replay.add_episode(
-                  np.stack(ep_obs[i], axis=0),
-                  np.stack(ep_act[i], axis=0))
-            except AssertionError:
-              pass  # degenerate len-0 episodes; skip
+            if not getattr(config, 'crl_on_policy', False):
+              try:
+                replay.add_episode(
+                    np.stack(ep_obs[i], axis=0),
+                    np.stack(ep_act[i], axis=0))
+              except AssertionError:
+                pass  # degenerate len-0 episodes; skip
             ep_obs[i] = [next_obs[i].copy()]  # auto-reset state seeds next ep
             s0_states[i] = next_obs[i, :int(config.obs_dim)].copy()
             ep_act[i] = []
@@ -1747,7 +1834,7 @@ def run_ppo_training(
           _rew_flat  = np.asarray(
               reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j, _flat_s0_j))
         else:
-          # Default CRL: r = φ(s,a)·ψ(g)
+          # Default CRL: r = ╧å(s,a)┬╖╧ê(g)
           _rew_flat = np.asarray(
               reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
         roll_rew_raw[:] = _rew_flat.reshape(T, E)
@@ -1778,7 +1865,7 @@ def run_ppo_training(
       ret = np.full((T, E), np.nan, dtype=np.float32)
 
     # =================================================================
-    # 3. PPO updates (epochs × minibatches over flat T·E batch)
+    # 3. PPO updates (epochs ├ù minibatches over flat T┬╖E batch)
     # =================================================================
     ppo_metrics_agg: Dict[str, list] = {}
     early_stop = False
@@ -1822,10 +1909,23 @@ def run_ppo_training(
       mean_pg = float('nan')
 
     # =================================================================
-    # 4. CRL updates (off-policy, from replay)
+    # 4. CRL updates (off-policy from replay OR on-policy from rollouts)
     # =================================================================
     crl_metrics_agg: Dict[str, list] = {}
-    if replay.size >= int(config.ppo_min_replay_size):
+    _n_crl = int(config.ppo_crl_steps_per_iter)
+
+    if getattr(config, 'crl_on_policy', False):
+      j_roll_obs = jnp.asarray(roll_obs)
+      j_roll_acts = jnp.asarray(roll_acts)
+      j_roll_dones = jnp.asarray(roll_step_dones)
+      for _ in range(_n_crl):
+        key, k_onp = jax.random.split(key)
+        q_params, q_opt_state, q_params_reward, key, m = onpolicy_crl_update(
+            q_params, q_opt_state, q_params_reward,
+            j_roll_obs, j_roll_acts, j_roll_dones, k_onp)
+        for k_, v in m.items():
+          crl_metrics_agg.setdefault(k_, []).append(float(v))
+    elif replay.size >= int(config.ppo_min_replay_size):
       # Update goal normalisation stats from a fresh replay sample (NF only).
       if use_nf and not _nf_normalizer_reset_done:
         # First time NF activates: reset the return normalizer so the extreme
@@ -1851,7 +1951,6 @@ def run_ppo_training(
           _nf_stat_log[f'nf/goal_mean_{_di}'] = float(_gm)
           _nf_stat_log[f'nf/goal_std_{_di}']  = float(_gs)
 
-      _n_crl = int(config.ppo_crl_steps_per_iter)
       if use_nf or use_gaussian:
         # NF / Gaussian loops take extra args — keep the Python loop for now.
         for _ in range(_n_crl):
@@ -1874,7 +1973,7 @@ def run_ppo_training(
           for k_, v in m.items():
             crl_metrics_agg.setdefault(k_, []).append(float(v))
       else:
-        # Standard CRL: pre-sample all batches → one H→D transfer → one JIT.
+        # Standard CRL: pre-sample all batches -> one H->D transfer -> one JIT.
         # This eliminates _n_crl rounds of dispatch + host sync.
         _samples = [
             (replay.sample_with_uniform_negatives(
@@ -1907,11 +2006,11 @@ def run_ppo_training(
     _has_flow_dense = not np.all(np.isnan(roll_flow_dense_rew))
 
     log = {
-        'iteration':         iteration,
-        'learner_steps':     iteration,
-        'global_step':       global_step,
-        'sps':               global_step / max(1e-6, elapsed),
-        'replay_size':       int(replay.size),
+        'iteration':          iteration,
+        'learner_steps':      iteration,
+        'global_step':        global_step,
+        'sps':                global_step / max(1e-6, elapsed),
+        'replay_size':        int(replay.size),
         'reward_repr_mean':      float(np.nanmean(roll_rew)) if not is_warmup else float('nan'),
         'reward_repr_raw_mean':  float(np.nanmean(roll_rew_raw)) if not is_warmup else float('nan'),
         'reward_repr_raw_std':   float(np.nanstd(roll_rew_raw)) if not is_warmup else float('nan'),
@@ -1938,7 +2037,7 @@ def run_ppo_training(
           if recent_success else float('nan'))
 
     # Acme CSVLogger fixes columns on the *first* write and drops any later
-    # keys.  Seed NF/SA columns from iter 0 so training metrics land in CSV.
+    # keys. Seed NF/SA columns from iter 0 so training metrics land in CSV.
     if use_nf:
       log.update({
           'nf/density_loss': float('nan'),
@@ -2066,7 +2165,7 @@ def run_ppo_training(
 
     # =================================================================
     # 7. Checkpointing: ckpt_iter_{iter}.pkl every `ppo_checkpoint_interval`
-    #    iters + rolling latest.pkl.  Prune only if ppo_checkpoint_keep_last>0.
+    #    iters + rolling latest.pkl. Prune only if ppo_checkpoint_keep_last>0.
     # =================================================================
     if (ckpt_interval > 0
         and checkpoint_dir is not None

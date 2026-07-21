@@ -209,6 +209,13 @@ flags.DEFINE_float(
     'ppo_warmup_percent', 0.0,
     'Percentage of total iterations to wait before starting PPO actor updates '
     '(CRL trains during this time).')
+
+flags.DEFINE_boolean(
+    'staggered_resets', False,
+    'If True, randomly staggers the parallel environments before training begins to maximize batch diversity.')
+flags.DEFINE_boolean(
+    'crl_on_policy', False,
+    'If True, disables the replay buffer and trains CRL strictly on the current (T, E) rollout tensor.')
 # ---------------------------------------------------------------------------
 # Fixed-goal lookup reused from lp_contrastive.py.
 # ---------------------------------------------------------------------------
@@ -477,6 +484,8 @@ def main(_):
     config.ppo_ent_coef = float(FLAGS.ppo_ent_coef)
   config.ppo_anneal_lr = bool(FLAGS.ppo_anneal_lr)
   config.uniform_sampling = bool(FLAGS.uniform_sampling)
+  config.staggered_resets = bool(FLAGS.staggered_resets)
+  config.crl_on_policy = bool(FLAGS.crl_on_policy)
   config.ppo_reward_mode = str(FLAGS.ppo_reward_mode).strip()
   config.ppo_repr_mode = str(FLAGS.ppo_repr_mode).strip()
   config.ppo_dirac_eps = float(FLAGS.ppo_dirac_eps)

@@ -413,3 +413,36 @@ class JaxBuilderBenchVecEnv:
   @property
   def action_shape(self) -> Tuple[int, ...]:
     return (self._action_dim,)
+
+  def stagger_resets(self):
+    """Randomly advances environments by t ~ Uniform(0, episode_length) to desynchronize rollouts."""
+    if self._state is None:
+      self.reset_state()
+
+    self._rng, k_offset, k_scan = jax.random.split(self._rng, 3)
+    offsets = jax.random.randint(
+        k_offset, (self._num_envs,), 0, self._episode_length)
+
+    @jax.jit
+    def _warmup_scan(carry, step_idx):
+      state, rng = carry
+      rng, a_key = jax.random.split(rng)
+
+      # Sample random actions to progress the environment
+      actions = jax.random.uniform(
+          a_key, (self._num_envs, self._action_dim), minval=-1.0, maxval=1.0)
+      next_state = self._step_impl(state, actions)
+
+      # Mask: Only accept the next_state if this env hasn't reached its target offset yet
+      mask = step_idx < offsets
+      state = jax.tree_util.tree_map(
+          lambda ns, s: jnp.where(mask.reshape(
+              (-1,) + (1,) * (ns.ndim - 1)), ns, s),
+          next_state, state
+      )
+      return (state, rng), None
+
+    (self._state, _), _ = jax.lax.scan(_warmup_scan,
+                                       (self._state, k_scan), jnp.arange(self._episode_length))
+    print(
+        f'[jax_vec] Staggered resets applied (max offset: {self._episode_length})')
