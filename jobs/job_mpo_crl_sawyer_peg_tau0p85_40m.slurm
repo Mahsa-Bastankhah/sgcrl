@@ -1,16 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_rnd_push_e8
-#SBATCH --output=slurm/ppo_rnd_push_e8_%A_%a.log
-#SBATCH --error=slurm/ppo_rnd_push_e8_%A_%a.log
+#SBATCH --job-name=mpo_crl_peg_40m
+#SBATCH --output=slurm/mpo_crl_sawyer_peg_tau0p85_40m_%A_%a.log
+#SBATCH --error=slurm/mpo_crl_sawyer_peg_tau0p85_40m_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=10:00:00
+#SBATCH --time=24:00:00
 #SBATCH --account=seas
-#SBATCH --array=0-1
+#SBATCH --array=0-3
 
+# MPO-CRL Sawyer peg comparison against PPO-CRL tau=0.85:
+# 40M steps, E=4, T=256, forward CRL, geometric future goals only.
 module purge
 
 if [ -n "${LD_LIBRARY_PATH:-}" ]; then
@@ -62,16 +64,15 @@ fi
 
 if [ "$CUDA_LOADED" != 1 ]; then
   echo "ERROR: Could not load cudatoolkit and no /usr/local/cuda* found."
-  module avail cudatoolkit 2>&1 || true
-  ls -d /usr/local/cuda* 2>&1 || true
   exit 1
 fi
 
 cd /n/fs/mislresearch/sgcrl
-source .venv/bin/activate
+source /n/fs/mislresearch/miniconda3/etc/profile.d/conda.sh
+conda activate sgcrl_flow
 
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/n/fs/mislresearch/miniconda3/envs/sgcrl_flow/lib:${LD_LIBRARY_PATH}
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${HOME}/.mujoco/mujoco210/bin
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
 export MUJOCO_PY_MUJOCO_PATH=${HOME}/.mujoco/mujoco210
@@ -80,40 +81,59 @@ export PYTHONUNBUFFERED=1
 export TMPDIR=/n/fs/mislresearch/mb6458-tmp
 export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.8
 
-ENV=sawyer_push
-NUM_STEPS=${NUM_STEPS:-10000000}
-SEED_OFFSET=${SEED_OFFSET:-0}
-SEED=$(( SEED_OFFSET + ${SLURM_ARRAY_TASK_ID:-0} ))
-LOG_DIR=${LOG_DIR:-logs/ppo_rnd_push_e8}
+SEEDS=(17 42 101 202)
+SEED=${SEEDS[${SLURM_ARRAY_TASK_ID}]}
+
+ENV=sawyer_peg
+NUM_STEPS=${NUM_STEPS:-40000000}
+LOG_DIR="${LOG_DIR:-logs/mpo_crl_sawyer_peg_tau0p85_40m/}"
+NUM_ENVS=4
+ROLLOUT_T=256
+CRL_UPDATES=128
+POLICY_UPDATES=128
+POLICY_BATCH=256
+MIN_REPLAY=10000
+DISCOUNT=0.99
+# Equivalent to PPO reward EMA tau=0.85:
+# target <- 0.85 * target + 0.15 * online.
+REPR_TARGET_RATE=0.15
 
 mkdir -p slurm "${LOG_DIR}"
-echo "SLURM_JOB_ID=${SLURM_JOB_ID} task=${SLURM_ARRAY_TASK_ID} env=${ENV} seed=${SEED}"
+
+echo "SLURM_JOB_ID=${SLURM_JOB_ID} task=${SLURM_ARRAY_TASK_ID}"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} log_dir=${LOG_DIR}"
+echo "E=${NUM_ENVS} T=${ROLLOUT_T} policy_updates=${POLICY_UPDATES} crl_updates=${CRL_UPDATES}"
+echo "uniform_sampling=false repr_target_rate=${REPR_TARGET_RATE} discount=${DISCOUNT}"
 nvidia-smi || true
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
 
-python -u baseline-agents/ppo-rnd-gym.py \
+python -u baseline-agents/mpo-crl.py \
   --env="${ENV}" \
   --seed="${SEED}" \
   --num_steps="${NUM_STEPS}" \
-  --log_dir="${LOG_DIR}" \
-  --num_envs=8 \
-  --rollout_length=256 \
-  --num_epochs=4 \
-  --num_minibatches=8 \
-  --learning_rate=1e-4 \
-  --discount=.99 \
-  --int_discount=.99 \
-  --gae_lambda=.95 \
-  --clip_coef=.2 \
-  --ent_coef=.01 \
-  --int_coef=.25 \
-  --ext_coef=1 \
-  --hidden_sizes=256,256,256 \
-  --eval_interval=50 \
-  --eval_episodes=10 \
-  --checkpoint_interval=500
+  --mpo_log_dir_path="${LOG_DIR}" \
+  --mpo_num_envs="${NUM_ENVS}" \
+  --mpo_rollout_length="${ROLLOUT_T}" \
+  --mpo_policy_updates_per_iter="${POLICY_UPDATES}" \
+  --mpo_crl_updates_per_iter="${CRL_UPDATES}" \
+  --mpo_policy_batch_size="${POLICY_BATCH}" \
+  --mpo_crl_batch_size=256 \
+  --mpo_min_replay_size="${MIN_REPLAY}" \
+  --mpo_num_action_samples=20 \
+  --discount="${DISCOUNT}" \
+  --uniform_sampling=false \
+  --ppo_crl_loss_direction=forward \
+  --mpo_repr_target_update_rate="${REPR_TARGET_RATE}" \
+  --mpo_target_update_period=100 \
+  --mpo_policy_learning_rate=3e-4 \
+  --mpo_dual_learning_rate=1e-2 \
+  --mpo_policy_hidden_sizes="256,256,256,256,256,256" \
+  --hidden_layer_sizes="256,256,256,256,256,256" \
+  --mpo_eval_interval=10 \
+  --mpo_eval_episodes=5 \
+  --mpo_checkpoint_interval=200 \
+  --mpo_checkpoint_keep_last=5
 PY_EXIT=$?
 pkill -P $$ 2>/dev/null || true
 exit $PY_EXIT
