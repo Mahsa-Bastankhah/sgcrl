@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=mpo_bb_c1t1
-#SBATCH --output=slurm/mpo_crl_builderbench_creative1_task1_e1024_pd_%A_%a.log
-#SBATCH --error=slurm/mpo_crl_builderbench_creative1_task1_e1024_pd_%A_%a.log
+#SBATCH --job-name=mpo_bb_c3t1
+#SBATCH --output=slurm/mpo_crl_builderbench_creative3_task1_e1024_pd_%A_%a.log
+#SBATCH --error=slurm/mpo_crl_builderbench_creative3_task1_e1024_pd_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -9,13 +9,18 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
 #SBATCH --account=seas
-#SBATCH --array=0-0
+#SBATCH --array=0-1
 
-# Online MPO-CRL on BuilderBench creative-1-task1 (1 cube).
-# Scale: E=1024, T=32, CRL=16 (match PPO PD), 200M steps, 10M replay.
-# Acme SPI≈32: policy_updates=512 × batch=2048 / (1024×32) = 32.
-# Logs train_success_* from env metrics and periodic eval Success / Success 1000.
+# Online MPO-CRL on BuilderBench creative-3-task1 (3-cube stack).
+# Adapted from successful c1t1 run 3548904:
+#   - train/eval success logging
+#   - Acme SPI≈32
+#   - mem 128G (c1t1 OOM'd at 64G ~iter 60)
+# PPO PD scale for c3: T=50, CRL=25 (ep_len=50 with pd_duration=5).
+# SPI: 800 × 2048 / (1024×50) = 32.
 unset LD_PRELOAD
+unset JAX_PLATFORMS
+unset JAX_PLATFORM_NAME
 
 module purge
 
@@ -89,22 +94,21 @@ export PIP_CACHE_DIR=/n/fs/mislresearch/mb6458-tmp/pip-cache
 export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-ENV=${ENV:-builderbench_creative_1_task1}
-SEED=${SEED:-0}
+ENV=${ENV:-builderbench_creative_3_task1}
+SEED=${SEED:-${SLURM_ARRAY_TASK_ID:-0}}
 NUM_STEPS=${NUM_STEPS:-200000000}
 NUM_ENVS=${NUM_ENVS:-1024}
 MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
-ROLLOUT_T=${ROLLOUT_T:-32}
-CRL_UPDATES=${CRL_UPDATES:-16}
-POLICY_UPDATES=${POLICY_UPDATES:-512}
+ROLLOUT_T=${ROLLOUT_T:-50}
+CRL_UPDATES=${CRL_UPDATES:-25}
+POLICY_UPDATES=${POLICY_UPDATES:-800}
 POLICY_BATCH=${POLICY_BATCH:-2048}
 REPR_TARGET_RATE=${REPR_TARGET_RATE:-0.005}
 EVAL_INTERVAL=${EVAL_INTERVAL:-10}
 EVAL_EPISODES=${EVAL_EPISODES:-8}
 DISCOUNT=0.99
 
-# Fresh log dir so CSV columns include train/eval success (old run had eval off).
-LOG_DIR="${LOG_DIR:-logs/mpo_crl_builderbench_creative1_task1_e1024_pd_succ/}"
+LOG_DIR="${LOG_DIR:-logs/mpo_crl_builderbench_creative3_task1_e1024_pd_fast_succ/}"
 
 mkdir -p slurm "${LOG_DIR}"
 
@@ -121,6 +125,10 @@ echo "steps_per_iter=$((NUM_ENVS * ROLLOUT_T))"
 echo "num_iterations=$((NUM_STEPS / (NUM_ENVS * ROLLOUT_T)))"
 nvidia-smi || true
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
+
+GPU_DMON_LOG="slurm/gpu_dmon_mpo_c3t1_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}.log"
+nvidia-smi dmon -s pucm -d 1 -o DT > "${GPU_DMON_LOG}" 2>&1 &
+GPU_DMON_PID=$!
 
 python -u baseline-agents/mpo-crl.py \
   --env="${ENV}" \
@@ -149,5 +157,6 @@ python -u baseline-agents/mpo-crl.py \
   --mpo_checkpoint_interval=150 \
   --mpo_checkpoint_keep_last=5
 PY_EXIT=$?
+kill "${GPU_DMON_PID}" 2>/dev/null || true
 pkill -P $$ 2>/dev/null || true
 exit $PY_EXIT

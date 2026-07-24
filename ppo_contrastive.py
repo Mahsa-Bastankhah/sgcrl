@@ -52,6 +52,10 @@ flags.DEFINE_integer('ppo_rollout_length', -1,
                      'If >=0, overrides the per-env rollout length default.')
 flags.DEFINE_integer('ppo_crl_steps_per_iter', -1,
                      'If >=0, overrides the per-env CRL-steps default.')
+flags.DEFINE_integer(
+    'ppo_crl_batch_size', -1,
+    'If >0, overrides the replay batch size used by each PPO-CRL update '
+    '(ContrastiveConfig.batch_size default=256).')
 flags.DEFINE_integer('ppo_num_envs', -1,
                      'If >=0, overrides the number of parallel env rollouts.')
 flags.DEFINE_integer(
@@ -539,6 +543,8 @@ def main(_):
     config.ppo_rollout_length = int(FLAGS.ppo_rollout_length)
   if FLAGS.ppo_crl_steps_per_iter >= 0:
     config.ppo_crl_steps_per_iter = int(FLAGS.ppo_crl_steps_per_iter)
+  if FLAGS.ppo_crl_batch_size > 0:
+    config.batch_size = int(FLAGS.ppo_crl_batch_size)
   if FLAGS.ppo_num_envs >= 0:
     config.ppo_num_envs = int(FLAGS.ppo_num_envs)
   if FLAGS.ppo_num_epochs >= 0:

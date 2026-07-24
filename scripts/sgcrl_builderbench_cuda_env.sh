@@ -3,6 +3,9 @@
 # on LD_LIBRARY_PATH *before* the system CUDA toolkit, or JAX falls back to CPU.
 
 unset LD_PRELOAD
+# Never inherit a submitter-forced CPU platform into GPU training jobs.
+unset JAX_PLATFORMS
+unset JAX_PLATFORM_NAME
 
 _CONDA_ENV="${CONDA_PREFIX:-/n/fs/mislresearch/miniconda3/envs/sgcrl_builderbench}"
 _NVIDIA_LIB_ROOT="${_CONDA_ENV}/lib/python3.11/site-packages/nvidia"

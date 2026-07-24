@@ -160,6 +160,19 @@ class ObservationReplay:
     indices = rng.integers(0, self._size, size=int(batch_size))
     return self._storage[indices]
 
+  def sample_batches(
+      self,
+      num_batches: int,
+      batch_size: int,
+      rng: np.random.Generator,
+  ) -> np.ndarray:
+    """Sample a stack of batches for one compiled learner scan."""
+    if self._size < batch_size:
+      raise ValueError(f'replay has {self._size} observations, need {batch_size}')
+    indices = rng.integers(
+        0, self._size, size=(int(num_batches), int(batch_size)))
+    return self._storage[indices]
+
 
 def _tree_copy(tree):
   return jax.tree_util.tree_map(lambda x: x, tree)
@@ -326,6 +339,13 @@ def _append_metrics(destination: Dict[str, list], metrics: Dict[str, Any]) -> No
     destination.setdefault(key, []).append(float(np.asarray(value)))
 
 
+def _mean_device_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
+  """Transfer one reduced metric value per key after a compiled update scan."""
+  reduced = jax.device_get(
+      jax.tree_util.tree_map(lambda value: jnp.mean(value), metrics))
+  return {key: float(value) for key, value in reduced.items()}
+
+
 def run_mpo_crl_training(
     config,
     mpo_config: MPOCRLConfig,
@@ -396,6 +416,37 @@ def run_mpo_crl_training(
   crl_update = ppo_learner.make_crl_update_fn(
       crl_networks, q_optimizer, backward=backward)
 
+  @jax.jit
+  def mpo_update_scan(
+      scan_state: MPOCRLTrainingState,
+      observation_batches: jnp.ndarray,
+  ):
+    """Run all replay updates sequentially on device without host syncs."""
+    def body(carry, observations):
+      return mpo_update(carry, observations)
+    return jax.lax.scan(body, scan_state, observation_batches)
+
+  @jax.jit
+  def crl_update_scan(
+      scan_state: MPOCRLTrainingState,
+      batches: Dict[str, jnp.ndarray],
+  ):
+    """Run CRL updates and target updates in one compiled device scan."""
+    def body(carry, batch):
+      state_key, update_key = jax.random.split(carry.key)
+      q_params, q_opt_state, metrics = crl_update(
+          carry.q_params, carry.q_optimizer_state, batch, update_key)
+      target_q_params = _incremental_update_tree(
+          carry.target_q_params, q_params,
+          mpo_config.repr_target_update_rate)
+      carry = carry._replace(
+          q_params=q_params,
+          target_q_params=target_q_params,
+          q_optimizer_state=q_opt_state,
+          key=state_key)
+      return carry, metrics
+    return jax.lax.scan(body, scan_state, batches)
+
   env_name = str(getattr(config, 'env_name', '') or '')
   use_jax_bb = env_name.startswith('builderbench_')
   if use_jax_bb:
@@ -433,6 +484,25 @@ def run_mpo_crl_training(
       int(config.max_replay_size), vec_env.observation_shape)
   rng = np.random.default_rng(seed + 12345)
 
+  # ---- uniform-sampling goal bounds (mirrors ppo_learner.py) -------------
+  uniform_sampling = bool(getattr(config, 'uniform_sampling', False))
+  goal_low = goal_high = None
+  if uniform_sampling:
+    import env_utils as _env_utils
+    if hasattr(vec_env, 'uniform_goal_obs_bounds'):
+      glo, ghi = vec_env.uniform_goal_obs_bounds()
+      si, ei = int(config.start_index), int(config.end_index)
+      if ei == -1:
+        ei = int(config.obs_dim)
+      goal_low = np.asarray(glo[si:ei], dtype=np.float32)
+      goal_high = np.asarray(ghi[si:ei], dtype=np.float32)
+    else:
+      goal_low, goal_high = _env_utils.resolve_uniform_goal_bounds(
+          environment_spec, vec_env._envs[0], int(config.obs_dim),
+          int(config.start_index), int(config.end_index))
+    print(f'[mpo-crl] uniform_sampling: goal_low={goal_low}, '
+          f'goal_high={goal_high}')
+
   start_iteration = 0
   global_step = 0
   if checkpoint_dir is not None:
@@ -454,6 +524,31 @@ def run_mpo_crl_training(
   @jax.jit
   def target_mode(params, observation):
     return policy_network.apply(params, observation).mode()
+
+  bb_mpo_unroll = (
+      vec_env.compile_mpo_unroll(
+          target_action, int(mpo_config.rollout_length))
+      if use_jax_bb else None)
+  bb_eval_vec = None
+  bb_eval_unroll = None
+  if use_jax_bb and mpo_config.eval_interval > 0:
+    bb_eval_vec = _mod.JaxBuilderBenchVecEnv(
+        env_name=env_name,
+        num_envs=int(mpo_config.eval_episodes),
+        seed=int(seed * 31 + 77),
+        use_pd=bool(_bb_kw.get('builderbench_use_pd', False)),
+        pd_duration=int(_bb_kw.get('builderbench_pd_duration', 5)),
+        pd_filter_policy_obs=bool(
+            _bb_kw.get('builderbench_pd_filter_policy_obs', True)),
+        fixed_target_goal=_bb_kw.get('fixed_target_goal'),
+        permute_start_boxes=bool(
+            _bb_kw.get('builderbench_permute_start_boxes', True)),
+    )
+    bb_eval_unroll = bb_eval_vec.compile_eval_unroll(
+        target_mode, unroll_length=bb_eval_vec.episode_length)
+    print(f'[mpo-crl] BuilderBench eval: jax.lax.scan '
+          f'(E={mpo_config.eval_episodes}, '
+          f'ep_len={bb_eval_vec.episode_length})')
 
   obs = vec_env.reset()
   num_envs = vec_env.num_envs
@@ -491,78 +586,158 @@ def run_mpo_crl_training(
       int(mpo_config.rollout_length) * num_envs)
   start_time = time.time()
   for iteration in range(start_iteration, iterations):
-    env_rewards = []
-    for _ in range(int(mpo_config.rollout_length)):
-      observation_replay.add(obs)
-      next_key, action_key = jax.random.split(state.key)
-      state = state._replace(key=next_key)
-      raw_action = np.asarray(target_action(
-          state.target_policy_params, jnp.asarray(obs), action_key))
-      action = np.clip(
-          np.nan_to_num(raw_action, nan=0.0), np.asarray(action_spec.minimum),
-          np.asarray(action_spec.maximum)).astype(np.float32)
-      next_obs, reward, dones, terminal_obs, _ = vec_env.step(action)
-      env_rewards.append(reward)
-      step_success = None
-      if track_train_success:
-        step_success = np.asarray(vec_env.last_success, dtype=np.float32)
-      for index in range(num_envs):
-        episode_actions[index].append(action[index].copy())
-        episode_returns[index] += float(reward[index])
-        episode_lengths[index] += 1
-        if step_success is not None:
-          ep_success_max[index] = max(
-              ep_success_max[index], float(step_success[index]))
-        if dones[index]:
-          episode_obs[index].append(terminal_obs[index].copy())
-          episode_replay.add_episode(
-              np.stack(episode_obs[index]),
-              np.stack(episode_actions[index]))
-          recent_returns.append(float(episode_returns[index]))
-          recent_lengths.append(int(episode_lengths[index]))
-          recent_returns[:] = recent_returns[-100:]
-          recent_lengths[:] = recent_lengths[-100:]
-          if step_success is not None:
-            recent_success.append(float(ep_success_max[index] >= 0.5))
-            if len(recent_success) > 1000:
-              recent_success.pop(0)
-            ep_success_max[index] = 0.0
-          episode_obs[index] = [next_obs[index].copy()]
-          episode_actions[index] = []
-          episode_returns[index] = 0.0
-          episode_lengths[index] = 0
-        else:
-          episode_obs[index].append(next_obs[index].copy())
-      obs = next_obs
-      global_step += num_envs
+    iteration_start = time.perf_counter()
+    if bb_mpo_unroll is not None:
+      # One policy+environment launch for the entire rollout. Device outputs
+      # cross to the host once for replay insertion and episode accounting.
+      (vec_env._state, collect_key), steps_j = bb_mpo_unroll(
+          vec_env._state, state.target_policy_params, state.key)
+      state = state._replace(key=collect_key)
+      steps = jax.device_get(steps_j)
+      rollout_obs = np.asarray(steps['obs'], dtype=np.float32)
+      rollout_actions = np.asarray(steps['actions'], dtype=np.float32)
+      env_rewards = np.asarray(steps['env_rew'], dtype=np.float32)
+      rollout_success = np.asarray(steps['success'], dtype=np.float32)
+      rollout_dones = np.asarray(steps['step_dones'], dtype=bool)
+      terminal_obs_rollout = np.asarray(
+          steps['terminal_obs'], dtype=np.float32)
+      next_obs_rollout = np.asarray(steps['next_obs'], dtype=np.float32)
+      observation_replay.add(rollout_obs)
 
-    crl_metrics: Dict[str, list] = {}
+      # BuilderBench PD jobs use T == episode length, so all synchronized
+      # environments normally terminate once at the final scan step. Handle
+      # that common case with one Python loop over E instead of T*E.
+      aligned_episodes = (
+          not np.any(rollout_dones[:-1])
+          and np.all(rollout_dones[-1])
+          and all(not actions for actions in episode_actions))
+      if aligned_episodes:
+        rollout_returns = np.sum(env_rewards, axis=0)
+        rollout_successes = np.max(rollout_success, axis=0) >= 0.5
+        for index in range(num_envs):
+          episode_replay.add_episode(
+              np.concatenate(
+                  [rollout_obs[:, index],
+                   terminal_obs_rollout[-1, index][None]],
+                  axis=0),
+              rollout_actions[:, index])
+        recent_returns.extend(rollout_returns.astype(float).tolist())
+        recent_lengths.extend(
+            [int(mpo_config.rollout_length)] * num_envs)
+        recent_success.extend(
+            rollout_successes.astype(float).tolist())
+        recent_returns[:] = recent_returns[-100:]
+        recent_lengths[:] = recent_lengths[-100:]
+        recent_success[:] = recent_success[-1000:]
+        obs = next_obs_rollout[-1]
+        episode_obs = [[obs[index].copy()] for index in range(num_envs)]
+      else:
+        # Generic fallback for early termination or a resumed partial episode.
+        for timestep in range(int(mpo_config.rollout_length)):
+          for index in range(num_envs):
+            episode_actions[index].append(
+                rollout_actions[timestep, index].copy())
+            episode_returns[index] += float(env_rewards[timestep, index])
+            episode_lengths[index] += 1
+            ep_success_max[index] = max(
+                ep_success_max[index],
+                float(rollout_success[timestep, index]))
+            if rollout_dones[timestep, index]:
+              episode_obs[index].append(
+                  terminal_obs_rollout[timestep, index].copy())
+              episode_replay.add_episode(
+                  np.stack(episode_obs[index]),
+                  np.stack(episode_actions[index]))
+              recent_returns.append(float(episode_returns[index]))
+              recent_lengths.append(int(episode_lengths[index]))
+              recent_success.append(
+                  float(ep_success_max[index] >= 0.5))
+              recent_returns[:] = recent_returns[-100:]
+              recent_lengths[:] = recent_lengths[-100:]
+              recent_success[:] = recent_success[-1000:]
+              episode_obs[index] = [
+                  next_obs_rollout[timestep, index].copy()]
+              episode_actions[index] = []
+              episode_returns[index] = 0.0
+              episode_lengths[index] = 0
+              ep_success_max[index] = 0.0
+            else:
+              episode_obs[index].append(
+                  next_obs_rollout[timestep, index].copy())
+        obs = next_obs_rollout[-1]
+      global_step += int(mpo_config.rollout_length) * num_envs
+    else:
+      env_rewards = []
+      for _ in range(int(mpo_config.rollout_length)):
+        observation_replay.add(obs)
+        next_key, action_key = jax.random.split(state.key)
+        state = state._replace(key=next_key)
+        raw_action = np.asarray(target_action(
+            state.target_policy_params, jnp.asarray(obs), action_key))
+        action = np.clip(
+            np.nan_to_num(raw_action, nan=0.0),
+            np.asarray(action_spec.minimum),
+            np.asarray(action_spec.maximum)).astype(np.float32)
+        next_obs, reward, dones, terminal_obs, _ = vec_env.step(action)
+        env_rewards.append(reward)
+        for index in range(num_envs):
+          episode_actions[index].append(action[index].copy())
+          episode_returns[index] += float(reward[index])
+          episode_lengths[index] += 1
+          if dones[index]:
+            episode_obs[index].append(terminal_obs[index].copy())
+            episode_replay.add_episode(
+                np.stack(episode_obs[index]),
+                np.stack(episode_actions[index]))
+            recent_returns.append(float(episode_returns[index]))
+            recent_lengths.append(int(episode_lengths[index]))
+            recent_returns[:] = recent_returns[-100:]
+            recent_lengths[:] = recent_lengths[-100:]
+            episode_obs[index] = [next_obs[index].copy()]
+            episode_actions[index] = []
+            episode_returns[index] = 0.0
+            episode_lengths[index] = 0
+          else:
+            episode_obs[index].append(next_obs[index].copy())
+        obs = next_obs
+        global_step += num_envs
+
+    collect_seconds = time.perf_counter() - iteration_start
+    crl_start = time.perf_counter()
+    crl_metrics_mean: Dict[str, float] = {}
     if (episode_replay.size >= int(mpo_config.min_replay_size)
         and episode_replay.num_episodes > 0):
-      for _ in range(int(mpo_config.crl_updates_per_iter)):
-        batch_np = episode_replay.sample(int(config.batch_size), rng)
-        batch = {key_: jnp.asarray(value) for key_, value in batch_np.items()}
-        state_key, update_key = jax.random.split(state.key)
-        q_params, q_opt_state, metrics = crl_update(
-            state.q_params, state.q_optimizer_state, batch, update_key)
-        target_q_params = _incremental_update_tree(
-            state.target_q_params, q_params,
-            mpo_config.repr_target_update_rate)
-        state = state._replace(
-            q_params=q_params,
-            target_q_params=target_q_params,
-            q_optimizer_state=q_opt_state,
-            key=state_key)
-        _append_metrics(crl_metrics, metrics)
+      if uniform_sampling:
+        crl_batch_list = [
+            episode_replay.sample_with_uniform_negatives(
+                int(config.batch_size), rng, goal_low, goal_high)
+            for _ in range(int(mpo_config.crl_updates_per_iter))
+        ]
+      else:
+        crl_batch_list = [
+            episode_replay.sample(int(config.batch_size), rng)
+            for _ in range(int(mpo_config.crl_updates_per_iter))
+        ]
+      crl_batches = {
+          key_: jnp.asarray(
+              np.stack([batch[key_] for batch in crl_batch_list], axis=0))
+          for key_ in crl_batch_list[0]
+      }
+      state, crl_metrics = crl_update_scan(state, crl_batches)
+      crl_metrics_mean = _mean_device_metrics(crl_metrics)
 
-    mpo_metrics: Dict[str, list] = {}
+    crl_seconds = time.perf_counter() - crl_start
+    mpo_start = time.perf_counter()
+    mpo_metrics_mean: Dict[str, float] = {}
     if observation_replay.size >= max(
         int(mpo_config.min_replay_size), int(mpo_config.policy_batch_size)):
-      for _ in range(int(mpo_config.policy_updates_per_iter)):
-        policy_obs = jnp.asarray(observation_replay.sample(
-            int(mpo_config.policy_batch_size), rng))
-        state, metrics = mpo_update(state, policy_obs)
-        _append_metrics(mpo_metrics, metrics)
+      policy_batches = jnp.asarray(observation_replay.sample_batches(
+          int(mpo_config.policy_updates_per_iter),
+          int(mpo_config.policy_batch_size),
+          rng))
+      state, mpo_metrics = mpo_update_scan(state, policy_batches)
+      mpo_metrics_mean = _mean_device_metrics(mpo_metrics)
+    mpo_seconds = time.perf_counter() - mpo_start
 
     elapsed = time.time() - start_time
     log = {
@@ -579,6 +754,10 @@ def run_mpo_crl_training(
         'ep_length_mean': (
             float(np.mean(recent_lengths)) if recent_lengths else float('nan')),
         'mpo/policy_steps': int(state.policy_steps),
+        'timing/collect_seconds': collect_seconds,
+        'timing/crl_seconds': crl_seconds,
+        'timing/mpo_seconds': mpo_seconds,
+        'timing/iteration_seconds': time.perf_counter() - iteration_start,
     }
     if track_train_success:
       # Seed columns on first write so CSV keeps train success for the run.
@@ -603,41 +782,53 @@ def run_mpo_crl_training(
         'logits_pos', 'logsumexp', 'update_skipped_nonfinite'):
       log[f'crl/{key_}'] = float('nan')
     log.update({f'mpo/{key_}': value
-                for key_, value in _mean_metrics(mpo_metrics).items()})
+                for key_, value in mpo_metrics_mean.items()})
     log.update({f'crl/{key_}': value
-                for key_, value in _mean_metrics(crl_metrics).items()})
+                for key_, value in crl_metrics_mean.items()})
     learner_logger.write(log)
 
     if mpo_config.eval_interval > 0 and iteration % mpo_config.eval_interval == 0:
-      episode_metrics = []
-      for eval_index in range(int(mpo_config.eval_episodes)):
-        env = eval_env_factory(
-            seed + 900_000 + iteration * 100 + eval_index)
-        timestep = env.reset()
-        eval_success_observer.observe_first(env, timestep)
-        eval_distance_observer.observe_first(env, timestep)
-        episode_return = 0.0
-        episode_length = 0
-        while not timestep.last():
-          action = np.asarray(target_mode(
-              state.target_policy_params,
-              jnp.asarray(timestep.observation)[None]))[0]
-          action = np.clip(
-              np.nan_to_num(action, nan=0.0),
-              np.asarray(action_spec.minimum),
-              np.asarray(action_spec.maximum)).astype(action_spec.dtype)
-          timestep = env.step(action)
-          eval_success_observer.observe(env, timestep, action)
-          eval_distance_observer.observe(env, timestep, action)
-          episode_return += float(timestep.reward or 0.0)
-          episode_length += 1
-        metrics = {
-            'episode_return': episode_return,
-            'episode_length': episode_length,
-        }
-        metrics.update(eval_success_observer.get_metrics())
-        metrics.update(eval_distance_observer.get_metrics())
-        episode_metrics.append(metrics)
+      if bb_eval_unroll is not None:
+        eval_steps = bb_eval_unroll(
+            bb_eval_vec.reset_state(), state.target_policy_params)
+        episode_metrics = ppo_learner._bb_ep_metrics_from_eval_steps(
+            eval_steps,
+            obs_dim=int(config.obs_dim),
+            start_index=int(config.start_index),
+            end_index=int(config.end_index),
+            episode_length=bb_eval_vec.episode_length)
+        episode_metrics = ppo_learner._smooth_bb_eval_metrics(
+            episode_metrics, eval_success_observer, eval_distance_observer)
+      else:
+        episode_metrics = []
+        for eval_index in range(int(mpo_config.eval_episodes)):
+          env = eval_env_factory(
+              seed + 900_000 + iteration * 100 + eval_index)
+          timestep = env.reset()
+          eval_success_observer.observe_first(env, timestep)
+          eval_distance_observer.observe_first(env, timestep)
+          episode_return = 0.0
+          episode_length = 0
+          while not timestep.last():
+            action = np.asarray(target_mode(
+                state.target_policy_params,
+                jnp.asarray(timestep.observation)[None]))[0]
+            action = np.clip(
+                np.nan_to_num(action, nan=0.0),
+                np.asarray(action_spec.minimum),
+                np.asarray(action_spec.maximum)).astype(action_spec.dtype)
+            timestep = env.step(action)
+            eval_success_observer.observe(env, timestep, action)
+            eval_distance_observer.observe(env, timestep, action)
+            episode_return += float(timestep.reward or 0.0)
+            episode_length += 1
+          metrics = {
+              'episode_return': episode_return,
+              'episode_length': episode_length,
+          }
+          metrics.update(eval_success_observer.get_metrics())
+          metrics.update(eval_distance_observer.get_metrics())
+          episode_metrics.append(metrics)
       eval_logger.write(
           contrastive_utils.aggregate_eval_metrics(episode_metrics, iteration))
 

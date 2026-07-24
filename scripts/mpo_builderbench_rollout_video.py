@@ -1,16 +1,20 @@
-"""Render BuilderBench rollout videos from sgcrl PPO-CRL checkpoints.
+"""Render BuilderBench rollout videos from MPO-CRL checkpoints.
 
-Matches training setup by reading ``run_config.json`` next to the checkpoint
-(PD wrapper, macro episode length, obs packing / PD policy-obs filter, fixed
-goals, network sizes).
+Matches training by reading ``run_config.json`` next to the checkpoint
+(PD wrapper, macro episode length, obs packing / PD policy-obs filter,
+fixed goals, MPO policy sizes). Uses ``target_policy_params`` (same as
+training collection / eval).
 
 Examples:
-  python scripts/ppo_builderbench_rollout_video.py \\
-      --checkpoint=logs/ppo_builderbench_creative1_task1/.../checkpoints/latest.pkl \\
-      --output=videos/ppo_builderbench_creative1_task1/
+  python scripts/mpo_builderbench_rollout_video.py \\
+      --checkpoint=logs/mpo_crl_.../checkpoints/latest.pkl \\
+      --output=videos/builderbench/mpo_c2t1/
 """
+from __future__ import annotations
+
 import json
 import os
+import pickle
 import sys
 
 os.environ.setdefault('JAX_PLATFORMS', 'cpu')
@@ -18,12 +22,13 @@ os.environ.setdefault('MUJOCO_GL', 'egl')
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
+sys.path.insert(0, os.path.join(_REPO, 'baseline-agents'))
 _BUILDERBENCH_ROOT = os.environ.get(
     'BUILDERBENCH_ROOT', '/n/fs/mislresearch/builderbench')
 if _BUILDERBENCH_ROOT not in sys.path:
   sys.path.insert(0, _BUILDERBENCH_ROOT)
 
-import sgcrl_jax_acme_compat  # noqa: F401 ΓÇö must precede acme/jax imports
+import sgcrl_jax_acme_compat  # noqa: F401 — must precede acme/jax imports
 
 import argparse
 import glob
@@ -37,18 +42,16 @@ import numpy as np
 from acme import specs
 
 import contrastive
-from contrastive import ppo_learner
 from contrastive import utils as contrastive_utils
 from ppo_contrastive import fixed_goal_for_env, ppo_env_defaults_for_env
+import mpo_crl_learner
 from envs.builderbench_utils import (
     creative_cube_mj_episode_length,
     creative_cube_full_state_obs_dim,
     filter_pd_policy_state_obs,
-    get_filtered_obs_dim,
     is_builderbench_creative_env,
     parse_bb_env_id,
     pd_policy_state_obs_dim,
-    scaled_episode_length,
     sgcrl_env_name_to_bb_env_id,
     video_render_skip_reason,
 )
@@ -70,13 +73,11 @@ class _TrainCtx:
   filter_policy_obs: bool
   episode_length: int
   obs_dim: int
-  hidden_layer_sizes: Tuple[int, ...]
+  policy_hidden_sizes: Tuple[int, ...]
+  policy_init_scale: float
   fixed_target_goal: Optional[np.ndarray]
-  actor_min_std: float
   start_index: int
   end_index: int
-  obs_space_list: list[str]
-  episode_length_multiplier: float = 1.0
   permute_start_boxes: bool
 
 
@@ -90,7 +91,6 @@ def _get_video(
     mocap_targets,
     num_cubes: int,
 ):
-  """Roll out one episode and render frames (matches training PD macro steps)."""
   video_env_states = _get_trajectory(
       inference_policy,
       video_env,
@@ -113,7 +113,7 @@ def _get_video(
   return video_images
 
 
-def _maybe_fix_target(
+def _maybe_force_target(
     state,
     fixed_target_goal: Optional[np.ndarray],
     mocap_targets,
@@ -126,7 +126,6 @@ def _maybe_fix_target(
   info = dict(state.info)
   info['target_goal'] = jnp.broadcast_to(
       fixed, state.info['target_goal'].shape)
-  # render_from_info draws translucent targets from this info field.
   info['target_mocap_pos'] = jnp.broadcast_to(
       fixed_pos, state.info['target_mocap_pos'].shape)
   mocap_pos = state.data.mocap_pos.at[mocap_targets].set(fixed_pos)
@@ -148,7 +147,7 @@ def _get_trajectory(
   def _run(key):
     env_key, key = jax.random.split(key)
     state = env.reset(jax.random.split(env_key, 1))
-    state = _maybe_fix_target(
+    state = _maybe_force_target(
         state, fixed_target_goal, mocap_targets, num_cubes)
 
     def f(carry, _):
@@ -156,8 +155,7 @@ def _get_trajectory(
       key, act_key = jax.random.split(key)
       action, _ = policy(state.obs, state.info['target_goal'], act_key)
       next_state = env.step(state, action)
-      # Re-pin after step (AutoReset can reintroduce randomized goals).
-      next_state = _maybe_fix_target(
+      next_state = _maybe_force_target(
           next_state, fixed_target_goal, mocap_targets, num_cubes)
       return (next_state, key), next_state
 
@@ -168,11 +166,6 @@ def _get_trajectory(
 
 
 def _run_config_path_for_checkpoint(checkpoint_path: str) -> Optional[str]:
-  """Locate run_config.json for a ckpt file or directory.
-
-  Follows symlinks so stride/staging dirs (symlink farms of ckpt_iter_*.pkl)
-  still resolve to the real ``.../run_dir/run_config.json``.
-  """
   if os.path.isfile(checkpoint_path):
     ckpt_dir = os.path.dirname(os.path.realpath(checkpoint_path))
   else:
@@ -192,34 +185,29 @@ def _run_config_path_for_checkpoint(checkpoint_path: str) -> Optional[str]:
 
 
 def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
-  """Infer training settings from run_config.json or env defaults."""
   num_cubes, task_index = parse_bb_env_id(sgcrl_env_name_to_bb_env_id(env_name))
   mj_ep_len = creative_cube_mj_episode_length(num_cubes, task_index)
   full_obs_dim = creative_cube_full_state_obs_dim(num_cubes)
+  pd_obs_dim = pd_policy_state_obs_dim(num_cubes)
 
   cfg_path = _run_config_path_for_checkpoint(checkpoint_path)
   if cfg_path is not None:
     with open(cfg_path, 'r', encoding='utf-8') as fh:
       run_cfg: Dict[str, Any] = json.load(fh)
     flags = run_cfg.get('flags', {})
-    obs_space_str = flags.get('obs_space', 'xy,select')
-    obs_space_list = [s.strip() for s in obs_space_str.split(',')]
-    ep_mult = float(flags.get('builderbench_episode_length_multiplier', 1.0))
-    mj_ep_len = scaled_episode_length(num_cubes, ep_mult)
-    pd_obs_dim = get_filtered_obs_dim(num_cubes, obs_space_list)
     resolved = run_cfg.get('resolved_config', {})
-    ppo_defaults = run_cfg.get('ppo_env_defaults', {})
+    mpo_cfg = run_cfg.get('mpo_config', {})
+    env_defaults = run_cfg.get('env_defaults', {})
     use_pd = bool(flags.get('builderbench_use_pd', False))
     pd_duration = int(flags.get('builderbench_pd_duration', 5))
     obs_dim = int(resolved.get('obs_dim', full_obs_dim))
-    hidden = tuple(int(x) for x in resolved.get(
-        'hidden_layer_sizes', contrastive.ContrastiveConfig().hidden_layer_sizes))
-    actor_min_std = float(resolved.get(
-        'ppo_actor_min_std', contrastive.ContrastiveConfig().ppo_actor_min_std))
+    hidden = tuple(int(x) for x in mpo_cfg.get(
+        'policy_hidden_sizes', (256, 256, 256)))
+    init_scale = float(mpo_cfg.get('policy_init_scale', 0.7))
     start_index = int(resolved.get(
-        'start_index', ppo_defaults.get('start_index', 0)))
+        'start_index', env_defaults.get('start_index', 0)))
     end_index = int(resolved.get(
-        'end_index', ppo_defaults.get('end_index', num_cubes * 3)))
+        'end_index', env_defaults.get('end_index', num_cubes * 3)))
     fixed = run_cfg.get('fixed_start_end')
     fixed_goal = (None if fixed is None
                   else np.asarray(fixed, dtype=np.float32))
@@ -228,36 +216,24 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
   else:
     use_pd = False
     pd_duration = 5
-    ep_mult = 1.0
-    mj_ep_len = scaled_episode_length(num_cubes, ep_mult)
     obs_dim = full_obs_dim
     defaults = ppo_env_defaults_for_env(env_name) or {}
-    hidden = tuple(contrastive.ContrastiveConfig().hidden_layer_sizes)
-    actor_min_std = float(contrastive.ContrastiveConfig().ppo_actor_min_std)
+    hidden = (256, 256, 256)
+    init_scale = 0.7
     start_index = int(defaults.get('start_index', 0))
     end_index = int(defaults.get('end_index', num_cubes * 3))
     fixed_goal = fixed_goal_for_env(env_name)
-    obs_space_list = ['xy', 'select']
-    pd_obs_dim = pd_policy_state_obs_dim(num_cubes)
     permute_start_boxes = True
 
   if use_pd:
     macro_ep_len = mj_ep_len // pd_duration
     filter_policy = (obs_dim == pd_obs_dim)
     if obs_dim not in (pd_obs_dim, full_obs_dim):
-      print(f'[bb_video] WARNING: obs_dim={obs_dim} unexpected for PD; '
+      print(f'[mpo_bb_video] WARNING: obs_dim={obs_dim} unexpected for PD; '
             f'assuming filter={obs_dim == pd_obs_dim}')
   else:
     macro_ep_len = mj_ep_len
     filter_policy = False
-
-  print(f'[bb_video] training context: use_pd={use_pd} pd_duration={pd_duration} '
-        f'filter_policy_obs={filter_policy} obs_dim={obs_dim} '
-        f'ep_len={macro_ep_len} hidden={hidden} '
-        f'fixed_goal={fixed_goal is not None} '
-        f'actor_min_std={actor_min_std} '
-        f'start_index={start_index} end_index={end_index} '
-        f'obs_space_list={obs_space_list} ep_mult={ep_mult}')
 
   return _TrainCtx(
       use_pd=use_pd,
@@ -265,25 +241,21 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
       filter_policy_obs=filter_policy,
       episode_length=int(macro_ep_len),
       obs_dim=int(obs_dim),
-      hidden_layer_sizes=hidden,
+      policy_hidden_sizes=hidden,
+      policy_init_scale=init_scale,
       fixed_target_goal=fixed_goal,
-      actor_min_std=actor_min_std,
       start_index=start_index,
       end_index=end_index,
-      obs_space_list=obs_space_list,
-      episode_length_multiplier=ep_mult,
       permute_start_boxes=permute_start_boxes,
   )
 
 
-def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
+def _build_policy_network(env_name: str, seed: int, ctx: _TrainCtx):
   env_kwargs: Dict[str, Any] = {}
-  env_kwargs['builderbench_episode_length_multiplier'] = ctx.episode_length_multiplier
   if ctx.use_pd:
     env_kwargs['builderbench_use_pd'] = True
     env_kwargs['builderbench_pd_duration'] = ctx.pd_duration
     env_kwargs['builderbench_pd_filter_policy_obs'] = ctx.filter_policy_obs
-    env_kwargs['obs_space_list'] = ctx.obs_space_list
   env_kwargs['builderbench_permute_start_boxes'] = ctx.permute_start_boxes
 
   probe_env, obs_dim = contrastive_utils.make_environment(
@@ -295,23 +267,15 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
       **env_kwargs,
   )
   if int(obs_dim) != int(ctx.obs_dim):
-    print(f'[bb_video] WARNING: probe obs_dim={obs_dim} != '
+    print(f'[mpo_bb_video] WARNING: probe obs_dim={obs_dim} != '
           f'run_config obs_dim={ctx.obs_dim}')
   env_spec = specs.make_environment_spec(probe_env)
   del probe_env
-
-  cfg = contrastive.ContrastiveConfig()
-  networks = contrastive.make_networks(
-      spec=env_spec,
-      obs_dim=int(ctx.obs_dim),
-      repr_dim=cfg.repr_dim,
-      repr_norm=cfg.repr_norm,
-      twin_q=cfg.twin_q,
-      use_image_obs=cfg.use_image_obs,
-      hidden_layer_sizes=ctx.hidden_layer_sizes,
-      actor_min_std=ctx.actor_min_std,
+  return mpo_crl_learner.make_mpo_policy(
+      env_spec,
+      hidden_sizes=ctx.policy_hidden_sizes,
+      init_scale=ctx.policy_init_scale,
   )
-  return networks
 
 
 def _enumerate_checkpoints(path: str) -> List[Tuple[str, str]]:
@@ -338,7 +302,6 @@ def _enumerate_checkpoints(path: str) -> List[Tuple[str, str]]:
 
 
 def _make_bb_env(env_id: str, ctx: _TrainCtx):
-  """Build a single-env batched BuilderBench stack matching training."""
   num_cubes, task_id = parse_bb_env_id(env_id)
   cfg = default_config()
   cfg.num_cubes = num_cubes
@@ -365,36 +328,44 @@ def _make_bb_env(env_id: str, ctx: _TrainCtx):
   env = VmapWrapper(inner)
   env = EpisodeWrapper(env, episode_length=int(macro_ep_len), action_repeat=1)
   env = AutoResetWrapper(env)
-  # Expose render helper from the underlying CreativeCube instance.
   env.render_from_info = base.render_from_info  # type: ignore[attr-defined]
   env._mocap_targets_geom = base._mocap_targets_geom  # type: ignore[attr-defined]
   env.model = base._mj_model  # type: ignore[attr-defined]
-
   return env, base, mocap_targets, int(macro_ep_len)
 
 
 def _make_policy_fn(
-    networks,
+    policy_network,
     policy_params,
     stochastic: bool,
     *,
     filter_policy_obs: bool,
     num_cubes: int,
-    obs_space_list: list[str]
 ):
   @jax.jit
   def policy(obs, goals, key):
     if filter_policy_obs:
-      obs = filter_pd_policy_state_obs(obs, num_cubes, obs_space_list)
+      obs = filter_pd_policy_state_obs(obs, num_cubes)
     packed = jnp.concatenate([obs, goals], axis=-1)
-    dist = networks.policy_network.apply(policy_params, packed)
+    distribution = policy_network.apply(policy_params, packed)
     if stochastic:
-      action = networks.sample(dist, key)
+      action = distribution.sample(seed=key)
     else:
-      action = networks.sample_eval(dist, jax.random.PRNGKey(0))
-    return action, {}
+      action = distribution.mode()
+    return jnp.clip(action, -1.0, 1.0), {}
 
   return policy
+
+
+def _load_mpo_checkpoint(path: str) -> Dict[str, Any]:
+  with open(path, 'rb') as handle:
+    payload = pickle.load(handle)
+  state = payload['state']
+  return {
+      'policy_params': state.target_policy_params,
+      'iteration': int(payload.get('iteration', -1)),
+      'global_step': int(payload.get('global_step', -1)),
+  }
 
 
 def _write_video(frames, path: str, fps: int):
@@ -420,7 +391,7 @@ def _resolve_output_path(output_arg: str, run_tag: str, label: str,
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument('--checkpoint', required=True)
-  parser.add_argument('--env', default='builderbench_creative_1_task1')
+  parser.add_argument('--env', default='builderbench_creative_2_task1')
   parser.add_argument('--output', required=True)
   parser.add_argument('--fps', type=int, default=10)
   parser.add_argument('--stochastic', action='store_true')
@@ -443,26 +414,26 @@ def main():
 
   ckpt_entries = _enumerate_checkpoints(args.checkpoint)
   if not ckpt_entries:
-    print(f'[bb_video] no checkpoints found at {args.checkpoint!r}')
+    print(f'[mpo_bb_video] no checkpoints found at {args.checkpoint!r}')
     return
-  print(f'[bb_video] found {len(ckpt_entries)} checkpoint(s)')
+  print(f'[mpo_bb_video] found {len(ckpt_entries)} checkpoint(s)')
 
   ctx = _load_train_ctx(args.env, args.checkpoint)
   cfg_path = _run_config_path_for_checkpoint(args.checkpoint)
   if cfg_path is not None:
     skip = video_render_skip_reason(cfg_path)
     if skip is not None:
-      print(f'[bb_video] skip: {skip}')
+      print(f'[mpo_bb_video] skip: {skip}')
       return
-  cfg_note = (f'use_pd={ctx.use_pd} pd_duration={ctx.pd_duration} '
-              f'filter_policy_obs={ctx.filter_policy_obs}')
-  print(f'[bb_video] training context: {cfg_note} '
-        f'obs_dim={ctx.obs_dim} ep_len={ctx.episode_length}')
+  print(f'[mpo_bb_video] training context: use_pd={ctx.use_pd} '
+        f'pd_duration={ctx.pd_duration} filter_policy_obs={ctx.filter_policy_obs} '
+        f'obs_dim={ctx.obs_dim} ep_len={ctx.episode_length} '
+        f'hidden={ctx.policy_hidden_sizes}')
 
-  print('[bb_video] building networks and builderbench env...')
-  networks = _build_networks(args.env, seed=args.seed, ctx=ctx)
+  print('[mpo_bb_video] building MPO policy and builderbench env...')
+  policy_network = _build_policy_network(args.env, seed=args.seed, ctx=ctx)
   video_env, _base, mocap_targets, episode_length = _make_bb_env(env_id, ctx)
-  print(f'[bb_video] env_id={env_id}  episode_length={episode_length}')
+  print(f'[mpo_bb_video] env_id={env_id}  episode_length={episode_length}')
 
   key = jax.random.PRNGKey(args.seed)
   multi = len(ckpt_entries) > 1
@@ -473,21 +444,20 @@ def main():
   for label, path in ckpt_entries:
     out_path = _resolve_output_path(out_dir, run_tag, label, multi)
     if args.skip_existing and os.path.isfile(out_path):
-      print(f'[bb_video] skip existing {out_path}', flush=True)
+      print(f'[mpo_bb_video] skip existing {out_path}', flush=True)
       continue
-    print(f'[bb_video] === {label}  ({path}) ===')
-    ckpt = ppo_learner.load_checkpoint(path)
+    print(f'[mpo_bb_video] === {label}  ({path}) ===')
+    ckpt = _load_mpo_checkpoint(path)
     policy_params = ckpt['policy_params']
-    print(f'[bb_video]   iteration={ckpt.get("iteration")} '
+    print(f'[mpo_bb_video]   iteration={ckpt.get("iteration")} '
           f'global_step={ckpt.get("global_step")}')
 
     policy = _make_policy_fn(
-        networks,
+        policy_network,
         policy_params,
         args.stochastic,
         filter_policy_obs=ctx.filter_policy_obs,
         num_cubes=num_cubes,
-      obs_space_list=ctx.obs_space_list
     )
     key, video_key = jax.random.split(key)
     frames = _get_video(
@@ -499,10 +469,8 @@ def main():
         mocap_targets=mocap_targets,
         num_cubes=num_cubes,
     )
-    print(f'[bb_video]   frames={len(frames)}')
-
-    _write_video(frames, out_path, args.fps)
-    print(f'[bb_video]   wrote {out_path}')
+    _write_video(frames, out_path, fps=args.fps)
+    print(f'[mpo_bb_video] wrote {out_path} ({len(frames)} frames)', flush=True)
 
 
 if __name__ == '__main__':

@@ -329,6 +329,63 @@ class JaxBuilderBenchVecEnv:
 
     return generate_unroll
 
+  def compile_mpo_unroll(
+      self,
+      action_fn: Callable,
+      unroll_length: int,
+  ):
+    """Build a fused target-policy + environment rollout for MPO.
+
+    ``action_fn(policy_params, packed_obs, key)`` returns one action per
+    environment. Keeping the complete rollout in one ``jax.lax.scan`` avoids
+    a device synchronization for every environment step.
+    """
+    step_fn = self._step_fn
+    _T = int(unroll_length)
+    _num_cubes = self._num_cubes
+    _filter_pd = self._pd_filter_policy_obs
+
+    @jax.jit
+    def generate_unroll(
+        env_state: State,
+        policy_params: Any,
+        key: jax.Array,
+    ):
+      def f(carry, _):
+        env_state, key = carry
+        packed_obs = _pack_obs(
+            env_state.obs, env_state.info['target_goal'],
+            num_cubes=_num_cubes, filter_pd_policy=_filter_pd)
+        key, action_key = jax.random.split(key)
+        actions = jnp.clip(
+            action_fn(policy_params, packed_obs, action_key), -1.0, 1.0)
+        next_state = step_fn(env_state, actions)
+        terminal_obs = _pack_obs(
+            next_state.info['terminal_obs'],
+            next_state.info['terminal_target_goal'],
+            num_cubes=_num_cubes, filter_pd_policy=_filter_pd)
+        next_packed = _pack_obs(
+            next_state.obs, next_state.info['target_goal'],
+            num_cubes=_num_cubes, filter_pd_policy=_filter_pd)
+        dones = next_state.done
+        step_out = {
+            'obs': packed_obs,
+            'actions': actions,
+            'env_rew': next_state.reward,
+            'success': next_state.metrics['success'],
+            'step_dones': dones,
+            'terminal_obs': jnp.where(
+                dones[:, None], terminal_obs, next_packed),
+            'next_obs': next_packed,
+        }
+        return (next_state, key), step_out
+
+      (final_state, key), steps = jax.lax.scan(
+          f, (env_state, key), (), length=_T)
+      return (final_state, key), steps
+
+    return generate_unroll
+
   def compile_eval_unroll(
       self,
       eval_policy_fn: Callable,

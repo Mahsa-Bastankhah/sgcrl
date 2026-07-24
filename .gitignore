@@ -21,5 +21,6 @@ figs/
 .slurm
 /slurm
 checkpoints/
+ready_plots/
 
 
