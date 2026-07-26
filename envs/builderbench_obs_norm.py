@@ -52,10 +52,10 @@ class BuilderBenchObsNormalizer:
     self.var = np.ones(self.total_obs_dim, dtype=np.float64)
     self._first_apply_done = False
 
-    # print(
-    #     f"[DEBUG] [ObsNorm] Initialized: mode={self.mode!r}, "
-    #     f"num_cubes={self.num_cubes}, state_obs_dim={self.state_obs_dim}, "
-    #     f"goal_dim={self.goal_dim}, z_scale={self.z_scale_multiplier}"
+    print(
+        f"[DEBUG] [ObsNorm] Initialized: mode={self.mode!r}, "
+        f"num_cubes={self.num_cubes}, state_obs_dim={self.state_obs_dim}, "
+        f"goal_dim={self.goal_dim}, z_scale={self.z_scale_multiplier}"
     )
 
     # Runtime assertions

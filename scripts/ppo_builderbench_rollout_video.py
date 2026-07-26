@@ -78,6 +78,10 @@ class _TrainCtx:
   obs_space_list: list[str]
   permute_start_boxes: bool
   episode_length_multiplier: float = 1.0
+  obs_norm_mode: str = 'none'
+  z_scale_multiplier: float = 3.0
+  rsnorm_clip: float = 10.0
+  ppo_cleanrl_actor: bool = True
 
 
 def _get_video(
@@ -225,6 +229,13 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
                   else np.asarray(fixed, dtype=np.float32))
     permute_start_boxes = bool(
         flags.get('builderbench_permute_start_boxes', True))
+    obs_norm_mode = str(resolved.get(
+        'obs_norm_mode', flags.get('obs_norm_mode', 'none'))).lower()
+    z_scale_multiplier = float(resolved.get(
+        'z_scale_multiplier', flags.get('z_scale_multiplier', 3.0)))
+    rsnorm_clip = float(resolved.get(
+        'rsnorm_clip', flags.get('rsnorm_clip', 10.0)))
+    ppo_cleanrl_actor = bool(flags.get('ppo_cleanrl_actor', True))
   else:
     use_pd = False
     pd_duration = 5
@@ -240,6 +251,10 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     obs_space_list = ['xy', 'select']
     pd_obs_dim = pd_policy_state_obs_dim(num_cubes)
     permute_start_boxes = True
+    obs_norm_mode = 'none'
+    z_scale_multiplier = 3.0
+    rsnorm_clip = 10.0
+    ppo_cleanrl_actor = True
 
   if use_pd:
     macro_ep_len = mj_ep_len // pd_duration
@@ -257,7 +272,8 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
         f'fixed_goal={fixed_goal is not None} '
         f'actor_min_std={actor_min_std} '
         f'start_index={start_index} end_index={end_index} '
-        f'obs_space_list={obs_space_list} ep_mult={ep_mult}')
+        f'obs_space_list={obs_space_list} ep_mult={ep_mult} '
+        f'obs_norm_mode={obs_norm_mode}')
 
   return _TrainCtx(
       use_pd=use_pd,
@@ -273,6 +289,10 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
       obs_space_list=obs_space_list,
       episode_length_multiplier=ep_mult,
       permute_start_boxes=permute_start_boxes,
+      obs_norm_mode=obs_norm_mode,
+      z_scale_multiplier=z_scale_multiplier,
+      rsnorm_clip=rsnorm_clip,
+      ppo_cleanrl_actor=ppo_cleanrl_actor,
   )
 
 
@@ -310,6 +330,7 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
       use_image_obs=cfg.use_image_obs,
       hidden_layer_sizes=ctx.hidden_layer_sizes,
       actor_min_std=ctx.actor_min_std,
+      ppo_cleanrl_actor=ctx.ppo_cleanrl_actor,
   )
   return networks
 
@@ -380,13 +401,18 @@ def _make_policy_fn(
     *,
     filter_policy_obs: bool,
     num_cubes: int,
-    obs_space_list: list[str]
+    obs_space_list: list[str],
+    obs_normalizer = None,
 ):
   @jax.jit
   def policy(obs, goals, key):
     if filter_policy_obs:
       obs = filter_pd_policy_state_obs(obs, num_cubes, obs_space_list)
     packed = jnp.concatenate([obs, goals], axis=-1)
+    if obs_normalizer is not None and obs_normalizer.mode != 'none':
+      packed = jnp.asarray(
+          obs_normalizer.normalize(np.asarray(packed), update_stats=False),
+          dtype=jnp.float32)
     dist = networks.policy_network.apply(policy_params, packed)
     if stochastic:
       action = networks.sample(dist, key)
@@ -470,6 +496,8 @@ def main():
   if out_dir.endswith(os.sep) or not out_dir.endswith('.mp4'):
     os.makedirs(out_dir, exist_ok=True)
 
+  from envs.builderbench_obs_norm import BuilderBenchObsNormalizer
+
   for label, path in ckpt_entries:
     out_path = _resolve_output_path(out_dir, run_tag, label, multi)
     if args.skip_existing and os.path.isfile(out_path):
@@ -478,8 +506,19 @@ def main():
     print(f'[bb_video] === {label}  ({path}) ===')
     ckpt = ppo_learner.load_checkpoint(path)
     policy_params = ckpt['policy_params']
-    print(f'[bb_video]   iteration={ckpt.get("iteration")} '
-          f'global_step={ckpt.get("global_step")}')
+
+    obs_normalizer = BuilderBenchObsNormalizer(
+        mode=ctx.obs_norm_mode,
+        num_cubes=num_cubes,
+        state_obs_dim=ctx.obs_dim,
+        goal_dim=num_cubes * 3,
+        z_scale_multiplier=ctx.z_scale_multiplier,
+        rsnorm_clip=ctx.rsnorm_clip,
+    )
+    if 'obs_norm_mean' in ckpt:
+      obs_normalizer.mean = np.asarray(ckpt['obs_norm_mean'], dtype=np.float64)
+      obs_normalizer.var = np.asarray(ckpt['obs_norm_var'], dtype=np.float64)
+      obs_normalizer.count = float(ckpt.get('obs_norm_count', 1.0))
 
     policy = _make_policy_fn(
         networks,

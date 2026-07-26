@@ -1013,7 +1013,12 @@ def _save_checkpoint(path: str,
                      ppo_opt_state, q_opt_state,
                      iteration: int, global_step: int, key,
                      q_params_ema=None,
-                     td3_policy_target=None):
+                     td3_policy_target=None,
+                     obs_norm_mean=None,
+                     obs_norm_var=None,
+                     obs_norm_count=None,
+                     obs_norm_mode=None,
+                     **kwargs):
   """Write a pickle checkpoint atomically (write to tmp → rename)."""
   import pickle as _pkl
   import os as _os
@@ -1032,6 +1037,11 @@ def _save_checkpoint(path: str,
     ckpt['q_params_ema'] = q_params_ema
   if td3_policy_target is not None:
     ckpt['td3_policy_target'] = td3_policy_target
+  if obs_norm_mean is not None:
+    ckpt['obs_norm_mean'] = obs_norm_mean
+    ckpt['obs_norm_var'] = obs_norm_var
+    ckpt['obs_norm_count'] = obs_norm_count
+    ckpt['obs_norm_mode'] = obs_norm_mode
   tmp_path = path + '.tmp'
   with open(tmp_path, 'wb') as fh:
     _pkl.dump(ckpt, fh, protocol=_pkl.HIGHEST_PROTOCOL)
@@ -1750,6 +1760,12 @@ def run_ppo_training(
       z_scale_multiplier=_z_scale_mult,
       rsnorm_clip=_rsnorm_clip,
   )
+  if '_ckpt' in locals() and _ckpt is not None:
+    if 'obs_norm_mean' in _ckpt:
+      obs_normalizer.mean = np.asarray(_ckpt['obs_norm_mean'], dtype=np.float64)
+      obs_normalizer.var = np.asarray(_ckpt['obs_norm_var'], dtype=np.float64)
+      obs_normalizer.count = float(_ckpt['obs_norm_count'])
+      print(f"[ppo] restored obs_normalizer stats from checkpoint: count={obs_normalizer.count:.0f}")
 
   # ---- checkpointing ----------------------------------------------------
   ckpt_interval = int(getattr(config, 'ppo_checkpoint_interval', 0))
@@ -2268,7 +2284,11 @@ def run_ppo_training(
           key=key,
           q_params_ema=(q_params_reward if _use_repr_ema else None),
           td3_policy_target=(
-              td3_policy_target if _use_td3_target_policy else None))
+              td3_policy_target if _use_td3_target_policy else None),
+          obs_norm_mean=obs_normalizer.mean,
+          obs_norm_var=obs_normalizer.var,
+          obs_norm_count=obs_normalizer.count,
+          obs_norm_mode=obs_normalizer.mode)
       milestone_path = os.path.join(
           checkpoint_dir, f'ckpt_iter_{iteration:07d}.pkl')
       _save_checkpoint(milestone_path, **ckpt_kw)

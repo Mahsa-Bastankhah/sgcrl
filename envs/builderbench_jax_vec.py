@@ -403,13 +403,13 @@ class JaxBuilderBenchVecEnv:
     _obs_space_list = self._obs_space_list
 
     @jax.jit
-    def eval_unroll(env_state: State, policy_params: Any):
+    def eval_unroll(env_state: State, policy_params: Any, *extra_args):
       def f(carry, _):
         env_state = carry
         packed_obs = _pack_obs(
             env_state.obs, env_state.info['target_goal'],
             num_cubes=_num_cubes, filter_pd_policy=_filter_pd, obs_space_list=_obs_space_list)
-        actions = eval_policy_fn(policy_params, packed_obs)
+        actions = eval_policy_fn(policy_params, packed_obs, *extra_args)
         next_state = step_fn(env_state, actions)
         step_out = {
             'reward': next_state.reward,

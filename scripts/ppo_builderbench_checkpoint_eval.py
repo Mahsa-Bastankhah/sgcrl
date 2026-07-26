@@ -255,9 +255,12 @@ class CheckpointEvalSession:
             getattr(ctx, 'permute_start_boxes', True)),
     )
 
+    rsnorm_clip = float(getattr(ctx, 'rsnorm_clip', 10.0))
+
     @jax.jit
-    def eval_policy_action(policy_p, obs):
-      dist = self.networks.policy_network.apply(policy_p, obs)
+    def eval_policy_action(policy_p, obs, mean, std):
+      norm_obs = jnp.clip((obs - mean) / std, -rsnorm_clip, rsnorm_clip)
+      dist = self.networks.policy_network.apply(policy_p, norm_obs)
       return dist.mode()
 
     self._eval_unroll = self.vec_env.compile_eval_unroll(
@@ -265,27 +268,58 @@ class CheckpointEvalSession:
         unroll_length=self.vec_env.episode_length,
     )
 
-  def eval_policy_params(self, policy_params: Any) -> Tuple[float, float, Tuple[float, ...]]:
+  def eval_policy_params(self, policy_params: Any, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float, Tuple[float, ...]]:
     eval_state = self.vec_env.reset_state()
-    steps = self._eval_unroll(eval_state, policy_params)
+    mean_j = jnp.asarray(mean, dtype=jnp.float32)
+    std_j = jnp.asarray(std, dtype=jnp.float32)
+    steps = self._eval_unroll(eval_state, policy_params, mean_j, std_j)
     ep_success = episode_successes_from_steps(steps)
-    mean = float(ep_success.mean())
+    mean_val = float(ep_success.mean())
     n = int(ep_success.size)
-    std = float(math.sqrt(mean * (1.0 - mean) / max(n, 1)))
-    return mean, std, tuple(float(x) for x in ep_success)
+    std_val = float(math.sqrt(mean_val * (1.0 - mean_val) / max(n, 1)))
+    return mean_val, std_val, tuple(float(x) for x in ep_success)
 
   def eval_checkpoint_file(self, label: str, path: str) -> CheckpointEvalResult:
     ckpt = ppo_learner.load_checkpoint(path)
     iteration = int(ckpt.get('iteration', _iteration_from_label(label)))
     global_step = int(ckpt.get('global_step', iteration))
-    mean, std, ep_succ = self.eval_policy_params(ckpt['policy_params'])
+
+    num_cubes = self.vec_env._num_cubes
+    state_obs_dim = self.ctx.obs_dim
+    total_obs_dim = state_obs_dim + num_cubes * 3
+
+    mean = np.zeros(total_obs_dim, dtype=np.float32)
+    std = np.ones(total_obs_dim, dtype=np.float32)
+
+    mode = str(getattr(self.ctx, 'obs_norm_mode', 'none')).lower()
+    if mode == 'z_scale':
+      k = float(getattr(self.ctx, 'z_scale_multiplier', 3.0))
+      for i in range(num_cubes):
+        std[3 * i + 2] = 1.0 / k
+        std[state_obs_dim + 3 * i + 2] = 1.0 / k
+    elif mode == 'tied_rsnorm' and 'obs_norm_mean' in ckpt:
+      from envs.builderbench_obs_norm import BuilderBenchObsNormalizer
+      normalizer = BuilderBenchObsNormalizer(
+          mode='tied_rsnorm',
+          num_cubes=num_cubes,
+          state_obs_dim=state_obs_dim,
+          goal_dim=num_cubes * 3,
+          rsnorm_clip=float(getattr(self.ctx, 'rsnorm_clip', 10.0)),
+      )
+      normalizer.mean = np.asarray(ckpt['obs_norm_mean'], dtype=np.float64)
+      normalizer.var = np.asarray(ckpt['obs_norm_var'], dtype=np.float64)
+      tied_mean, tied_var = normalizer._get_tied_stats()
+      mean = tied_mean.astype(np.float32)
+      std = np.sqrt(np.maximum(tied_var, 1e-8)).astype(np.float32)
+
+    mean_val, std_val, ep_succ = self.eval_policy_params(ckpt['policy_params'], mean, std)
     return CheckpointEvalResult(
         label=label,
         path=path,
         iteration=iteration,
         global_step=global_step,
-        success_mean=mean,
-        success_std=std,
+        success_mean=mean_val,
+        success_std=std_val,
         episode_successes=ep_succ,
     )
 
