@@ -702,9 +702,6 @@ def main(_):
     if FLAGS.builderbench_use_pd and FLAGS.ppo_rollout_length < 0:
       pd_defaults = ppo_env_defaults_for_env(
           env_name, use_pd=True, episode_length_multiplier=_ep_mult)
-      if pd_defaults is not None:
-        config.ppo_rollout_length = int(pd_defaults['rollout_length'])
-        config.ppo_crl_steps_per_iter = int(pd_defaults['crl_steps_per_iter'])
     _env_kwargs['builderbench_permute_start_boxes'] = bool(
         FLAGS.builderbench_permute_start_boxes)
     # NOTE: this used to silently recompute ppo_rollout_length /

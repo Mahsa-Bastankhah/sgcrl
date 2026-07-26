@@ -705,6 +705,7 @@ def make_ppo_update_fn(
     return total, metrics
 
   grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
+
   if ent_coef_schedule is not None:
     @jax.jit
     def update(params, opt_state, batch, key, step):
@@ -904,81 +905,6 @@ def make_scan_crl_update_fn(
     return q_params, q_opt_state, q_params_ema, key, metrics
 
   return multi_update
-
-
-def make_onpolicy_crl_update_fn(
-    networks: contrastive_networks.ContrastiveNetworks,
-    q_optimizer: optax.GradientTransformation,
-    config: contrastive_config.ContrastiveConfig,
-    backward: bool = False,
-    repr_tau: float = 0.0,
-):
-  """Pure on-policy CRL updater over fresh (T, E, ...) rollout tensors."""
-  _, raw_update = make_crl_update_fn(
-      networks, q_optimizer, backward=backward, _return_raw=True)
-
-  obs_dim = int(config.obs_dim)
-  start_index = int(config.start_index)
-  end_index = int(config.end_index)
-  discount = float(config.discount)
-  batch_size = int(config.batch_size)
-  use_ema = 0.0 < float(repr_tau) < 1.0
-  _tau = float(repr_tau)
-
-  @jax.jit
-  def onpolicy_update(q_params, q_opt_state, q_params_ema, roll_obs, roll_acts, roll_dones, key):
-    T, E, _ = roll_obs.shape
-
-    # Reverse scan to compute distance to episode done boundary
-    def rev_scan(carry, done_t):
-      val = jnp.where(done_t, 0, carry + 1)
-      return val, val
-
-    _, dist_to_done = jax.lax.scan(rev_scan, jnp.zeros(E, dtype=jnp.int32), roll_dones[::-1])
-    dist_to_done = dist_to_done[::-1]
-
-    # Upper bound future distance by current tensor dimensions
-    t_indices = jnp.arange(T)[:, None]
-    max_d_tensor = jnp.minimum(dist_to_done, T - 1 - t_indices)
-
-    # Sample anchors (t, e)
-    key, k_t, k_e, k_d, k_crl = jax.random.split(key, 5)
-    t_samp = jax.random.randint(k_t, (batch_size,), 0, T)
-    e_samp = jax.random.randint(k_e, (batch_size,), 0, E)
-    max_d_samp = max_d_tensor[t_samp, e_samp]
-
-    # Sample offset d using truncated geometric distribution
-    trunc_cdf = 1.0 - jnp.power(discount, max_d_samp.astype(jnp.float32))
-    u_d = jax.random.uniform(k_d, (batch_size,)) * trunc_cdf
-    d_samp = 1 + jnp.floor(jnp.log1p(-u_d) / jnp.log(discount)).astype(jnp.int32)
-    d_samp = jnp.clip(d_samp, 1, jnp.maximum(1, max_d_samp))
-    d_samp = jnp.where(max_d_samp == 0, 0, d_samp)
-
-    j_samp = t_samp + d_samp
-
-    s_t = roll_obs[t_samp, e_samp, :obs_dim]
-    a_t = roll_acts[t_samp, e_samp]
-    s_j = roll_obs[j_samp, e_samp, :obs_dim]
-
-    if end_index == -1:
-      goal_j = s_j[:, start_index:]
-    else:
-      goal_j = s_j[:, start_index:end_index]
-
-    crl_obs = jnp.concatenate([s_t, goal_j], axis=-1)
-    batch = {'obs': crl_obs, 'action': a_t}
-
-    q_params, q_opt_state, metrics = raw_update(q_params, q_opt_state, batch, k_crl)
-
-    if use_ema:
-      q_params_ema = jax.tree_util.tree_map(
-          lambda t_val, o_val: _tau * t_val + (1.0 - _tau) * o_val, q_params_ema, q_params)
-    else:
-      q_params_ema = q_params
-
-    return q_params, q_opt_state, q_params_ema, key, metrics
-
-  return onpolicy_update
 
 
 # ---------------------------------------------------------------------------
@@ -1290,9 +1216,6 @@ def run_ppo_training(
         pd_filter_policy_obs=bool(
             _bb_kw.get('builderbench_pd_filter_policy_obs', True)),
         fixed_target_goal=_bb_kw.get('fixed_target_goal'),
-        obs_space_list=_bb_kw.get('obs_space_list'), # <--- ADD THIS LINE
-        episode_length_multiplier=float(
-                _bb_kw.get('builderbench_episode_length_multiplier', 1.0)),
         permute_start_boxes=bool(
             _bb_kw.get('builderbench_permute_start_boxes', True)),
     )
@@ -1631,12 +1554,10 @@ def run_ppo_training(
     # Scan-based multi-step updater: one JIT dispatch for all CRL steps.
     crl_scan_update = make_scan_crl_update_fn(
         networks, q_optimizer, backward=_backward, repr_tau=_repr_tau)
-    onpolicy_crl_update = make_onpolicy_crl_update_fn(
-        networks, q_optimizer, config, backward=_backward, repr_tau=_repr_tau)
     print(f'[ppo] CRL loss direction: {_direction}')
     if _use_repr_ema:
       print(f'[ppo] CRL reward repr EMA: tau={_repr_tau} '
-            f'(InfoNCE still uses online ╧å, ╧ê)')
+            f'(InfoNCE still uses online φ, ψ)')
     gaussian_reward_fn = None
     nf_reward_fn = None
     td3_reward_fn = None
@@ -1671,9 +1592,6 @@ def run_ppo_training(
           use_pd=bool(_bb_kw.get('builderbench_use_pd', False)),
           pd_duration=int(_bb_kw.get('builderbench_pd_duration', 5)),
           fixed_target_goal=_bb_kw.get('fixed_target_goal'),
-          episode_length_multiplier=float(
-                  _bb_kw.get('builderbench_episode_length_multiplier', 1.0)),
-          obs_space_list=_bb_kw.get('obs_space_list'),
           permute_start_boxes=bool(
               _bb_kw.get('builderbench_permute_start_boxes', True)),
       )
@@ -1755,19 +1673,11 @@ def run_ppo_training(
   for i in range(E):
     ep_obs[i].append(obs[i].copy())
 
-  if getattr(config, 'staggered_resets', False) and hasattr(vec_env, 'stagger_resets'):
-    print(f'[ppo] Applying staggered resets to {E} environments...')
-    vec_env.stagger_resets()
-    if _use_jax_bb_vec:
-      obs_packed = vec_env.pack_obs_from_state(vec_env._state)
-      obs = np.asarray(obs_packed, dtype=np.float32)
-      s0_states = np.asarray(obs[:, :int(config.obs_dim)], dtype=np.float32).copy()
-
   # ---- loggers ----------------------------------------------------------
   learner_logger = logger_fn(label='learner')
   eval_logger = logger_fn(label='eval')
 
-  # Persistent eval observers (mirrors Acme's evaluator loop). Keeping
+  # Persistent eval observers (mirrors Acme's evaluator loop).  Keeping
   # them alive across iterations is what lets `success_1000` and
   # `*_dist_{10,100,1000}` smooth over eval history.
   # RiverSwim: success = visited goal cell at least once (not env +1 reward).
@@ -1802,7 +1712,7 @@ def run_ppo_training(
 
   # ---- reward normalizer (CleanRL NormalizeReward) ----------------------
   # Normalizes the reps-based reward by the running std of discounted
-  # returns. Critical for PPO with learned rewards — raw ╧å┬╖╧ê values can
+  # returns.  Critical for PPO with learned rewards — raw φ·ψ values can
   # be O(10) and non-stationary, leading to unbounded advantages and
   # policy collapse within a handful of updates.
   norm_reward = bool(getattr(config, 'ppo_norm_reward', True))
@@ -1825,21 +1735,14 @@ def run_ppo_training(
     keep_msg = ('keep all milestones'
                 if ckpt_keep_last <= 0
                 else f'keep last {ckpt_keep_last} milestones')
-    print(f'[ppo] checkpoints -> {checkpoint_dir} '
+    print(f'[ppo] checkpoints → {checkpoint_dir} '
           f'(every {ckpt_interval} iters, {keep_msg})')
-
-  warmup_percent = float(getattr(config, 'ppo_warmup_percent', 0.0))
-  warmup_iters = int(num_iterations * warmup_percent)
-  if warmup_iters > 0:
-    print(f'[ppo] Warmup phase: PPO updates delayed for first {warmup_iters} iterations '
-          f'({warmup_percent * 100:.1f}%). CRL will train on random rollouts.')
 
   start_time = time.time()
   # global_step, ppo_sgd_step, start_iteration set above (0 for fresh runs,
   # restored from checkpoint on resume).
 
   for iteration in range(start_iteration, num_iterations):
-    is_warmup = iteration < warmup_iters
     # =================================================================
     # 1. Rollout (on-policy, CleanRL convention)
     # =================================================================
@@ -1854,15 +1757,6 @@ def run_ppo_training(
           jnp.asarray(s0_states),
       )
       roll_obs[:] = np.asarray(_steps_j['obs'], dtype=np.float32)
-      if iteration == start_iteration:
-        print("\n" + "="*80)
-        print(f"[VERIFICATION] PPO Actor Observation Verification")
-        print(f"Requested obs_space_list: {vec_env._obs_space_list}")
-        print(f"Expected state_obs_dim: {vec_env._state_obs_dim}")
-        print(f"Expected goal_dim:      {vec_env._goal_dim}")
-        print(f"Rollout obs matrix shape: {roll_obs.shape} (T, E, total_obs_dim)")
-        print(f"Actual total features fed to actor: {roll_obs.shape[-1]}")
-        print("="*80 + "\n", flush=True)
       roll_dones[:] = np.asarray(_steps_j['roll_dones'], dtype=np.float32)
       roll_acts[:] = np.asarray(_steps_j['actions'], dtype=np.float32)
       roll_logp[:] = np.asarray(_steps_j['logprobs'], dtype=np.float32)
@@ -1896,13 +1790,12 @@ def run_ppo_training(
                 ep_success_max[i], float(_roll_success[_t, i]))
           if _dones_t[i]:
             ep_obs[i].append(_term_t[i].copy())
-            if not getattr(config, 'crl_on_policy', False):
-              try:
-                replay.add_episode(
-                    np.stack(ep_obs[i], axis=0),
-                    np.stack(ep_act[i], axis=0))
-              except AssertionError:
-                pass
+            try:
+              replay.add_episode(
+                  np.stack(ep_obs[i], axis=0),
+                  np.stack(ep_act[i], axis=0))
+            except AssertionError:
+              pass
             ep_obs[i] = [_next_t[i].copy()]
             s0_states[i] = _next_t[i, :int(config.obs_dim)].copy()
             ep_act[i] = []
@@ -1960,13 +1853,12 @@ def run_ppo_training(
           ep_len[i] += 1
           if dones[i]:
             ep_obs[i].append(terminal_obs[i].copy())
-            if not getattr(config, 'crl_on_policy', False):
-              try:
-                replay.add_episode(
-                    np.stack(ep_obs[i], axis=0),
-                    np.stack(ep_act[i], axis=0))
-              except AssertionError:
-                pass  # degenerate len-0 episodes; skip
+            try:
+              replay.add_episode(
+                  np.stack(ep_obs[i], axis=0),
+                  np.stack(ep_act[i], axis=0))
+            except AssertionError:
+              pass  # degenerate len-0 episodes; skip
             ep_obs[i] = [next_obs[i].copy()]  # auto-reset state seeds next ep
             s0_states[i] = next_obs[i, :int(config.obs_dim)].copy()
             ep_act[i] = []
@@ -2018,34 +1910,35 @@ def run_ppo_training(
             reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
       roll_rew_raw[:] = _rew_flat.reshape(T, E)
 
-      # Apply reward normalisation
-      if reward_normalizer is not None:
-        for _t in range(T):
-          roll_rew[_t] = reward_normalizer(roll_rew_raw[_t], roll_step_dones[_t])
-      else:
-        roll_rew[:] = roll_rew_raw
+    # Apply reward normalisation (cheap NumPy loop; normalizer state is shared
+    # across the rollout, reset on episode boundaries via roll_step_dones).
+    if reward_normalizer is not None:
+      for _t in range(T):
+        roll_rew[_t] = reward_normalizer(roll_rew_raw[_t], roll_step_dones[_t])
     else:
-      roll_rew_raw[:] = np.nan
-      roll_rew[:] = np.nan
+      roll_rew[:] = roll_rew_raw
 
     # =================================================================
     # 2. GAE advantages / returns
     # =================================================================
-    if not is_warmup:
-      next_val = np.asarray(value_only(ppo_params['value'], jnp.asarray(obs)))
-      adv_j, ret_j = gae_fn(
-          jnp.asarray(roll_rew), jnp.asarray(roll_vals),
-          jnp.asarray(roll_dones),
-          jnp.asarray(next_val), jnp.asarray(next_done))
-      adv = np.asarray(adv_j)
-      ret = np.asarray(ret_j)
-    else:
-      adv = np.full((T, E), np.nan, dtype=np.float32)
-      ret = np.full((T, E), np.nan, dtype=np.float32)
+    next_val = np.asarray(value_only(ppo_params['value'], jnp.asarray(obs)))
+    adv_j, ret_j = gae_fn(
+        jnp.asarray(roll_rew), jnp.asarray(roll_vals),
+        jnp.asarray(roll_dones),
+        jnp.asarray(next_val), jnp.asarray(next_done))
+    adv = np.asarray(adv_j)
+    ret = np.asarray(ret_j)
 
     # =================================================================
-    # 3. PPO updates (epochs ├ù minibatches over flat T┬╖E batch)
+    # 3. PPO updates (epochs × minibatches over flat T·E batch)
     # =================================================================
+    flat_obs = roll_obs.reshape((batch_per_iter,) + obs_shape)
+    flat_acts = roll_acts.reshape((batch_per_iter,) + act_shape)
+    flat_logp = roll_logp.reshape(batch_per_iter)
+    flat_adv = adv.reshape(batch_per_iter)
+    flat_ret = ret.reshape(batch_per_iter)
+    flat_vals = roll_vals.reshape(batch_per_iter)
+
     ppo_metrics_agg: Dict[str, list] = {}
     early_stop = False
     for epoch in range(int(config.ppo_num_epochs)):
@@ -2078,54 +1971,14 @@ def run_ppo_training(
         early_stop = True
         break
 
-      for epoch in range(int(config.ppo_num_epochs)):
-        perm = np_rng.permutation(batch_per_iter)
-        last_kl = None
-        for start in range(0, batch_per_iter, mb_size):
-          mb = perm[start:start + mb_size]
-          batch = {
-              'obs':          jnp.asarray(flat_obs[mb]),
-              'actions':      jnp.asarray(flat_acts[mb]),
-              'old_logprobs': jnp.asarray(flat_logp[mb]),
-              'advantages':   jnp.asarray(flat_adv[mb]),
-              'returns':      jnp.asarray(flat_ret[mb]),
-              'old_values':   jnp.asarray(flat_vals[mb]),
-          }
-          key, k_mb = jax.random.split(key)
-          ppo_params, ppo_opt_state, m = ppo_update(
-              ppo_params, ppo_opt_state, batch, k_mb)
-          ppo_sgd_step += 1
-          last_kl = float(m['approx_kl'])
-          for k_, v in m.items():
-            ppo_metrics_agg.setdefault(k_, []).append(float(v))
-        if (config.ppo_target_kl is not None and last_kl is not None
-            and last_kl > float(config.ppo_target_kl)):
-          early_stop = True
-          break
-
-      pg_vals = ppo_metrics_agg.get('pg_loss', [])
-      mean_pg = float(np.mean(pg_vals)) if pg_vals else float('inf')
-    else:
-      mean_pg = float('nan')
+    pg_vals = ppo_metrics_agg.get('pg_loss', [])
+    mean_pg = float(np.mean(pg_vals)) if pg_vals else float('inf')
 
     # =================================================================
-    # 4. CRL updates (off-policy from replay OR on-policy from rollouts)
+    # 4. CRL updates (off-policy, from replay)
     # =================================================================
     crl_metrics_agg: Dict[str, list] = {}
-    _n_crl = int(config.ppo_crl_steps_per_iter)
-
-    if getattr(config, 'crl_on_policy', False):
-      j_roll_obs = jnp.asarray(roll_obs)
-      j_roll_acts = jnp.asarray(roll_acts)
-      j_roll_dones = jnp.asarray(roll_step_dones)
-      for _ in range(_n_crl):
-        key, k_onp = jax.random.split(key)
-        q_params, q_opt_state, q_params_reward, key, m = onpolicy_crl_update(
-            q_params, q_opt_state, q_params_reward,
-            j_roll_obs, j_roll_acts, j_roll_dones, k_onp)
-        for k_, v in m.items():
-          crl_metrics_agg.setdefault(k_, []).append(float(v))
-    elif replay.size >= int(config.ppo_min_replay_size):
+    if replay.size >= int(config.ppo_min_replay_size):
       # Update goal normalisation stats from a fresh replay sample (NF only).
       if use_nf and not _nf_normalizer_reset_done:
         # First time NF activates: reset the return normalizer so the extreme
@@ -2178,7 +2031,7 @@ def run_ppo_training(
           for k_, v in m.items():
             crl_metrics_agg.setdefault(k_, []).append(float(v))
       else:
-        # Standard CRL: pre-sample all batches -> one H->D transfer -> one JIT.
+        # Standard CRL: pre-sample all batches → one H→D transfer → one JIT.
         # This eliminates _n_crl rounds of dispatch + host sync.
         _samples = [
             (replay.sample_with_uniform_negatives(
@@ -2211,28 +2064,27 @@ def run_ppo_training(
     _has_flow_dense = not np.all(np.isnan(roll_flow_dense_rew))
 
     log = {
-        'iteration':          iteration,
-        'learner_steps':      iteration,
-        'global_step':        global_step,
-        'sps':                global_step / max(1e-6, elapsed),
-        'replay_size':        int(replay.size),
-        'reward_repr_mean':      float(np.nanmean(roll_rew)) if not is_warmup else float('nan'),
-        'reward_repr_raw_mean':  float(np.nanmean(roll_rew_raw)) if not is_warmup else float('nan'),
-        'reward_repr_raw_std':   float(np.nanstd(roll_rew_raw)) if not is_warmup else float('nan'),
+        'iteration':         iteration,
+        'learner_steps':     iteration,
+        'global_step':       global_step,
+        'sps':               global_step / max(1e-6, elapsed),
+        'replay_size':       int(replay.size),
+        'reward_repr_mean':      float(roll_rew.mean()),
+        'reward_repr_raw_mean':  float(roll_rew_raw.mean()),
+        'reward_repr_raw_std':   float(roll_rew_raw.std()),
         'reward_return_norm_std': (
-            float(reward_normalizer.std) if reward_normalizer is not None and not is_warmup
+            float(reward_normalizer.std) if reward_normalizer is not None
             else float('nan')),
         'reward_env_mean':       float(roll_env_rew.mean()),
         'value_mean':        float(roll_vals.mean()),
-        'returns_mean':      float(np.nanmean(ret)) if not is_warmup else float('nan'),
-        'advantage_mean':    float(np.nanmean(adv)) if not is_warmup else float('nan'),
-        'advantage_std':     float(np.nanstd(adv)) if not is_warmup else float('nan'),
+        'returns_mean':      float(ret.mean()),
+        'advantage_mean':    float(adv.mean()),
+        'advantage_std':     float(adv.std()),
         'early_stop_epochs': int(early_stop),
         'ep_return_mean':    float(np.mean(recent_returns)) if recent_returns else float('nan'),
         'ep_length_mean':    float(np.mean(recent_lengths)) if recent_lengths else float('nan'),
         'ppo/mean_pg_loss':  mean_pg,
     }
-
     if _track_train_success:
       log['train_success_mean'] = (
           float(np.mean(recent_success[-100:]))
@@ -2242,7 +2094,7 @@ def run_ppo_training(
           if recent_success else float('nan'))
 
     # Acme CSVLogger fixes columns on the *first* write and drops any later
-    # keys. Seed NF/SA columns from iter 0 so training metrics land in CSV.
+    # keys.  Seed NF/SA columns from iter 0 so training metrics land in CSV.
     if use_nf:
       log.update({
           'nf/density_loss': float('nan'),
@@ -2268,17 +2120,9 @@ def run_ppo_training(
           float(np.mean(recent_flow_dense_returns))
           if recent_flow_dense_returns else float('nan'))
 
-    if is_warmup:
-      expected_ppo_keys = [
-          'ppo_total_loss', 'pg_loss', 'v_loss', 'entropy', 'entropy_loss',
-          'approx_kl', 'old_approx_kl', 'clipfrac', 'ratio_mean',
-          'policy_loc_mean', 'policy_loc_abs_mean', 'policy_scale_mean', 'policy_scale_min'
-      ]
-      for k in expected_ppo_keys:
-        log[f'ppo/{k}'] = float('nan')
-    else:
-      for k_, vs in ppo_metrics_agg.items():
-        log[f'ppo/{k_}'] = float(np.mean(vs))
+    # PPO update metrics (always present).
+    for k_, vs in ppo_metrics_agg.items():
+      log[f'ppo/{k_}'] = float(np.mean(vs))
 
     # Density-estimator metrics: only the active mode.
     if use_gaussian:
@@ -2373,7 +2217,7 @@ def run_ppo_training(
 
     # =================================================================
     # 7. Checkpointing: ckpt_iter_{iter}.pkl every `ppo_checkpoint_interval`
-    #    iters + rolling latest.pkl. Prune only if ppo_checkpoint_keep_last>0.
+    #    iters + rolling latest.pkl.  Prune only if ppo_checkpoint_keep_last>0.
     # =================================================================
     if (ckpt_interval > 0
         and checkpoint_dir is not None

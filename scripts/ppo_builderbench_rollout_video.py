@@ -76,8 +76,8 @@ class _TrainCtx:
   start_index: int
   end_index: int
   obs_space_list: list[str]
-  episode_length_multiplier: float = 1.0
   permute_start_boxes: bool
+  episode_length_multiplier: float = 1.0
 
 
 def _get_video(

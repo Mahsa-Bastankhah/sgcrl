@@ -254,9 +254,6 @@ class CheckpointEvalSession:
         permute_start_boxes=bool(
             getattr(ctx, 'permute_start_boxes', True)),
     )
-    print(f'[bb_eval] eval session: env={env_name}  num_envs={self.num_eval_episodes}  '
-          f'ep_len={self.vec_env.episode_length}  obs_dim={self.vec_env.obs_dim}  act_dim={self.vec_env.act_dim}  '
-          f'use_pd={ctx.use_pd}  filter_policy_obs={ctx.filter_policy_obs}  pd_duration={ctx.pd_duration}  fixed_goal={fixed_goal}  ')
 
     @jax.jit
     def eval_policy_action(policy_p, obs):
