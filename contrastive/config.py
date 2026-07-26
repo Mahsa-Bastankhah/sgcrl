@@ -285,6 +285,11 @@ class ContrastiveConfig:
   jit: bool = True
   add_mc_to_td: bool = False
   resample_neg_actions: bool = False
+
+  # Observation Normalization & Scaling options
+  obs_norm_mode: str = 'none'         # Options: 'none', 'z_scale', 'tied_rsnorm'
+  z_scale_multiplier: float = 3.0     # Multiplier k for z_scale mode (z_scaled = z * k)
+  rsnorm_clip: float = 10.0           # Clipping bound for tied_rsnorm mode
   
   # Parameters that should be overwritten, based on each environment.
   obs_dim: int = -1

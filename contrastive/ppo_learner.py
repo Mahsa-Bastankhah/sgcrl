@@ -1727,6 +1727,30 @@ def run_ppo_training(
   _nf_normalizer_reset_done = False  # reset once when NF first activates
   _nf_stat_log: Dict[str, float] = {}  # per-dim goal mean/std, updated each iter
 
+  # ---- Observation Normalizer & Preprocessing ------------------------------
+  _obs_norm_mode = getattr(config, 'obs_norm_mode', 'none')
+  _z_scale_mult = float(getattr(config, 'z_scale_multiplier', 3.0))
+  _rsnorm_clip = float(getattr(config, 'rsnorm_clip', 10.0))
+  _num_cubes = 1
+  if _env.startswith('builderbench_creative_'):
+    import re
+    _m_cubes = re.search(r'builderbench_creative_(\d+)', _env)
+    if _m_cubes:
+      _num_cubes = int(_m_cubes.group(1))
+
+  _state_obs_dim = int(config.obs_dim)
+  _goal_dim = total_obs_dim - _state_obs_dim
+
+  from envs.builderbench_obs_norm import BuilderBenchObsNormalizer, compute_per_axis_diagnostics
+  obs_normalizer = BuilderBenchObsNormalizer(
+      mode=_obs_norm_mode,
+      num_cubes=_num_cubes,
+      state_obs_dim=_state_obs_dim,
+      goal_dim=_goal_dim,
+      z_scale_multiplier=_z_scale_mult,
+      rsnorm_clip=_rsnorm_clip,
+  )
+
   # ---- checkpointing ----------------------------------------------------
   ckpt_interval = int(getattr(config, 'ppo_checkpoint_interval', 0))
   ckpt_keep_last = int(getattr(config, 'ppo_checkpoint_keep_last', 0))
@@ -1757,6 +1781,8 @@ def run_ppo_training(
           jnp.asarray(s0_states),
       )
       roll_obs[:] = np.asarray(_steps_j['obs'], dtype=np.float32)
+      if obs_normalizer.mode != 'none':
+        roll_obs[:] = obs_normalizer.normalize(roll_obs, update_stats=True)
       roll_dones[:] = np.asarray(_steps_j['roll_dones'], dtype=np.float32)
       roll_acts[:] = np.asarray(_steps_j['actions'], dtype=np.float32)
       roll_logp[:] = np.asarray(_steps_j['logprobs'], dtype=np.float32)
@@ -1816,13 +1842,14 @@ def run_ppo_training(
       global_step += T * E
     else:
       for t in range(T):
-        roll_obs[t] = obs
+        norm_obs = obs_normalizer.normalize(obs, update_stats=True)
+        roll_obs[t] = norm_obs
         roll_dones[t] = next_done
 
         key, k_act = jax.random.split(key)
         action_j, logprob_j, value_j = act_and_value(
             ppo_params['policy'], ppo_params['value'],
-            jnp.asarray(obs), k_act)
+            jnp.asarray(norm_obs), k_act)
         action = np.asarray(action_j)
         roll_acts[t] = action
         roll_logp[t] = np.asarray(logprob_j)
@@ -2153,6 +2180,13 @@ def run_ppo_training(
     # Seven fractional digits so CSV / terminal show stable small LRs.
     log['ppo/learning_rate'] = round(lr_log, 7)
     log.update(_nf_stat_log)
+
+    if _env.startswith('builderbench_'):
+      diag_metrics = compute_per_axis_diagnostics(
+          roll_obs, _num_cubes, _state_obs_dim)
+      for k_d, v_d in diag_metrics.items():
+        log[f'obs/{k_d}'] = v_d
+
     learner_logger.write(log)
 
     # =================================================================

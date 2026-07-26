@@ -275,6 +275,19 @@ flags.DEFINE_boolean(
       'ppo_cleanrl_actor', False,
       'If True, uses Tanh activations, Orthogonal init, and state-independent std for the Actor (Trick 2).')
 
+flags.DEFINE_enum(
+    'obs_norm_mode', 'none', ['none', 'z_scale', 'tied_rsnorm'],
+    'Observation preprocessing / normalization mode. '
+    '\'none\' (default) = raw observations; '
+    '\'z_scale\' = static scaling of z-coordinates (z_scaled = z * z_scale_multiplier); '
+    '\'tied_rsnorm\' = tied per-dimension Running Statistics Normalization.')
+flags.DEFINE_float(
+    'z_scale_multiplier', 3.0,
+    'Scaling multiplier k for z_scale mode (z_scaled = z * k).')
+flags.DEFINE_float(
+    'rsnorm_clip', 10.0,
+    'Clipping bound for tied_rsnorm mode.')
+
 
 flags.DEFINE_float(
     'ppo_warmup_percent', 0.0,
@@ -501,6 +514,9 @@ def main(_):
       log_dir=FLAGS.log_dir_path,
       add_uid=FLAGS.add_uid,
       fix_goals=not FLAGS.sample_goals,
+      obs_norm_mode=FLAGS.obs_norm_mode,
+      z_scale_multiplier=float(FLAGS.z_scale_multiplier),
+      rsnorm_clip=float(FLAGS.rsnorm_clip),
   )
   config = contrastive.ContrastiveConfig(**params)
   config.repr_norm = bool(FLAGS.repr_norm)
