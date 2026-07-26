@@ -52,10 +52,10 @@ class BuilderBenchObsNormalizer:
     self.var = np.ones(self.total_obs_dim, dtype=np.float64)
     self._first_apply_done = False
 
-    print(
-        f"[DEBUG] [ObsNorm] Initialized: mode={self.mode!r}, "
-        f"num_cubes={self.num_cubes}, state_obs_dim={self.state_obs_dim}, "
-        f"goal_dim={self.goal_dim}, z_scale={self.z_scale_multiplier}"
+    # print(
+    #     f"[DEBUG] [ObsNorm] Initialized: mode={self.mode!r}, "
+    #     f"num_cubes={self.num_cubes}, state_obs_dim={self.state_obs_dim}, "
+    #     f"goal_dim={self.goal_dim}, z_scale={self.z_scale_multiplier}"
     )
 
     # Runtime assertions
@@ -95,13 +95,13 @@ class BuilderBenchObsNormalizer:
       self.count = new_count
 
     running_std = np.sqrt(np.maximum(self.var, self.eps))
-    print(
-        f"[DEBUG] [ObsNorm Stats Update] count_prev={count_prev:.0f} -> "
-        f"count_new={self.count:.0f} | "
-        f"Running Mean (first 3 dims): {self.mean[:3].round(4)} | "
-        f"Running Std (first 3 dims): {running_std[:3].round(4)} | "
-        f"Z-dim Running Std (state): {running_std[self.state_z_indices].round(4)}"
-    )
+    # print(
+    #     f"[DEBUG] [ObsNorm Stats Update] count_prev={count_prev:.0f} -> "
+    #     f"count_new={self.count:.0f} | "
+    #     f"Running Mean (first 3 dims): {self.mean[:3].round(4)} | "
+    #     f"Running Std (first 3 dims): {running_std[:3].round(4)} | "
+    #     f"Z-dim Running Std (state): {running_std[self.state_z_indices].round(4)}"
+    # )
 
   def _get_tied_stats(self) -> Tuple[np.ndarray, np.ndarray]:
     """Construct tied mean and variance for matching state and goal spatial dimensions."""
