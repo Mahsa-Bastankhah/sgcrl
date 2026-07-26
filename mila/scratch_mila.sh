@@ -13,16 +13,27 @@ SEEDS=( 0 1 )
 LOG_ROOT="/network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs"
 # ------------------------------------------------------------------------------
 
-BASE_FLAGS="--num_steps=200000000 --ppo_num_envs=1024 --ppo_ent_coef=0.05 --ppo_actor_min_std=0.01 --ppo_discount=0.99 --ppo_clip_coef=0.2 --ppo_checkpoint_interval=150 --builderbench_use_pd=true --builderbench_pd_duration=5 --ppo_skip_first_eval=true --ppo_eval_interval=0 --max_replay_size=10000000 --ppo_crl_repr_tau=0 --hidden_layer_sizes=\"256,256,256,256,256,256\" --env=builderbench_creative_3_task1"
+BASE_FLAGS="--num_steps=200000000 --ppo_num_envs=1024 --ppo_ent_coef=0.05 --ppo_actor_min_std=0.01 --ppo_discount=0.99 --ppo_clip_coef=0.2 --ppo_checkpoint_interval=150 --builderbench_use_pd=true --builderbench_pd_duration=5 --ppo_skip_first_eval=true --ppo_eval_interval=0 --max_replay_size=10000000 --ppo_crl_repr_tau=0 --hidden_layer_sizes=\"256,256,256,256,256,256\" --env=builderbench_creative_3_task1 --ppo_rollout_length=50 --ppo_crl_steps_per_iter=25"
 
 EXPERIMENTS=( 
 
     # "debug|--num_steps=20_000_000"
     # "reproduce|--env=builderbench_creative_4_task1"
-    "reproduce|--env=builderbench_creative_4_task6 --obs_space="xy,quaternions,select""
-    "reproduce|--env=builderbench_creative_3_task2 -obs_space="xy,quaternions,select""
+    # "reproduce|--env=builderbench_creative_4_task6 --obs_space="xy,quaternions,select""
+    # "reproduce|--env=builderbench_creative_3_task2 -obs_space="xy,quaternions,select""
     # "reproduce2|"
-
+    # "reproduce_longer_rollout|--env=builderbench_creative_4_task1 --ppo_rollout_length=128" # Roughly double which is automatically calculated to 60.
+    # "reproduce_longer_rollout|--env=builderbench_creative_4_task1 --ppo_rollout_length=256" # Roughly quadruple which is automatically calculated to 60.
+    # "reproduce|--env=builderbench_creative_2_task2"
+    # "reproduce|--env=builderbench_creative_2_task3"
+    # "reproduce_warmup|--env=builderbench_creative_4_task1 --ppo_warmup_percent=0.05"
+    # "reproduce_warmup|--env=builderbench_creative_4_task1 --ppo_warmup_percent=0.10"
+    # "reproduce_warmup|--env=builderbench_creative_4_task1 --ppo_warmup_percent=0.20"
+    # "reproduce_cleanr_actor|--env=builderbench_creative_4_task1 --ppo_cleanrl_actor=True"
+    # "reproduce_longer_env_epi|--env=builderbench_creative_4_task1 --builderbench_episode_length_multiplier=5"
+    # "reproduce_longer_env_epi|--env=builderbench_creative_4_task1 --builderbench_episode_length_multiplier=10"
+    # "reproduce_longer_env_epi|--env=builderbench_creative_4_task6 --builderbench_episode_length_multiplier=5"
+    "reproduce3|"
 
 
     )
@@ -116,6 +127,14 @@ echo "{\"command\": \"${CMD}\"}" > "${LOG_ROOT}/${SAFE_NAME}/ppo_${ENV_ID}_${see
 python scripts/ppo_builderbench_checkpoint_eval.py \
     --run_dir=${LOG_ROOT}/${SAFE_NAME}/ppo_${ENV_ID}_${seed} \
     --csv_output=${LOG_ROOT}/${SAFE_NAME}/ppo_${ENV_ID}_${seed}/logs/eval/logs.csv
+
+
+mkdir -p ${LOG_ROOT}/${SAFE_NAME}/ppo_${ENV_ID}_${seed}/videos/
+python scripts/ppo_builderbench_rollout_video.py \
+    --checkpoint=${LOG_ROOT}/${SAFE_NAME}/ppo_${ENV_ID}_${seed}/checkpoints \
+    --env=${ENV_ID} \
+    --output=${LOG_ROOT}/${SAFE_NAME}/ppo_${ENV_ID}_${seed}/videos/ \
+    --fps=10
 
 # Immediately sync the results of this experiment to WandB
 python scripts/csv_runs_to_wandb.py \
