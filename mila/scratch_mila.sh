@@ -8,7 +8,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 # ---------- USER CONFIGURATION ------------------------------------------------
 # ENVS=( "builderbench_creative_3_task1" )
 # ENVS=( "builderbench_creative_4_task1" "builderbench_creative_4_task6" "builderbench_creative_3_task2" "builderbench_creative_3_task5")
-SEEDS=( 0 1 )
+SEEDS=( 0  1 )
 
 LOG_ROOT="/network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs"
 # ------------------------------------------------------------------------------
@@ -18,25 +18,46 @@ BASE_FLAGS="--num_steps=200000000 --ppo_num_envs=1024 --ppo_ent_coef=0.05 --ppo_
 EXPERIMENTS=( 
 
     # "debug|--num_steps=20_000_000"
-    # "reproduce|--env=builderbench_creative_4_task1"
+    # "reproduce|--env=builderbench_creative_4_task1 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
     # "reproduce|--env=builderbench_creative_4_task6 --obs_space="xy,quaternions,select""
     # "reproduce|--env=builderbench_creative_3_task2 -obs_space="xy,quaternions,select""
     # "reproduce2|"
-    # "reproduce_longer_rollout|--env=builderbench_creative_4_task1 --ppo_rollout_length=128" # Roughly double which is automatically calculated to 60.
-    # "reproduce_longer_rollout|--env=builderbench_creative_4_task1 --ppo_rollout_length=256" # Roughly quadruple which is automatically calculated to 60.
+    # "reproduce_longer_rollout|--env=builderbench_creative_4_task1 --num_steps=300000000 --ppo_rollout_length=128" # Roughly double which is automatically calculated to 60.
+    # "reproduce_longer_rollout|--env=builderbench_creative_4_task1 --num_steps=300000000 --ppo_rollout_length=256" # Roughly quadruple which is automatically calculated to 60.
     # "reproduce|--env=builderbench_creative_2_task2"
     # "reproduce|--env=builderbench_creative_2_task3"
-    # "reproduce_warmup|--env=builderbench_creative_4_task1 --ppo_warmup_percent=0.05"
-    # "reproduce_warmup|--env=builderbench_creative_4_task1 --ppo_warmup_percent=0.10"
-    # "reproduce_warmup|--env=builderbench_creative_4_task1 --ppo_warmup_percent=0.20"
-    # "reproduce_cleanr_actor|--env=builderbench_creative_4_task1 --ppo_cleanrl_actor=True"
-    # "reproduce_longer_env_epi|--env=builderbench_creative_4_task1 --builderbench_episode_length_multiplier=5"
-    # "reproduce_longer_env_epi|--env=builderbench_creative_4_task1 --builderbench_episode_length_multiplier=10"
+    # "reproduce_warmup|--env=builderbench_creative_4_task1 --num_steps=300000000 --ppo_warmup_percent=0.05"
+    # "reproduce_warmup|--env=builderbench_creative_4_task1 --num_steps=300000000 --ppo_warmup_percent=0.10"
+    # "reproduce_warmup|--env=builderbench_creative_4_task1 --num_steps=300000000 --ppo_warmup_percent=0.20"
+    # "reproduce_cleanr_actor|--env=builderbench_creative_4_task1 --num_steps=300000000 --ppo_cleanrl_actor=True"
+    # "reproduce_longer_env_epi|--env=builderbench_creative_4_task1 --num_steps=300000000 --builderbench_episode_length_multiplier=5"
+    # "reproduce_longer_env_epi|--env=builderbench_creative_4_task1 --num_steps=300000000 --builderbench_episode_length_multiplier=10"
     # "reproduce_longer_env_epi|--env=builderbench_creative_4_task6 --builderbench_episode_length_multiplier=5"
-    "reproduce3|"
+    # "reproduce_rms_obs_norm|--env=builderbench_creative_4_task1 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000 --obs_norm_mode=tied_rsnorm"
+    # "reproduce_z_scale|--env=builderbench_creative_4_task1 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000 --obs_norm_mode=z_scale"
+    # "pd_nf|--env=builderbench_creative_4_task1 --num_steps=300000000 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --ppo_repr_mode=nf --nf_rep_size=256 --nf_num_blocks=12 --nf_coupling_width=512 --nf_grad_clip=1.0 --nf_noise_std=0.05 --nf_goal_std_min=0.02 --nf_goal_enc_size=0"
+    # "pd_nf_tau05|--env=builderbench_creative_4_task1 --num_steps=300000000 --builderbench_permute_start_boxes=true --ppo_repr_mode=nf --ppo_nf_reward_tau=0.5 --nf_rep_size=256 --nf_num_blocks=12 --nf_coupling_width=512 --nf_grad_clip=1.0 --nf_noise_std=0.05 --nf_goal_std_min=0.02 --nf_goal_enc_size=0"
+    # "pd_td3_logq_tau05|--env=builderbench_creative_4_task1 --num_steps=300000000 --builderbench_permute_start_boxes=true --ppo_repr_mode=td3 --noppo_td3_cross_batch_goals --ppo_td3_log_reward --ppo_td3_reward_tau=0.5"
 
+    # --- Active Experiments ---
+    # 1. Permutation Isolation (hue: builderbench_permute_start_boxes)
+    "permute_start_boxes|--env=builderbench_creative_4_task1 --builderbench_permute_start_boxes=false --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
+    "permute_start_boxes|--env=builderbench_creative_4_task1 --builderbench_permute_start_boxes=true --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
 
-    )
+    # 2. Exploration & Selection Bin Un-locking (hue: ppo_ent_coef)
+    "high_std_ent_anneal|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
+    "high_std_ent_anneal|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.10 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
+    "high_std_ent_anneal|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.20 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
+
+    # 4. Representation Smoothing & L2 Normalization (hue: ppo_crl_repr_tau)
+    "crl_tau_repr_norm|--env=builderbench_creative_4_task1 --ppo_crl_repr_tau=0.05 --repr_norm=True --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
+    "crl_tau_repr_norm|--env=builderbench_creative_4_task1 --ppo_crl_repr_tau=0.10 --repr_norm=True --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
+    "crl_tau_repr_norm|--env=builderbench_creative_4_task1 --ppo_crl_repr_tau=0.50 --repr_norm=True --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
+
+    # 7. TD3 Density Mode Goal Tolerance (hue: ppo_td3_goal_tol)
+    "td3_tol|--env=builderbench_creative_4_task1 --ppo_repr_mode=td3 --ppo_td3_goal_tol=0.02 --noppo_td3_cross_batch_goals --ppo_td3_log_reward --ppo_td3_reward_tau=0.5 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
+    "td3_tol|--env=builderbench_creative_4_task1 --ppo_repr_mode=td3 --ppo_td3_goal_tol=0.04 --noppo_td3_cross_batch_goals --ppo_td3_log_reward --ppo_td3_reward_tau=0.5 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
+)
 
 mkdir -p "$SCRIPT_DIR/slurm_logs"
 
