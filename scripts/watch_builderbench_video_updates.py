@@ -6,9 +6,10 @@ submit one short GPU job that renders **only those new checkpoints**, then
 keep watching. Never holds a GPU on the login node.
 
 Videos go under ``videos/builderbench/active_runs/<short>_s<seed>/``.
-That folder is rebuilt each scan to match squeue (finished runs are removed
-from the index; their video dirs are left on disk but unlinked from the
-active index file).
+Each scan rewrites ``README.txt`` to list live runs only. When a run leaves
+the queue, its video folder is **moved** to
+``videos/builderbench/completed_runs/`` (never deleted), so mid-training
+mp4s are kept.
 
 State: ``videos/builderbench/active_runs/.watch_state.json``
 
@@ -32,6 +33,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _ACTIVE_ROOT = os.path.join(_REPO, 'videos', 'builderbench', 'active_runs')
+_COMPLETED_ROOT = os.path.join(_REPO, 'videos', 'builderbench', 'completed_runs')
 _DEFAULT_STATE = os.path.join(_ACTIVE_ROOT, '.watch_state.json')
 _BB_VIDEO_JOB = os.path.join(_REPO, 'jobs', 'job_bb_video_new_ckpts.slurm')
 _CKPT_RE = re.compile(r'ckpt_iter_(\d+)\.pkl$')
@@ -136,9 +138,13 @@ def short_name_for(run_dir: str, seed: int) -> str:
          .replace('creative3_task1_', 'c3t1_')
          .replace('creative3_task2_', 'c3t2_')
          .replace('creative4_task1_', 'c4t1_')
+         .replace('creative4_task2_', 'c4t2_')
+         .replace('creative5_task1_', 'c5t1_')
+         .replace('creative5_task2_', 'c5t2_')
          .replace('e1024_pd_', '')
          .replace('td3_logq_tau05', 'td3_lq05')
-         .replace('nf_tau05', 'nf_t05'))
+         .replace('nf_tau05', 'nf_t05')
+         .replace('crl_tau05', 'crl_t05'))
   return f'{tag}_s{seed}'
 
 
@@ -296,7 +302,8 @@ def rebuild_active_index(live: Sequence[dict]) -> None:
   wanted_shorts: Set[str] = set()
   lines = [
       'Currently-running BuilderBench video folders (auto-maintained).',
-      'Watcher writes new-ckpt mp4s here; finished runs are dropped from this index.',
+      'Watcher writes new-ckpt mp4s here. When a run ends, its folder is moved',
+      'to videos/builderbench/completed_runs/ (videos are never deleted).',
       '',
   ]
   for item in live:
@@ -318,20 +325,51 @@ def rebuild_active_index(live: Sequence[dict]) -> None:
   with open(readme, 'w', encoding='utf-8') as fh:
     fh.write('\n'.join(lines) + '\n')
 
-  # Remove stale *symlinks* and empty leftover dirs from previous index;
-  # keep non-empty finished video dirs but rename aside? User asked to get rid
-  # of old runs' videos from active_runs — remove dirs not in wanted.
+  # Move finished runs out of active_runs/ — never delete their videos.
+  os.makedirs(_COMPLETED_ROOT, exist_ok=True)
   for name in os.listdir(_ACTIVE_ROOT):
     if name.startswith('.') or name == 'README.txt':
       continue
     path = os.path.join(_ACTIVE_ROOT, name)
-    if name not in wanted_shorts:
-      if os.path.islink(path):
-        os.unlink(path)
-        print(f'[watch_bb_vid] removed stale link {name}', flush=True)
-      elif os.path.isdir(path):
+    if name in wanted_shorts:
+      continue
+    dest = os.path.join(_COMPLETED_ROOT, name)
+    if os.path.islink(path):
+      os.unlink(path)
+      print(f'[watch_bb_vid] removed stale link {name}', flush=True)
+      continue
+    if not os.path.isdir(path):
+      continue
+    if os.path.exists(dest):
+      os.makedirs(dest, exist_ok=True)
+      for src in glob.glob(os.path.join(path, '*')):
+        target = os.path.join(dest, os.path.basename(src))
+        if os.path.isdir(src):
+          continue
+        if not os.path.exists(target):
+          shutil.move(src, target)
+        else:
+          # Keep the newer file; never drop an mp4 on the floor.
+          try:
+            if os.path.getmtime(src) >= os.path.getmtime(target):
+              os.replace(src, target)
+            else:
+              os.remove(src)
+          except OSError:
+            # If replace fails, leave src and skip rmtree below.
+            print(f'[watch_bb_vid] WARN: could not merge {src} → {target}',
+                  flush=True)
+      leftover = glob.glob(os.path.join(path, '*'))
+      if leftover:
+        print(f'[watch_bb_vid] WARN: not removing {path}; leftover={leftover}',
+              flush=True)
+      else:
         shutil.rmtree(path)
-        print(f'[watch_bb_vid] removed stale active dir {name}', flush=True)
+        print(f'[watch_bb_vid] merged+archived {name} → completed_runs/',
+              flush=True)
+    else:
+      shutil.move(path, dest)
+      print(f'[watch_bb_vid] archived {name} → completed_runs/', flush=True)
 
 
 def walltime_for(n_ckpts: int) -> str:
@@ -361,8 +399,10 @@ def submit_new_ckpt_videos(
 
   list_dir = os.path.join(_ACTIVE_ROOT, '.ckpt_lists')
   os.makedirs(list_dir, exist_ok=True)
+  # Include a nonce so rapid successive submits do not overwrite the same file.
   list_file = os.path.join(
-      list_dir, f'{run_tag}_{int(time.time())}_{os.getpid()}.txt')
+      list_dir,
+      f'{run_tag}_{int(time.time())}_{os.getpid()}_{len(paths)}_{id(paths)}.txt')
   with open(list_file, 'w', encoding='utf-8') as fh:
     for p in paths:
       fh.write(p + '\n')

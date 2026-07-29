@@ -1139,6 +1139,22 @@ def _tree_copy(params):
   return jax.tree_util.tree_map(lambda x: x, params)
 
 
+def _merge_policy_opt_state(old_opt_state, fresh_opt_state):
+  """Keep value-network Adam state; replace policy branches from ``fresh``."""
+
+  def _pick(path, old, fresh):
+    for p in path:
+      key = getattr(p, 'key', None)
+      if key == 'policy':
+        return fresh
+      if key == 'value':
+        return old
+    return old
+
+  return jax.tree_util.tree_map_with_path(
+      _pick, old_opt_state, fresh_opt_state)
+
+
 def _ema_tree(target, online, tau: float):
   """target ← τ·target + (1−τ)·online elementwise over a param pytree."""
   tau = float(tau)
@@ -1820,6 +1836,25 @@ def run_ppo_training(
   recent_success: list = []
   ep_success_max = np.zeros(E, dtype=np.float32)
   _track_train_success = _use_jax_bb_vec
+  # Nominal PD/MJ episode length (BuilderBench). Used to detect collapse via
+  # short episodes (e.g. repeated OOB early terminations) and reinit the actor.
+  _nominal_ep_len = (
+      int(vec_env.episode_length) if _use_jax_bb_vec else 0)
+  _actor_reset_ep_frac = 0.8
+  _force_reset_iters: set = set()
+  _raw_force = str(getattr(config, 'ppo_actor_reset_iters', '') or '').strip()
+  if _raw_force:
+    for _tok in _raw_force.replace(';', ',').split(','):
+      _tok = _tok.strip()
+      if _tok:
+        _force_reset_iters.add(int(_tok))
+  if _nominal_ep_len > 0:
+    print(f'[ppo] actor-reset guard: reinit policy if ep_length_mean < '
+          f'{_actor_reset_ep_frac:.0%} of nominal ({_nominal_ep_len}) '
+          f'= {_actor_reset_ep_frac * _nominal_ep_len:.1f}')
+  if _force_reset_iters:
+    print(f'[ppo] actor-reset schedule: force reinit at iters '
+          f'{sorted(_force_reset_iters)}')
 
   # Running goal normalisation stats for NF mode.
   # Updated from replay buffer each iteration; broadcast-compatible with goals.
@@ -2402,6 +2437,37 @@ def run_ppo_training(
         log[f'obs/{k_d}'] = v_d
 
     learner_logger.write(log)
+
+    # =================================================================
+    # 5b. Actor reset if episodes are collapsing OR on a forced schedule
+    # =================================================================
+    _ep_mean = (float(np.mean(recent_lengths)) if recent_lengths
+                else float('nan'))
+    _short_ep = (
+        _nominal_ep_len > 0 and recent_lengths
+        and _ep_mean < _actor_reset_ep_frac * float(_nominal_ep_len))
+    _forced = int(iteration) in _force_reset_iters
+    if _short_ep or _forced:
+      _thresh = _actor_reset_ep_frac * float(_nominal_ep_len)
+      key, k_pol = jax.random.split(key)
+      _new_policy = networks.policy_network.init(k_pol)
+      ppo_params = {'policy': _new_policy, 'value': ppo_params['value']}
+      _fresh_opt = ppo_optimizer.init(ppo_params)
+      ppo_opt_state = _merge_policy_opt_state(ppo_opt_state, _fresh_opt)
+      if _use_td3_target_policy:
+        td3_policy_target = _tree_copy(_new_policy)
+      else:
+        td3_policy_target = ppo_params['policy']
+      recent_lengths.clear()
+      recent_returns.clear()
+      if _forced and _short_ep:
+        _why = (f'forced+short ep_length_mean={_ep_mean:.2f} < {_thresh:.1f}')
+      elif _forced:
+        _why = 'forced schedule'
+      else:
+        _why = (f'ep_length_mean={_ep_mean:.2f} < {_thresh:.1f} '
+                f'(nominal={_nominal_ep_len})')
+      print(f'[ppo] actor reset at iter={iteration}: {_why}')
 
     # =================================================================
     # 6. Periodic evaluation

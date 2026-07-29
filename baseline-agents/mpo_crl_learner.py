@@ -1,14 +1,14 @@
-"""Standalone online MPO policy learning on a CRL representation critic.
+"""Standalone online MPO policy learning with CRL representations.
 
 The policy and representation objectives intentionally use different replay
 views:
 
-* MPO samples the original goal-conditioned observations collected online and
-  always scores actions with target ``phi(s, a) dot psi(g)``.
+* MPO samples the original goal-conditioned observations collected online.
+  By default it directly scores actions with target ``phi(s, a) dot psi(g)``.
+  With ``use_td_critic``, that score instead becomes a fixed-goal reward for a
+  scalar TD critic ``G(s, a)``, and MPO scores actions with target ``G``.
 * CRL samples complete episodes through ``EpisodeReplay``, which relabels each
   transition with a geometrically sampled future goal.
-
-There is no TD critic or value network in this baseline.
 """
 
 from __future__ import annotations
@@ -78,6 +78,18 @@ class MPOCRLConfig:
   policy_hidden_sizes: Sequence[int] = (256, 256, 256)
   policy_init_scale: float = 0.7
 
+  # Optional fixed-goal scalar TD critic G(s, a).  CRL target scores are the
+  # rewards; G supplies the long-horizon action values used by MPO.
+  use_td_critic: bool = False
+  critic_learning_rate: float = 1e-4
+  critic_grad_norm_clip: float = 40.0
+  critic_hidden_sizes: Sequence[int] = (512, 512, 256)
+  critic_target_update_period: int = 100
+  critic_target_update_rate: float = 0.005
+  bootstrap_action_samples: int = 20
+  normalize_critic_reward: bool = False
+  critic_reward_norm_rate: float = 0.001
+
   epsilon: float = 0.1
   epsilon_mean: float = 0.0025
   epsilon_stddev: float = 1e-6
@@ -109,6 +121,17 @@ class MPOCRLConfig:
           'target_update_rate must be in (0, 1] when target_update_period <= 0')
     if not 0.0 < self.repr_target_update_rate <= 1.0:
       raise ValueError('repr_target_update_rate must be in (0, 1]')
+    if self.use_td_critic:
+      if (self.critic_target_update_period <= 0
+          and not 0.0 < self.critic_target_update_rate <= 1.0):
+        raise ValueError(
+            'critic_target_update_rate must be in (0, 1] when '
+            'critic_target_update_period <= 0')
+      if self.bootstrap_action_samples <= 0:
+        raise ValueError('bootstrap_action_samples must be positive')
+      if (self.normalize_critic_reward
+          and not 0.0 < self.critic_reward_norm_rate <= 1.0):
+        raise ValueError('critic_reward_norm_rate must be in (0, 1]')
 
 
 class MPOCRLTrainingState(NamedTuple):
@@ -174,6 +197,85 @@ class ObservationReplay:
     return self._storage[indices]
 
 
+class TransitionReplay:
+  """FIFO replay of original fixed-goal transitions for scalar TD learning."""
+
+  def __init__(
+      self,
+      capacity: int,
+      observation_shape: Sequence[int],
+      action_shape: Sequence[int],
+  ):
+    self._capacity = int(capacity)
+    self._obs = np.empty(
+        (self._capacity,) + tuple(observation_shape), dtype=np.float32)
+    self._action = np.empty(
+        (self._capacity,) + tuple(action_shape), dtype=np.float32)
+    self._next_obs = np.empty_like(self._obs)
+    self._done = np.empty((self._capacity,), dtype=np.float32)
+    self._size = 0
+    self._cursor = 0
+
+  @property
+  def size(self) -> int:
+    return self._size
+
+  def add(
+      self,
+      obs: np.ndarray,
+      action: np.ndarray,
+      next_obs: np.ndarray,
+      done: np.ndarray,
+  ) -> None:
+    obs = np.asarray(obs, dtype=np.float32).reshape(
+        (-1,) + self._obs.shape[1:])
+    action = np.asarray(action, dtype=np.float32).reshape(
+        (-1,) + self._action.shape[1:])
+    next_obs = np.asarray(next_obs, dtype=np.float32).reshape(
+        (-1,) + self._next_obs.shape[1:])
+    done = np.asarray(done, dtype=np.float32).reshape(-1)
+    n = obs.shape[0]
+    if not (action.shape[0] == next_obs.shape[0] == done.shape[0] == n):
+      raise ValueError('transition fields must have equal leading sizes')
+    if n >= self._capacity:
+      obs = obs[-self._capacity:]
+      action = action[-self._capacity:]
+      next_obs = next_obs[-self._capacity:]
+      done = done[-self._capacity:]
+      n = self._capacity
+    first = min(n, self._capacity - self._cursor)
+    sl = slice(self._cursor, self._cursor + first)
+    self._obs[sl] = obs[:first]
+    self._action[sl] = action[:first]
+    self._next_obs[sl] = next_obs[:first]
+    self._done[sl] = done[:first]
+    remaining = n - first
+    if remaining:
+      self._obs[:remaining] = obs[first:]
+      self._action[:remaining] = action[first:]
+      self._next_obs[:remaining] = next_obs[first:]
+      self._done[:remaining] = done[first:]
+    self._cursor = (self._cursor + n) % self._capacity
+    self._size = min(self._capacity, self._size + n)
+
+  def sample_batches(
+      self,
+      num_batches: int,
+      batch_size: int,
+      rng: np.random.Generator,
+  ) -> Dict[str, np.ndarray]:
+    if self._size < batch_size:
+      raise ValueError(f'replay has {self._size} transitions, need {batch_size}')
+    indices = rng.integers(
+        0, self._size, size=(int(num_batches), int(batch_size)))
+    return {
+        'obs': self._obs[indices],
+        'action': self._action[indices],
+        'next_obs': self._next_obs[indices],
+        'done': self._done[indices],
+    }
+
+
 def _tree_copy(tree):
   return jax.tree_util.tree_map(lambda x: x, tree)
 
@@ -203,6 +305,29 @@ def make_mpo_policy(
   transformed = hk.without_apply_rng(hk.transform(policy_fn))
   return networks_lib.FeedForwardNetwork(
       init=lambda key: transformed.init(key, dummy_obs),
+      apply=transformed.apply)
+
+
+def make_scalar_critic(
+    environment_spec: specs.EnvironmentSpec,
+    obs_dim: int,
+    hidden_sizes: Sequence[int],
+) -> networks_lib.FeedForwardNetwork:
+  """Build the fixed-goal scalar critic G(s, a); goal is not an input."""
+  action_dim = int(np.prod(environment_spec.actions.shape))
+  dummy_state = jnp.zeros((1, int(obs_dim)), dtype=jnp.float32)
+  dummy_action = jnp.zeros((1, action_dim), dtype=jnp.float32)
+
+  def critic_fn(state, action):
+    inputs = jnp.concatenate([state, action], axis=-1)
+    embedding = networks_lib.LayerNormMLP(
+        tuple(hidden_sizes), activate_final=True)(inputs)
+    return hk.Linear(
+        1, w_init=hk.initializers.VarianceScaling(1e-4))(embedding)[..., 0]
+
+  transformed = hk.without_apply_rng(hk.transform(critic_fn))
+  return networks_lib.FeedForwardNetwork(
+      init=lambda key: transformed.init(key, dummy_state, dummy_action),
       apply=transformed.apply)
 
 
@@ -303,6 +428,244 @@ def make_mpo_update_fn(
   return update, mpo_loss
 
 
+def make_mpo_td_update_fn(
+    policy_network: networks_lib.FeedForwardNetwork,
+    crl_networks: contrastive_networks.ContrastiveNetworks,
+    critic_network: networks_lib.FeedForwardNetwork,
+    obs_dim: int,
+    discount: float,
+    action_min: jnp.ndarray,
+    action_max: jnp.ndarray,
+    mpo_config: MPOCRLConfig,
+    policy_optimizer: optax.GradientTransformation,
+    dual_optimizer: optax.GradientTransformation,
+    critic_optimizer: optax.GradientTransformation,
+):
+  """Jointly update scalar G(s,a), MPO policy, and MPO dual variables.
+
+  CRL target scores provide a fixed-goal reward.  Expected-SARSA targets
+  average G_target over actions sampled from the target policy.  MPO policy
+  improvement also uses G_target, never the online G being optimized.
+  """
+  mpo_loss = mpo_losses.MPO(
+      epsilon=mpo_config.epsilon,
+      epsilon_mean=mpo_config.epsilon_mean,
+      epsilon_stddev=mpo_config.epsilon_stddev,
+      epsilon_penalty=mpo_config.epsilon_penalty,
+      init_log_temperature=mpo_config.init_log_temperature,
+      init_log_alpha_mean=mpo_config.init_log_alpha_mean,
+      init_log_alpha_stddev=mpo_config.init_log_alpha_stddev,
+      per_dim_constraining=mpo_config.per_dim_constraining,
+      action_penalization=mpo_config.action_penalization)
+  num_samples = int(mpo_config.num_action_samples)
+  bootstrap_samples = int(mpo_config.bootstrap_action_samples)
+  target_period = int(mpo_config.target_update_period)
+  target_rate = float(mpo_config.target_update_rate)
+  critic_target_period = int(mpo_config.critic_target_update_period)
+  critic_target_rate = float(mpo_config.critic_target_update_rate)
+  normalize_reward = bool(mpo_config.normalize_critic_reward)
+  reward_norm_rate = float(mpo_config.critic_reward_norm_rate)
+  obs_dim = int(obs_dim)
+  discount = float(discount)
+
+  def _target_critic_values(target_critic_params, observations, actions):
+    """Evaluate G_target for actions shaped (N, B, A)."""
+    clipped_actions = jnp.clip(actions, action_min, action_max)
+    n, b, a = clipped_actions.shape
+    tiled_state = jnp.broadcast_to(
+        observations[None, :, :obs_dim],
+        (n, b, obs_dim)).reshape(n * b, obs_dim)
+    flat_actions = clipped_actions.reshape(n * b, a)
+    return critic_network.apply(
+        target_critic_params, tiled_state, flat_actions).reshape(n, b)
+
+  def critic_loss_fn(
+      critic_params,
+      target_critic_params,
+      target_policy_params,
+      reward,
+      raw_reward,
+      reward_std,
+      batch,
+      key,
+  ):
+    obs = batch['obs']
+    action = batch['action']
+    next_obs = batch['next_obs']
+    done = batch['done']
+
+    next_dist = policy_network.apply(target_policy_params, next_obs)
+    next_actions = next_dist.sample(bootstrap_samples, seed=key)
+    next_values = _target_critic_values(
+        target_critic_params, next_obs, next_actions)
+    next_value = jnp.mean(next_values, axis=0)
+    td_target = jax.lax.stop_gradient(
+        reward + discount * (1.0 - done) * next_value)
+    prediction = critic_network.apply(
+        critic_params, obs[:, :obs_dim], action)
+    td_error = td_target - prediction
+    loss = 0.5 * jnp.mean(jnp.square(td_error))
+    metrics = {
+        'critic_loss': loss,
+        'critic_prediction_mean': jnp.mean(prediction),
+        'critic_reward_mean': jnp.mean(reward),
+        'critic_reward_raw_mean': jnp.mean(raw_reward),
+        'critic_reward_norm_std': reward_std,
+        'critic_target_mean': jnp.mean(td_target),
+        'critic_td_error_abs': jnp.mean(jnp.abs(td_error)),
+    }
+    return loss, metrics
+
+  critic_grad_fn = jax.value_and_grad(critic_loss_fn, has_aux=True)
+
+  def policy_loss_fn(
+      policy_params,
+      dual_params,
+      target_policy_params,
+      target_critic_params,
+      observations,
+      key,
+  ):
+    online_dist = policy_network.apply(policy_params, observations)
+    target_dist = policy_network.apply(target_policy_params, observations)
+    sampled_actions = target_dist.sample(num_samples, seed=key)
+    q_values = jax.lax.stop_gradient(_target_critic_values(
+        target_critic_params, observations, sampled_actions))
+    loss, stats = mpo_loss(
+        params=dual_params,
+        online_action_distribution=online_dist,
+        target_action_distribution=target_dist,
+        actions=sampled_actions,
+        q_values=q_values)
+    metrics = {name: jnp.mean(value) if value is not None else jnp.nan
+               for name, value in stats._asdict().items()}
+    metrics['total_loss'] = jnp.mean(loss)
+    metrics['q_mean'] = jnp.mean(q_values)
+    return jnp.mean(loss), metrics
+
+  policy_grad_fn = jax.value_and_grad(
+      policy_loss_fn, argnums=(0, 1), has_aux=True)
+
+  @jax.jit
+  def update(state: MPOCRLTrainingState, batch: Dict[str, jnp.ndarray]):
+    key, critic_key, policy_key = jax.random.split(state.key, 3)
+    crl_params = state.q_params['crl']
+    critic_params = state.q_params['critic']
+    target_crl_params = state.target_q_params['crl']
+    target_critic_params = state.target_q_params['critic']
+
+    # Track the slowly moving CRL reward with EMA moments. Initializing from
+    # the first minibatch avoids a large artificial transient from zero-valued
+    # moments. Centering and scaling make G's target insensitive to CRL logit
+    # offset/scale drift.
+    sa_repr, g_repr, _ = crl_networks.repr_fn(
+        target_crl_params, batch['obs'], batch['action'])
+    raw_reward = jax.lax.stop_gradient(
+        jnp.sum(sa_repr * g_repr, axis=-1))
+    reward_mean = state.q_params['critic_reward_mean']
+    reward_var = state.q_params['critic_reward_var']
+    reward_initialized = state.q_params['critic_reward_initialized']
+    if normalize_reward:
+      batch_mean = jnp.mean(raw_reward)
+      batch_var = jnp.var(raw_reward)
+      mean_delta = batch_mean - reward_mean
+      ema_mean = reward_mean + reward_norm_rate * mean_delta
+      ema_var = (
+          (1.0 - reward_norm_rate) * reward_var
+          + reward_norm_rate * batch_var
+          + reward_norm_rate * (1.0 - reward_norm_rate)
+          * jnp.square(mean_delta))
+      reward_mean = jnp.where(
+          reward_initialized, ema_mean, batch_mean)
+      reward_var = jnp.where(
+          reward_initialized, ema_var, batch_var)
+      reward_initialized = jnp.asarray(True)
+      reward_std = jnp.sqrt(jnp.maximum(reward_var, 1e-6))
+      reward = (raw_reward - reward_mean) / reward_std
+    else:
+      reward_std = jnp.asarray(1.0, dtype=raw_reward.dtype)
+      reward = raw_reward
+
+    (_, critic_metrics), critic_grads = critic_grad_fn(
+        critic_params,
+        target_critic_params,
+        state.target_policy_params,
+        reward,
+        raw_reward,
+        reward_std,
+        batch,
+        critic_key)
+    (_, policy_metrics), (policy_grads, dual_grads) = policy_grad_fn(
+        state.policy_params,
+        state.dual_params,
+        state.target_policy_params,
+        target_critic_params,
+        batch['obs'],
+        policy_key)
+
+    critic_updates, critic_opt_state = critic_optimizer.update(
+        critic_grads, state.q_optimizer_state['critic'], critic_params)
+    policy_updates, policy_opt_state = policy_optimizer.update(
+        policy_grads, state.policy_optimizer_state, state.policy_params)
+    dual_updates, dual_opt_state = dual_optimizer.update(
+        dual_grads, state.dual_optimizer_state, state.dual_params)
+    critic_params = optax.apply_updates(critic_params, critic_updates)
+    policy_params = optax.apply_updates(state.policy_params, policy_updates)
+    dual_params = optax.apply_updates(state.dual_params, dual_updates)
+    dual_params = mpo_losses.clip_mpo_params(
+        dual_params, mpo_config.per_dim_constraining)
+
+    policy_steps = state.policy_steps + 1
+    if target_period > 0:
+      target_policy_params = optax.periodic_update(
+          policy_params, state.target_policy_params, policy_steps, target_period)
+    else:
+      target_policy_params = optax.incremental_update(
+          policy_params, state.target_policy_params, target_rate)
+    if critic_target_period > 0:
+      target_critic_params = optax.periodic_update(
+          critic_params,
+          target_critic_params,
+          policy_steps,
+          critic_target_period)
+    else:
+      target_critic_params = optax.incremental_update(
+          critic_params, target_critic_params, critic_target_rate)
+
+    metrics = dict(policy_metrics)
+    metrics.update(critic_metrics)
+    # These are pre-clipping norms.  The optimizer chains below apply the
+    # configured global-norm clips before Adam.
+    metrics['policy_grad_norm'] = optax.global_norm(policy_grads)
+    metrics['dual_grad_norm'] = optax.global_norm(dual_grads)
+    metrics['critic_grad_norm'] = optax.global_norm(critic_grads)
+    return state._replace(
+        policy_params=policy_params,
+        target_policy_params=target_policy_params,
+        dual_params=dual_params,
+        policy_optimizer_state=policy_opt_state,
+        dual_optimizer_state=dual_opt_state,
+        q_params={
+            'crl': crl_params,
+            'critic': critic_params,
+            'critic_reward_mean': reward_mean,
+            'critic_reward_var': reward_var,
+            'critic_reward_initialized': reward_initialized,
+        },
+        target_q_params={
+            'crl': target_crl_params,
+            'critic': target_critic_params,
+        },
+        q_optimizer_state={
+            'crl': state.q_optimizer_state['crl'],
+            'critic': critic_opt_state,
+        },
+        policy_steps=policy_steps,
+        key=key), metrics
+
+  return update, mpo_loss
+
+
 def _save_checkpoint(path: str, state: MPOCRLTrainingState,
                      iteration: int, global_step: int) -> None:
   payload = {
@@ -371,18 +734,29 @@ def run_mpo_crl_training(
       environment_spec,
       hidden_sizes=mpo_config.policy_hidden_sizes,
       init_scale=mpo_config.policy_init_scale)
+  critic_network = (
+      make_scalar_critic(
+          environment_spec,
+          obs_dim=int(config.obs_dim),
+          hidden_sizes=mpo_config.critic_hidden_sizes)
+      if mpo_config.use_td_critic else None)
   policy_optimizer = optax.chain(
       optax.clip_by_global_norm(mpo_config.policy_grad_norm_clip),
       optax.adam(mpo_config.policy_learning_rate))
   dual_optimizer = optax.chain(
       optax.clip_by_global_norm(mpo_config.policy_grad_norm_clip),
       optax.adam(mpo_config.dual_learning_rate))
+  critic_optimizer = optax.chain(
+      optax.clip_by_global_norm(mpo_config.critic_grad_norm_clip),
+      optax.adam(mpo_config.critic_learning_rate))
   q_optimizer = optax.adam(float(config.learning_rate))
 
   key = jax.random.PRNGKey(seed)
-  key, policy_key, q_key = jax.random.split(key, 3)
+  key, policy_key, q_key, critic_key = jax.random.split(key, 4)
   policy_params = policy_network.init(policy_key)
-  q_params = crl_networks.q_network.init(q_key)
+  crl_params = crl_networks.q_network.init(q_key)
+  critic_params = (
+      critic_network.init(critic_key) if critic_network is not None else None)
   mpo_module = mpo_losses.MPO(
       epsilon=mpo_config.epsilon,
       epsilon_mean=mpo_config.epsilon_mean,
@@ -395,6 +769,26 @@ def run_mpo_crl_training(
       action_penalization=mpo_config.action_penalization)
   action_dim = int(np.prod(action_spec.shape))
   dual_params = mpo_module.init_params(action_dim=action_dim)
+  if mpo_config.use_td_critic:
+    q_params = {
+        'crl': crl_params,
+        'critic': critic_params,
+        'critic_reward_mean': jnp.asarray(0.0, dtype=jnp.float32),
+        'critic_reward_var': jnp.asarray(1.0, dtype=jnp.float32),
+        'critic_reward_initialized': jnp.asarray(False),
+    }
+    target_q_params = {
+        'crl': _tree_copy(crl_params),
+        'critic': _tree_copy(critic_params),
+    }
+    q_optimizer_state = {
+        'crl': q_optimizer.init(crl_params),
+        'critic': critic_optimizer.init(critic_params),
+    }
+  else:
+    q_params = crl_params
+    target_q_params = _tree_copy(crl_params)
+    q_optimizer_state = q_optimizer.init(crl_params)
   state = MPOCRLTrainingState(
       policy_params=policy_params,
       target_policy_params=_tree_copy(policy_params),
@@ -402,14 +796,22 @@ def run_mpo_crl_training(
       policy_optimizer_state=policy_optimizer.init(policy_params),
       dual_optimizer_state=dual_optimizer.init(dual_params),
       q_params=q_params,
-      target_q_params=_tree_copy(q_params),
-      q_optimizer_state=q_optimizer.init(q_params),
+      target_q_params=target_q_params,
+      q_optimizer_state=q_optimizer_state,
       policy_steps=jnp.asarray(0, dtype=jnp.int32),
       key=key)
 
-  mpo_update, _ = make_mpo_update_fn(
-      policy_network, crl_networks, action_min, action_max, mpo_config,
-      policy_optimizer, dual_optimizer)
+  if mpo_config.use_td_critic:
+    mpo_update, _ = make_mpo_td_update_fn(
+        policy_network, crl_networks, critic_network,
+        obs_dim=int(config.obs_dim), discount=float(config.discount),
+        action_min=action_min, action_max=action_max, mpo_config=mpo_config,
+        policy_optimizer=policy_optimizer, dual_optimizer=dual_optimizer,
+        critic_optimizer=critic_optimizer)
+  else:
+    mpo_update, _ = make_mpo_update_fn(
+        policy_network, crl_networks, action_min, action_max, mpo_config,
+        policy_optimizer, dual_optimizer)
   backward = (
       str(getattr(config, 'ppo_crl_loss_direction', 'forward')).lower()
       == 'backward')
@@ -419,12 +821,12 @@ def run_mpo_crl_training(
   @jax.jit
   def mpo_update_scan(
       scan_state: MPOCRLTrainingState,
-      observation_batches: jnp.ndarray,
+      replay_batches,
   ):
     """Run all replay updates sequentially on device without host syncs."""
-    def body(carry, observations):
-      return mpo_update(carry, observations)
-    return jax.lax.scan(body, scan_state, observation_batches)
+    def body(carry, batch):
+      return mpo_update(carry, batch)
+    return jax.lax.scan(body, scan_state, replay_batches)
 
   @jax.jit
   def crl_update_scan(
@@ -434,15 +836,35 @@ def run_mpo_crl_training(
     """Run CRL updates and target updates in one compiled device scan."""
     def body(carry, batch):
       state_key, update_key = jax.random.split(carry.key)
+      current_q_params = (
+          carry.q_params['crl'] if mpo_config.use_td_critic
+          else carry.q_params)
+      current_target_q_params = (
+          carry.target_q_params['crl'] if mpo_config.use_td_critic
+          else carry.target_q_params)
+      current_q_opt_state = (
+          carry.q_optimizer_state['crl'] if mpo_config.use_td_critic
+          else carry.q_optimizer_state)
       q_params, q_opt_state, metrics = crl_update(
-          carry.q_params, carry.q_optimizer_state, batch, update_key)
+          current_q_params, current_q_opt_state, batch, update_key)
       target_q_params = _incremental_update_tree(
-          carry.target_q_params, q_params,
+          current_target_q_params, q_params,
           mpo_config.repr_target_update_rate)
+      if mpo_config.use_td_critic:
+        all_q_params = dict(carry.q_params)
+        all_q_params['crl'] = q_params
+        all_target_q_params = dict(carry.target_q_params)
+        all_target_q_params['crl'] = target_q_params
+        all_q_opt_state = dict(carry.q_optimizer_state)
+        all_q_opt_state['crl'] = q_opt_state
+      else:
+        all_q_params = q_params
+        all_target_q_params = target_q_params
+        all_q_opt_state = q_opt_state
       carry = carry._replace(
-          q_params=q_params,
-          target_q_params=target_q_params,
-          q_optimizer_state=q_opt_state,
+          q_params=all_q_params,
+          target_q_params=all_target_q_params,
+          q_optimizer_state=all_q_opt_state,
           key=state_key)
       return carry, metrics
     return jax.lax.scan(body, scan_state, batches)
@@ -480,8 +902,14 @@ def run_mpo_crl_training(
       discount=float(config.discount),
       start_index=int(config.start_index),
       end_index=int(config.end_index))
-  observation_replay = ObservationReplay(
-      int(config.max_replay_size), vec_env.observation_shape)
+  policy_replay = (
+      TransitionReplay(
+          int(config.max_replay_size),
+          vec_env.observation_shape,
+          action_spec.shape)
+      if mpo_config.use_td_critic
+      else ObservationReplay(
+          int(config.max_replay_size), vec_env.observation_shape))
   rng = np.random.default_rng(seed + 12345)
 
   # ---- uniform-sampling goal bounds (mirrors ppo_learner.py) -------------
@@ -510,7 +938,43 @@ def run_mpo_crl_training(
     if os.path.exists(latest):
       with open(latest, 'rb') as handle:
         payload = pickle.load(handle)
-      state = payload['state']
+      loaded_state = payload['state']
+      loaded_has_td = (
+          isinstance(loaded_state.q_params, dict)
+          and 'crl' in loaded_state.q_params
+          and 'critic' in loaded_state.q_params)
+      if mpo_config.use_td_critic and not loaded_has_td:
+        # Allow starting the new TD critic from an existing direct-CRL
+        # checkpoint without changing the checkpoint tuple schema.
+        state = loaded_state._replace(
+            q_params={
+                'crl': loaded_state.q_params,
+                'critic': state.q_params['critic'],
+            },
+            target_q_params={
+                'crl': loaded_state.target_q_params,
+                'critic': state.target_q_params['critic'],
+            },
+            q_optimizer_state={
+                'crl': loaded_state.q_optimizer_state,
+                'critic': state.q_optimizer_state['critic'],
+            })
+        print('[mpo-crl] initialized a fresh TD critic while resuming '
+              'policy/CRL parameters')
+      elif not mpo_config.use_td_critic and loaded_has_td:
+        raise ValueError(
+            'checkpoint contains a TD critic; resume with --mpo_use_td_critic')
+      else:
+        state = loaded_state
+      if mpo_config.use_td_critic and 'critic_reward_mean' not in state.q_params:
+        # Older TD-critic checkpoints predate reward normalization.
+        loaded_q_params = dict(state.q_params)
+        loaded_q_params.update({
+            'critic_reward_mean': jnp.asarray(0.0, dtype=jnp.float32),
+            'critic_reward_var': jnp.asarray(1.0, dtype=jnp.float32),
+            'critic_reward_initialized': jnp.asarray(False),
+        })
+        state = state._replace(q_params=loaded_q_params)
       start_iteration = int(payload['iteration']) + 1
       global_step = int(payload['global_step'])
       print(f'[mpo-crl] resumed at iteration={start_iteration}, '
@@ -602,7 +1066,15 @@ def run_mpo_crl_training(
       terminal_obs_rollout = np.asarray(
           steps['terminal_obs'], dtype=np.float32)
       next_obs_rollout = np.asarray(steps['next_obs'], dtype=np.float32)
-      observation_replay.add(rollout_obs)
+      if mpo_config.use_td_critic:
+        replay_next_obs = np.where(
+            rollout_dones[..., None],
+            terminal_obs_rollout,
+            next_obs_rollout)
+        policy_replay.add(
+            rollout_obs, rollout_actions, replay_next_obs, rollout_dones)
+      else:
+        policy_replay.add(rollout_obs)
 
       # BuilderBench PD jobs use T == episode length, so all synchronized
       # environments normally terminate once at the final scan step. Handle
@@ -669,7 +1141,6 @@ def run_mpo_crl_training(
     else:
       env_rewards = []
       for _ in range(int(mpo_config.rollout_length)):
-        observation_replay.add(obs)
         next_key, action_key = jax.random.split(state.key)
         state = state._replace(key=next_key)
         raw_action = np.asarray(target_action(
@@ -679,6 +1150,14 @@ def run_mpo_crl_training(
             np.asarray(action_spec.minimum),
             np.asarray(action_spec.maximum)).astype(np.float32)
         next_obs, reward, dones, terminal_obs, _ = vec_env.step(action)
+        if mpo_config.use_td_critic:
+          replay_next_obs = np.where(
+              np.asarray(dones)[:, None],
+              np.asarray(terminal_obs),
+              np.asarray(next_obs))
+          policy_replay.add(obs, action, replay_next_obs, dones)
+        else:
+          policy_replay.add(obs)
         env_rewards.append(reward)
         for index in range(num_envs):
           episode_actions[index].append(action[index].copy())
@@ -729,12 +1208,13 @@ def run_mpo_crl_training(
     crl_seconds = time.perf_counter() - crl_start
     mpo_start = time.perf_counter()
     mpo_metrics_mean: Dict[str, float] = {}
-    if observation_replay.size >= max(
+    if policy_replay.size >= max(
         int(mpo_config.min_replay_size), int(mpo_config.policy_batch_size)):
-      policy_batches = jnp.asarray(observation_replay.sample_batches(
+      sampled_batches = policy_replay.sample_batches(
           int(mpo_config.policy_updates_per_iter),
           int(mpo_config.policy_batch_size),
-          rng))
+          rng)
+      policy_batches = jax.tree_util.tree_map(jnp.asarray, sampled_batches)
       state, mpo_metrics = mpo_update_scan(state, policy_batches)
       mpo_metrics_mean = _mean_device_metrics(mpo_metrics)
     mpo_seconds = time.perf_counter() - mpo_start
@@ -745,7 +1225,7 @@ def run_mpo_crl_training(
         'learner_steps': iteration,
         'global_step': global_step,
         'sps': global_step / max(elapsed, 1e-6),
-        'policy_replay_size': observation_replay.size,
+        'policy_replay_size': policy_replay.size,
         'crl_replay_size': episode_replay.size,
         'crl_replay_episodes': episode_replay.num_episodes,
         'reward_env_mean': float(np.mean(env_rewards)),
@@ -775,7 +1255,10 @@ def run_mpo_crl_training(
         'loss_alpha', 'loss_policy', 'loss_temperature',
         'penalty_kl_q_rel', 'pi_stddev_cond', 'pi_stddev_max',
         'pi_stddev_min', 'policy_grad_norm', 'q_max', 'q_mean', 'q_min',
-        'total_loss'):
+        'total_loss', 'critic_grad_norm', 'critic_loss',
+        'critic_prediction_mean', 'critic_reward_mean',
+        'critic_reward_raw_mean', 'critic_reward_norm_std',
+        'critic_target_mean', 'critic_td_error_abs'):
       log[f'mpo/{key_}'] = float('nan')
     for key_ in (
         'binary_accuracy', 'categorical_accuracy', 'crl_loss', 'logits_neg',

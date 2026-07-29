@@ -200,6 +200,10 @@ flags.DEFINE_string(
 flags.DEFINE_boolean(
     'ppo_skip_first_eval', False,
     'Skip logging the iteration-0 eval (avoids logging the checkpoint result as the first data point when resuming).')
+flags.DEFINE_string(
+    'ppo_actor_reset_iters', '',
+    'Comma-separated PPO iterations at which to force an actor reinit '
+    '(in addition to the short-episode guard). Empty disables the schedule.')
 flags.DEFINE_integer(
     'ppo_eval_interval', -1,
     'Run eval every N PPO iterations. <0 keeps config/env default (10). 0 disables eval.')
@@ -398,8 +402,10 @@ fixed_goal_dict = {
 # point_FourRooms / point_Spiral11x11: 50/100-step episodes -> T=128 keeps
 #   ~1-2 completed episodes per env per rollout.  These are the values the
 #   tuned point-env runs use, so we keep them to avoid regressing.
-# sawyer_{bin,box,peg}: 150-step episodes -> T=256 gives one full episode
-#   per env per rollout, matching CleanRL's MuJoCo convention.
+# sawyer_{bin,box,peg,...}: 150-step episodes -> T=256 gives one full episode
+#   per env per rollout, matching CleanRL's MuJoCo convention. Default CRL
+#   updates/iter=10 (sparse relative to env steps; override with
+#   --ppo_crl_steps_per_iter).
 # ---------------------------------------------------------------------------
 PPO_ENV_DEFAULTS = {
     'point_FourRooms':   dict(rollout_length=128, crl_steps_per_iter=64),
@@ -417,17 +423,17 @@ PPO_ENV_DEFAULTS = {
     'point_Wall11x11':   dict(rollout_length=128, crl_steps_per_iter=64),
     'point_Impossible':  dict(rollout_length=128, crl_steps_per_iter=64),
     'riverswim':         dict(rollout_length=128, crl_steps_per_iter=64),
-    'sawyer_bin':        dict(rollout_length=256, crl_steps_per_iter=128),
-    'sawyer_box':        dict(rollout_length=256, crl_steps_per_iter=128),
-    'sawyer_peg':        dict(rollout_length=256, crl_steps_per_iter=128),
+    'sawyer_bin':        dict(rollout_length=256, crl_steps_per_iter=10),
+    'sawyer_box':        dict(rollout_length=256, crl_steps_per_iter=10),
+    'sawyer_peg':        dict(rollout_length=256, crl_steps_per_iter=10),
     # Reach: very short episodes (150 steps), tiny obs → fast.
-    'sawyer_reach':      dict(rollout_length=256, crl_steps_per_iter=128),
+    'sawyer_reach':      dict(rollout_length=256, crl_steps_per_iter=10),
     # Push: same budget as bin (same episode length, similar obs structure).
-    'sawyer_push':       dict(rollout_length=256, crl_steps_per_iter=128),
+    'sawyer_push':       dict(rollout_length=256, crl_steps_per_iter=10),
     # Drawer-open: same episode length / obs structure as push.
-    'sawyer_drawer_open':  dict(rollout_length=256, crl_steps_per_iter=128),
+    'sawyer_drawer_open':  dict(rollout_length=256, crl_steps_per_iter=10),
     # Button-press: same episode length / obs structure as push.
-    'sawyer_button_press': dict(rollout_length=256, crl_steps_per_iter=128),
+    'sawyer_button_press': dict(rollout_length=256, crl_steps_per_iter=10),
     # flow_figureeight: 1500-step episodes. T=1500 gives one complete episode
     # per env per rollout (important for GAE accuracy on a long-horizon env).
     # φ: state = speeds+positions; ψ: goal speeds only (end_index=14 on state).
@@ -645,6 +651,8 @@ def main(_):
   config.nf_goal_std_min = float(FLAGS.nf_goal_std_min)
   config.nf_mix_env_goal_stats = bool(FLAGS.nf_mix_env_goal_stats)
   config.ppo_skip_first_eval = bool(FLAGS.ppo_skip_first_eval)
+  if str(FLAGS.ppo_actor_reset_iters or '').strip():
+    config.ppo_actor_reset_iters = str(FLAGS.ppo_actor_reset_iters).strip()
   if FLAGS.ppo_eval_interval >= 0:
     config.ppo_eval_interval = int(FLAGS.ppo_eval_interval)
   if FLAGS.ppo_eval_episodes >= 0:
