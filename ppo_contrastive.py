@@ -97,6 +97,21 @@ flags.DEFINE_float(
     'ppo_ent_coef_final', 0.0,
     'Final entropy coefficient when --ppo_anneal_ent_coef is set.')
 flags.DEFINE_bool(
+    'ppo_use_good_buffer', False,
+    'If True, enable Good Experience Replay buffer for PPO bootstrapping.')
+flags.DEFINE_string(
+    'ppo_good_buffer_mode', 'sil',
+    'Good experience buffer mode: "sil" (Self-Imitation Loss) or "mixed" (Mixed minibatches).')
+flags.DEFINE_integer(
+    'ppo_good_buffer_min_cubes', 2,
+    'Minimum stacked cubes (2, 3, or 4) required to save rollout trajectory.')
+flags.DEFINE_float(
+    'ppo_good_buffer_coef', 0.1,
+    'Loss coefficient for SIL loss (or mix fraction for mixed mode).')
+flags.DEFINE_integer(
+    'ppo_good_buffer_max_size', 50000,
+    'Maximum transitions stored in Good Experience Buffer.')
+flags.DEFINE_bool(
     'uniform_sampling', False,
     'If True, mix 50% uniformly sampled goals into each CRL replay batch. '
     'Half the in-batch InfoNCE negatives come from the uniform goal '
@@ -596,6 +611,11 @@ def main(_):
   config.ppo_anneal_lr = bool(FLAGS.ppo_anneal_lr)
   config.ppo_anneal_ent_coef = bool(FLAGS.ppo_anneal_ent_coef)
   config.ppo_ent_coef_final = float(FLAGS.ppo_ent_coef_final)
+  config.ppo_use_good_buffer = bool(FLAGS.ppo_use_good_buffer)
+  config.ppo_good_buffer_mode = str(FLAGS.ppo_good_buffer_mode).strip().lower()
+  config.ppo_good_buffer_min_cubes = int(FLAGS.ppo_good_buffer_min_cubes)
+  config.ppo_good_buffer_coef = float(FLAGS.ppo_good_buffer_coef)
+  config.ppo_good_buffer_max_size = int(FLAGS.ppo_good_buffer_max_size)
   config.uniform_sampling = bool(FLAGS.uniform_sampling)
   config.staggered_resets = bool(FLAGS.staggered_resets)
   config.crl_on_policy = bool(FLAGS.crl_on_policy)

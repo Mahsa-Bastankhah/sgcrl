@@ -177,12 +177,13 @@ class ContrastiveConfig:
   ppo_anneal_ent_coef: bool = False
   ppo_ent_coef_final: float = 0.0
   ppo_target_kl: Optional[float] = None
-  # Minimum policy std for the PPO actor.  The shared `make_networks`
-  # floor is 1e-6 (fine for SAC where adaptive-α controls entropy); PPO
-  # has no such mechanism and needs a larger floor (~0.05-0.1) to prevent
-  # the tanh-squashed Gaussian from collapsing to a point mass.  Passed
-  # through `network_factory` in `ppo_contrastive.py`.
   ppo_actor_min_std: float = 0.01
+  # Good Experience Replay & Bootstrapping
+  ppo_use_good_buffer: bool = False
+  ppo_good_buffer_mode: str = 'sil'  # 'sil' (Approach 1) | 'mixed' (Approach 2)
+  ppo_good_buffer_min_cubes: int = 2  # Min cubes stacked (2, 3, 4) to store trajectory
+  ppo_good_buffer_coef: float = 0.1  # SIL loss weight (or mix ratio for 'mixed' mode)
+  ppo_good_buffer_max_size: int = 50_000  # Max transitions in Good Experience Buffer
   # CRL updates per PPO iteration (InfoNCE on φ, ψ over replay).
   ppo_crl_steps_per_iter: int = 64
   # InfoNCE direction for PPO-CRL. 'forward': fix anchor sᵢ, vary goal gⱼ

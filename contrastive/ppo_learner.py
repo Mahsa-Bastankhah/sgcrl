@@ -382,6 +382,133 @@ class EpisodeReplay:
 
 
 # ---------------------------------------------------------------------------
+# Good Experience Replay & Progress Evaluation
+# ---------------------------------------------------------------------------
+def compute_max_cubes_stacked(
+    ep_obs: np.ndarray,
+    target_goal: Optional[np.ndarray] = None,
+    num_cubes: int = 4,
+    tol: float = 0.03,
+) -> int:
+  """Calculate max number of cubes at target locations across an episode."""
+  if ep_obs.ndim != 2 or ep_obs.shape[1] < num_cubes * 3:
+    return 0
+  cube_pos = ep_obs[:, :num_cubes * 3].reshape(-1, num_cubes, 3)
+
+  if target_goal is not None and target_goal.size >= num_cubes * 3:
+    target_pos = target_goal.reshape(-1, num_cubes, 3)
+  elif ep_obs.shape[1] >= 2 * num_cubes * 3:
+    target_pos = ep_obs[:, -num_cubes * 3:].reshape(-1, num_cubes, 3)
+  else:
+    z_heights = cube_pos[:, :, 2]
+    elevated_count = np.sum(z_heights > 0.04, axis=-1)
+    return int(np.max(elevated_count))
+
+  dists = np.linalg.norm(cube_pos - target_pos, axis=-1)
+  cubes_stacked_per_step = np.sum(dists < tol, axis=-1)
+  return int(np.max(cubes_stacked_per_step))
+
+
+class GoodTrajectoryReplay:
+  """Host-side buffer storing high-performing rollouts (>= min_cubes stacked).
+  
+  Matches EpisodeReplay design: stores list of episode dicts containing
+  (obs, action, returns, log_probs).
+  """
+
+  def __init__(self, capacity: int = 50000):
+    self._cap = int(capacity)
+    self._episodes: list = []
+    self._ep_lens: list = []
+    self._total_transitions = 0
+    self._episodes_added = 0
+
+  @property
+  def size(self) -> int:
+    return self._total_transitions
+
+  @property
+  def num_episodes(self) -> int:
+    return len(self._episodes)
+
+  @property
+  def episodes_added(self) -> int:
+    return self._episodes_added
+
+  def add_episode(self, obs: np.ndarray, action: np.ndarray, returns: np.ndarray, log_probs: np.ndarray, stacked_cubes: int = 0):
+    T = action.shape[0]
+    if T < 1:
+      return
+    obs_arr = np.asarray(obs[:T], dtype=np.float32)
+    act_arr = np.asarray(action, dtype=np.float32)
+    ret_arr = np.asarray(returns[:T], dtype=np.float32)
+    logp_arr = np.asarray(log_probs[:T], dtype=np.float32)
+
+    assert obs_arr.shape[0] == T, f'Shape mismatch: obs len {obs_arr.shape[0]} != action len {T}'
+    assert ret_arr.shape[0] == T, f'Shape mismatch: returns len {ret_arr.shape[0]} != action len {T}'
+    assert logp_arr.shape[0] == T, f'Shape mismatch: log_probs len {logp_arr.shape[0]} != action len {T}'
+
+    self._episodes.append({
+        'obs': obs_arr,
+        'action': act_arr,
+        'returns': ret_arr,
+        'log_probs': logp_arr,
+    })
+    self._ep_lens.append(T)
+    self._total_transitions += T
+    self._episodes_added += 1
+
+    print(f'[GoodTrajectoryReplay] Ingested episode #{self._episodes_added} '
+          f'({stacked_cubes} cubes stacked, len={T}, return={ret_arr[0]:.2f}). '
+          f'Buffer size: {self._total_transitions}/{self._cap} transitions.')
+
+    while self._total_transitions > self._cap and len(self._episodes) > 1:
+      self._episodes.pop(0)
+      self._total_transitions -= self._ep_lens.pop(0)
+
+  def sample(self, batch_size: int, rng: np.random.Generator) -> Dict[str, np.ndarray]:
+    assert self.size > 0, 'Cannot sample from an empty GoodTrajectoryReplay.'
+    B = int(batch_size)
+    num_eps = len(self._episodes)
+    ep_lens = np.asarray(self._ep_lens, dtype=np.int64)
+
+    ep_ids = rng.integers(0, num_eps, size=B)
+    lens = ep_lens[ep_ids]
+
+    u_t = rng.random(B)
+    t = np.floor(u_t * lens).astype(np.int64)
+    t = np.minimum(t, lens - 1)
+
+    first_ep = self._episodes[0]
+    obs_dim = first_ep['obs'].shape[1]
+    act_dim = first_ep['action'].shape[1]
+
+    obs_out = np.empty((B, obs_dim), dtype=np.float32)
+    act_out = np.empty((B, act_dim), dtype=np.float32)
+    returns_out = np.empty((B,), dtype=np.float32)
+    log_probs_out = np.empty((B,), dtype=np.float32)
+
+    for i in range(B):
+      ep = self._episodes[int(ep_ids[i])]
+      ti = int(t[i])
+      obs_out[i] = ep['obs'][ti]
+      act_out[i] = ep['action'][ti]
+      returns_out[i] = ep['returns'][ti]
+      log_probs_out[i] = ep['log_probs'][ti]
+
+    assert obs_out.shape == (B, obs_dim), f'Sample obs shape error: {obs_out.shape} vs ({B}, {obs_dim})'
+    assert act_out.shape == (B, act_dim), f'Sample action shape error: {act_out.shape} vs ({B}, {act_dim})'
+    assert returns_out.shape == (B,), f'Sample returns shape error: {returns_out.shape} vs ({B},)'
+
+    return {
+        'obs': obs_out,
+        'action': act_out,
+        'returns': returns_out,
+        'log_probs': log_probs_out,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Core factories.  Each returns a jitted function plus any needed metadata.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -673,8 +800,18 @@ def make_ppo_update_fn(
     # Term as it enters the minimized objective: L includes -coef * H.
     entropy_loss_term = -ent_coef * entropy_mean
 
+    # ---- Self-Imitation Learning (SIL) loss (Approach 1) ----
+    sil_loss = jnp.array(0.0, dtype=jnp.float32)
+    if 'good_obs' in batch:
+      good_dist = networks.policy_network.apply(params['policy'], batch['good_obs'])
+      good_logprob = networks.log_prob(good_dist, batch['good_actions'])
+      good_value = networks.value_network.apply(params['value'], batch['good_obs'])
+      sil_adv = jnp.maximum(batch['good_returns'] - good_value, 0.0)
+      sil_loss = -jnp.mean(good_logprob * sil_adv)
+
     # ---- combined loss ----
-    total = pg_loss - ent_coef * entropy_mean + vf_coef * v_loss
+    sil_coef = float(getattr(config, 'ppo_good_buffer_coef', 0.1)) if 'good_obs' in batch else 0.0
+    total = pg_loss - ent_coef * entropy_mean + vf_coef * v_loss + sil_coef * sil_loss
 
     # ---- diagnostics (stop_gradient is implicit for metrics) ----
     approx_kl = jnp.mean((ratio - 1.0) - logratio)    # http://joschu.net/blog/kl-approx.html
@@ -690,6 +827,7 @@ def make_ppo_update_fn(
         'ppo_total_loss': total,
         'pg_loss': pg_loss,
         'v_loss': v_loss,
+        'sil_loss': sil_loss,
         'entropy': entropy_mean,
         'entropy_loss': entropy_loss_term,
         'approx_kl': approx_kl,
@@ -1493,6 +1631,17 @@ def run_ppo_training(
   ppo_update = make_ppo_update_fn(
       networks, config, ppo_optimizer, ent_coef_schedule=ent_coef_schedule)
 
+  use_good_buffer = bool(getattr(config, 'ppo_use_good_buffer', False))
+  good_replay: Optional[GoodTrajectoryReplay] = None
+  if use_good_buffer:
+    good_capacity = int(getattr(config, 'ppo_good_buffer_max_size', 50000))
+    good_replay = GoodTrajectoryReplay(capacity=good_capacity)
+    print(f'[ppo] Good Experience Replay buffer initialized: '
+          f'mode={config.ppo_good_buffer_mode}, '
+          f'min_cubes={config.ppo_good_buffer_min_cubes}, '
+          f'coef={config.ppo_good_buffer_coef}, '
+          f'capacity={good_capacity}')
+
   if use_gaussian:
     crl_update = _gd.make_gaussian_density_update_fn(
         density_nets, q_optimizer, obs_dim=int(config.obs_dim))
@@ -1833,9 +1982,19 @@ def run_ppo_training(
           if _dones_t[i]:
             ep_obs[i].append(_term_t[i].copy())
             try:
-              replay.add_episode(
-                  np.stack(ep_obs[i], axis=0),
-                  np.stack(ep_act[i], axis=0))
+              _stack_obs = np.stack(ep_obs[i], axis=0)
+              _stack_act = np.stack(ep_act[i], axis=0)
+              replay.add_episode(_stack_obs, _stack_act)
+              if use_good_buffer and good_replay is not None:
+                _st_cnt = compute_max_cubes_stacked(_stack_obs, num_cubes=4, tol=0.03)
+                if _st_cnt >= int(getattr(config, 'ppo_good_buffer_min_cubes', 2)):
+                  good_replay.add_episode(
+                      obs=_stack_obs,
+                      action=_stack_act,
+                      returns=np.full(len(_stack_act), ep_return[i], dtype=np.float32),
+                      log_probs=np.zeros(len(_stack_act), dtype=np.float32),
+                      stacked_cubes=_st_cnt,
+                  )
             except AssertionError:
               pass
             ep_obs[i] = [_next_t[i].copy()]
@@ -1897,9 +2056,19 @@ def run_ppo_training(
           if dones[i]:
             ep_obs[i].append(terminal_obs[i].copy())
             try:
-              replay.add_episode(
-                  np.stack(ep_obs[i], axis=0),
-                  np.stack(ep_act[i], axis=0))
+              _stack_obs = np.stack(ep_obs[i], axis=0)
+              _stack_act = np.stack(ep_act[i], axis=0)
+              replay.add_episode(_stack_obs, _stack_act)
+              if use_good_buffer and good_replay is not None:
+                _st_cnt = compute_max_cubes_stacked(_stack_obs, num_cubes=4, tol=0.03)
+                if _st_cnt >= int(getattr(config, 'ppo_good_buffer_min_cubes', 2)):
+                  good_replay.add_episode(
+                      obs=_stack_obs,
+                      action=_stack_act,
+                      returns=np.full(len(_stack_act), ep_return[i], dtype=np.float32),
+                      log_probs=np.zeros(len(_stack_act), dtype=np.float32),
+                      stacked_cubes=_st_cnt,
+                  )
             except AssertionError:
               pass  # degenerate len-0 episodes; skip
             ep_obs[i] = [next_obs[i].copy()]  # auto-reset state seeds next ep
@@ -1997,6 +2166,32 @@ def run_ppo_training(
             'returns':      jnp.asarray(flat_ret[mb]),
             'old_values':   jnp.asarray(flat_vals[mb]),
         }
+
+        good_mode = str(getattr(config, 'ppo_good_buffer_mode', 'sil')).lower()
+        if use_good_buffer and good_replay is not None and good_replay.size > 0:
+          if good_mode == 'mixed':
+            mix_ratio = float(getattr(config, 'ppo_good_buffer_coef', 0.5))
+            n_mix = min(int(len(mb) * mix_ratio), good_replay.size)
+            if n_mix > 0:
+              good_sample = good_replay.sample(n_mix, np_rng)
+              m_obs = flat_obs[mb].copy()
+              m_acts = flat_acts[mb].copy()
+              m_logp = flat_logp[mb].copy()
+              m_ret = flat_ret[mb].copy()
+              m_obs[:n_mix] = good_sample['obs']
+              m_acts[:n_mix] = good_sample['action']
+              m_logp[:n_mix] = good_sample['log_probs']
+              m_ret[:n_mix] = good_sample['returns']
+              batch['obs'] = jnp.asarray(m_obs)
+              batch['actions'] = jnp.asarray(m_acts)
+              batch['old_logprobs'] = jnp.asarray(m_logp)
+              batch['returns'] = jnp.asarray(m_ret)
+          else:
+            good_sample = good_replay.sample(len(mb), np_rng)
+            batch['good_obs'] = jnp.asarray(good_sample['obs'])
+            batch['good_actions'] = jnp.asarray(good_sample['action'])
+            batch['good_returns'] = jnp.asarray(good_sample['returns'])
+
         key, k_mb = jax.random.split(key)
         if ent_coef_schedule is not None:
           ppo_params, ppo_opt_state, m = ppo_update(
@@ -2009,6 +2204,9 @@ def run_ppo_training(
         last_kl = float(m['approx_kl'])
         for k_, v in m.items():
           ppo_metrics_agg.setdefault(k_, []).append(float(v))
+        if use_good_buffer and good_replay is not None:
+          ppo_metrics_agg.setdefault('good_buffer_size', []).append(float(good_replay.size))
+          ppo_metrics_agg.setdefault('good_buffer_episodes', []).append(float(good_replay.episodes_added))
       if (config.ppo_target_kl is not None and last_kl is not None
           and last_kl > float(config.ppo_target_kl)):
         early_stop = True
