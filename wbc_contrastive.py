@@ -88,9 +88,9 @@ PPO_ENV_DEFAULTS = {
     'point_Wall11x11':            dict(rollout_length=128,  crl_steps_per_iter=64),
     'point_Impossible':           dict(rollout_length=128,  crl_steps_per_iter=64),
     'riverswim':                  dict(rollout_length=128,  crl_steps_per_iter=64),
-    'sawyer_bin':                 dict(rollout_length=256,  crl_steps_per_iter=128),
-    'sawyer_box':                 dict(rollout_length=256,  crl_steps_per_iter=128),
-    'sawyer_peg':                 dict(rollout_length=256,  crl_steps_per_iter=128),
+    'sawyer_bin':                 dict(rollout_length=256,  crl_steps_per_iter=10),
+    'sawyer_box':                 dict(rollout_length=256,  crl_steps_per_iter=10),
+    'sawyer_peg':                 dict(rollout_length=256,  crl_steps_per_iter=10),
 }
 
 FLAGS = flags.FLAGS

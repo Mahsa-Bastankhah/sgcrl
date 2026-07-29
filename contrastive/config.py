@@ -269,6 +269,9 @@ class ContrastiveConfig:
   nf_goal_norm_low: Optional[Any] = None   # deprecated; unused
   nf_goal_norm_high: Optional[Any] = None  # deprecated; unused
   ppo_skip_first_eval: bool = False  # skip logging the iteration-0 eval (avoids artificially high checkpoint result)
+  # Comma-separated PPO iterations at which to force an actor reinit
+  # (in addition to the short-episode guard). Empty = schedule disabled.
+  ppo_actor_reset_iters: str = ''
   ppo_eval_interval: int = 10  # run eval every N PPO iterations (0 = disabled)
   ppo_eval_episodes: int = 5  # number of eval episodes per eval round
   # KDE options (only used when ppo_reward_mode == 'kde_dirac').

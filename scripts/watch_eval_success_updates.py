@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Login-node watcher: refresh eval-success plots when >2 new checkpoints appear.
+"""Login-node watcher: refresh eval-success plots when new checkpoints appear.
 
 Runs on the login node (CPU). Never holds a GPU.
 
 * Metaworld / Sawyer runs: training already writes ``logs/eval/logs.csv`` with
-  a ``success`` column. When >2 new ``ckpt_iter_*.pkl`` appear since the last
+  a ``success`` column. When new ``ckpt_iter_*.pkl`` appear since the last
   refresh, replot from that CSV (all seeds under the same log root).
-* BuilderBench runs: deterministic eval needs a GPU. When >2 new checkpoints
+* BuilderBench runs: deterministic eval needs a GPU. When new checkpoints
   are not yet in the checkpoint-eval CSV, submit a short one-shot SLURM job
   (``jobs/job_bb_ckpt_eval_oneshot.slurm``, time≤1h).
 
@@ -17,8 +17,10 @@ Examples::
   # one scan
   python scripts/watch_eval_success_updates.py --once
 
-  # daemon (login node)
-  python scripts/watch_eval_success_updates.py --watch_interval 300
+  # daemon (login node), any new ckpt, C4/C5 actorreset runs
+  python scripts/watch_eval_success_updates.py --watch_interval 300 \\
+      --threshold 0 --include actorreset \\
+      --include_any creative4_task2 --include_any creative5_task2
 """
 from __future__ import annotations
 
@@ -326,6 +328,61 @@ def submit_bb_eval(run_dir: str, env_name: str, plot_tag: str, seed: int) -> Opt
   return job_id
 
 
+def refresh_bb_aggregate_plot(plot_tag: str, env_name: str) -> Optional[str]:
+  """Login-node safe: mean±SE success vs step from per-seed CSVs."""
+  eval_dir = os.path.join(_REPO, 'figs', 'builderbench', 'checkpoint_eval')
+  by_x: Dict[int, List[float]] = {}
+  n_seeds = 0
+  for path in sorted(glob.glob(os.path.join(
+      eval_dir, f'{plot_tag}_seed*_checkpoint_success.csv'))):
+    rows = 0
+    with open(path, newline='', encoding='utf-8') as fh:
+      for row in csv.DictReader(fh):
+        x = _coerce(row.get('global_step'))
+        y = _coerce(row.get('success_mean'))
+        if x is None or y is None:
+          continue
+        by_x.setdefault(int(x), []).append(float(y))
+        rows += 1
+    if rows:
+      n_seeds += 1
+  if not by_x or n_seeds == 0:
+    return None
+
+  xs = sorted(by_x)
+  means = np.array([float(np.mean(by_x[x])) for x in xs], dtype=np.float64)
+  if n_seeds > 1:
+    ses = np.array([
+        float(np.std(by_x[x], ddof=1) / math.sqrt(len(by_x[x])))
+        if len(by_x[x]) > 1 else 0.0 for x in xs], dtype=np.float64)
+  else:
+    ses = np.zeros_like(means)
+
+  out_path = os.path.join(
+      _REPO, 'figs', 'builderbench', f'{plot_tag}_checkpoint_success.png')
+  os.makedirs(os.path.dirname(out_path), exist_ok=True)
+  fig, ax = plt.subplots(figsize=(7.5, 4.2))
+  ax.plot(xs, means, color='#1f77b4', lw=2.0,
+          label=f'eval success (mean ± SE, n={n_seeds} seed'
+                f'{"s" if n_seeds != 1 else ""})')
+  if n_seeds > 1:
+    ax.fill_between(xs, means - ses, means + ses, color='#1f77b4', alpha=0.22,
+                     linewidth=0)
+  ax.set_xlabel('env steps')
+  ax.set_ylabel('eval success')
+  ax.set_title(f'BuilderBench eval success — {env_name} ({plot_tag})')
+  ax.set_ylim(-0.05, 1.05)
+  ax.xaxis.set_major_formatter(mticker.FuncFormatter(
+      lambda v, _p: f'{v / 1e6:.1f}M' if abs(v) >= 1e6 else f'{v / 1e3:.0f}k'))
+  ax.grid(True, alpha=0.25)
+  ax.legend(loc='best', frameon=False)
+  fig.tight_layout()
+  fig.savefig(out_path, dpi=140)
+  plt.close(fig)
+  print(f'[watch_eval] aggregate plot (n={n_seeds}): {out_path}', flush=True)
+  return out_path
+
+
 def handle_builderbench(run_dir: str, rs: dict, labels: Sequence[str],
                         run_cfg: dict, threshold: int) -> str:
   seed = seed_from_run_dir(run_dir)
@@ -350,6 +407,7 @@ def handle_builderbench(run_dir: str, rs: dict, labels: Sequence[str],
     rs['pending_labels'] = []
     rs['done_labels'] = sorted(bb_eval_csv_labels(plot_tag, seed))
     rs['last_action'] = f'job_done:{pending_job}'
+    refresh_bb_aggregate_plot(plot_tag, env_name)
 
   # First sighting with no eval CSV yet: bootstrap so we only track *future*
   # checkpoints (avoids submitting a backlog storm on daemon start).
@@ -364,17 +422,6 @@ def handle_builderbench(run_dir: str, rs: dict, labels: Sequence[str],
   new = [lab for lab in labels if lab not in done and lab not in pending]
   if len(new) <= threshold:
     return f'ok(new={len(new)})'
-
-  if rs.get('pending_job_id') and squeue_has_job(str(rs['pending_job_id'])):
-    return f'waiting_job={rs["pending_job_id"]}(new={len(new)})'
-
-  job_id = submit_bb_eval(run_dir, env_name, plot_tag, seed)
-  if not job_id:
-    return 'sbatch_failed'
-  rs['pending_job_id'] = job_id
-  rs['pending_labels'] = list(new)
-  rs['last_action'] = f'submitted:{job_id}:n={len(new)}'
-  return f'submitted:{job_id}:new={len(new)}'
 
   if rs.get('pending_job_id') and squeue_has_job(str(rs['pending_job_id'])):
     return f'waiting_job={rs["pending_job_id"]}(new={len(new)})'
@@ -404,10 +451,33 @@ def handle_sawyer(run_dir: str, rs: dict, labels: Sequence[str]) -> str:
   return f'plotted:{out}:new={len(new)}'
 
 
-def scan_once(log_root: str, state: dict, threshold: int) -> Dict[str, int]:
+def _passes_include(
+    run_dir: str,
+    include: Sequence[str] = (),
+    include_any: Sequence[str] = (),
+) -> bool:
+  """Keep run if every --include token matches, and at least one --include_any."""
+  path = os.path.abspath(run_dir)
+  if include and not all(tok in path for tok in include):
+    return False
+  if include_any and not any(tok in path for tok in include_any):
+    return False
+  return True
+
+
+def scan_once(log_root: str, state: dict, threshold: int,
+              include: Sequence[str] = (),
+              include_any: Sequence[str] = ()) -> Dict[str, int]:
   counts = defaultdict(int)
-  run_dirs = discover_run_dirs(log_root)
-  print(f'[watch_eval] discovered {len(run_dirs)} run dir(s) under {log_root}',
+  run_dirs = [
+      d for d in discover_run_dirs(log_root)
+      if _passes_include(d, include, include_any)
+  ]
+  filt = ''
+  if include or include_any:
+    filt = f' include={list(include)} include_any={list(include_any)}'
+  print(f'[watch_eval] discovered {len(run_dirs)} run dir(s) under {log_root}'
+        f'{filt}',
         flush=True)
 
   # Group Sawyer triggers by log_dir so we only replot once per parent.
@@ -476,6 +546,14 @@ def main() -> None:
   ap.add_argument('--watch_interval', type=float, default=300.0)
   ap.add_argument('--threshold', type=int, default=NEW_CKPT_THRESHOLD,
                   help='Trigger when new checkpoints > threshold (default 2).')
+  ap.add_argument(
+      '--include', action='append', default=[],
+      help='Only watch run dirs whose path contains this substring. '
+           'Repeatable; all tokens must match (AND).')
+  ap.add_argument(
+      '--include_any', action='append', default=[],
+      help='Additionally require the path to contain at least one of these '
+           'substrings (OR). Repeatable.')
   args = ap.parse_args()
 
   repo = os.path.abspath(args.repo_root)
@@ -485,9 +563,13 @@ def main() -> None:
                 else os.path.join(repo, args.state_file))
 
   threshold = int(args.threshold)
+  include = list(args.include or [])
+  include_any = list(args.include_any or [])
   print(f'[watch_eval] log_root={log_root}', flush=True)
   print(f'[watch_eval] state={state_path}', flush=True)
   print(f'[watch_eval] threshold=new_ckpts>{threshold}', flush=True)
+  print(f'[watch_eval] include={include or "(all)"}', flush=True)
+  print(f'[watch_eval] include_any={include_any or "(all)"}', flush=True)
   print(f'[watch_eval] BB job={_BB_EVAL_JOB}', flush=True)
 
   try:
@@ -495,7 +577,9 @@ def main() -> None:
       ts = time.strftime('%Y-%m-%d %H:%M:%S')
       print(f'\n[watch_eval] === scan @ {ts} ===', flush=True)
       state = _load_state(state_path)
-      counts = scan_once(log_root, state, threshold)
+      counts = scan_once(
+          log_root, state, threshold,
+          include=include, include_any=include_any)
       _save_state(state_path, state)
       print(f'[watch_eval] counts={counts}', flush=True)
       if args.once:

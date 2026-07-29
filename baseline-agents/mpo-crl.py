@@ -67,6 +67,32 @@ flags.DEFINE_string(
     'Comma-separated hidden sizes for the unsquashed Gaussian policy.')
 flags.DEFINE_float(
     'mpo_policy_init_scale', 0.7, 'Initial Gaussian policy scale.')
+flags.DEFINE_bool(
+    'mpo_use_td_critic', False,
+    'Train fixed-goal scalar G(s,a) on target CRL rewards and use target G '
+    'for MPO instead of directly using phi(s,a) dot psi(g).')
+flags.DEFINE_float(
+    'mpo_critic_learning_rate', 1e-4, 'Scalar G critic Adam rate.')
+flags.DEFINE_float(
+    'mpo_critic_grad_norm_clip', 40.0, 'Scalar G global gradient-norm clip.')
+flags.DEFINE_string(
+    'mpo_critic_hidden_sizes', '512,512,256',
+    'Comma-separated hidden sizes for fixed-goal scalar G(s,a).')
+flags.DEFINE_integer(
+    'mpo_critic_target_update_period', 100,
+    'Hard online-to-target G copy period; <=0 enables Polyak updates.')
+flags.DEFINE_float(
+    'mpo_critic_target_update_rate', 0.005,
+    'Polyak online-G weight when critic_target_update_period <=0.')
+flags.DEFINE_integer(
+    'mpo_bootstrap_action_samples', 20,
+    'Target-policy actions averaged in the expected-SARSA G target.')
+flags.DEFINE_bool(
+    'mpo_normalize_critic_reward', False,
+    'Standardize CRL rewards using running EMA mean and variance.')
+flags.DEFINE_float(
+    'mpo_critic_reward_norm_rate', 0.001,
+    'EMA update rate for CRL reward normalization moments.')
 
 flags.DEFINE_float('mpo_epsilon', 0.1, 'Non-parametric MPO KL bound.')
 flags.DEFINE_float('mpo_epsilon_mean', 0.0025, 'Policy mean KL bound.')
@@ -179,6 +205,16 @@ def main(_):
       policy_grad_norm_clip=float(FLAGS.mpo_policy_grad_norm_clip),
       policy_hidden_sizes=_comma_ints(FLAGS.mpo_policy_hidden_sizes),
       policy_init_scale=float(FLAGS.mpo_policy_init_scale),
+      use_td_critic=bool(FLAGS.mpo_use_td_critic),
+      critic_learning_rate=float(FLAGS.mpo_critic_learning_rate),
+      critic_grad_norm_clip=float(FLAGS.mpo_critic_grad_norm_clip),
+      critic_hidden_sizes=_comma_ints(FLAGS.mpo_critic_hidden_sizes),
+      critic_target_update_period=int(
+          FLAGS.mpo_critic_target_update_period),
+      critic_target_update_rate=float(FLAGS.mpo_critic_target_update_rate),
+      bootstrap_action_samples=int(FLAGS.mpo_bootstrap_action_samples),
+      normalize_critic_reward=bool(FLAGS.mpo_normalize_critic_reward),
+      critic_reward_norm_rate=float(FLAGS.mpo_critic_reward_norm_rate),
       epsilon=float(FLAGS.mpo_epsilon),
       epsilon_mean=float(FLAGS.mpo_epsilon_mean),
       epsilon_stddev=float(FLAGS.mpo_epsilon_stddev),
@@ -217,6 +253,11 @@ def main(_):
 
   fixed_start_end = (
       ppo_entry.fixed_goal_for_env(env_name) if config.fix_goals else None)
+  if mpo_config.use_td_critic and fixed_start_end is None:
+    raise ValueError(
+        '--mpo_use_td_critic trains G(s,a) without a goal input and therefore '
+        'requires a fixed goal; remove --sample_goals and use an environment '
+        'with a configured fixed goal')
   env_kwargs = {}
   if env_name == 'sawyer_bin' and FLAGS.bin_randomize_gripper_init:
     env_kwargs['randomize_gripper_init'] = True
@@ -293,7 +334,13 @@ def main(_):
       f'{mpo_config.policy_updates_per_iter} crl_updates='
       f'{mpo_config.crl_updates_per_iter} target_period='
       f'{mpo_config.target_update_period} repr_target_rate='
-      f'{mpo_config.repr_target_update_rate} run_dir={run_dir}')
+      f'{mpo_config.repr_target_update_rate} td_critic='
+      f'{mpo_config.use_td_critic} critic_target_period='
+      f'{mpo_config.critic_target_update_period} critic_target_rate='
+      f'{mpo_config.critic_target_update_rate} reward_norm='
+      f'{mpo_config.normalize_critic_reward} reward_norm_rate='
+      f'{mpo_config.critic_reward_norm_rate} bootstrap_actions='
+      f'{mpo_config.bootstrap_action_samples} run_dir={run_dir}')
 
   _bb_kwargs = None
   if env_name.startswith('builderbench_'):
