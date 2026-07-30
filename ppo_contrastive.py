@@ -112,6 +112,13 @@ flags.DEFINE_integer(
     'ppo_good_buffer_max_size', 50000,
     'Maximum transitions stored in Good Experience Buffer.')
 flags.DEFINE_bool(
+    'ppo_norm_obs', False,
+    'Normalize state observations using running per-dimension statistics. '
+    'Goals reuse the corresponding state statistics. Off by default.')
+flags.DEFINE_float(
+    'ppo_obs_norm_clip', 10.0,
+    'Absolute clipping bound after observation normalization.')
+flags.DEFINE_bool(
     'uniform_sampling', False,
     'If True, mix 50% uniformly sampled goals into each CRL replay batch. '
     'Half the in-batch InfoNCE negatives come from the uniform goal '
@@ -129,7 +136,19 @@ flags.DEFINE_string(
     "'gaussian' = diagonal Gaussian p_θ(g|s), reward = log p_θ(g|s_t); "
     "'nf' = conditional RealNVP log p_NF(g|s,a), reward = log p_NF; "
     "'td3' = twin Q(s,a,s_f) TD3-style on r=1{s≈s_f}, reward = Q1(s,a,g) "
-    "(or log((1−γ)Q1) with --ppo_td3_log_reward).")
+    "(or log((1−γ)Q1) with --ppo_td3_log_reward); "
+    "'crl_td3_switch' = train both critics, initially reward PPO with CRL, "
+    "then switch to TD3 after the configured number of hard-goal visits.")
+flags.DEFINE_integer(
+    'ppo_reward_switch_goal_visits', 5,
+    "crl_td3_switch mode: completed successful training episodes required "
+    "before PPO changes from CRL reward to TD3 reward on the next iteration.")
+flags.DEFINE_integer(
+    'ppo_reward_switch_blend_iters', 0,
+    "crl_td3_switch mode: after the visit threshold, linearly blend "
+    "r=(1-w)·CRL + w·TD3 over this many PPO iterations "
+    "(w=0 at switch_iter, w=1 after blend_iters). "
+    "0 = hard switch to TD3 (legacy).")
 flags.DEFINE_float(
     'ppo_td3_tau', -1.0,
     'TD3 mode: Polyak τ for target Q networks. '
@@ -210,6 +229,16 @@ flags.DEFINE_integer(
 flags.DEFINE_integer(
     'ppo_eval_episodes', -1,
     'Number of eval episodes per eval round. <0 keeps config default (5).')
+flags.DEFINE_integer(
+    'ppo_video_interval', -1,
+    'Render a deterministic BuilderBench video every N PPO iterations. '
+    '<0 keeps config default (0=disabled). 0 disables. Uses live obs_rms.')
+flags.DEFINE_integer(
+    'ppo_video_fps', -1,
+    'FPS for in-train BuilderBench videos. <0 keeps config default (10).')
+flags.DEFINE_boolean(
+    'ppo_skip_first_video', True,
+    'Skip the iteration-0 in-train video (random init policy).')
 flags.DEFINE_boolean(
     'ppo_norm_reward', True,
     'Normalize the repr reward by the running std of discounted returns. Set False to pass raw reward directly to PPO.')
@@ -243,6 +272,11 @@ flags.DEFINE_integer(
 flags.DEFINE_integer(
     'ppo_min_replay_size', -1,
     'Min replay transitions before density/CRL updates start. <0 keeps default (1e4).')
+flags.DEFINE_float(
+    'ppo_success_sample_weight', -1.0,
+    'CRL replay: sampling weight for successful episodes (others weight 1). '
+    'Episode indices are drawn proportional to w / sum(w). '
+    '1.0 is uniform. <0 keeps config default (1.0).')
 flags.DEFINE_integer(
     'ppo_checkpoint_interval', -1,
     'Save checkpoints every N PPO iterations. <0 keeps config default (500).')
@@ -627,6 +661,10 @@ def main(_):
   config.crl_on_policy = bool(FLAGS.crl_on_policy)
   config.ppo_reward_mode = str(FLAGS.ppo_reward_mode).strip()
   config.ppo_repr_mode = str(FLAGS.ppo_repr_mode).strip()
+  config.ppo_reward_switch_goal_visits = int(
+      FLAGS.ppo_reward_switch_goal_visits)
+  config.ppo_reward_switch_blend_iters = int(
+      FLAGS.ppo_reward_switch_blend_iters)
   if FLAGS.ppo_td3_tau >= 0.0:
     config.ppo_td3_tau = float(FLAGS.ppo_td3_tau)
   if FLAGS.ppo_td3_goal_tol >= 0.0:
@@ -657,7 +695,14 @@ def main(_):
     config.ppo_eval_interval = int(FLAGS.ppo_eval_interval)
   if FLAGS.ppo_eval_episodes >= 0:
     config.ppo_eval_episodes = int(FLAGS.ppo_eval_episodes)
+  if FLAGS.ppo_video_interval >= 0:
+    config.ppo_video_interval = int(FLAGS.ppo_video_interval)
+  if FLAGS.ppo_video_fps >= 0:
+    config.ppo_video_fps = int(FLAGS.ppo_video_fps)
+  config.ppo_skip_first_video = bool(FLAGS.ppo_skip_first_video)
   config.ppo_norm_reward = bool(FLAGS.ppo_norm_reward)
+  config.ppo_norm_obs = bool(FLAGS.ppo_norm_obs)
+  config.ppo_obs_norm_clip = float(FLAGS.ppo_obs_norm_clip)
   config.nf_goal_enc_size = int(FLAGS.nf_goal_enc_size)
   config.ppo_return_norm_window = int(FLAGS.ppo_return_norm_window)
   config.ppo_warmup_percent = float(FLAGS.ppo_warmup_percent)
@@ -669,6 +714,9 @@ def main(_):
     config.max_replay_size = int(FLAGS.max_replay_size)
   if FLAGS.ppo_min_replay_size >= 0:
     config.ppo_min_replay_size = int(FLAGS.ppo_min_replay_size)
+  if FLAGS.ppo_success_sample_weight >= 0.0:
+    config.ppo_success_sample_weight = float(
+        FLAGS.ppo_success_sample_weight)
   if FLAGS.ppo_checkpoint_interval >= 0:
     config.ppo_checkpoint_interval = int(FLAGS.ppo_checkpoint_interval)
   if FLAGS.ppo_checkpoint_keep_last >= 0:
@@ -697,9 +745,15 @@ def main(_):
         f'discount_crl={config.discount}, '
         f'discount_ppo={config.ppo_discount if config.ppo_discount > 0 else config.discount}, '
         f'norm_reward={config.ppo_norm_reward}, '
+        f'norm_obs={config.ppo_norm_obs}'
+        f'{f"(clip={config.ppo_obs_norm_clip})" if config.ppo_norm_obs else ""}, '
+        f'eval_interval={config.ppo_eval_interval}, '
+        f'video_interval={config.ppo_video_interval}, '
         f'repr_norm={config.repr_norm}, '
         f'ppo_anneal_lr={config.ppo_anneal_lr}  '
         f'ppo_repr_mode={config.ppo_repr_mode!r}  '
+        f'ppo_reward_switch_goal_visits={config.ppo_reward_switch_goal_visits}  '
+        f'ppo_reward_switch_blend_iters={config.ppo_reward_switch_blend_iters}  '
         f'ppo_reward_mode={config.ppo_reward_mode!r}  '
         f'ppo_crl_repr_tau={config.ppo_crl_repr_tau}  '
         f'ppo_nf_reward_tau={config.ppo_nf_reward_tau}  '
@@ -714,6 +768,7 @@ def main(_):
         f'ppo_dirac_eps={config.ppo_dirac_eps}  '
         f'max_replay_size={config.max_replay_size}  '
         f'ppo_min_replay_size={config.ppo_min_replay_size}  '
+        f'ppo_success_sample_weight={config.ppo_success_sample_weight}  '
         f'kde_max_points={config.kde_max_points}  '
         f'kde_refit_interval={config.kde_refit_interval}  '
         f'kde_bandwidth={config.kde_bandwidth}  '

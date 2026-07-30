@@ -17,6 +17,8 @@ Examples::
 
   python scripts/watch_builderbench_video_updates.py --once
   python scripts/watch_builderbench_video_updates.py --watch_interval 300
+  python scripts/watch_builderbench_video_updates.py --watch_interval 300 \\
+      --exclude creative4_task2
 """
 from __future__ import annotations
 
@@ -518,10 +520,31 @@ def handle_run(item: dict, rs: dict, labels: Sequence[str], run_cfg: dict,
   return f'submitted:{job_id}:new={len(batch)}/{len(new)}'
 
 
-def scan_once(state: dict, threshold: int) -> Dict[str, int]:
+def _is_excluded(run_dir: str, exclude: Sequence[str] = ()) -> bool:
+  """True if run_dir path contains any --exclude substring."""
+  if not exclude:
+    return False
+  path = os.path.abspath(run_dir)
+  return any(tok in path for tok in exclude)
+
+
+def scan_once(state: dict, threshold: int,
+              exclude: Sequence[str] = ()) -> Dict[str, int]:
   counts = defaultdict(int)
   live = discover_running_bb_runs()
-  print(f'[watch_bb_vid] live BB training runs: {len(live)}', flush=True)
+  if exclude:
+    kept = []
+    for item in live:
+      if _is_excluded(item['run_dir'], exclude):
+        counts['excluded'] += 1
+        short = short_name_for(item['run_dir'], int(item['seed']))
+        print(f'[watch_bb_vid] {short}: excluded', flush=True)
+      else:
+        kept.append(item)
+    live = kept
+  print(f'[watch_bb_vid] live BB training runs: {len(live)}'
+        f'{f" (excluded substrings={list(exclude)})" if exclude else ""}',
+        flush=True)
   rebuild_active_index(live)
   counts['live'] = len(live)
 
@@ -564,15 +587,20 @@ def main() -> None:
   ap.add_argument('--watch_interval', type=float, default=300.0)
   ap.add_argument('--threshold', type=int, default=NEW_CKPT_THRESHOLD,
                   help='Trigger when new checkpoints > threshold (default 0).')
+  ap.add_argument(
+      '--exclude', action='append', default=[],
+      help='Skip live runs whose path contains this substring. Repeatable.')
   args = ap.parse_args()
 
   state_path = (args.state_file if os.path.isabs(args.state_file)
                 else os.path.join(_REPO, args.state_file))
   threshold = int(args.threshold)
+  exclude = list(args.exclude or [])
 
   print(f'[watch_bb_vid] active_root={_ACTIVE_ROOT}', flush=True)
   print(f'[watch_bb_vid] state={state_path}', flush=True)
   print(f'[watch_bb_vid] threshold=new_ckpts>{threshold}', flush=True)
+  print(f'[watch_bb_vid] exclude={exclude or "(none)"}', flush=True)
   print(f'[watch_bb_vid] job={_BB_VIDEO_JOB}', flush=True)
 
   try:
@@ -580,7 +608,7 @@ def main() -> None:
       ts = time.strftime('%Y-%m-%d %H:%M:%S')
       print(f'\n[watch_bb_vid] === scan @ {ts} ===', flush=True)
       state = _load_state(state_path)
-      counts = scan_once(state, threshold)
+      counts = scan_once(state, threshold, exclude=exclude)
       _save_state(state_path, state)
       print(f'[watch_bb_vid] counts={counts}', flush=True)
       if args.once:

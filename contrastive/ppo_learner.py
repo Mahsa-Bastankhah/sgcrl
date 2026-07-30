@@ -112,6 +112,33 @@ class RunningMeanStd:
       self.count = self.max_count
 
 
+def _normalize_packed_obs(
+    obs: jnp.ndarray,
+    mean: jnp.ndarray,
+    var: jnp.ndarray,
+    *,
+    obs_dim: int,
+    start_index: int,
+    end_index: int,
+    clip: float,
+    enabled: bool,
+) -> jnp.ndarray:
+  """Normalize packed ``[state; goal]`` observations from state-only stats."""
+  if not enabled:
+    return obs
+  active = jnp.all(jnp.isfinite(mean))
+  mean = jnp.nan_to_num(mean)
+  state = obs[..., :obs_dim]
+  goal = obs[..., obs_dim:]
+  state_norm = (state - mean) / jnp.sqrt(jnp.maximum(var, 1e-8))
+  goal_mean = mean[start_index:end_index]
+  goal_var = var[start_index:end_index]
+  goal_norm = (goal - goal_mean) / jnp.sqrt(jnp.maximum(goal_var, 1e-8))
+  normalized = jnp.clip(
+      jnp.concatenate([state_norm, goal_norm], axis=-1), -clip, clip)
+  return jnp.where(active, normalized, obs)
+
+
 class ReturnNormalizer:
   """Normalizes a per-env reward stream by the running std of discounted
   returns (NOT by the std of raw rewards).
@@ -178,7 +205,9 @@ class EpisodeReplay:
   Uniform-selector episode table).  After that tf.data chain, each
   individual training sample has the following distribution:
 
-      k  ~ Uniform(stored episodes)
+      k  ~ Categorical(w_k / sum_i w_i) over stored episodes
+            (w_k = success_sample_weight if episode k succeeded else 1;
+             default weight 1 recovers Uniform)
       t  ~ Uniform[0, T_k - 1]
       d  ~ TruncatedGeometric(1 - γ,  range=[1, T_k - t])
       j  = t + d
@@ -196,20 +225,29 @@ class EpisodeReplay:
   episode in a single batch call (except by coincidence, same as the
   naive pipeline).
 
-  Storage: list of episodes, each {'obs': (T+1, D), 'action': (T, A)}.
+  Storage: list of episodes, each
+  {'obs': (T+1, D), 'action': (T, A), 'successful': bool}.
   FIFO eviction is at the episode granularity once total stored
   transitions exceed `capacity`.
   """
 
   def __init__(self, capacity: int, obs_dim: int, discount: float,
-               start_index: int, end_index: int):
+               start_index: int, end_index: int,
+               success_sample_weight: float = 1.0):
     self._cap = capacity
     self._obs_dim = obs_dim               # state slice size
     self._discount = float(discount)
     self._start_index = start_index
     self._end_index = end_index
+    self._success_sample_weight = float(success_sample_weight)
+    if self._success_sample_weight <= 0.0:
+      raise ValueError(
+          'success_sample_weight must be > 0, got '
+          f'{self._success_sample_weight}')
     self._episodes: list = []             # list[{'obs': (T+1, D), 'action': (T, A)}]
     self._ep_lens: list = []              # parallel list of T (== len(action))
+    self._ep_weights: list = []           # parallel sampling weights
+    self._weight_sum = 0.0
     self._total_transitions = 0
     # Pre-compute log(γ) once; used per sample call for the truncated
     # geometric.  γ must be in (0, 1) for the formula to be well-defined.
@@ -226,28 +264,36 @@ class EpisodeReplay:
   def num_episodes(self) -> int:
     return len(self._episodes)
 
-  def add_episode(self, obs: np.ndarray, action: np.ndarray):
+  def add_episode(self, obs: np.ndarray, action: np.ndarray,
+                  successful: bool = False):
     """Store one complete episode.
 
     Args:
       obs:    (T+1, obs_dim_total) — includes the terminal observation.
       action: (T,   act_dim)
+      successful: Whether the episode saw the environment goal at least once.
     Episodes shorter than 1 transition are rejected.
     """
     T = action.shape[0]
     assert obs.shape[0] == T + 1, f'obs len {obs.shape[0]} != action len {T} + 1'
     if T < 1:
       return
+    weight = (
+        self._success_sample_weight if bool(successful) else 1.0)
     self._episodes.append({
         'obs': np.asarray(obs, dtype=np.float32),
         'action': np.asarray(action, dtype=np.float32),
+        'successful': bool(successful),
     })
     self._ep_lens.append(T)
+    self._ep_weights.append(float(weight))
+    self._weight_sum += float(weight)
     self._total_transitions += T
     # FIFO eviction at the episode granularity.
     while self._total_transitions > self._cap and len(self._episodes) > 1:
       self._episodes.pop(0)
       self._total_transitions -= self._ep_lens.pop(0)
+      self._weight_sum -= float(self._ep_weights.pop(0))
 
   # ---------------------------------------------------------------------
   # Internal helpers
@@ -281,8 +327,14 @@ class EpisodeReplay:
     num_eps = len(self._episodes)
     ep_lens = np.asarray(self._ep_lens, dtype=np.int64)      # (K,)
 
-    # (1) Episode index: Uniform over stored episodes (matches reverb Uniform).
-    ep_ids = rng.integers(0, num_eps, size=B)
+    # (1) Episode index: uniform, or weighted by success_sample_weight.
+    if self._success_sample_weight == 1.0:
+      ep_ids = rng.integers(0, num_eps, size=B)
+    else:
+      weights = np.asarray(self._ep_weights, dtype=np.float64)
+      ep_ids = rng.choice(
+          num_eps, size=B, replace=True,
+          p=weights / self._weight_sum)
     lens = ep_lens[ep_ids]                                   # (B,)  == T_k
 
     # (2) Starting timestep t: Uniform[0, T_k - 1].  Flatten_fn's valid t
@@ -600,10 +652,19 @@ def make_reward_fn(
     raise ValueError(
         f'Unknown ppo_reward_mode={config.ppo_reward_mode!r}; '
         f"supported: '', 'phi_psi', 'dirac_target', 'kde_dirac'")
+  norm_obs = bool(getattr(config, 'ppo_norm_obs', False))
+  obs_dim = int(config.obs_dim)
+  si = int(config.start_index)
+  ei = int(config.end_index if config.end_index != -1 else obs_dim)
+  norm_clip = float(getattr(config, 'ppo_obs_norm_clip', 10.0))
 
   @jax.jit
   def reward_fn(q_params: networks_lib.Params,
-                obs: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+                obs: jnp.ndarray, action: jnp.ndarray,
+                obs_mean: jnp.ndarray, obs_var: jnp.ndarray) -> jnp.ndarray:
+    obs = _normalize_packed_obs(
+        obs, obs_mean, obs_var, obs_dim=obs_dim, start_index=si,
+        end_index=ei, clip=norm_clip, enabled=norm_obs)
     _, sa_repr, g_repr = networks.q_network.apply(q_params, obs, action)
     return jnp.sum(sa_repr * g_repr, axis=-1)  # (B,)
   return reward_fn
@@ -759,19 +820,27 @@ def make_ppo_update_fn(
   ent_coef_const = float(config.ppo_ent_coef)
   clip_vloss = bool(config.ppo_clip_vloss)
   norm_adv = bool(config.ppo_norm_adv)
+  norm_obs = bool(getattr(config, 'ppo_norm_obs', False))
+  obs_dim = int(config.obs_dim)
+  si = int(config.start_index)
+  ei = int(config.end_index if config.end_index != -1 else obs_dim)
+  norm_clip = float(getattr(config, 'ppo_obs_norm_clip', 10.0))
 
-  def ppo_loss(params, batch, key, step=None):
+  def ppo_loss(params, batch, key, obs_mean, obs_var, step=None):
     ent_coef = (ent_coef_schedule(step) if ent_coef_schedule is not None
                 else ent_coef_const)
+    network_obs = _normalize_packed_obs(
+        batch['obs'], obs_mean, obs_var, obs_dim=obs_dim, start_index=si,
+        end_index=ei, clip=norm_clip, enabled=norm_obs)
     # ---- policy forward ----
-    dist = networks.policy_network.apply(params['policy'], batch['obs'])
+    dist = networks.policy_network.apply(params['policy'], network_obs)
     new_logprob = networks.log_prob(dist, batch['actions'])         # (B,)
     # MC-estimate entropy: H(π) ≈ -log π(ã|s), ã ~ π.
     fresh_action = networks.sample(dist, key)
     entropy_est = -networks.log_prob(dist, fresh_action)            # (B,)
 
     # ---- value forward ----
-    new_value = networks.value_network.apply(params['value'], batch['obs'])  # (B,)
+    new_value = networks.value_network.apply(params['value'], network_obs)  # (B,)
 
     # ---- advantage normalization (per-minibatch) ----
     adv = batch['advantages']
@@ -846,8 +915,9 @@ def make_ppo_update_fn(
 
   if ent_coef_schedule is not None:
     @jax.jit
-    def update(params, opt_state, batch, key, step):
-      (_, metrics), grads = grad_fn(params, batch, key, step)
+    def update(params, opt_state, batch, key, obs_mean, obs_var, step):
+      (_, metrics), grads = grad_fn(
+          params, batch, key, obs_mean, obs_var, step)
       actor_metrics = compute_analysis_dict(
           prefix="actor",
           params=params['policy'],
@@ -859,8 +929,9 @@ def make_ppo_update_fn(
       return new_params, new_opt_state, metrics
   else:
     @jax.jit
-    def update(params, opt_state, batch, key):
-      (_, metrics), grads = grad_fn(params, batch, key)
+    def update(params, opt_state, batch, key, obs_mean, obs_var):
+      (_, metrics), grads = grad_fn(
+          params, batch, key, obs_mean, obs_var)
       actor_metrics = compute_analysis_dict(
           prefix="actor",
           params=params['policy'],
@@ -879,6 +950,7 @@ def make_crl_update_fn(
     q_optimizer: optax.GradientTransformation,
     backward: bool = False,
     _return_raw: bool = False,
+    config: Optional[contrastive_config.ContrastiveConfig] = None,
 ):
   """Returns a jitted CRL critic update over one replay batch.
 
@@ -900,10 +972,22 @@ def make_crl_update_fn(
     → ``(new_q_params, new_q_optimizer_state, metrics)``
   """
   _logsumexp_penalty_coef = 0.01
+  norm_obs = bool(
+      config is not None and getattr(config, 'ppo_norm_obs', False))
+  obs_dim = int(config.obs_dim) if config is not None else 0
+  si = int(config.start_index) if config is not None else 0
+  ei = int(
+      config.end_index if config is not None and config.end_index != -1
+      else obs_dim)
+  norm_clip = float(
+      getattr(config, 'ppo_obs_norm_clip', 10.0)
+      if config is not None else 10.0)
 
-  def critic_loss(q_params, batch, key):
+  def critic_loss(q_params, batch, key, obs_mean, obs_var):
     del key
-    obs = batch['obs']
+    obs = _normalize_packed_obs(
+        batch['obs'], obs_mean, obs_var, obs_dim=obs_dim, start_index=si,
+        end_index=ei, clip=norm_clip, enabled=norm_obs)
     action = batch['action']
     batch_size = obs.shape[0]
     labels = jnp.eye(batch_size)
@@ -962,9 +1046,11 @@ def make_crl_update_fn(
 
   grad_fn = jax.value_and_grad(critic_loss, has_aux=True)
 
-  def update(q_params, q_optimizer_state, batch, key):
-    (_, metrics), grads = grad_fn(q_params, batch, key)
-    print("DEBUG CRITIC GRADS SHAPE:", jax.tree_util.tree_map(lambda x: x.shape, grads))
+  def update(
+      q_params, q_optimizer_state, batch, key,
+      obs_mean=None, obs_var=None):
+    (_, metrics), grads = grad_fn(
+        q_params, batch, key, obs_mean, obs_var)
     critic_metrics = compute_analysis_dict(
           prefix="critic",
           params=q_params,
@@ -1001,6 +1087,7 @@ def make_scan_crl_update_fn(
     q_optimizer: optax.GradientTransformation,
     backward: bool = False,
     repr_tau: float = 0.0,
+    config: Optional[contrastive_config.ContrastiveConfig] = None,
 ):
   """Scan-based CRL updater: runs N steps in one JIT call.
 
@@ -1019,17 +1106,20 @@ def make_scan_crl_update_fn(
     where ``batches`` is a dict of ``(N, B, dim)`` JAX arrays.
   """
   _, raw_update = make_crl_update_fn(
-      networks, q_optimizer, backward=backward, _return_raw=True)
+      networks, q_optimizer, backward=backward, _return_raw=True,
+      config=config)
 
   use_ema = 0.0 < float(repr_tau) < 1.0
   _tau = float(repr_tau)
 
   @jax.jit
-  def multi_update(q_params, q_opt_state, q_params_ema, batches, key):
+  def multi_update(
+      q_params, q_opt_state, q_params_ema, batches, key, obs_mean, obs_var):
     def scan_step(carry, batch):
       q_p, q_opt, q_ema, k = carry
       k, k_crl = jax.random.split(k)
-      q_p, q_opt, m = raw_update(q_p, q_opt, batch, k_crl)
+      q_p, q_opt, m = raw_update(
+          q_p, q_opt, batch, k_crl, obs_mean, obs_var)
       if use_ema:
         q_ema = jax.tree_util.tree_map(
             lambda t, o: _tau * t + (1.0 - _tau) * o, q_ema, q_p)
@@ -1167,11 +1257,11 @@ def _save_checkpoint(path: str,
                      ppo_opt_state, q_opt_state,
                      iteration: int, global_step: int, key,
                      q_params_ema=None,
-                     td3_policy_target=None,
                      obs_norm_mean=None,
                      obs_norm_var=None,
                      obs_norm_count=None,
                      obs_norm_mode=None,
+                     extra_state=None,
                      **kwargs):
   """Write a pickle checkpoint atomically (write to tmp → rename)."""
   import pickle as _pkl
@@ -1196,6 +1286,8 @@ def _save_checkpoint(path: str,
     ckpt['obs_norm_var'] = obs_norm_var
     ckpt['obs_norm_count'] = obs_norm_count
     ckpt['obs_norm_mode'] = obs_norm_mode
+  if extra_state is not None:
+    ckpt['extra_state'] = extra_state
   tmp_path = path + '.tmp'
   with open(tmp_path, 'wb') as fh:
     _pkl.dump(ckpt, fh, protocol=_pkl.HIGHEST_PROTOCOL)
@@ -1406,6 +1498,23 @@ def run_ppo_training(
   use_gaussian = repr_mode == 'gaussian'
   use_nf       = repr_mode == 'nf'
   use_td3      = repr_mode == 'td3'
+  use_crl_td3_switch = repr_mode == 'crl_td3_switch'
+  if use_crl_td3_switch and not _use_jax_bb_vec:
+    raise ValueError(
+        'crl_td3_switch currently requires a BuilderBench environment so '
+        'hard-goal visits can be counted from its success signal')
+  if repr_mode not in ('crl', 'gaussian', 'nf', 'td3', 'crl_td3_switch'):
+    raise ValueError(f'Unknown ppo_repr_mode={repr_mode!r}')
+  _switch_goal_visits = int(
+      getattr(config, 'ppo_reward_switch_goal_visits', 5))
+  if use_crl_td3_switch and _switch_goal_visits <= 0:
+    raise ValueError(
+        'ppo_reward_switch_goal_visits must be > 0 in crl_td3_switch mode')
+  _switch_blend_iters = int(
+      getattr(config, 'ppo_reward_switch_blend_iters', 0))
+  if use_crl_td3_switch and _switch_blend_iters < 0:
+    raise ValueError(
+        'ppo_reward_switch_blend_iters must be >= 0 in crl_td3_switch mode')
   density_nets    = None
   nf_density_nets = None
   td3_density_nets = None
@@ -1414,6 +1523,41 @@ def run_ppo_training(
   total_obs_dim = int(np.prod(obs_shape))
   goal_dim_cfg  = total_obs_dim - obs_dim_cfg
   act_dim_cfg   = int(np.prod(act_shape))
+  norm_obs = bool(getattr(config, 'ppo_norm_obs', False))
+  obs_norm_clip = float(getattr(config, 'ppo_obs_norm_clip', 10.0))
+  norm_si = int(config.start_index)
+  norm_ei = int(
+      config.end_index if int(config.end_index) != -1 else obs_dim_cfg)
+  _configured_reward_mode = (
+      getattr(config, 'ppo_reward_mode', '') or '').strip().lower()
+  if norm_obs:
+    if not 0 <= norm_si < norm_ei <= obs_dim_cfg:
+      raise ValueError(
+          'ppo_norm_obs requires 0 <= start_index < end_index <= obs_dim; '
+          f'got start_index={norm_si}, end_index={norm_ei}, '
+          f'obs_dim={obs_dim_cfg}')
+    if goal_dim_cfg != norm_ei - norm_si:
+      raise ValueError(
+          'ppo_norm_obs maps each goal coordinate to state stats from '
+          'start_index:end_index, so dimensions must match; '
+          f'goal_dim={goal_dim_cfg}, state slice={norm_ei - norm_si}')
+    if not np.isfinite(obs_norm_clip) or obs_norm_clip <= 0.0:
+      raise ValueError(
+          f'ppo_obs_norm_clip must be finite and > 0, got {obs_norm_clip}')
+    if (use_gaussian or use_nf
+        or _configured_reward_mode not in ('', 'phi_psi')):
+      raise ValueError(
+          'ppo_norm_obs currently supports ppo_repr_mode=crl, td3, or '
+          'crl_td3_switch with ppo_reward_mode="" or "phi_psi"; Gaussian, '
+          'NF, dirac_target, and kde_dirac have separate density-coordinate '
+          'semantics and are intentionally rejected.')
+    print(f'[ppo] observation normalization enabled: state_dim={obs_dim_cfg}, '
+          f'goal_stats=state[{norm_si}:{norm_ei}], clip={obs_norm_clip}; '
+          'rollout/replay storage remains raw')
+  else:
+    print('[ppo] observation normalization disabled')
+  # Zero pseudo-count plus mean=0/var=1 makes iteration zero exactly identity.
+  obs_rms = RunningMeanStd(shape=(obs_dim_cfg,), epsilon=0.0)
 
   if use_gaussian:
     density_nets = _gd.make_gaussian_density_networks(
@@ -1447,7 +1591,7 @@ def run_ppo_training(
           f'rep_size={nf_rep_size}  num_blocks={nf_num_blocks}  '
           f'coupling_width={nf_coupling_w}  flow_dim={nf_density_nets.flow_dim}  '
           f'sa_encoder=4x1024+swish  {_goal_enc_desc}')
-  elif use_td3:
+  elif use_td3 or use_crl_td3_switch:
     _td3_bilinear = bool(getattr(config, 'ppo_td3_bilinear', False))
     td3_density_nets = _td3.make_td3_density_networks(
         obs_dim=obs_dim_cfg,
@@ -1464,7 +1608,10 @@ def run_ppo_training(
     _q_param = (
         f'bilinear x(s,a)·y(g) repr_dim={config.repr_dim}'
         if _td3_bilinear else 'mlp([s;g;a])')
-    print(f'[ppo] repr_mode=td3 (twin Q(s,a,s_f))  obs_dim={obs_dim_cfg}  '
+    _mode_desc = (
+        f'crl_td3_switch (CRL→TD3 after {_switch_goal_visits} goal visits)'
+        if use_crl_td3_switch else 'td3')
+    print(f'[ppo] repr_mode={_mode_desc} (twin Q(s,a,s_f))  obs_dim={obs_dim_cfg}  '
           f'act_dim={act_dim_cfg}  goal_dim={goal_dim_cfg}  '
           f'hidden_layers={config.hidden_layer_sizes}  '
           f'q_param={_q_param}  '
@@ -1493,6 +1640,11 @@ def run_ppo_training(
     q_params = _td3.init_td3_params(td3_density_nets, k_q)
   else:
     q_params = networks.q_network.init(k_q)
+  hybrid_td3_params = None
+  if use_crl_td3_switch:
+    key, k_hybrid_td3 = jax.random.split(key)
+    hybrid_td3_params = _td3.init_td3_params(
+        td3_density_nets, k_hybrid_td3)
   ppo_params = {'policy': policy_params, 'value': value_params}
 
   # ---- optimizers -------------------------------------------------------
@@ -1555,6 +1707,10 @@ def run_ppo_training(
     q_opt_state = q_optimizer.init(_td3.online_td3_params(q_params))
   else:
     q_opt_state = q_optimizer.init(q_params)
+  hybrid_td3_opt_state = None
+  if use_crl_td3_switch:
+    hybrid_td3_opt_state = q_optimizer.init(
+        _td3.online_td3_params(hybrid_td3_params))
 
   # ---- optional EMA of reward-network params ----------------------------
   # CRL: EMA of φ, ψ for r = φ·ψ (ppo_crl_repr_tau).
@@ -1577,12 +1733,22 @@ def run_ppo_training(
     _repr_tau = float(getattr(config, 'ppo_crl_repr_tau', 0.0))
     _use_repr_ema = 0.0 < _repr_tau < 1.0
   q_params_reward = _tree_copy(q_params) if _use_repr_ema else q_params
+  _hybrid_td3_reward_tau = float(
+      getattr(config, 'ppo_td3_reward_tau', 0.0))
+  _use_hybrid_td3_reward_ema = (
+      use_crl_td3_switch and 0.0 < _hybrid_td3_reward_tau < 1.0)
+  hybrid_td3_params_reward = (
+      _tree_copy(hybrid_td3_params)
+      if _use_hybrid_td3_reward_ema else hybrid_td3_params)
 
   # ---- resume from checkpoint if one exists -----------------------------
   start_iteration = 0
   global_step = 0
   ppo_sgd_step = 0
   _td3_policy_target_from_ckpt = None
+  hard_goal_visit_count = 0
+  reward_switched_to_td3 = False
+  reward_switch_iteration = -1
   if checkpoint_dir is not None:
     _latest = os.path.join(checkpoint_dir, 'latest.pkl')
     if os.path.exists(_latest):
@@ -1603,10 +1769,36 @@ def run_ppo_training(
         q_params_reward = (_ckpt['q_params_ema']
                            if 'q_params_ema' in _ckpt
                            else _tree_copy(q_params))
+      _extra = _ckpt.get('extra_state', {})
+      if norm_obs and 'obs_rms' in _extra:
+        _obs_state = _extra['obs_rms']
+        obs_rms.mean = np.asarray(
+            _obs_state.get('mean', obs_rms.mean), dtype=np.float64)
+        obs_rms.var = np.asarray(
+            _obs_state.get('var', obs_rms.var), dtype=np.float64)
+        obs_rms.count = float(_obs_state.get('count', obs_rms.count))
       if (use_td3
           and bool(getattr(config, 'ppo_td3_use_target_policy', False))
           and 'td3_policy_target' in _ckpt):
         _td3_policy_target_from_ckpt = _ckpt['td3_policy_target']
+      if use_crl_td3_switch:
+        hybrid_td3_params = _extra.get(
+            'hybrid_td3_params', hybrid_td3_params)
+        hybrid_td3_opt_state = _extra.get(
+            'hybrid_td3_opt_state', hybrid_td3_opt_state)
+        hybrid_td3_params_reward = _extra.get(
+            'hybrid_td3_params_reward',
+            (_tree_copy(hybrid_td3_params)
+             if _use_hybrid_td3_reward_ema else hybrid_td3_params))
+        hard_goal_visit_count = int(
+            _extra.get('hard_goal_visit_count', 0))
+        reward_switched_to_td3 = bool(
+            _extra.get('reward_switched_to_td3', False))
+        reward_switch_iteration = int(
+            _extra.get('reward_switch_iteration', -1))
+        if (bool(getattr(config, 'ppo_td3_use_target_policy', False))
+            and 'td3_policy_target' in _ckpt):
+          _td3_policy_target_from_ckpt = _ckpt['td3_policy_target']
       print(f'[ppo] resumed from checkpoint: '
             f'start_iteration={start_iteration}, global_step={global_step}')
       # Truncate CSV logs to remove any entries written after the checkpoint
@@ -1618,7 +1810,8 @@ def run_ppo_training(
 
   # TD3 optional Polyak target policy for bootstrap a' ~ π̄(·|s',g).
   _use_td3_target_policy = (
-      use_td3 and bool(getattr(config, 'ppo_td3_use_target_policy', False)))
+      (use_td3 or use_crl_td3_switch)
+      and bool(getattr(config, 'ppo_td3_use_target_policy', False)))
   if _use_td3_target_policy:
     td3_policy_target = (
         _td3_policy_target_from_ckpt
@@ -1697,12 +1890,18 @@ def run_ppo_training(
         use_target_policy=_use_td3_target_policy,
         cross_batch_goals=bool(
             getattr(config, 'ppo_td3_cross_batch_goals', False)),
+        normalize_obs=norm_obs,
+        obs_norm_clip=obs_norm_clip,
     )
     td3_reward_fn = _td3.make_td3_reward_fn(
         td3_density_nets,
         obs_dim=int(config.obs_dim),
         discount=float(config.discount),
         log_reward=bool(getattr(config, 'ppo_td3_log_reward', False)),
+        start_index=norm_si,
+        end_index=norm_ei,
+        normalize_obs=norm_obs,
+        obs_norm_clip=obs_norm_clip,
     )
     gaussian_reward_fn = None
     nf_reward_fn = None
@@ -1725,10 +1924,12 @@ def run_ppo_training(
   else:
     _direction = str(getattr(config, 'ppo_crl_loss_direction', 'forward')).lower()
     _backward = (_direction == 'backward')
-    crl_update = make_crl_update_fn(networks, q_optimizer, backward=_backward)
+    crl_update = make_crl_update_fn(
+        networks, q_optimizer, backward=_backward, config=config)
     # Scan-based multi-step updater: one JIT dispatch for all CRL steps.
     crl_scan_update = make_scan_crl_update_fn(
-        networks, q_optimizer, backward=_backward, repr_tau=_repr_tau)
+        networks, q_optimizer, backward=_backward, repr_tau=_repr_tau,
+        config=config)
     print(f'[ppo] CRL loss direction: {_direction}')
     if _use_repr_ema:
       print(f'[ppo] CRL reward repr EMA: tau={_repr_tau} '
@@ -1737,15 +1938,65 @@ def run_ppo_training(
     nf_reward_fn = None
     td3_reward_fn = None
 
+  hybrid_td3_update = None
+  hybrid_td3_reward_fn = None
+  if use_crl_td3_switch:
+    _td3_tau_cfg = float(getattr(config, 'ppo_td3_tau', -1.0))
+    _td3_tau = (_td3_tau_cfg if _td3_tau_cfg >= 0.0
+                else float(config.tau))
+    hybrid_td3_update = _td3.make_td3_density_update_fn(
+        td3_density_nets,
+        policy_network=networks.policy_network,
+        sample_fn=networks.sample,
+        optimizer=q_optimizer,
+        obs_dim=int(config.obs_dim),
+        start_index=int(config.start_index),
+        end_index=int(config.end_index),
+        discount=float(config.discount),
+        tau=_td3_tau,
+        goal_tol=float(getattr(config, 'ppo_td3_goal_tol', 1e-2)),
+        use_target_policy=_use_td3_target_policy,
+        cross_batch_goals=bool(
+            getattr(config, 'ppo_td3_cross_batch_goals', False)),
+        normalize_obs=norm_obs,
+        obs_norm_clip=obs_norm_clip,
+    )
+    hybrid_td3_reward_fn = _td3.make_td3_reward_fn(
+        td3_density_nets,
+        obs_dim=int(config.obs_dim),
+        discount=float(config.discount),
+        log_reward=bool(getattr(config, 'ppo_td3_log_reward', False)),
+        start_index=norm_si,
+        end_index=norm_ei,
+        normalize_obs=norm_obs,
+        obs_norm_clip=obs_norm_clip,
+    )
+    print(f'[ppo] CRL→TD3 switch enabled: threshold='
+          f'{_switch_goal_visits} completed hard-goal visits; '
+          f'CRL and TD3 updates/iter={config.ppo_crl_steps_per_iter}; '
+          f'CRL training stops at threshold, TD3 continues; '
+          f'reward_blend_iters={_switch_blend_iters} '
+          f'({"hard switch" if _switch_blend_iters == 0 else "linear CRL→TD3"})')
+    if _use_hybrid_td3_reward_ema:
+      print(f'[ppo] hybrid TD3 reward Q EMA: '
+            f'tau={_hybrid_td3_reward_tau}')
+
   def _reward_q_params():
     return q_params_reward if _use_repr_ema else q_params
 
+  def _hybrid_reward_td3_params():
+    return (hybrid_td3_params_reward
+            if _use_hybrid_td3_reward_ema else hybrid_td3_params)
+
   @jax.jit
-  def act_and_value(policy_p, value_p, obs, rng):
-    dist = networks.policy_network.apply(policy_p, obs)
+  def act_and_value(policy_p, value_p, obs, rng, obs_mean, obs_var):
+    network_obs = _normalize_packed_obs(
+        obs, obs_mean, obs_var, obs_dim=obs_dim_cfg, start_index=norm_si,
+        end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs)
+    dist = networks.policy_network.apply(policy_p, network_obs)
     action = networks.sample(dist, rng)
     logprob = networks.log_prob(dist, action)
-    value = networks.value_network.apply(value_p, obs)
+    value = networks.value_network.apply(value_p, network_obs)
     return action, logprob, value
 
   bb_generate_unroll = None
@@ -1755,7 +2006,8 @@ def run_ppo_training(
     bb_generate_unroll = vec_env.compile_generate_unroll(
         act_and_value,
         unroll_length=T,
-        obs_dim=int(config.obs_dim))
+        obs_dim=int(config.obs_dim),
+        dynamic_obs_stats=True)
     print(f'[ppo] BuilderBench rollout: jax.lax.scan (T={T})')
     _eval_iv = int(getattr(config, 'ppo_eval_interval', 10))
     if _eval_iv > 0:
@@ -1772,27 +2024,84 @@ def run_ppo_training(
       )
 
       @jax.jit
-      def eval_policy_action(policy_p, obs):
-        dist = networks.policy_network.apply(policy_p, obs)
+      def eval_policy_action(policy_p, obs, obs_mean, obs_var):
+        network_obs = _normalize_packed_obs(
+            obs, obs_mean, obs_var, obs_dim=obs_dim_cfg, start_index=norm_si,
+            end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs)
+        dist = networks.policy_network.apply(policy_p, network_obs)
         return dist.mode()
 
       bb_eval_unroll = bb_eval_vec.compile_eval_unroll(
           eval_policy_action,
-          unroll_length=bb_eval_vec.episode_length)
+          unroll_length=bb_eval_vec.episode_length,
+          dynamic_obs_stats=True)
       print(f'[ppo] BuilderBench eval: jax.lax.scan '
             f'(E={_n_eval}, ep_len={bb_eval_vec.episode_length}, '
             f'every {_eval_iv} iters)')
+      # Warm-compile once at startup so the first logged eval does not stall
+      # training (XLA compile of the E_eval scan can take minutes otherwise).
+      _warm_t0 = time.time()
+      print('[ppo] warming BuilderBench eval unroll (XLA compile)...',
+            flush=True)
+      _warm_mean = jnp.asarray(obs_rms.mean, dtype=jnp.float32)
+      _warm_var = jnp.asarray(obs_rms.var, dtype=jnp.float32)
+      _warm_steps = bb_eval_unroll(
+          bb_eval_vec.reset_state(), ppo_params['policy'],
+          _warm_mean, _warm_var)
+      jax.block_until_ready(_warm_steps['reward'])
+      print(f'[ppo] BuilderBench eval warm-compile done in '
+            f'{time.time() - _warm_t0:.1f}s', flush=True)
+      del _warm_steps, _warm_mean, _warm_var
     else:
       print('[ppo] BuilderBench: periodic eval disabled; '
             'logging train_success_mean / train_success_1000 from rollouts')
 
+  # Optional in-train deterministic video (BuilderBench only).
+  bb_video_env = None
+  bb_video_mocap = None
+  bb_video_ep_len = None
+  bb_video_num_cubes = None
+  bb_video_filter = False
+  bb_video_dir = None
+  _video_interval = int(getattr(config, 'ppo_video_interval', 0) or 0)
+  _video_fps = int(getattr(config, 'ppo_video_fps', 10) or 10)
+  _skip_first_video = bool(getattr(config, 'ppo_skip_first_video', True))
+  if _use_jax_bb_vec and _video_interval > 0:
+    from contrastive import builderbench_video as _bb_vid
+    _filter_pol = bool(_bb_kw.get('builderbench_pd_filter_policy_obs', True))
+    if not bool(_bb_kw.get('builderbench_use_pd', False)):
+      _filter_pol = False
+    (bb_video_env, bb_video_mocap, bb_video_ep_len, bb_video_num_cubes,
+     bb_video_filter) = _bb_vid.make_bb_video_env(
+         _env_name,
+         use_pd=bool(_bb_kw.get('builderbench_use_pd', False)),
+         pd_duration=int(_bb_kw.get('builderbench_pd_duration', 5)),
+         permute_start_boxes=bool(
+             _bb_kw.get('builderbench_permute_start_boxes', True)),
+         filter_policy_obs=_filter_pol,
+    )
+    if checkpoint_dir is not None:
+      bb_video_dir = os.path.join(os.path.dirname(checkpoint_dir), 'videos')
+    else:
+      bb_video_dir = os.path.join('videos', 'builderbench', 'in_train')
+    os.makedirs(bb_video_dir, exist_ok=True)
+    print(f'[ppo] BuilderBench in-train video: every {_video_interval} iters, '
+          f'deterministic, norm_obs={norm_obs}, fps={_video_fps}, '
+          f'dir={bb_video_dir}', flush=True)
+
   @jax.jit
-  def value_only(value_p, obs):
+  def value_only(value_p, obs, obs_mean, obs_var):
+    obs = _normalize_packed_obs(
+        obs, obs_mean, obs_var, obs_dim=obs_dim_cfg, start_index=norm_si,
+        end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs)
     return networks.value_network.apply(value_p, obs)
 
   @jax.jit
-  def greedy_action(policy_p, obs):
+  def greedy_action(policy_p, obs, obs_mean, obs_var):
     # Deterministic policy mean for evaluation.
+    obs = _normalize_packed_obs(
+        obs, obs_mean, obs_var, obs_dim=obs_dim_cfg, start_index=norm_si,
+        end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs)
     dist = networks.policy_network.apply(policy_p, obs)
     return networks.sample(dist, jax.random.PRNGKey(0))  # sample still; we log both below
 
@@ -1815,13 +2124,24 @@ def run_ppo_training(
     print(f'[ppo] uniform_sampling: goal_low={goal_low}, goal_high={goal_high}')
 
   # ---- replay buffer (episodes) -----------------------------------------
+  _success_sample_weight = float(
+      getattr(config, 'ppo_success_sample_weight', 1.0))
+  if _success_sample_weight <= 0.0:
+    raise ValueError(
+        'ppo_success_sample_weight must be > 0, got '
+        f'{_success_sample_weight}')
   replay = EpisodeReplay(
       capacity=int(config.max_replay_size),
       obs_dim=int(config.obs_dim),
       discount=float(config.discount),
       start_index=int(config.start_index),
-      end_index=int(config.end_index))
+      end_index=int(config.end_index),
+      success_sample_weight=_success_sample_weight)
   np_rng = np.random.default_rng(seed + 12345)
+  if _success_sample_weight != 1.0:
+    print('[ppo] CRL episode sampling: successful trajectories weight='
+          f'{_success_sample_weight:g}, others weight=1 '
+          '(sample proportional to w / sum w)')
 
   # ---- per-env episode buffers (for flushing complete trajectories) -----
   ep_obs: list = [[] for _ in range(E)]
@@ -1967,6 +2287,29 @@ def run_ppo_training(
   # restored from checkpoint on resume).
 
   for iteration in range(start_iteration, num_iterations):
+    # One immutable snapshot is shared by every network call in this
+    # iteration. Stats are advanced from raw rollout states only after eval.
+    iter_obs_mean = np.asarray(obs_rms.mean, dtype=np.float32).copy()
+    iter_obs_var = np.asarray(obs_rms.var, dtype=np.float32).copy()
+    if norm_obs and obs_rms.count <= 0.0:
+      # Sentinel consumed by _normalize_packed_obs: first iteration is raw,
+      # including no clipping, then rollout data initializes the RMS.
+      iter_obs_mean.fill(np.nan)
+    iter_obs_mean_j = jnp.asarray(iter_obs_mean)
+    iter_obs_var_j = jnp.asarray(iter_obs_var)
+    # Freeze the reward-transition decision for the whole iteration. If the
+    # threshold is crossed in this rollout, blending / TD3 starts next iter.
+    _reward_uses_td3_this_iter = (
+        use_crl_td3_switch and reward_switched_to_td3)
+    _reward_td3_weight = 0.0
+    if _reward_uses_td3_this_iter:
+      if _switch_blend_iters <= 0:
+        _reward_td3_weight = 1.0
+      else:
+        _reward_td3_weight = float(np.clip(
+            (int(iteration) - int(reward_switch_iteration))
+            / float(_switch_blend_iters),
+            0.0, 1.0))
     # =================================================================
     # 1. Rollout (on-policy, CleanRL convention)
     # =================================================================
@@ -1979,6 +2322,8 @@ def run_ppo_training(
           key,
           jnp.asarray(next_done),
           jnp.asarray(s0_states),
+          iter_obs_mean_j,
+          iter_obs_var_j,
       )
       roll_obs[:] = np.asarray(_steps_j['obs'], dtype=np.float32)
       if obs_normalizer.mode != 'none':
@@ -2016,10 +2361,14 @@ def run_ppo_training(
                 ep_success_max[i], float(_roll_success[_t, i]))
           if _dones_t[i]:
             ep_obs[i].append(_term_t[i].copy())
+            _episode_succeeded = bool(
+                _roll_success is not None and ep_success_max[i] >= 0.5)
+            _episode_obs = np.stack(ep_obs[i], axis=0)
+            _episode_act = np.stack(ep_act[i], axis=0)
             try:
               _stack_obs = np.stack(ep_obs[i], axis=0)
               _stack_act = np.stack(ep_act[i], axis=0)
-              replay.add_episode(_stack_obs, _stack_act)
+              replay.add_episode(_stack_obs, _stack_act, successful=_episode_succeeded)
               if use_good_buffer and good_replay is not None:
                 _st_cnt = compute_max_cubes_stacked(_stack_obs, num_cubes=4, tol=0.03)
                 if _st_cnt >= int(getattr(config, 'ppo_good_buffer_min_cubes', 2)):
@@ -2038,7 +2387,9 @@ def run_ppo_training(
             recent_returns.append(float(ep_return[i]))
             recent_lengths.append(int(ep_len[i]))
             if _roll_success is not None:
-              recent_success.append(float(ep_success_max[i] >= 0.5))
+              recent_success.append(float(_episode_succeeded))
+              if use_crl_td3_switch and _episode_succeeded:
+                hard_goal_visit_count += 1
               ep_success_max[i] = 0.0
               if len(recent_success) > 1000:
                 recent_success.pop(0)
@@ -2059,7 +2410,7 @@ def run_ppo_training(
         key, k_act = jax.random.split(key)
         action_j, logprob_j, value_j = act_and_value(
             ppo_params['policy'], ppo_params['value'],
-            jnp.asarray(norm_obs), k_act)
+            jnp.asarray(obs), k_act, iter_obs_mean_j, iter_obs_var_j)
         action = np.asarray(action_j)
         roll_acts[t] = action
         roll_logp[t] = np.asarray(logprob_j)
@@ -2129,6 +2480,25 @@ def run_ppo_training(
         next_done = dones.astype(np.float32)
         global_step += E
 
+    _switch_after_this_iteration = (
+        use_crl_td3_switch
+        and not reward_switched_to_td3
+        and hard_goal_visit_count >= _switch_goal_visits)
+
+    # Occasional raw-vs-normalized sanity print (2 early iters only).
+    if norm_obs and iteration in (1, 10) and np.all(np.isfinite(iter_obs_mean)):
+      _raw = np.asarray(roll_obs[0, 0], dtype=np.float32)
+      _norm = np.asarray(_normalize_packed_obs(
+          jnp.asarray(_raw[None]), iter_obs_mean_j, iter_obs_var_j,
+          obs_dim=obs_dim_cfg, start_index=norm_si, end_index=norm_ei,
+          clip=obs_norm_clip, enabled=True)[0])
+      print(f'[ppo][obs_norm] iter={iteration} raw  '
+            f'state={np.array2string(_raw[:obs_dim_cfg], precision=3)} '
+            f'goal={np.array2string(_raw[obs_dim_cfg:], precision=3)}')
+      print(f'[ppo][obs_norm] iter={iteration} norm '
+            f'state={np.array2string(_norm[:obs_dim_cfg], precision=3)} '
+            f'goal={np.array2string(_norm[obs_dim_cfg:], precision=3)}')
+
     # =================================================================
     # 1b. Batched reward computation (single GPU call over full rollout)
     # =================================================================
@@ -2146,7 +2516,24 @@ def run_ppo_training(
                 _reward_q_params(), _flat_obs_j, _flat_acts_j))
       elif use_td3:
         _rew_flat = np.asarray(
-            td3_reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
+            td3_reward_fn(
+                _reward_q_params(), _flat_obs_j, _flat_acts_j,
+                iter_obs_mean_j, iter_obs_var_j))
+      elif use_crl_td3_switch and _reward_uses_td3_this_iter:
+        _rew_td3 = np.asarray(
+            hybrid_td3_reward_fn(
+                _hybrid_reward_td3_params(), _flat_obs_j, _flat_acts_j,
+                iter_obs_mean_j, iter_obs_var_j))
+        if _reward_td3_weight >= 1.0 - 1e-8:
+          _rew_flat = _rew_td3
+        else:
+          # Still mix in (frozen) CRL reward during the blend window.
+          _rew_crl = np.asarray(
+              reward_fn(
+                  _reward_q_params(), _flat_obs_j, _flat_acts_j,
+                  iter_obs_mean_j, iter_obs_var_j))
+          _w = float(_reward_td3_weight)
+          _rew_flat = (1.0 - _w) * _rew_crl + _w * _rew_td3
       elif use_dirac_target:
         _flat_s0_j = jnp.asarray(roll_s0_states.reshape(T * E, -1))
         _rew_flat  = np.asarray(
@@ -2154,7 +2541,9 @@ def run_ppo_training(
       else:
         # Default CRL: r = φ(s,a)·ψ(g)
         _rew_flat = np.asarray(
-            reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
+            reward_fn(
+                _reward_q_params(), _flat_obs_j, _flat_acts_j,
+                iter_obs_mean_j, iter_obs_var_j))
       roll_rew_raw[:] = _rew_flat.reshape(T, E)
 
     # Apply reward normalisation (cheap NumPy loop; normalizer state is shared
@@ -2168,7 +2557,9 @@ def run_ppo_training(
     # =================================================================
     # 2. GAE advantages / returns
     # =================================================================
-    next_val = np.asarray(value_only(ppo_params['value'], jnp.asarray(obs)))
+    next_val = np.asarray(value_only(
+        ppo_params['value'], jnp.asarray(obs),
+        iter_obs_mean_j, iter_obs_var_j))
     adv_j, ret_j = gae_fn(
         jnp.asarray(roll_rew), jnp.asarray(roll_vals),
         jnp.asarray(roll_dones),
@@ -2231,10 +2622,12 @@ def run_ppo_training(
         if ent_coef_schedule is not None:
           ppo_params, ppo_opt_state, m = ppo_update(
               ppo_params, ppo_opt_state, batch, k_mb,
+              iter_obs_mean_j, iter_obs_var_j,
               jnp.asarray(ppo_sgd_step, dtype=jnp.int32))
         else:
           ppo_params, ppo_opt_state, m = ppo_update(
-              ppo_params, ppo_opt_state, batch, k_mb)
+              ppo_params, ppo_opt_state, batch, k_mb,
+              iter_obs_mean_j, iter_obs_var_j)
         ppo_sgd_step += 1
         last_kl = float(m['approx_kl'])
         for k_, v in m.items():
@@ -2254,6 +2647,7 @@ def run_ppo_training(
     # 4. CRL updates (off-policy, from replay)
     # =================================================================
     crl_metrics_agg: Dict[str, list] = {}
+    hybrid_td3_metrics_agg: Dict[str, list] = {}
     if replay.size >= int(config.ppo_min_replay_size):
       # Update goal normalisation stats from a fresh replay sample (NF only).
       if use_nf and not _nf_normalizer_reset_done:
@@ -2281,7 +2675,47 @@ def run_ppo_training(
           _nf_stat_log[f'nf/goal_std_{_di}']  = float(_gs)
 
       _n_crl = int(config.ppo_crl_steps_per_iter)
-      if use_nf or use_gaussian or use_td3:
+      if use_crl_td3_switch:
+        # TD3 learns from the beginning and continues after the reward switch.
+        for _ in range(_n_crl):
+          if uniform_sampling:
+            crl_batch_np = replay.sample_with_uniform_negatives(
+                int(config.batch_size), np_rng, goal_low, goal_high)
+          else:
+            crl_batch_np = replay.sample(int(config.batch_size), np_rng)
+          crl_batch = {k_: jnp.asarray(v) for k_, v in crl_batch_np.items()}
+          key, k_td3 = jax.random.split(key)
+          (hybrid_td3_params, hybrid_td3_opt_state, m,
+           td3_policy_target) = hybrid_td3_update(
+              hybrid_td3_params, hybrid_td3_opt_state, crl_batch, k_td3,
+              ppo_params['policy'], td3_policy_target,
+              iter_obs_mean_j, iter_obs_var_j)
+          if _use_hybrid_td3_reward_ema:
+            hybrid_td3_params_reward = _ema_tree(
+                hybrid_td3_params_reward, hybrid_td3_params,
+                _hybrid_td3_reward_tau)
+          for k_, v in m.items():
+            hybrid_td3_metrics_agg.setdefault(k_, []).append(float(v))
+
+        # Once the goal threshold is reached CRL is no longer trained. The
+        # frozen CRL critic still supplied this iteration's already-computed
+        # rewards; TD3 becomes active only on the next iteration.
+        if not _switch_after_this_iteration and not reward_switched_to_td3:
+          _samples = [
+              (replay.sample_with_uniform_negatives(
+                  int(config.batch_size), np_rng, goal_low, goal_high)
+               if uniform_sampling
+               else replay.sample(int(config.batch_size), np_rng))
+              for _ in range(_n_crl)]
+          _stacked = {
+              k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
+              for k_ in _samples[0]}
+          (q_params, q_opt_state, q_params_reward,
+           key, m) = crl_scan_update(
+              q_params, q_opt_state, q_params_reward, _stacked, key,
+              iter_obs_mean_j, iter_obs_var_j)
+          crl_metrics_agg = {k_: [float(v)] for k_, v in m.items()}
+      elif use_nf or use_gaussian or use_td3:
         # NF / Gaussian / TD3 loops take extra args — keep the Python loop.
         for _ in range(_n_crl):
           if uniform_sampling:
@@ -2298,7 +2732,8 @@ def run_ppo_training(
           elif use_td3:
             q_params, q_opt_state, m, td3_policy_target = crl_update(
                 q_params, q_opt_state, crl_batch, k_crl,
-                ppo_params['policy'], td3_policy_target)
+                ppo_params['policy'], td3_policy_target,
+                iter_obs_mean_j, iter_obs_var_j)
           else:
             q_params, q_opt_state, m = crl_update(
                 q_params, q_opt_state, crl_batch, k_crl)
@@ -2320,7 +2755,8 @@ def run_ppo_training(
             for k_ in _samples[0]}
         (q_params, q_opt_state, q_params_reward,
          key, m) = crl_scan_update(
-            q_params, q_opt_state, q_params_reward, _stacked, key)
+            q_params, q_opt_state, q_params_reward, _stacked, key,
+            iter_obs_mean_j, iter_obs_var_j)
         crl_metrics_agg = {k_: [float(v)] for k_, v in m.items()}
 
     # =================================================================
@@ -2368,6 +2804,16 @@ def run_ppo_training(
       log['train_success_1000'] = (
           float(np.mean(recent_success[-1000:]))
           if recent_success else float('nan'))
+    if use_crl_td3_switch:
+      log['reward_source_td3'] = float(_reward_uses_td3_this_iter)
+      log['reward_td3_weight'] = float(_reward_td3_weight)
+      log['hard_goal_visit_count'] = int(hard_goal_visit_count)
+      log['reward_switch_pending'] = float(_switch_after_this_iteration)
+      log['reward_switch_iteration'] = int(reward_switch_iteration)
+    log['obs_norm_enabled'] = float(norm_obs)
+    log['obs_norm_count'] = float(obs_rms.count)
+    log['obs_norm_mean_abs'] = float(np.mean(np.abs(obs_rms.mean)))
+    log['obs_norm_std_mean'] = float(np.mean(np.sqrt(iter_obs_var + 1e-8)))
 
     # Acme CSVLogger fixes columns on the *first* write and drops any later
     # keys.  Seed NF/SA columns from iter 0 so training metrics land in CSV.
@@ -2419,6 +2865,15 @@ def run_ppo_training(
     elif use_td3:
       for k_, vs in crl_metrics_agg.items():
         log[f'td3/{k_}'] = float(np.mean(vs))
+    elif use_crl_td3_switch:
+      for k_, vs in crl_metrics_agg.items():
+        log[f'crl/{k_}'] = float(np.mean(vs))
+      for k_, vs in hybrid_td3_metrics_agg.items():
+        log[f'td3/{k_}'] = float(np.mean(vs))
+      log['crl/update_steps'] = (
+          int(config.ppo_crl_steps_per_iter) if crl_metrics_agg else 0)
+      log['td3/update_steps'] = len(
+          hybrid_td3_metrics_agg.get('td3_qf_loss', []))
     else:
       for k_, vs in crl_metrics_agg.items():
         log[f'crl/{k_}'] = float(np.mean(vs))
@@ -2437,6 +2892,22 @@ def run_ppo_training(
         log[f'obs/{k_d}'] = v_d
 
     learner_logger.write(log)
+
+    if _switch_after_this_iteration:
+      reward_switched_to_td3 = True
+      reward_switch_iteration = int(iteration) + 1
+      if _switch_blend_iters > 0:
+        print(f'[ppo] hard-goal visit threshold reached at iter={iteration}: '
+              f'visits={hard_goal_visit_count}; linear CRL→TD3 blend starts '
+              f'at iter={reward_switch_iteration} over '
+              f'{_switch_blend_iters} iters '
+              f'(w=0→1); CRL training stopped; '
+              f'PPO/value/replay/reward-normalizer state preserved')
+      else:
+        print(f'[ppo] hard-goal visit threshold reached at iter={iteration}: '
+              f'visits={hard_goal_visit_count}; TD3 reward starts at '
+              f'iter={reward_switch_iteration}; CRL training stopped; '
+              f'PPO/value/replay/reward-normalizer state preserved')
 
     # =================================================================
     # 5b. Actor reset if episodes are collapsing OR on a forced schedule
@@ -2478,9 +2949,15 @@ def run_ppo_training(
     if (_eval_interval > 0
         and iteration % _eval_interval == 0
         and not (iteration == 0 and _skip_first)):
+      _eval_t0 = time.time()
+      _eval_gpu_s = None
       if bb_eval_unroll is not None and bb_eval_vec is not None:
         eval_state = bb_eval_vec.reset_state()
-        steps_j = bb_eval_unroll(eval_state, ppo_params['policy'])
+        steps_j = bb_eval_unroll(
+            eval_state, ppo_params['policy'],
+            iter_obs_mean_j, iter_obs_var_j)
+        jax.block_until_ready(steps_j['reward'])
+        _eval_gpu_s = time.time() - _eval_t0
         ep_metrics_list = _bb_ep_metrics_from_eval_steps(
             steps_j,
             obs_dim=int(config.obs_dim),
@@ -2504,7 +2981,8 @@ def run_ppo_training(
             key, k_eval = jax.random.split(key)
             a, _, _ = act_and_value(
                 ppo_params['policy'], ppo_params['value'],
-                jnp.asarray(ts.observation)[None], k_eval)
+                jnp.asarray(ts.observation)[None], k_eval,
+                iter_obs_mean_j, iter_obs_var_j)
             action = np.asarray(a)[0].astype(np.float32)
             action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
             action = np.clip(action, -1.0, 1.0)
@@ -2528,6 +3006,58 @@ def run_ppo_training(
 
       agg = _cu.aggregate_eval_metrics(ep_metrics_list, iteration)
       eval_logger.write(agg)
+      _eval_total_s = time.time() - _eval_t0
+      _gpu_part = (f'gpu={_eval_gpu_s:.2f}s '
+                   if _eval_gpu_s is not None else 'gpu=n/a ')
+      print(f'[ppo] eval iter={iteration}: {_gpu_part}'
+            f'total={_eval_total_s:.2f}s E={_n_eval} '
+            f'success={agg.get("success", float("nan")):.3f}',
+            flush=True)
+
+    # =================================================================
+    # 6b. Periodic deterministic video (same frozen obs_rms as eval)
+    # =================================================================
+    if (bb_video_env is not None
+        and _video_interval > 0
+        and iteration % _video_interval == 0
+        and not (iteration == 0 and _skip_first_video)):
+      from contrastive import builderbench_video as _bb_vid
+      _vid_t0 = time.time()
+      _vid_path = os.path.join(
+          bb_video_dir, f'iter_{int(iteration):07d}.mp4')
+      try:
+        _out, _n_frames = _bb_vid.render_deterministic_episode(
+            video_env=bb_video_env,
+            mocap_targets=bb_video_mocap,
+            num_cubes=int(bb_video_num_cubes),
+            episode_length=int(bb_video_ep_len),
+            networks=networks,
+            policy_params=ppo_params['policy'],
+            obs_mean=np.asarray(iter_obs_mean, dtype=np.float32),
+            obs_var=np.asarray(iter_obs_var, dtype=np.float32),
+            fixed_target_goal=_bb_kw.get('fixed_target_goal'),
+            seed=int(seed + 17_000 + iteration),
+            filter_policy_obs=bool(bb_video_filter),
+            normalize_obs=bool(norm_obs),
+            obs_dim=int(obs_dim_cfg),
+            start_index=int(norm_si),
+            end_index=int(norm_ei),
+            obs_norm_clip=float(obs_norm_clip),
+            fps=int(_video_fps),
+            out_path=_vid_path,
+        )
+        print(f'[ppo] video iter={iteration}: wrote {_out} '
+              f'({_n_frames} frames) in {time.time() - _vid_t0:.1f}s',
+              flush=True)
+      except Exception as _vid_exc:
+        print(f'[ppo] video iter={iteration}: FAILED after '
+              f'{time.time() - _vid_t0:.1f}s: {_vid_exc}', flush=True)
+
+    # Advance only after every network call in the iteration has consumed the
+    # frozen snapshot. The first fresh run therefore uses identity/raw inputs.
+    if norm_obs:
+      obs_rms.update(
+          roll_obs.reshape(T * E, -1)[:, :obs_dim_cfg])
 
     # =================================================================
     # 7. Checkpointing: ckpt_iter_{iter}.pkl every `ppo_checkpoint_interval`
@@ -2537,6 +3067,22 @@ def run_ppo_training(
         and checkpoint_dir is not None
         and (iteration % ckpt_interval == 0
              or iteration == num_iterations - 1)):
+      _checkpoint_extra = {
+          'obs_rms': {
+              'mean': np.asarray(obs_rms.mean, dtype=np.float64),
+              'var': np.asarray(obs_rms.var, dtype=np.float64),
+              'count': float(obs_rms.count),
+          },
+      } if norm_obs else {}
+      if use_crl_td3_switch:
+        _checkpoint_extra.update({
+            'hybrid_td3_params': hybrid_td3_params,
+            'hybrid_td3_opt_state': hybrid_td3_opt_state,
+            'hybrid_td3_params_reward': hybrid_td3_params_reward,
+            'hard_goal_visit_count': int(hard_goal_visit_count),
+            'reward_switched_to_td3': bool(reward_switched_to_td3),
+            'reward_switch_iteration': int(reward_switch_iteration),
+        })
       ckpt_kw = dict(
           policy_params=ppo_params['policy'],
           value_params=ppo_params['value'],
@@ -2552,7 +3098,8 @@ def run_ppo_training(
           obs_norm_mean=obs_normalizer.mean,
           obs_norm_var=obs_normalizer.var,
           obs_norm_count=obs_normalizer.count,
-          obs_norm_mode=obs_normalizer.mode)
+          obs_norm_mode=obs_normalizer.mode,
+          extra_state=(_checkpoint_extra if _checkpoint_extra else None))
       milestone_path = os.path.join(
           checkpoint_dir, f'ckpt_iter_{iteration:07d}.pkl')
       _save_checkpoint(milestone_path, **ckpt_kw)

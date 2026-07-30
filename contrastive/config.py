@@ -164,6 +164,11 @@ class ContrastiveConfig:
   ppo_max_grad_norm: float = 0.5
   ppo_clip_vloss: bool = True
   ppo_norm_adv: bool = True
+  # Optional observation normalization for standalone PPO. Running statistics
+  # cover raw state dimensions only; goal coordinates reuse the corresponding
+  # state statistics selected by start_index:end_index.
+  ppo_norm_obs: bool = False
+  ppo_obs_norm_clip: float = 10.0
   # Normalize the φ·ψ reward by the running std of discounted returns
   # (CleanRL's `NormalizeReward` wrapper).  Strongly recommended when the
   # reward comes from a non-stationary learned critic: unscaled φ·ψ values
@@ -205,6 +210,10 @@ class ContrastiveConfig:
   ppo_gaussian_reward_tau: float = 0.0
   # Minimum replay size before CRL updates start.
   ppo_min_replay_size: int = 10_000
+  # CRL replay episode sampling weight for successful trajectories.
+  # Unsuccessful episodes always have weight 1. Episode indices are drawn
+  # with probability w_k / sum_i w_i. Default 1.0 recovers uniform sampling.
+  ppo_success_sample_weight: float = 1.0
   # Checkpointing: save policy/value/CRL params every N PPO iterations.
   # At default settings (8 envs × 128 steps = 1024 env-steps/iter), 100
   # iterations ≈ 100k env steps — light enough not to bottleneck training.
@@ -232,7 +241,19 @@ class ContrastiveConfig:
   #                PPO reward = Q1(s,a,g) (or log((1−γ)Q) if
   #                ppo_td3_log_reward).  Target Polyak uses ppo_td3_tau
   #                (falls back to `tau`); NOT ppo_crl_repr_tau.
+  #   'crl_td3_switch' — opt-in hybrid: train CRL and TD3 together, use the
+  #                CRL reward until `ppo_reward_switch_goal_visits` completed
+  #                training episodes have visited the hard goal, then use only
+  #                the TD3 reward starting on the following PPO iteration.
   ppo_repr_mode: str = 'crl'
+  # Goal-visit threshold for ppo_repr_mode='crl_td3_switch'. Values <= 0 are
+  # invalid in that mode. This does not affect any other representation mode.
+  ppo_reward_switch_goal_visits: int = 5
+  # After the visit threshold, blend PPO rewards for this many iterations:
+  #   r = (1-w)·r_CRL + w·r_TD3,  w = clip((iter - switch_iter) / blend_iters, 0, 1)
+  # At switch_iter, w=0 (pure CRL); after blend_iters, w=1 (pure TD3).
+  # 0 = hard switch to TD3 on the first post-threshold iteration (legacy).
+  ppo_reward_switch_blend_iters: int = 0
   # Polyak τ for TD3 target Q networks when ppo_repr_mode='td3'.
   # Independent of ppo_crl_repr_tau (CRL reward EMA).  <0 → use `tau`.
   ppo_td3_tau: float = -1.0
@@ -275,6 +296,11 @@ class ContrastiveConfig:
   ppo_actor_reset_iters: str = ''
   ppo_eval_interval: int = 10  # run eval every N PPO iterations (0 = disabled)
   ppo_eval_episodes: int = 5  # number of eval episodes per eval round
+  # In-train BuilderBench video (deterministic policy + live obs_rms).
+  # 0 = disabled. Videos written under <run_dir>/videos/.
+  ppo_video_interval: int = 0
+  ppo_video_fps: int = 10
+  ppo_skip_first_video: bool = True
   # KDE options (only used when ppo_reward_mode == 'kde_dirac').
   # kde_max_points: number of replay states to fit the KDE on.
   # kde_refit_interval: refit the KDE every N PPO iterations (1 = every iter).

@@ -254,25 +254,95 @@ class CheckpointEvalSession:
         permute_start_boxes=bool(
             getattr(ctx, 'permute_start_boxes', True)),
     )
+    self._norm_obs = bool(getattr(ctx, 'ppo_norm_obs', False))
+    self._obs_dim = int(ctx.obs_dim)
+    self._norm_si = int(ctx.start_index)
+    self._norm_ei = int(
+        ctx.end_index if int(ctx.end_index) != -1 else ctx.obs_dim)
+    self._norm_clip = float(getattr(ctx, 'ppo_obs_norm_clip', 10.0))
+    obs_norm_mode = str(getattr(ctx, 'obs_norm_mode', 'none')).lower()
+    self._legacy_norm = (obs_norm_mode in ('z_scale', 'tied_rsnorm'))
 
-    rsnorm_clip = float(getattr(ctx, 'rsnorm_clip', 10.0))
+    if self._norm_obs:
+      print(f'[bb_eval] observation normalization ON: '
+            f'state_dim={self._obs_dim}, '
+            f'goal_stats=state[{self._norm_si}:{self._norm_ei}], '
+            f'clip={self._norm_clip}')
+      obs_dim = self._obs_dim
+      norm_si = self._norm_si
+      norm_ei = self._norm_ei
+      norm_clip = self._norm_clip
+      policy_network = self.networks.policy_network
 
-    @jax.jit
-    def eval_policy_action(policy_p, obs, mean, std):
-      norm_obs = jnp.clip((obs - mean) / std, -rsnorm_clip, rsnorm_clip)
-      dist = self.networks.policy_network.apply(policy_p, norm_obs)
-      return dist.mode()
+      @jax.jit
+      def eval_policy_action(policy_p, obs, obs_mean, obs_var):
+        network_obs = ppo_learner._normalize_packed_obs(
+            obs, obs_mean, obs_var,
+            obs_dim=obs_dim,
+            start_index=norm_si,
+            end_index=norm_ei,
+            clip=norm_clip,
+            enabled=True)
+        dist = policy_network.apply(policy_p, network_obs)
+        return dist.mode()
 
-    self._eval_unroll = self.vec_env.compile_eval_unroll(
-        eval_policy_action,
-        unroll_length=self.vec_env.episode_length,
-    )
+      self._eval_unroll = self.vec_env.compile_eval_unroll(
+          eval_policy_action,
+          unroll_length=self.vec_env.episode_length,
+          dynamic_obs_stats=True,
+      )
+    elif self._legacy_norm:
+      rsnorm_clip = float(getattr(ctx, 'rsnorm_clip', 10.0))
+      policy_network = self.networks.policy_network
 
-  def eval_policy_params(self, policy_params: Any, mean: np.ndarray, std: np.ndarray) -> Tuple[float, float, Tuple[float, ...]]:
+      @jax.jit
+      def eval_policy_action(policy_p, obs, mean, std):
+        norm_obs = jnp.clip((obs - mean) / std, -rsnorm_clip, rsnorm_clip)
+        dist = policy_network.apply(policy_p, norm_obs)
+        return dist.mode()
+
+      self._eval_unroll = self.vec_env.compile_eval_unroll(
+          eval_policy_action,
+          unroll_length=self.vec_env.episode_length,
+          dynamic_obs_stats=True,
+      )
+    else:
+      policy_network = self.networks.policy_network
+
+      @jax.jit
+      def eval_policy_action(policy_p, obs):
+        dist = policy_network.apply(policy_p, obs)
+        return dist.mode()
+
+      self._eval_unroll = self.vec_env.compile_eval_unroll(
+          eval_policy_action,
+          unroll_length=self.vec_env.episode_length,
+      )
+
+  def eval_policy_params(
+      self,
+      policy_params: Any,
+      obs_mean: Optional[np.ndarray] = None,
+      obs_var: Optional[np.ndarray] = None,
+      mean: Optional[np.ndarray] = None,
+      std: Optional[np.ndarray] = None,
+  ) -> Tuple[float, float, Tuple[float, ...]]:
     eval_state = self.vec_env.reset_state()
-    mean_j = jnp.asarray(mean, dtype=jnp.float32)
-    std_j = jnp.asarray(std, dtype=jnp.float32)
-    steps = self._eval_unroll(eval_state, policy_params, mean_j, std_j)
+    if self._norm_obs:
+      if obs_mean is None or obs_var is None:
+        raise ValueError(
+            'ppo_norm_obs checkpoints must include extra_state.obs_rms')
+      steps = self._eval_unroll(
+          eval_state, policy_params,
+          jnp.asarray(obs_mean, dtype=jnp.float32),
+          jnp.asarray(obs_var, dtype=jnp.float32))
+    elif self._legacy_norm:
+      steps = self._eval_unroll(
+          eval_state, policy_params,
+          jnp.asarray(mean, dtype=jnp.float32),
+          jnp.asarray(std, dtype=jnp.float32))
+    else:
+      steps = self._eval_unroll(eval_state, policy_params)
     ep_success = episode_successes_from_steps(steps)
     mean_val = float(ep_success.mean())
     n = int(ep_success.size)
@@ -284,35 +354,49 @@ class CheckpointEvalSession:
     iteration = int(ckpt.get('iteration', _iteration_from_label(label)))
     global_step = int(ckpt.get('global_step', iteration))
 
-    num_cubes = self.vec_env._num_cubes
-    state_obs_dim = self.ctx.obs_dim
-    total_obs_dim = state_obs_dim + num_cubes * 3
+    obs_mean = obs_var = None
+    mean = std = None
 
-    mean = np.zeros(total_obs_dim, dtype=np.float32)
-    std = np.ones(total_obs_dim, dtype=np.float32)
+    if self._norm_obs:
+      extra = ckpt.get('extra_state') or {}
+      obs_state = extra.get('obs_rms')
+      if not isinstance(obs_state, dict):
+        raise ValueError(
+            f'checkpoint {path} missing extra_state.obs_rms '
+            f'(required for ppo_norm_obs eval)')
+      obs_mean = np.asarray(obs_state['mean'], dtype=np.float32)
+      obs_var = np.asarray(obs_state['var'], dtype=np.float32)
+      if int(obs_state.get('count', 0)) <= 0:
+        obs_mean = np.full_like(obs_mean, np.nan)
+    elif self._legacy_norm:
+      num_cubes = self.vec_env._num_cubes
+      state_obs_dim = self.ctx.obs_dim
+      total_obs_dim = state_obs_dim + num_cubes * 3
+      mean = np.zeros(total_obs_dim, dtype=np.float32)
+      std = np.ones(total_obs_dim, dtype=np.float32)
+      mode = str(getattr(self.ctx, 'obs_norm_mode', 'none')).lower()
+      if mode == 'z_scale':
+        k = float(getattr(self.ctx, 'z_scale_multiplier', 3.0))
+        for i in range(num_cubes):
+          std[3 * i + 2] = 1.0 / k
+          std[state_obs_dim + 3 * i + 2] = 1.0 / k
+      elif mode == 'tied_rsnorm' and 'obs_norm_mean' in ckpt:
+        from envs.builderbench_obs_norm import BuilderBenchObsNormalizer
+        normalizer = BuilderBenchObsNormalizer(
+            mode='tied_rsnorm',
+            num_cubes=num_cubes,
+            state_obs_dim=state_obs_dim,
+            goal_dim=num_cubes * 3,
+            rsnorm_clip=float(getattr(self.ctx, 'rsnorm_clip', 10.0)),
+        )
+        normalizer.mean = np.asarray(ckpt['obs_norm_mean'], dtype=np.float64)
+        normalizer.var = np.asarray(ckpt['obs_norm_var'], dtype=np.float64)
+        tied_mean, tied_var = normalizer._get_tied_stats()
+        mean = tied_mean.astype(np.float32)
+        std = np.sqrt(np.maximum(tied_var, 1e-8)).astype(np.float32)
 
-    mode = str(getattr(self.ctx, 'obs_norm_mode', 'none')).lower()
-    if mode == 'z_scale':
-      k = float(getattr(self.ctx, 'z_scale_multiplier', 3.0))
-      for i in range(num_cubes):
-        std[3 * i + 2] = 1.0 / k
-        std[state_obs_dim + 3 * i + 2] = 1.0 / k
-    elif mode == 'tied_rsnorm' and 'obs_norm_mean' in ckpt:
-      from envs.builderbench_obs_norm import BuilderBenchObsNormalizer
-      normalizer = BuilderBenchObsNormalizer(
-          mode='tied_rsnorm',
-          num_cubes=num_cubes,
-          state_obs_dim=state_obs_dim,
-          goal_dim=num_cubes * 3,
-          rsnorm_clip=float(getattr(self.ctx, 'rsnorm_clip', 10.0)),
-      )
-      normalizer.mean = np.asarray(ckpt['obs_norm_mean'], dtype=np.float64)
-      normalizer.var = np.asarray(ckpt['obs_norm_var'], dtype=np.float64)
-      tied_mean, tied_var = normalizer._get_tied_stats()
-      mean = tied_mean.astype(np.float32)
-      std = np.sqrt(np.maximum(tied_var, 1e-8)).astype(np.float32)
-
-    mean_val, std_val, ep_succ = self.eval_policy_params(ckpt['policy_params'], mean, std)
+    mean_val, std_val, ep_succ = self.eval_policy_params(
+        ckpt['policy_params'], obs_mean=obs_mean, obs_var=obs_var, mean=mean, std=std)
     return CheckpointEvalResult(
         label=label,
         path=path,

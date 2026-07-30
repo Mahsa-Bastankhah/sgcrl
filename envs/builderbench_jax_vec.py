@@ -258,11 +258,12 @@ class JaxBuilderBenchVecEnv:
       act_and_value_fn: Callable,
       unroll_length: int,
       obs_dim: int,
+      dynamic_obs_stats: bool = False,
   ):
     """Build a ``jax.lax.scan`` rollout collector (BuilderBench-style).
 
-    ``act_and_value_fn(policy_p, value_p, packed_obs, key)``
-    must return ``(actions, logprobs, values)`` ΓÇö same contract as
+    ``act_and_value_fn(policy_p, value_p, packed_obs, key, obs_mean, obs_var)``
+    must return ``(actions, logprobs, values)`` — same contract as
     ``ppo_learner.act_and_value``.
     """
     step_fn = self._step_fn
@@ -271,15 +272,17 @@ class JaxBuilderBenchVecEnv:
     _num_cubes = self._num_cubes
     _filter_pd = self._pd_filter_policy_obs
     _obs_space_list = self._obs_space_list
+    _dynamic_obs_stats = bool(dynamic_obs_stats)
 
-    @jax.jit
-    def generate_unroll(
+    def _generate_unroll(
         env_state: State,
         policy_params: Any,
         value_params: Any,
         key: jax.Array,
         next_done_init: jax.Array,
         s0_states_init: jax.Array,
+        obs_mean: jax.Array,
+        obs_var: jax.Array,
     ):
       def f(carry, _):
         env_state, key, next_done, s0_states = carry
@@ -287,8 +290,13 @@ class JaxBuilderBenchVecEnv:
             env_state.obs, env_state.info['target_goal'],
             num_cubes=_num_cubes, filter_pd_policy=_filter_pd, obs_space_list=_obs_space_list)
         key, k_act = jax.random.split(key)
-        actions, logprobs, values = act_and_value_fn(
-            policy_params, value_params, packed_obs, k_act)
+        if _dynamic_obs_stats:
+          actions, logprobs, values = act_and_value_fn(
+              policy_params, value_params, packed_obs, k_act,
+              obs_mean, obs_var)
+        else:
+          actions, logprobs, values = act_and_value_fn(
+              policy_params, value_params, packed_obs, k_act)
         next_state = step_fn(env_state, actions)
 
         terminal_obs = _pack_obs(
@@ -327,7 +335,18 @@ class JaxBuilderBenchVecEnv:
       )
       return (final_state, key, final_next_done, final_s0), steps
 
-    return generate_unroll
+    if _dynamic_obs_stats:
+      return jax.jit(_generate_unroll)
+
+    @jax.jit
+    def generate_unroll_legacy(
+        env_state, policy_params, value_params, key,
+        next_done_init, s0_states_init):
+      return _generate_unroll(
+          env_state, policy_params, value_params, key,
+          next_done_init, s0_states_init, None, None)
+
+    return generate_unroll_legacy
 
   def compile_mpo_unroll(
       self,
@@ -390,10 +409,12 @@ class JaxBuilderBenchVecEnv:
       self,
       eval_policy_fn: Callable,
       unroll_length: int,
+      dynamic_obs_stats: bool = False,
   ):
     """Batched eval rollout: deterministic policy + env scan on GPU.
 
-    ``eval_policy_fn(policy_params, packed_obs)`` must return actions in
+    ``eval_policy_fn(policy_params, packed_obs, obs_mean, obs_var)`` must
+    return actions in
     ``[-1, 1]`` with batch shape ``(E, act_dim)``.
     """
     step_fn = self._step_fn
@@ -401,15 +422,21 @@ class JaxBuilderBenchVecEnv:
     _num_cubes = self._num_cubes
     _filter_pd = self._pd_filter_policy_obs
     _obs_space_list = self._obs_space_list
+    _dynamic_obs_stats = bool(dynamic_obs_stats)
 
-    @jax.jit
-    def eval_unroll(env_state: State, policy_params: Any, *extra_args):
+    def _eval_unroll(
+        env_state: State, policy_params: Any,
+        obs_mean: jax.Array, obs_var: jax.Array):
       def f(carry, _):
         env_state = carry
         packed_obs = _pack_obs(
             env_state.obs, env_state.info['target_goal'],
             num_cubes=_num_cubes, filter_pd_policy=_filter_pd, obs_space_list=_obs_space_list)
-        actions = eval_policy_fn(policy_params, packed_obs, *extra_args)
+        if _dynamic_obs_stats:
+          actions = eval_policy_fn(
+              policy_params, packed_obs, obs_mean, obs_var)
+        else:
+          actions = eval_policy_fn(policy_params, packed_obs)
         next_state = step_fn(env_state, actions)
         step_out = {
             'reward': next_state.reward,
@@ -422,7 +449,14 @@ class JaxBuilderBenchVecEnv:
       _, steps = jax.lax.scan(f, env_state, (), length=_T)
       return steps
 
-    return eval_unroll
+    if _dynamic_obs_stats:
+      return jax.jit(_eval_unroll)
+
+    @jax.jit
+    def eval_unroll_legacy(env_state, policy_params):
+      return _eval_unroll(env_state, policy_params, None, None)
+
+    return eval_unroll_legacy
 
   @property
   def episode_length(self) -> int:

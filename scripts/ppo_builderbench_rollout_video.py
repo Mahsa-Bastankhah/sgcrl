@@ -82,6 +82,8 @@ class _TrainCtx:
   z_scale_multiplier: float = 3.0
   rsnorm_clip: float = 10.0
   ppo_cleanrl_actor: bool = True
+  ppo_norm_obs: bool = False
+  ppo_obs_norm_clip: float = 10.0
 
 
 def _get_video(
@@ -236,6 +238,11 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     rsnorm_clip = float(resolved.get(
         'rsnorm_clip', flags.get('rsnorm_clip', 10.0)))
     ppo_cleanrl_actor = bool(flags.get('ppo_cleanrl_actor', True))
+    ppo_norm_obs = bool(flags.get(
+        'ppo_norm_obs', resolved.get('ppo_norm_obs', False)))
+    ppo_obs_norm_clip = float(flags.get(
+        'ppo_obs_norm_clip',
+        resolved.get('ppo_obs_norm_clip', 10.0)))
   else:
     use_pd = False
     pd_duration = 5
@@ -255,6 +262,8 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     z_scale_multiplier = 3.0
     rsnorm_clip = 10.0
     ppo_cleanrl_actor = True
+    ppo_norm_obs = False
+    ppo_obs_norm_clip = 10.0
 
   if use_pd:
     macro_ep_len = mj_ep_len // pd_duration
@@ -293,6 +302,8 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
       z_scale_multiplier=z_scale_multiplier,
       rsnorm_clip=rsnorm_clip,
       ppo_cleanrl_actor=ppo_cleanrl_actor,
+      ppo_norm_obs=ppo_norm_obs,
+      ppo_obs_norm_clip=ppo_obs_norm_clip,
   )
 
 
@@ -401,23 +412,49 @@ def _make_policy_fn(
     *,
     filter_policy_obs: bool,
     num_cubes: int,
-    obs_space_list: list[str],
+    obs_space_list: list[str] = ['xy', 'select'],
     obs_normalizer = None,
+    normalize_obs: bool = False,
+    obs_dim: int = 0,
+    start_index: int = 0,
+    end_index: int = -1,
+    obs_norm_clip: float = 10.0,
+    obs_mean: Optional[np.ndarray] = None,
+    obs_var: Optional[np.ndarray] = None,
 ):
+  _norm = bool(normalize_obs)
+  _obs_dim = int(obs_dim)
+  _si = int(start_index)
+  _ei = int(end_index if end_index != -1 else obs_dim)
+  _clip = float(obs_norm_clip)
+  if _norm:
+    if obs_mean is None or obs_var is None:
+      raise ValueError('normalize_obs requires obs_mean and obs_var')
+    mean_j = jnp.asarray(obs_mean, dtype=jnp.float32)
+    var_j = jnp.asarray(obs_var, dtype=jnp.float32)
+  else:
+    mean_j = jnp.zeros((_obs_dim,), dtype=jnp.float32)
+    var_j = jnp.ones((_obs_dim,), dtype=jnp.float32)
+
   @jax.jit
   def policy(obs, goals, key):
     if filter_policy_obs:
       obs = filter_pd_policy_state_obs(obs, num_cubes, obs_space_list)
     packed = jnp.concatenate([obs, goals], axis=-1)
-    if obs_normalizer is not None and obs_normalizer.mode != 'none':
+    if obs_normalizer is not None and getattr(obs_normalizer, 'mode', 'none') != 'none':
       packed = jnp.asarray(
           obs_normalizer.normalize(np.asarray(packed), update_stats=False),
           dtype=jnp.float32)
+    elif _norm:
+      packed = ppo_learner._normalize_packed_obs(
+          packed, mean_j, var_j,
+          obs_dim=_obs_dim, start_index=_si, end_index=_ei,
+          clip=_clip, enabled=_norm)
     dist = networks.policy_network.apply(policy_params, packed)
     if stochastic:
       action = networks.sample(dist, key)
     else:
-      action = networks.sample_eval(dist, jax.random.PRNGKey(0))
+      action = dist.mode()
     return action, {}
 
   return policy
@@ -520,13 +557,33 @@ def main():
       obs_normalizer.var = np.asarray(ckpt['obs_norm_var'], dtype=np.float64)
       obs_normalizer.count = float(ckpt.get('obs_norm_count', 1.0))
 
+    obs_mean = obs_var = None
+    if ctx.ppo_norm_obs:
+      extra = ckpt.get('extra_state') or {}
+      obs_state = extra.get('obs_rms')
+      if not isinstance(obs_state, dict):
+        raise RuntimeError(
+            f'ppo_norm_obs checkpoint missing extra_state.obs_rms: {path}')
+      obs_mean = np.asarray(obs_state['mean'], dtype=np.float32)
+      obs_var = np.asarray(obs_state['var'], dtype=np.float32)
+      print(f'[bb_video]   obs_rms count={obs_state.get("count")} '
+            f'mean_abs={float(np.mean(np.abs(obs_mean))):.4f}')
+
     policy = _make_policy_fn(
         networks,
         policy_params,
         args.stochastic,
         filter_policy_obs=ctx.filter_policy_obs,
         num_cubes=num_cubes,
-      obs_space_list=ctx.obs_space_list
+        obs_space_list=ctx.obs_space_list,
+        obs_normalizer=obs_normalizer,
+        normalize_obs=ctx.ppo_norm_obs,
+        obs_dim=ctx.obs_dim,
+        start_index=ctx.start_index,
+        end_index=ctx.end_index,
+        obs_norm_clip=ctx.ppo_obs_norm_clip,
+        obs_mean=obs_mean,
+        obs_var=obs_var,
     )
     key, video_key = jax.random.split(key)
     frames = _get_video(
