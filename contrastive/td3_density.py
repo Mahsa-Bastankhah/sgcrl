@@ -221,6 +221,8 @@ def make_td3_density_update_fn(
     goal_tol: float = 1e-2,
     use_target_policy: bool = False,
     cross_batch_goals: bool = True,
+    normalize_obs: bool = False,
+    obs_norm_clip: float = 10.0,
 ):
   """Jitted TD3 twin-Q update over one EpisodeReplay batch.
 
@@ -249,13 +251,32 @@ def make_td3_density_update_fn(
   ei = int(end_index)
   use_pi_bar = bool(use_target_policy)
   use_cross = bool(cross_batch_goals)
+  use_obs_norm = bool(normalize_obs)
+  norm_clip = float(obs_norm_clip)
+  norm_ei = int(obs_dim if ei == -1 else ei)
 
   def _state_as_goal(state: jnp.ndarray) -> jnp.ndarray:
     if ei == -1:
       return state[:, si:]
     return state[:, si:ei]
 
-  def _critic_loss(online_params, batch, key, policy_for_bootstrap, target_params):
+  def _normalize(obs, obs_mean, obs_var):
+    if not use_obs_norm:
+      return obs
+    active = jnp.all(jnp.isfinite(obs_mean))
+    obs_mean = jnp.nan_to_num(obs_mean)
+    state = obs[..., :obs_dim]
+    goal = obs[..., obs_dim:]
+    state = (state - obs_mean) / jnp.sqrt(jnp.maximum(obs_var, 1e-8))
+    goal = ((goal - obs_mean[si:norm_ei])
+            / jnp.sqrt(jnp.maximum(obs_var[si:norm_ei], 1e-8)))
+    normalized = jnp.clip(jnp.concatenate([state, goal], axis=-1),
+                          -norm_clip, norm_clip)
+    return jnp.where(active, normalized, obs)
+
+  def _critic_loss(
+      online_params, batch, key, policy_for_bootstrap, target_params,
+      obs_mean, obs_var):
     obs = batch['obs']            # [s ; g],  g = obs_to_goal(s_f)
     action = batch['action']
     next_obs = batch['next_obs']  # [s' ; g]
@@ -294,24 +315,27 @@ def make_td3_density_update_fn(
           obs.dtype)  # (B,)
       rewards_flat = rewards
 
+    obs_network = _normalize(obs_flat, obs_mean, obs_var)
+    next_obs_network = _normalize(next_obs_flat, obs_mean, obs_var)
+
     # a' ~ π or π̄ (· | s', g) with frozen weights.
     key, k_act = jax.random.split(key)
     next_dist = policy_network.apply(
-        jax.lax.stop_gradient(policy_for_bootstrap), next_obs_flat)
+        jax.lax.stop_gradient(policy_for_bootstrap), next_obs_network)
     next_action = sample_fn(next_dist, k_act)
 
     q1_next = density_nets.qf1_net.apply(
-        target_params['qf1_target'], next_obs_flat, next_action)
+        target_params['qf1_target'], next_obs_network, next_action)
     q2_next = density_nets.qf2_net.apply(
-        target_params['qf2_target'], next_obs_flat, next_action)
+        target_params['qf2_target'], next_obs_network, next_action)
     min_next = jnp.minimum(q1_next, q2_next)
     # Non-absorbing backup: y = 1[s'≈g] + γ min Q̄(s', a', g)
     target_q = jax.lax.stop_gradient(rewards_flat + gamma * min_next)
 
     q1 = density_nets.qf1_net.apply(
-        online_params['qf1'], obs_flat, action_flat)
+        online_params['qf1'], obs_network, action_flat)
     q2 = density_nets.qf2_net.apply(
-        online_params['qf2'], obs_flat, action_flat)
+        online_params['qf2'], obs_network, action_flat)
     qf1_loss = jnp.mean((q1 - target_q) ** 2)
     qf2_loss = jnp.mean((q2 - target_q) ** 2)
     loss = qf1_loss + qf2_loss
@@ -334,7 +358,9 @@ def make_td3_density_update_fn(
   grad_fn = jax.value_and_grad(_critic_loss, has_aux=True)
 
   @jax.jit
-  def update(q_params, opt_state, batch, key, policy_params, policy_target_params):
+  def update(
+      q_params, opt_state, batch, key, policy_params, policy_target_params,
+      obs_mean=None, obs_var=None):
     online = online_td3_params(q_params)
     target = {
         'qf1_target': q_params['qf1_target'],
@@ -343,7 +369,7 @@ def make_td3_density_update_fn(
     policy_for_bootstrap = (
         policy_target_params if use_pi_bar else policy_params)
     (_, metrics), grads = grad_fn(
-        online, batch, key, policy_for_bootstrap, target)
+        online, batch, key, policy_for_bootstrap, target, obs_mean, obs_var)
 
     grads_finite = jnp.all(jnp.asarray(jax.tree_util.tree_leaves(
         jax.tree_util.tree_map(lambda x: jnp.all(jnp.isfinite(x)), grads))))
@@ -396,19 +422,40 @@ def make_td3_reward_fn(
     discount: float = 0.99,
     log_reward: bool = False,
     q_eps: float = 1e-8,
+    start_index: int = 0,
+    end_index: int = -1,
+    normalize_obs: bool = False,
+    obs_norm_clip: float = 10.0,
 ):
   """Jitted PPO reward from the online (or EMA) twin critic.
 
   Default: ``r = Q1(s, a, g)``.
   If ``log_reward``: ``r = log((1 − γ) · max(Q1, q_eps))``.
   """
-  del obs_dim  # obs already packed as [s; g]
   one_m_gamma = float(1.0 - float(discount))
   use_log = bool(log_reward)
   eps = float(q_eps)
+  si = int(start_index)
+  ei = int(obs_dim if end_index == -1 else end_index)
+  use_obs_norm = bool(normalize_obs)
+  norm_clip = float(obs_norm_clip)
 
   @jax.jit
-  def reward_fn(q_params, obs: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+  def reward_fn(
+      q_params, obs: jnp.ndarray, action: jnp.ndarray,
+      obs_mean: jnp.ndarray = None,
+      obs_var: jnp.ndarray = None) -> jnp.ndarray:
+    if use_obs_norm:
+      active = jnp.all(jnp.isfinite(obs_mean))
+      obs_mean = jnp.nan_to_num(obs_mean)
+      raw_obs = obs
+      state = ((obs[..., :obs_dim] - obs_mean)
+               / jnp.sqrt(jnp.maximum(obs_var, 1e-8)))
+      goal = ((obs[..., obs_dim:] - obs_mean[si:ei])
+              / jnp.sqrt(jnp.maximum(obs_var[si:ei], 1e-8)))
+      obs = jnp.clip(
+          jnp.concatenate([state, goal], axis=-1), -norm_clip, norm_clip)
+      obs = jnp.where(active, obs, raw_obs)
     q1 = density_nets.qf1_net.apply(q_params['qf1'], obs, action)
     if use_log:
       return jnp.log(one_m_gamma * jnp.maximum(q1, eps))

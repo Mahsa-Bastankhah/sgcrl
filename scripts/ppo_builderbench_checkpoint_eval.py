@@ -253,19 +253,70 @@ class CheckpointEvalSession:
             getattr(ctx, 'permute_start_boxes', True)),
     )
 
-    @jax.jit
-    def eval_policy_action(policy_p, obs):
-      dist = self.networks.policy_network.apply(policy_p, obs)
-      return dist.mode()
+    self._norm_obs = bool(getattr(ctx, 'ppo_norm_obs', False))
+    self._obs_dim = int(ctx.obs_dim)
+    self._norm_si = int(ctx.start_index)
+    self._norm_ei = int(
+        ctx.end_index if int(ctx.end_index) != -1 else ctx.obs_dim)
+    self._norm_clip = float(getattr(ctx, 'ppo_obs_norm_clip', 10.0))
+    if self._norm_obs:
+      print(f'[bb_eval] observation normalization ON: '
+            f'state_dim={self._obs_dim}, '
+            f'goal_stats=state[{self._norm_si}:{self._norm_ei}], '
+            f'clip={self._norm_clip}')
+      obs_dim = self._obs_dim
+      norm_si = self._norm_si
+      norm_ei = self._norm_ei
+      norm_clip = self._norm_clip
+      policy_network = self.networks.policy_network
 
-    self._eval_unroll = self.vec_env.compile_eval_unroll(
-        eval_policy_action,
-        unroll_length=self.vec_env.episode_length,
-    )
+      @jax.jit
+      def eval_policy_action(policy_p, obs, obs_mean, obs_var):
+        network_obs = ppo_learner._normalize_packed_obs(
+            obs, obs_mean, obs_var,
+            obs_dim=obs_dim,
+            start_index=norm_si,
+            end_index=norm_ei,
+            clip=norm_clip,
+            enabled=True)
+        dist = policy_network.apply(policy_p, network_obs)
+        return dist.mode()
 
-  def eval_policy_params(self, policy_params: Any) -> Tuple[float, float, Tuple[float, ...]]:
+      self._eval_unroll = self.vec_env.compile_eval_unroll(
+          eval_policy_action,
+          unroll_length=self.vec_env.episode_length,
+          dynamic_obs_stats=True,
+      )
+    else:
+      policy_network = self.networks.policy_network
+
+      @jax.jit
+      def eval_policy_action(policy_p, obs):
+        dist = policy_network.apply(policy_p, obs)
+        return dist.mode()
+
+      self._eval_unroll = self.vec_env.compile_eval_unroll(
+          eval_policy_action,
+          unroll_length=self.vec_env.episode_length,
+      )
+
+  def eval_policy_params(
+      self,
+      policy_params: Any,
+      obs_mean: Optional[np.ndarray] = None,
+      obs_var: Optional[np.ndarray] = None,
+  ) -> Tuple[float, float, Tuple[float, ...]]:
     eval_state = self.vec_env.reset_state()
-    steps = self._eval_unroll(eval_state, policy_params)
+    if self._norm_obs:
+      if obs_mean is None or obs_var is None:
+        raise ValueError(
+            'ppo_norm_obs checkpoints must include extra_state.obs_rms')
+      steps = self._eval_unroll(
+          eval_state, policy_params,
+          jnp.asarray(obs_mean, dtype=jnp.float32),
+          jnp.asarray(obs_var, dtype=jnp.float32))
+    else:
+      steps = self._eval_unroll(eval_state, policy_params)
     ep_success = episode_successes_from_steps(steps)
     mean = float(ep_success.mean())
     n = int(ep_success.size)
@@ -276,7 +327,21 @@ class CheckpointEvalSession:
     ckpt = ppo_learner.load_checkpoint(path)
     iteration = int(ckpt.get('iteration', _iteration_from_label(label)))
     global_step = int(ckpt.get('global_step', iteration))
-    mean, std, ep_succ = self.eval_policy_params(ckpt['policy_params'])
+    obs_mean = obs_var = None
+    if self._norm_obs:
+      extra = ckpt.get('extra_state') or {}
+      obs_state = extra.get('obs_rms')
+      if not isinstance(obs_state, dict):
+        raise ValueError(
+            f'checkpoint {path} missing extra_state.obs_rms '
+            f'(required for ppo_norm_obs eval)')
+      obs_mean = np.asarray(obs_state['mean'], dtype=np.float32)
+      obs_var = np.asarray(obs_state['var'], dtype=np.float32)
+      if int(obs_state.get('count', 0)) <= 0:
+        # Identity / raw inputs when stats have not started yet.
+        obs_mean = np.full_like(obs_mean, np.nan)
+    mean, std, ep_succ = self.eval_policy_params(
+        ckpt['policy_params'], obs_mean=obs_mean, obs_var=obs_var)
     return CheckpointEvalResult(
         label=label,
         path=path,

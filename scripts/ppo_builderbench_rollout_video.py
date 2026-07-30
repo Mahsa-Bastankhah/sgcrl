@@ -74,6 +74,8 @@ class _TrainCtx:
   start_index: int
   end_index: int
   permute_start_boxes: bool
+  ppo_norm_obs: bool = False
+  ppo_obs_norm_clip: float = 10.0
 
 
 def _get_video(
@@ -217,6 +219,11 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
                   else np.asarray(fixed, dtype=np.float32))
     permute_start_boxes = bool(
         flags.get('builderbench_permute_start_boxes', True))
+    ppo_norm_obs = bool(flags.get(
+        'ppo_norm_obs', resolved.get('ppo_norm_obs', False)))
+    ppo_obs_norm_clip = float(flags.get(
+        'ppo_obs_norm_clip',
+        resolved.get('ppo_obs_norm_clip', 10.0)))
   else:
     use_pd = False
     pd_duration = 5
@@ -228,6 +235,8 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     end_index = int(defaults.get('end_index', num_cubes * 3))
     fixed_goal = fixed_goal_for_env(env_name)
     permute_start_boxes = True
+    ppo_norm_obs = False
+    ppo_obs_norm_clip = 10.0
 
   if use_pd:
     macro_ep_len = mj_ep_len // pd_duration
@@ -251,6 +260,8 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
       start_index=start_index,
       end_index=end_index,
       permute_start_boxes=permute_start_boxes,
+      ppo_norm_obs=ppo_norm_obs,
+      ppo_obs_norm_clip=ppo_obs_norm_clip,
   )
 
 
@@ -356,17 +367,42 @@ def _make_policy_fn(
     *,
     filter_policy_obs: bool,
     num_cubes: int,
+    normalize_obs: bool = False,
+    obs_dim: int = 0,
+    start_index: int = 0,
+    end_index: int = -1,
+    obs_norm_clip: float = 10.0,
+    obs_mean: Optional[np.ndarray] = None,
+    obs_var: Optional[np.ndarray] = None,
 ):
+  _norm = bool(normalize_obs)
+  _obs_dim = int(obs_dim)
+  _si = int(start_index)
+  _ei = int(end_index if end_index != -1 else obs_dim)
+  _clip = float(obs_norm_clip)
+  if _norm:
+    if obs_mean is None or obs_var is None:
+      raise ValueError('normalize_obs requires obs_mean and obs_var')
+    mean_j = jnp.asarray(obs_mean, dtype=jnp.float32)
+    var_j = jnp.asarray(obs_var, dtype=jnp.float32)
+  else:
+    mean_j = jnp.zeros((_obs_dim,), dtype=jnp.float32)
+    var_j = jnp.ones((_obs_dim,), dtype=jnp.float32)
+
   @jax.jit
   def policy(obs, goals, key):
     if filter_policy_obs:
       obs = filter_pd_policy_state_obs(obs, num_cubes)
     packed = jnp.concatenate([obs, goals], axis=-1)
+    packed = ppo_learner._normalize_packed_obs(
+        packed, mean_j, var_j,
+        obs_dim=_obs_dim, start_index=_si, end_index=_ei,
+        clip=_clip, enabled=_norm)
     dist = networks.policy_network.apply(policy_params, packed)
     if stochastic:
       action = networks.sample(dist, key)
     else:
-      action = networks.sample_eval(dist, jax.random.PRNGKey(0))
+      action = dist.mode()
     return action, {}
 
   return policy
@@ -456,12 +492,31 @@ def main():
     print(f'[bb_video]   iteration={ckpt.get("iteration")} '
           f'global_step={ckpt.get("global_step")}')
 
+    obs_mean = obs_var = None
+    if ctx.ppo_norm_obs:
+      extra = ckpt.get('extra_state') or {}
+      obs_state = extra.get('obs_rms')
+      if not isinstance(obs_state, dict):
+        raise RuntimeError(
+            f'ppo_norm_obs checkpoint missing extra_state.obs_rms: {path}')
+      obs_mean = np.asarray(obs_state['mean'], dtype=np.float32)
+      obs_var = np.asarray(obs_state['var'], dtype=np.float32)
+      print(f'[bb_video]   obs_rms count={obs_state.get("count")} '
+            f'mean_abs={float(np.mean(np.abs(obs_mean))):.4f}')
+
     policy = _make_policy_fn(
         networks,
         policy_params,
         args.stochastic,
         filter_policy_obs=ctx.filter_policy_obs,
         num_cubes=num_cubes,
+        normalize_obs=ctx.ppo_norm_obs,
+        obs_dim=ctx.obs_dim,
+        start_index=ctx.start_index,
+        end_index=ctx.end_index,
+        obs_norm_clip=ctx.ppo_obs_norm_clip,
+        obs_mean=obs_mean,
+        obs_var=obs_var,
     )
     key, video_key = jax.random.split(key)
     frames = _get_video(
