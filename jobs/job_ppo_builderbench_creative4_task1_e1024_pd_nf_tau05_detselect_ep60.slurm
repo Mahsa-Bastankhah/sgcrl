@@ -1,19 +1,21 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_bb_c4t2_nf_sw10
-#SBATCH --output=slurm/ppo_builderbench_creative4_task2_nf_success_weight10_%A_%a.log
-#SBATCH --error=slurm/ppo_builderbench_creative4_task2_nf_success_weight10_%A_%a.log
+#SBATCH --job-name=ppo_bb_c4t1_nf_ds60
+#SBATCH --output=slurm/ppo_builderbench_creative4_task1_e1024_pd_nf_tau05_detselect_ep60_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative4_task1_e1024_pd_nf_tau05_detselect_ep60_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem=128G
 #SBATCH --gres=gpu:1
-#SBATCH --time=15:00:00
+#SBATCH --time=48:00:00
 #SBATCH --account=seas
-#SBATCH --array=0-1
+#SBATCH --array=0-0
 
-# Standard creative-4-task2 NF setup, with success-weighted episode sampling:
-# successful trajectories get weight 10, others weight 1; sample ~ w/sum(w).
+# One-seed test: c4t1 PD + NF tau=0.5, with:
+#   - deterministic select dim (last action = μ only)
+#   - PD macro episode length 60 (mj_episode_length=300; default c4t1 is 100)
 unset LD_PRELOAD
+
 module purge
 
 if [ -n "${LD_LIBRARY_PATH:-}" ]; then
@@ -39,6 +41,8 @@ try_cuda() {
     fi
     [ -z "${CUDA_HOME:-}" ] && return 1
     CUDA_LOADED=1
+    echo "Loaded CUDA modules: $*"
+    echo "CUDA_HOME=${CUDA_HOME}"
     return 0
   fi
   return 1
@@ -55,19 +59,23 @@ if [ "$CUDA_LOADED" != 1 ]; then
       export PATH="${CUDA_HOME}/bin${PATH:+:${PATH}}"
       export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
       CUDA_LOADED=1
+      echo "Fallback CUDA_HOME=${CUDA_HOME} (module load failed)"
       break
     fi
   done
 fi
 
 if [ "$CUDA_LOADED" != 1 ]; then
-  echo "ERROR: no usable CUDA installation found"
+  echo "ERROR: Could not load cudatoolkit and no /usr/local/cuda* found."
+  module avail cudatoolkit 2>&1 || true
+  ls -d /usr/local/cuda* 2>&1 || true
   exit 1
 fi
 
 cd /n/fs/mislresearch/sgcrl
 source /n/fs/mislresearch/miniconda3/etc/profile.d/conda.sh
 conda activate sgcrl_builderbench
+
 source /n/fs/mislresearch/sgcrl/scripts/sgcrl_builderbench_cuda_env.sh
 
 export BUILDERBENCH_ROOT=/n/fs/mislresearch/builderbench
@@ -80,8 +88,8 @@ export PIP_CACHE_DIR=/n/fs/mislresearch/mb6458-tmp/pip-cache
 export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-ENV=${ENV:-builderbench_creative_4_task2}
-SEED=${SEED:-${SLURM_ARRAY_TASK_ID:-0}}
+ENV=${ENV:-builderbench_creative_4_task1}
+SEED=${SEED:-0}
 NUM_STEPS=${NUM_STEPS:-200000000}
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
 MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
@@ -90,9 +98,8 @@ MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
 NF_REWARD_TAU=${NF_REWARD_TAU:-0.5}
-SUCCESS_SAMPLE_WEIGHT=${SUCCESS_SAMPLE_WEIGHT:-10}
+MJ_EP_LEN=${MJ_EP_LEN:-300}  # 300/5 = 60 PD macro steps
 
-# NF architecture (same as other BuilderBench NF jobs)
 NF_REP_SIZE=${NF_REP_SIZE:-256}
 NF_NUM_BLOCKS=${NF_NUM_BLOCKS:-12}
 NF_COUPLING_WIDTH=${NF_COUPLING_WIDTH:-512}
@@ -100,16 +107,19 @@ NF_GRAD_CLIP=${NF_GRAD_CLIP:-1.0}
 NF_NOISE_STD=${NF_NOISE_STD:-0.05}
 NF_GOAL_STD_MIN=${NF_GOAL_STD_MIN:-0.02}
 
-LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative4_task2_nf_success_weight10/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative4_task1_e1024_pd_nf_tau05_detselect_ep60/}"
 
 mkdir -p slurm "${LOG_DIR}"
 
-echo "SLURM_JOB_ID=${SLURM_JOB_ID} SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
+echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
 echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=nf nf_reward_tau=${NF_REWARD_TAU}"
-echo "success_sample_weight=${SUCCESS_SAMPLE_WEIGHT} (others=1, sample ~ w/sum w)"
-echo "success_definition=goal_seen_at_least_once_in_episode"
-echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS} max_replay_size=${MAX_REPLAY_SIZE}"
-echo "nf_rep_size=${NF_REP_SIZE} nf_num_blocks=${NF_NUM_BLOCKS} nf_coupling_width=${NF_COUPLING_WIDTH}"
+echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
+echo "deterministic_select_dim=true mj_episode_length=${MJ_EP_LEN} (pd_macro=$((MJ_EP_LEN / 5)))"
+echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=true"
+echo "steps_per_iter=$((PPO_NUM_ENVS * 50))"
+echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * 50)))"
+nvidia-smi || true
+python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
 
 python -u ppo_contrastive.py \
   --env="${ENV}" \
@@ -125,6 +135,8 @@ python -u ppo_contrastive.py \
   --builderbench_use_pd=true \
   --builderbench_pd_duration=5 \
   --builderbench_permute_start_boxes=true \
+  --builderbench_mj_episode_length="${MJ_EP_LEN}" \
+  --ppo_deterministic_select_dim \
   --ppo_rollout_length=50 \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
@@ -132,7 +144,6 @@ python -u ppo_contrastive.py \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
   --ppo_repr_mode=nf \
   --ppo_nf_reward_tau="${NF_REWARD_TAU}" \
-  --ppo_success_sample_weight="${SUCCESS_SAMPLE_WEIGHT}" \
   --nf_rep_size="${NF_REP_SIZE}" \
   --nf_num_blocks="${NF_NUM_BLOCKS}" \
   --nf_coupling_width="${NF_COUPLING_WIDTH}" \

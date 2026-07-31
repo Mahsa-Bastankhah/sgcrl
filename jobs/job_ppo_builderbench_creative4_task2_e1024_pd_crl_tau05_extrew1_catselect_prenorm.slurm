@@ -1,22 +1,24 @@
 #!/bin/bash
-#SBATCH --job-name=c5t2_td3_nobs_ev
-#SBATCH --output=slurm/ppo_builderbench_creative5_task2_e1024_pd_td3_logq_tau05_actorreset_nopermute_normobs_evalvid_%A_%a.log
-#SBATCH --error=slurm/ppo_builderbench_creative5_task2_e1024_pd_td3_logq_tau05_actorreset_nopermute_normobs_evalvid_%A_%a.log
+#SBATCH --job-name=ppo_bb_c4t2_crl_extrew1_pn
+#SBATCH --output=slurm/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_extrew1_catselect_prenorm_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_extrew1_catselect_prenorm_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=15:00:00
+#SBATCH --time=14:00:00
 #SBATCH --account=seas
-#SBATCH --array=0
+#SBATCH --array=0-0
 
-# 5-cube creative-5-task2 (two towers), PD + TD3 logQ tau=0.5 + ppo_norm_obs.
-# Actor-reset guard active. Seed 0. Same knobs as nopermute c5t2 td3_logq_tau05:
-#   PPO reward = log((1-γ)·Q1) with EMA Q1 tau=0.5.
-# Critic still uses online Q + Polyak targets (tau=0.005).
+# 4-cube creative-4-task2 (two towers), PD + CRL (phi·psi) with repr EMA tau=0.5.
+# Same PPO knobs as creative3_task2 NF/TD3 baselines:
+#   rollout_length=50, crl_steps_per_iter=25, ent_coef=0.05, e=1024, 200M steps.
 # Fixed goals = sampling midpoint + task offsets (default).
-# Init start-box permutation DISABLED.
+# Init start-box permutation ENABLED (matches c3t2 NF/TD3).
+# External hard-success bonus: +1 on metrics['success'] steps (BEFORE reward norm).
+# Plus categorical select (hybrid Gaussian + categorical select dim).
+# Eval every 200 PPO iters.
 unset LD_PRELOAD
 
 module purge
@@ -76,8 +78,21 @@ if [ "$CUDA_LOADED" != 1 ]; then
 fi
 
 cd /n/fs/mislresearch/sgcrl
+CONDA_ENV=/n/fs/mislresearch/miniconda3/envs/sgcrl_builderbench
 source /n/fs/mislresearch/miniconda3/etc/profile.d/conda.sh
 conda activate sgcrl_builderbench
+# Guard against broken/partial conda activate (PATH left on base python).
+export PATH="${CONDA_ENV}/bin:${PATH}"
+export CONDA_PREFIX="${CONDA_ENV}"
+export CONDA_DEFAULT_ENV=sgcrl_builderbench
+hash -r
+PYTHON="${CONDA_ENV}/bin/python"
+if [ ! -x "${PYTHON}" ]; then
+  echo "ERROR: missing ${PYTHON}"
+  exit 1
+fi
+echo "conda_env=${CONDA_DEFAULT_ENV} python=${PYTHON} which_python=$(which python)"
+"${PYTHON}" -u -c "import sys; assert 'sgcrl_builderbench' in sys.executable, sys.executable; import tensorflow as tf; print('tensorflow', tf.__version__)"
 
 source /n/fs/mislresearch/sgcrl/scripts/sgcrl_builderbench_cuda_env.sh
 
@@ -91,8 +106,8 @@ export PIP_CACHE_DIR=/n/fs/mislresearch/mb6458-tmp/pip-cache
 export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-ENV=${ENV:-builderbench_creative_5_task2}
-SEED=${SEED:-${SLURM_ARRAY_TASK_ID:-0}}
+ENV=${ENV:-builderbench_creative_4_task2}
+SEED=${SEED:-0}
 NUM_STEPS=${NUM_STEPS:-200000000}
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
 MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
@@ -100,35 +115,35 @@ ENT_COEF=0.05
 MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
+CRL_REPR_TAU=${CRL_REPR_TAU:-0.5}
 
-LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative5_task2_e1024_pd_td3_logq_tau05_actorreset_nopermute_normobs_evalvid/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_extrew1_catselect_prenorm/}"
+EXT_REW_SCALE=${EXT_REW_SCALE:-1}
 
 mkdir -p slurm "${LOG_DIR}"
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=td3"
-echo "td3 reward=log((1-γ)Q1)  td3_reward_tau=0.5"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=crl crl_repr_tau=${CRL_REPR_TAU}"
 echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
 echo "max_replay_size=${MAX_REPLAY_SIZE}"
-echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=false goals=MID+offsets(default)"
-echo "actor_reset=true (ep_length_mean < 0.8 * nominal)"
-echo "ppo_norm_obs=true"
-echo "ppo_eval_interval=200 ppo_video_interval=400 (deterministic + live obs_rms)"
-echo "td3 defaults otherwise: cross_batch_goals=false, mlp Q, no bilinear; polyak_tau=0.005"
+echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=true goals=MID+offsets(default)"
+echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} ppo_external_reward_before_norm=true"
+echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
+echo "ppo_eval_interval=200"
 echo "steps_per_iter=$((PPO_NUM_ENVS * 50))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * 50)))"
-python -u -c "
+"${PYTHON}" -u -c "
 from envs.builderbench_utils import default_fixed_target_goal
 import numpy as np
-g = default_fixed_target_goal(5, 1)
+g = default_fixed_target_goal(4, 1)
 print('hard_goal (flat)=', g.tolist())
 print('hard_goal (cubes)=')
 print(np.asarray(g).reshape(-1, 3))
 "
 nvidia-smi || true
-python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
+"${PYTHON}" -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
 
-python -u ppo_contrastive.py \
+"${PYTHON}" -u ppo_contrastive.py \
   --env="${ENV}" \
   --seed="${SEED}" \
   --num_steps="${NUM_STEPS}" \
@@ -141,21 +156,18 @@ python -u ppo_contrastive.py \
   --ppo_checkpoint_interval=150 \
   --builderbench_use_pd=true \
   --builderbench_pd_duration=5 \
-  --builderbench_permute_start_boxes=false \
+  --builderbench_permute_start_boxes=true \
   --ppo_rollout_length=50 \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
   --ppo_eval_interval=200 \
-  --ppo_eval_episodes=5 \
-  --ppo_video_interval=400 \
-  --ppo_video_fps=10 \
-  --ppo_skip_first_video=true \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
-  --ppo_repr_mode=td3 \
-  --noppo_td3_cross_batch_goals \
-  --ppo_td3_log_reward \
-  --ppo_td3_reward_tau=0.5 \
-  --ppo_norm_obs \
+  --ppo_repr_mode=crl \
+  --ppo_crl_repr_tau="${CRL_REPR_TAU}" \
+  --ppo_use_external_reward \
+  --ppo_external_reward_scale="${EXT_REW_SCALE}" \
+  --ppo_external_reward_before_norm \
+  --ppo_categorical_select \
   --hidden_layer_sizes="256,256,256,256,256,256"
 PY_EXIT=$?
 pkill -P $$ 2>/dev/null || true

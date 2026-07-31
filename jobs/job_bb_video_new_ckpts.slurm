@@ -12,7 +12,8 @@
 
 # Short one-shot: render ONLY checkpoints listed in CKPT_LIST_FILE (one path/line).
 # Required: ENV_NAME, RUN_TAG, OUT_DIR, CKPT_LIST_FILE
-# Optional: SEED (default 0). Walltime overridden by sbatch --time from the watcher.
+# Optional: SEED (default 0), STOCHASTIC=1 to sample actions (default: mode).
+# Walltime overridden by sbatch --time from the watcher.
 unset LD_PRELOAD
 module purge
 
@@ -60,9 +61,14 @@ export JAX_PLATFORMS=cuda
 : "${OUT_DIR:?OUT_DIR required}"
 : "${CKPT_LIST_FILE:?CKPT_LIST_FILE required (one checkpoint path per line)}"
 SEED="${SEED:-0}"
+STOCHASTIC="${STOCHASTIC:-0}"
+EXTRA_ARGS=()
+if [[ "${STOCHASTIC}" == "1" || "${STOCHASTIC}" == "true" ]]; then
+  EXTRA_ARGS+=(--stochastic)
+fi
 mkdir -p slurm "${OUT_DIR}"
 
-echo "ENV_NAME=${ENV_NAME}  RUN_TAG=${RUN_TAG}  SEED=${SEED}"
+echo "ENV_NAME=${ENV_NAME}  RUN_TAG=${RUN_TAG}  SEED=${SEED}  STOCHASTIC=${STOCHASTIC}"
 echo "OUT_DIR=${OUT_DIR}"
 echo "CKPT_LIST_FILE=${CKPT_LIST_FILE}"
 nvidia-smi || true
@@ -87,7 +93,8 @@ while IFS= read -r ckpt || [[ -n "${ckpt}" ]]; do
     --output="${OUT_DIR}/" \
     --run_tag="${RUN_TAG}" \
     --seed="${SEED}" \
-    --skip_existing || PY_EXIT=$?
+    --skip_existing \
+    "${EXTRA_ARGS[@]}" || PY_EXIT=$?
 done < "${CKPT_LIST_FILE}"
 
 ls -lh "${OUT_DIR}/${RUN_TAG}"_*.mp4 2>&1 | tail -30 || true

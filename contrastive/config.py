@@ -188,6 +188,14 @@ class ContrastiveConfig:
   # the tanh-squashed Gaussian from collapsing to a point mass.  Passed
   # through `network_factory` in `ppo_contrastive.py`.
   ppo_actor_min_std: float = 0.01
+  # If True, force the last action dim (BuilderBench PD `select_action`) to
+  # use μ / mode only: policy std on that dim is deactivated for sampling,
+  # log-prob, and entropy. Other action dims keep their stochastic policy.
+  ppo_deterministic_select_dim: bool = False
+  # If True, use a hybrid actor: shared policy trunk, tanh-Gaussian mean/std
+  # on continuous action dims, and a categorical logits head over num_cubes
+  # classes for the select dim (cube ids 0..n-1).  Requires BuilderBench.
+  ppo_categorical_select: bool = False
   # CRL updates per PPO iteration (InfoNCE on φ, ψ over replay).
   ppo_crl_steps_per_iter: int = 64
   # InfoNCE direction for PPO-CRL. 'forward': fix anchor sᵢ, vary goal gⱼ
@@ -207,12 +215,26 @@ class ContrastiveConfig:
   # ema ← τ·ema + (1−τ)·online after each density step.  τ=0 uses online
   # params (default).  Independent of ppo_crl_repr_tau / ppo_nf_reward_tau.
   ppo_gaussian_reward_tau: float = 0.0
+  # EMA decay τ for flow-matching density params used in PPO reward
+  # r = log p_FM(g|s,a) (fm mode only).  Same update as Gaussian/NF:
+  # ema ← τ·ema + (1−τ)·online after each density step.  τ=0 uses online
+  # params (default).
+  ppo_fm_reward_tau: float = 0.0
   # Minimum replay size before CRL updates start.
   ppo_min_replay_size: int = 10_000
   # CRL replay episode sampling weight for successful trajectories.
   # Unsuccessful episodes always have weight 1. Episode indices are drawn
   # with probability w_k / sum_i w_i. Default 1.0 recovers uniform sampling.
   ppo_success_sample_weight: float = 1.0
+  # If True, add `ppo_external_reward_scale` to the PPO reward on steps where
+  # BuilderBench hard success fires (metrics['success'], threshold 0.02).
+  # By default applied after shaped-reward computation (CRL/NF/…) and after
+  # reward normalisation so the bonus is not washed out by return-std scaling.
+  # Set `ppo_external_reward_before_norm=True` to add the bonus to the raw
+  # shaped reward before return-norm instead.
+  ppo_use_external_reward: bool = False
+  ppo_external_reward_scale: float = 100.0
+  ppo_external_reward_before_norm: bool = False
   # Checkpointing: save policy/value/CRL params every N PPO iterations.
   # At default settings (8 envs × 128 steps = 1024 env-steps/iter), 100
   # iterations ≈ 100k env steps — light enough not to bottleneck training.
@@ -236,6 +258,8 @@ class ContrastiveConfig:
   #   'crl'      (default) — φ(s,a)·ψ(g) contrastive representations.
   #   'gaussian' — diagonal Gaussian  p_θ(g|s); reward = log p_θ(g|s_t).
   #   'nf'       — conditional RealNVP  log p_NF(g|s,a); reward = log p_NF.
+  #   'fm'       — OT flow-matching velocity field; reward = log p_FM(g|s,a)
+  #                via reverse ODE (FAC-style); train on CRL future goals.
   #   'td3'      — twin Q(s,a,s_f) with TD3 backup on r=1{s≈s_f};
   #                PPO reward = Q1(s,a,g) (or log((1−γ)Q) if
   #                ppo_td3_log_reward).  Target Polyak uses ppo_td3_tau
@@ -244,7 +268,26 @@ class ContrastiveConfig:
   #                CRL reward until `ppo_reward_switch_goal_visits` completed
   #                training episodes have visited the hard goal, then use only
   #                the TD3 reward starting on the following PPO iteration.
+  #   'tdinfonce' — TD InfoNCE bilinear φ(s,a)·ψ(s_f) critic (Zheng et al.);
+  #                PPO reward is still r = φ·ψ with ppo_crl_repr_tau EMA.
+  #                Target-critic EMA keep-rate uses ppo_td_infonce_target_tau
+  #                (independent of the reward EMA).
   ppo_repr_mode: str = 'crl'
+  # Keep-rate for TD-InfoNCE target critic:
+  #   target ← τ·target + (1−τ)·online.  Default 0.995 (slow target).
+  ppo_td_infonce_target_tau: float = 0.995
+  # Mix weight for TD-InfoNCE critic loss L = (1-γ) L_InfoNCE + γ L_TD.
+  # <0 → use config.discount (shared with HER geometric sampling).
+  # Set ≈0 to sanity-check term 1 only without changing HER γ.
+  ppo_td_infonce_discount: float = -1.0
+  # Coefficient on logsumexp(logits)^2 added to TD-InfoNCE softmax CE
+  # (same default 0.01 as CPC/CRL).  Set 0 to disable.
+  ppo_td_infonce_logsumexp_coef: float = 0.01
+  # If >0 with ppo_repr_mode=tdinfonce: train φ,ψ with standard CRL InfoNCE
+  # for this many PPO iterations, then switch critic updates to TD-InfoNCE
+  # (same params).  PPO reward stays r=φ·ψ throughout.  0 = TD-InfoNCE from
+  # the first critic update (default).
+  ppo_tdinfonce_crl_warmup_iters: int = 0
   # Goal-visit threshold for ppo_repr_mode='crl_td3_switch'. Values <= 0 are
   # invalid in that mode. This does not affect any other representation mode.
   ppo_reward_switch_goal_visits: int = 5
@@ -273,6 +316,11 @@ class ContrastiveConfig:
   # If True, PPO reward is log((1−γ)·max(Q1, ε)) instead of raw Q1
   # (log-occupancy scale, comparable to Gaussian/NF log p).
   ppo_td3_log_reward: bool = False
+  # Flow-matching options (only used when ppo_repr_mode == 'fm').
+  fm_flow_steps: int = 10          # Euler steps for sample / reverse-ODE logp
+  fm_logp_mode: str = 'exact'      # 'exact' | 'hutch-rade' | 'hutch-gaus'
+  fm_hutch_probes: int = 8         # Hutchinson probes when using hutch-* modes
+  fm_layer_norm: bool = False      # LayerNorm inside velocity MLP (FAC-style)
   # NF-specific options (only used when ppo_repr_mode == 'nf').
   nf_rep_size: int = 256       # SA encoder output dim (conditioning vector)
   nf_num_blocks: int = 12      # number of affine coupling blocks
