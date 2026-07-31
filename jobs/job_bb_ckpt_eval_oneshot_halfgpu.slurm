@@ -1,16 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=bb_ckpt_eval
-#SBATCH --output=slurm/bb_ckpt_eval_%j.log
-#SBATCH --error=slurm/bb_ckpt_eval_%j.log
+#SBATCH --job-name=bb_ckpt_eval05
+#SBATCH --output=slurm/bb_ckpt_eval05_%j.log
+#SBATCH --error=slurm/bb_ckpt_eval05_%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=01:00:00
+#SBATCH --time=00:55:00
 #SBATCH --account=seas
 
-# One-shot BuilderBench checkpoint eval + success plot.
+# One-shot BuilderBench checkpoint eval + success plot (light: 16G, ≤55min).
+# NOTE: this cluster does not allocate a device for --gpus-per-task=0.5
+# (jobs start with CUDA_ERROR_NO_DEVICE), so we request 1 full GPU.
 # Required env vars: RUN_DIR, ENV_NAME, PLOT_TAG
 # Optional: SEED (default 0), NUM_EVAL_EPISODES (default 20)
 unset LD_PRELOAD

@@ -84,6 +84,7 @@ class _TrainCtx:
   ppo_cleanrl_actor: bool = True
   ppo_norm_obs: bool = False
   ppo_obs_norm_clip: float = 10.0
+  categorical_select_classes: Optional[int] = None
 
 
 def _get_video(
@@ -243,6 +244,10 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     ppo_obs_norm_clip = float(flags.get(
         'ppo_obs_norm_clip',
         resolved.get('ppo_obs_norm_clip', 10.0)))
+    cat_select = bool(flags.get(
+        'ppo_categorical_select',
+        resolved.get('ppo_categorical_select', False)))
+    categorical_select_classes = int(num_cubes) if cat_select else None
   else:
     use_pd = False
     pd_duration = 5
@@ -264,6 +269,7 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     ppo_cleanrl_actor = True
     ppo_norm_obs = False
     ppo_obs_norm_clip = 10.0
+    categorical_select_classes = None
 
   if use_pd:
     macro_ep_len = mj_ep_len // pd_duration
@@ -304,6 +310,7 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
       ppo_cleanrl_actor=ppo_cleanrl_actor,
       ppo_norm_obs=ppo_norm_obs,
       ppo_obs_norm_clip=ppo_obs_norm_clip,
+      categorical_select_classes=categorical_select_classes,
   )
 
 
@@ -342,6 +349,7 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
       hidden_layer_sizes=ctx.hidden_layer_sizes,
       actor_min_std=ctx.actor_min_std,
       ppo_cleanrl_actor=ctx.ppo_cleanrl_actor,
+      categorical_select_classes=ctx.categorical_select_classes,
   )
   return networks
 

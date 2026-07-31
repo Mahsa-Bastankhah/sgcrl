@@ -158,6 +158,7 @@ class JaxBuilderBenchVecEnv:
       obs_space_list: Optional[list[str]] = None,
       episode_length_multiplier: float = 1.0,
       permute_start_boxes: bool = True,
+      mj_episode_length: Optional[int] = None,
   ):
     _require_builderbench(env_name)
     self._env_name = str(env_name)
@@ -178,8 +179,11 @@ class JaxBuilderBenchVecEnv:
     cfg.num_cubes = num_cubes
     cfg.task_id = task_id
     self._episode_length_multiplier = float(episode_length_multiplier)
-    cfg.episode_length = creative_cube_mj_episode_length(
-        num_cubes, task_id)
+    if mj_episode_length is not None and int(mj_episode_length) > 0:
+      cfg.episode_length = int(mj_episode_length)
+    else:
+      cfg.episode_length = creative_cube_mj_episode_length(
+          num_cubes, task_id)
     cfg.permute_start_boxes = self._permute_start_boxes
     cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
     if self._bb_env_id in _MJX_PARAMS:

@@ -1,18 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=bb_ckpt_eval
-#SBATCH --output=slurm/bb_ckpt_eval_%j.log
-#SBATCH --error=slurm/bb_ckpt_eval_%j.log
+#SBATCH --job-name=bb_vid_c3t1_fm
+#SBATCH --output=slurm/bb_vid_c3t1_fm_%j.log
+#SBATCH --error=slurm/bb_vid_c3t1_fm_%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=01:00:00
+#SBATCH --time=00:45:00
 #SBATCH --account=seas
 
-# One-shot BuilderBench checkpoint eval + success plot.
-# Required env vars: RUN_DIR, ENV_NAME, PLOT_TAG
-# Optional: SEED (default 0), NUM_EVAL_EPISODES (default 20)
+# Stochastic-policy videos for c3t1 FM tau05 catselect (job 3608743).
+# Renders two late checkpoints only.
 unset LD_PRELOAD
 module purge
 
@@ -53,39 +52,39 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 MKL_NUM_THREADS=4
 export TMPDIR=/n/fs/mislresearch/mb6458-tmp
 export MPLCONFIGDIR=/n/fs/mislresearch/mb6458-tmp/mpl-cache
+export JAX_PLATFORMS=cuda
 
-: "${RUN_DIR:?RUN_DIR required}"
-: "${ENV_NAME:?ENV_NAME required}"
-: "${PLOT_TAG:?PLOT_TAG required}"
-SEED="${SEED:-0}"
-NUM_EVAL_EPISODES="${NUM_EVAL_EPISODES:-20}"
+RUN_DIR=logs/ppo_builderbench_creative3_task1_e1024_pd_fm_tau05_catselect/ppo_builderbench_creative_3_task1_0
+CKPT_DIR="${RUN_DIR}/checkpoints"
+OUT_DIR=videos/builderbench/ppo_builderbench_creative3_task1_e1024_pd_fm_tau05_catselect_stoch
+RUN_TAG=c3t1_fm_catselect_stoch
+STAGE_DIR="${TMPDIR}/bb_vid_stoch_${SLURM_JOB_ID}"
+mkdir -p slurm "${OUT_DIR}" "${STAGE_DIR}"
 
-CSV="figs/builderbench/checkpoint_eval/${PLOT_TAG}_seed${SEED}_checkpoint_success.csv"
-PNG="figs/builderbench/${PLOT_TAG}_checkpoint_success.png"
-ACTIVE_PNG="figs/builderbench/active_runs/${PLOT_TAG}_checkpoint_success.png"
-mkdir -p slurm figs/builderbench/checkpoint_eval figs/builderbench/active_runs
-
+# A couple of late checkpoints currently available.
+for ckpt in ckpt_iter_0000300.pkl ckpt_iter_0000450.pkl; do
+  if [ ! -f "${CKPT_DIR}/${ckpt}" ]; then
+    echo "ERROR: missing ${CKPT_DIR}/${ckpt}"
+    exit 2
+  fi
+  ln -sfn "$(realpath "${CKPT_DIR}/${ckpt}")" "${STAGE_DIR}/${ckpt}"
+done
 echo "RUN_DIR=${RUN_DIR}"
-echo "ENV_NAME=${ENV_NAME}  PLOT_TAG=${PLOT_TAG}  SEED=${SEED}"
-echo "CSV=${CSV}"
-echo "PNG=${PNG}"
-ls "${RUN_DIR}/checkpoints"/ckpt_iter_*.pkl 2>/dev/null | wc -l | awk '{print "n_ckpts="$1}'
+echo "OUT_DIR=${OUT_DIR}  RUN_TAG=${RUN_TAG}  stochastic=true"
+ls -l "${STAGE_DIR}"
 nvidia-smi || true
 
-python -u scripts/ppo_builderbench_checkpoint_eval.py \
-  --run_dir="${RUN_DIR}" \
-  --env="${ENV_NAME}" \
-  --plot_tag="${PLOT_TAG}" \
-  --csv_output="${CSV}" \
-  --output="${PNG}" \
-  --incremental \
-  --num_eval_episodes="${NUM_EVAL_EPISODES}"
+python -u scripts/ppo_builderbench_rollout_video.py \
+  --checkpoint="${STAGE_DIR}" \
+  --env=builderbench_creative_3_task1 \
+  --output="${OUT_DIR}/" \
+  --run_tag="${RUN_TAG}" \
+  --seed=0 \
+  --stochastic \
+  --fps=10
 
 PY_EXIT=$?
-if [ $PY_EXIT -eq 0 ] && [ -f "${PNG}" ]; then
-  cp -f "${PNG}" "${ACTIVE_PNG}"
-  echo "mirrored → ${ACTIVE_PNG}"
-fi
-ls -lh "${PNG}" "${CSV}" "${ACTIVE_PNG}" 2>&1 || true
+rm -rf "${STAGE_DIR}"
+ls -lh "${OUT_DIR}/${RUN_TAG}"_*.mp4 2>&1 || true
 pkill -P $$ 2>/dev/null || true
 exit $PY_EXIT

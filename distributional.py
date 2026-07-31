@@ -265,6 +265,111 @@ class NormalTanhDistribution(hk.Module):
         TanhTransformedDistribution(distribution), reinterpreted_batch_ndims=1)
 
 
+def select_cube_centers(num_cubes: int) -> jnp.ndarray:
+  """Canonical PD ``select_action`` values for cube ids ``0 .. num_cubes-1``.
+
+  Matches BuilderBench ``PDWrapper.get_action`` encoding so env digitize
+  recovers the intended cube id.
+  """
+  ids = jnp.arange(num_cubes, dtype=jnp.float32)
+  return (((2.0 * ids + 1.0) * jnp.pi / num_cubes) - jnp.pi) / jnp.pi
+
+
+def select_action_to_cube_id(select: jnp.ndarray, num_cubes: int) -> jnp.ndarray:
+  """Invert continuous select ∈ [-1, 1] → discrete cube id (BuilderBench digitize)."""
+  bins = jnp.arange(1, num_cubes + 1) * (2.0 * jnp.pi / float(num_cubes))
+  cube_id = jnp.digitize(jnp.pi * select + jnp.pi, bins)
+  return jnp.clip(cube_id, 0, num_cubes - 1)
+
+
+class HybridSelectDistribution:
+  """Joint policy: tanh-Gaussian on continuous dims + Categorical select.
+
+  Samples / modes are packed as continuous actions ``[..., :-1]`` concatenated
+  with the PD-encoded select center for the chosen cube class.  ``log_prob``
+  digitizes the stored select dim back to a class so PPO can train against
+  continuous env actions without changing the env API.
+  """
+
+  hybrid_select: bool = True
+
+  def __init__(
+      self,
+      continuous_dist: tfd.Distribution,
+      categorical_dist: tfd.Distribution,
+      num_select_classes: int,
+  ):
+    self.continuous_dist = continuous_dist
+    self.categorical_dist = categorical_dist
+    self.num_select_classes = int(num_select_classes)
+    self._centers = select_cube_centers(self.num_select_classes)
+
+  def _select_from_class(self, cube_id: jnp.ndarray) -> jnp.ndarray:
+    select = self._centers[cube_id]
+    return select[..., None]
+
+  def sample(self, seed=None, sample_shape=()):
+    key_cont, key_cat = jax.random.split(seed)
+    cont = self.continuous_dist.sample(seed=key_cont, sample_shape=sample_shape)
+    cube_id = self.categorical_dist.sample(seed=key_cat, sample_shape=sample_shape)
+    return jnp.concatenate([cont, self._select_from_class(cube_id)], axis=-1)
+
+  def mode(self):
+    cont = self.continuous_dist.mode()
+    cube_id = self.categorical_dist.mode()
+    return jnp.concatenate([cont, self._select_from_class(cube_id)], axis=-1)
+
+  def log_prob(self, actions: jnp.ndarray) -> jnp.ndarray:
+    cont_lp = self.continuous_dist.log_prob(actions[..., :-1])
+    cube_id = select_action_to_cube_id(actions[..., -1], self.num_select_classes)
+    cat_lp = self.categorical_dist.log_prob(cube_id)
+    return cont_lp + cat_lp
+
+  def entropy(self, seed=None):
+    # TanhTransformedDistribution.entropy may need a seed; pass through if set.
+    try:
+      cont_h = self.continuous_dist.entropy(seed=seed)
+    except TypeError:
+      cont_h = self.continuous_dist.entropy()
+    return cont_h + self.categorical_dist.entropy()
+
+
+class NormalTanhCategoricalSelect(hk.Module):
+  """Shared-trunk hybrid actor head: Gaussian continuous + categorical select.
+
+  Continuous dims use the same mean/std heads as ``NormalTanhDistribution``.
+  Select uses a linear logits head with ``num_select_classes`` outputs (one
+  class per cube, indices ``0 .. n-1``).
+  """
+
+  def __init__(
+      self,
+      num_continuous: int,
+      num_select_classes: int,
+      min_scale: float = 1e-3,
+      w_init: hk_init.Initializer = hk_init.VarianceScaling(
+          1.0, 'fan_in', 'uniform'),
+      b_init: hk_init.Initializer = hk_init.Constant(0.),
+      name: Optional[str] = None,
+  ):
+    super().__init__(name=name or 'NormalTanhCategoricalSelect')
+    self._num_continuous = int(num_continuous)
+    self._num_select_classes = int(num_select_classes)
+    self._min_scale = min_scale
+    self._cont_head = NormalTanhDistribution(
+        self._num_continuous, min_scale=min_scale, w_init=w_init, b_init=b_init)
+    self._select_logits = hk.Linear(
+        self._num_select_classes, w_init=w_init, b_init=b_init,
+        name='select_logits')
+
+  def __call__(self, inputs: jnp.ndarray) -> HybridSelectDistribution:
+    continuous_dist = self._cont_head(inputs)
+    logits = self._select_logits(inputs)
+    categorical_dist = tfd.Categorical(logits=logits)
+    return HybridSelectDistribution(
+        continuous_dist, categorical_dist, self._num_select_classes)
+
+
 class MultivariateNormalDiagHead(hk.Module):
   """Module that produces a tfd.MultivariateNormalDiag distribution."""
 

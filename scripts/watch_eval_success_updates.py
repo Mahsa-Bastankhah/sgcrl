@@ -45,7 +45,8 @@ import numpy as np
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_STATE = os.path.join(_REPO, 'figs', '.watch_eval_success_state.json')
-_BB_EVAL_JOB = os.path.join(_REPO, 'jobs', 'job_bb_ckpt_eval_oneshot.slurm')
+_DEFAULT_BB_EVAL_JOB = os.path.join(_REPO, 'jobs', 'job_bb_ckpt_eval_oneshot.slurm')
+_BB_EVAL_JOB = os.environ.get('BB_EVAL_JOB', _DEFAULT_BB_EVAL_JOB)
 _CKPT_RE = re.compile(r'ckpt_iter_(\d+)\.pkl$')
 _SEED_RE = re.compile(r'^ppo_(.+)_(\d+)$')
 
@@ -299,9 +300,13 @@ def squeue_has_job(job_id: Optional[str]) -> bool:
   return bool(r.stdout.strip())
 
 
-def submit_bb_eval(run_dir: str, env_name: str, plot_tag: str, seed: int) -> Optional[str]:
-  if not os.path.isfile(_BB_EVAL_JOB):
-    print(f'[watch_eval] missing job script: {_BB_EVAL_JOB}', flush=True)
+def submit_bb_eval(run_dir: str, env_name: str, plot_tag: str, seed: int,
+                   job_script: Optional[str] = None) -> Optional[str]:
+  job = job_script or _BB_EVAL_JOB
+  if not os.path.isabs(job):
+    job = os.path.join(_REPO, job)
+  if not os.path.isfile(job):
+    print(f'[watch_eval] missing job script: {job}', flush=True)
     return None
   env = os.environ.copy()
   env.update({
@@ -314,7 +319,7 @@ def submit_bb_eval(run_dir: str, env_name: str, plot_tag: str, seed: int) -> Opt
       'sbatch', '--parsable',
       f'--export=ALL,RUN_DIR={run_dir},ENV_NAME={env_name},'
       f'PLOT_TAG={plot_tag},SEED={seed}',
-      _BB_EVAL_JOB,
+      job,
   ]
   print(f'[watch_eval] sbatch BB eval: {" ".join(cmd)}', flush=True)
   r = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
@@ -379,6 +384,15 @@ def refresh_bb_aggregate_plot(plot_tag: str, env_name: str) -> Optional[str]:
   fig.tight_layout()
   fig.savefig(out_path, dpi=140)
   plt.close(fig)
+  # Mirror into active_runs/ for easy tracking of current experiments.
+  active_dir = os.path.join(_REPO, 'figs', 'builderbench', 'active_runs')
+  os.makedirs(active_dir, exist_ok=True)
+  active_path = os.path.join(active_dir, os.path.basename(out_path))
+  try:
+    import shutil
+    shutil.copy2(out_path, active_path)
+  except OSError as exc:
+    print(f'[watch_eval] active_runs copy failed: {exc}', flush=True)
   print(f'[watch_eval] aggregate plot (n={n_seeds}): {out_path}', flush=True)
   return out_path
 
@@ -554,6 +568,10 @@ def main() -> None:
       '--include_any', action='append', default=[],
       help='Additionally require the path to contain at least one of these '
            'substrings (OR). Repeatable.')
+  ap.add_argument(
+      '--bb_eval_job', default=None,
+      help='SLURM script for BuilderBench checkpoint eval oneshots '
+           '(default: $BB_EVAL_JOB or jobs/job_bb_ckpt_eval_oneshot.slurm).')
   args = ap.parse_args()
 
   repo = os.path.abspath(args.repo_root)
@@ -561,6 +579,11 @@ def main() -> None:
               else os.path.join(repo, 'logs'))
   state_path = (args.state_file if os.path.isabs(args.state_file)
                 else os.path.join(repo, args.state_file))
+
+  global _BB_EVAL_JOB
+  if args.bb_eval_job:
+    _BB_EVAL_JOB = (args.bb_eval_job if os.path.isabs(args.bb_eval_job)
+                    else os.path.join(repo, args.bb_eval_job))
 
   threshold = int(args.threshold)
   include = list(args.include or [])

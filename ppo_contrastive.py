@@ -80,6 +80,15 @@ flags.DEFINE_float(
 flags.DEFINE_float(
     'ppo_actor_min_std', -1.0,
     'If >0, overrides PPO actor min std.')
+flags.DEFINE_bool(
+    'ppo_deterministic_select_dim', False,
+    'If True, deactivate policy std on the last action dim (BuilderBench PD '
+    'select_action): that dim always uses μ/mode; other dims stay stochastic.')
+flags.DEFINE_bool(
+    'ppo_categorical_select', False,
+    'If True, use hybrid actor: shared trunk, tanh-Gaussian on continuous '
+    'action dims, categorical logits over num_cubes classes for select '
+    '(BuilderBench only).')
 flags.DEFINE_float(
     'ppo_ent_coef', -1.0,
     'If >=0, overrides PPO entropy bonus coefficient; '
@@ -135,10 +144,34 @@ flags.DEFINE_string(
     "'crl' (default) = contrastive φ(s,a)·ψ(g) representations; "
     "'gaussian' = diagonal Gaussian p_θ(g|s), reward = log p_θ(g|s_t); "
     "'nf' = conditional RealNVP log p_NF(g|s,a), reward = log p_NF; "
+    "'fm' = OT flow-matching log p_FM(g|s,a) via reverse ODE, "
+    "reward = log p_FM (uses --ppo_fm_reward_tau for reward EMA); "
     "'td3' = twin Q(s,a,s_f) TD3-style on r=1{s≈s_f}, reward = Q1(s,a,g) "
     "(or log((1−γ)Q1) with --ppo_td3_log_reward); "
     "'crl_td3_switch' = train both critics, initially reward PPO with CRL, "
-    "then switch to TD3 after the configured number of hard-goal visits.")
+    "then switch to TD3 after the configured number of hard-goal visits; "
+    "'tdinfonce' = TD InfoNCE φ(s,a)·ψ(s_f) critic, reward still φ·ψ "
+    "(uses --ppo_crl_repr_tau for reward EMA).")
+flags.DEFINE_float(
+    'ppo_td_infonce_target_tau', -1.0,
+    'TD-InfoNCE mode: keep-rate for target critic '
+    'target ← τ·target + (1−τ)·online. Default/config is 0.995. '
+    '<0 keeps ContrastiveConfig.ppo_td_infonce_target_tau. '
+    'Independent of ppo_crl_repr_tau (reward EMA).')
+flags.DEFINE_float(
+    'ppo_td_infonce_discount', -1.0,
+    'TD-InfoNCE mode: mix γ in L=(1-γ)·L_InfoNCE + γ·L_TD. '
+    '<0 uses --discount / config.discount (also HER γ). '
+    'Set ~0 to isolate term 1 for sanity checks without changing HER.')
+flags.DEFINE_float(
+    'ppo_td_infonce_logsumexp_coef', -1.0,
+    'TD-InfoNCE mode: coef on logsumexp(logits)^2 added to softmax CE '
+    '(CRL/CPC default is 0.01). <0 keeps config default. 0 disables.')
+flags.DEFINE_integer(
+    'ppo_tdinfonce_crl_warmup_iters', 0,
+    'TD-InfoNCE mode: if >0, train φ,ψ with standard CRL InfoNCE for this '
+    'many PPO iterations, then switch critic updates to TD-InfoNCE. '
+    'Reward stays φ·ψ throughout. 0 = TD-InfoNCE from the start.')
 flags.DEFINE_integer(
     'ppo_reward_switch_goal_visits', 5,
     "crl_td3_switch mode: completed successful training episodes required "
@@ -186,6 +219,26 @@ flags.DEFINE_float(
     'Gaussian mode: EMA decay τ for density params used in PPO reward '
     'r=log p_θ(g|s,a). ema ← τ·ema + (1−τ)·online after each density step. '
     '0 = use online params (default). <0 keeps config default.')
+flags.DEFINE_float(
+    'ppo_fm_reward_tau', -1.0,
+    'FM mode: EMA decay τ for velocity-field params used in PPO reward '
+    'r=log p_FM(g|s,a). ema ← τ·ema + (1−τ)·online after each density step. '
+    '0 = use online params (default). <0 keeps config default.')
+flags.DEFINE_integer(
+    'fm_flow_steps', -1,
+    'FM mode: Euler steps for reverse-ODE log-density / sampling. '
+    '<0 keeps config default (10).')
+flags.DEFINE_string(
+    'fm_logp_mode', '',
+    "FM mode: divergence for log p — 'exact', 'hutch-rade', or 'hutch-gaus'. "
+    'Empty keeps config default (exact).')
+flags.DEFINE_integer(
+    'fm_hutch_probes', -1,
+    'FM mode: Hutchinson probes when fm_logp_mode is hutch-*. '
+    '<0 keeps config default (8).')
+flags.DEFINE_boolean(
+    'fm_layer_norm', False,
+    'FM mode: apply LayerNorm inside the velocity MLP (FAC-style).')
 flags.DEFINE_integer(
     'nf_rep_size', 64,
     'NF mode: SA encoder output dim (conditioning vector size).')
@@ -277,6 +330,18 @@ flags.DEFINE_float(
     'CRL replay: sampling weight for successful episodes (others weight 1). '
     'Episode indices are drawn proportional to w / sum(w). '
     '1.0 is uniform. <0 keeps config default (1.0).')
+flags.DEFINE_boolean(
+    'ppo_use_external_reward', False,
+    'If True, add ppo_external_reward_scale to the PPO reward on steps with '
+    'BuilderBench hard success (metrics["success"]). Off by default.')
+flags.DEFINE_float(
+    'ppo_external_reward_scale', 100.0,
+    'Bonus added to the PPO reward when ppo_use_external_reward is True and '
+    'the step is a hard success. Default +100.')
+flags.DEFINE_boolean(
+    'ppo_external_reward_before_norm', False,
+    'If True with ppo_use_external_reward, add the extrinsic bonus to the raw '
+    'shaped reward BEFORE return-norm. Default False (add after norm).')
 flags.DEFINE_integer(
     'ppo_checkpoint_interval', -1,
     'Save checkpoints every N PPO iterations. <0 keeps config default (500).')
@@ -314,6 +379,11 @@ flags.DEFINE_boolean(
     'BuilderBench: if True (default), randomly permute which cube gets which '
     'start-box lane (y assignment) at reset. Set False to freeze lane order '
     'from the task file (still samples x within each lane box).')
+flags.DEFINE_integer(
+    'builderbench_mj_episode_length', -1,
+    'BuilderBench: if >0, override MuJoCo episode_length (before PD macro '
+    'division). E.g. 300 with pd_duration=5 → 60 PD macro steps. '
+    '<=0 keeps creative_cube_mj_episode_length default.')
 flags.DEFINE_string(
     'hidden_layer_sizes', '',
     'Comma-separated hidden layer widths, e.g. "256,256,256,256,256,256". '
@@ -646,6 +716,9 @@ def main(_):
     config.ppo_clip_coef = float(FLAGS.ppo_clip_coef)
   if FLAGS.ppo_actor_min_std > 0.0:
     config.ppo_actor_min_std = float(FLAGS.ppo_actor_min_std)
+  config.ppo_deterministic_select_dim = bool(
+      FLAGS.ppo_deterministic_select_dim)
+  config.ppo_categorical_select = bool(FLAGS.ppo_categorical_select)
   if FLAGS.ppo_ent_coef >= 0.0:
     config.ppo_ent_coef = float(FLAGS.ppo_ent_coef)
   config.ppo_anneal_lr = bool(FLAGS.ppo_anneal_lr)
@@ -661,6 +734,22 @@ def main(_):
   config.crl_on_policy = bool(FLAGS.crl_on_policy)
   config.ppo_reward_mode = str(FLAGS.ppo_reward_mode).strip()
   config.ppo_repr_mode = str(FLAGS.ppo_repr_mode).strip()
+  if FLAGS.ppo_td_infonce_target_tau >= 0.0:
+    config.ppo_td_infonce_target_tau = float(FLAGS.ppo_td_infonce_target_tau)
+  # Allow 0.0 (term-1-only sanity); <0 keeps config default (−1 → use discount).
+  if FLAGS.ppo_td_infonce_discount >= 0.0:
+    config.ppo_td_infonce_discount = float(FLAGS.ppo_td_infonce_discount)
+  # Allow 0.0 (disable); <0 keeps config default (0.01).
+  if FLAGS.ppo_td_infonce_logsumexp_coef >= 0.0:
+    config.ppo_td_infonce_logsumexp_coef = float(
+        FLAGS.ppo_td_infonce_logsumexp_coef)
+  config.ppo_tdinfonce_crl_warmup_iters = int(
+      FLAGS.ppo_tdinfonce_crl_warmup_iters)
+  if str(config.ppo_repr_mode).strip().lower() in ('tdinfonce', 'td_infonce'):
+    if bool(config.twin_q):
+      print('[ppo_contrastive] tdinfonce requires twin_q=False; '
+            'forcing twin_q=False')
+    config.twin_q = False
   config.ppo_reward_switch_goal_visits = int(
       FLAGS.ppo_reward_switch_goal_visits)
   config.ppo_reward_switch_blend_iters = int(
@@ -677,6 +766,15 @@ def main(_):
   config.ppo_td3_log_reward = bool(FLAGS.ppo_td3_log_reward)
   if FLAGS.ppo_gaussian_reward_tau >= 0.0:
     config.ppo_gaussian_reward_tau = float(FLAGS.ppo_gaussian_reward_tau)
+  if FLAGS.ppo_fm_reward_tau >= 0.0:
+    config.ppo_fm_reward_tau = float(FLAGS.ppo_fm_reward_tau)
+  if FLAGS.fm_flow_steps >= 0:
+    config.fm_flow_steps = int(FLAGS.fm_flow_steps)
+  if str(FLAGS.fm_logp_mode or '').strip():
+    config.fm_logp_mode = str(FLAGS.fm_logp_mode).strip().lower()
+  if FLAGS.fm_hutch_probes >= 0:
+    config.fm_hutch_probes = int(FLAGS.fm_hutch_probes)
+  config.fm_layer_norm = bool(FLAGS.fm_layer_norm)
   config.ppo_dirac_eps = float(FLAGS.ppo_dirac_eps)
   config.nf_rep_size = int(FLAGS.nf_rep_size)
   config.nf_num_blocks = int(FLAGS.nf_num_blocks)
@@ -717,6 +815,10 @@ def main(_):
   if FLAGS.ppo_success_sample_weight >= 0.0:
     config.ppo_success_sample_weight = float(
         FLAGS.ppo_success_sample_weight)
+  config.ppo_use_external_reward = bool(FLAGS.ppo_use_external_reward)
+  config.ppo_external_reward_scale = float(FLAGS.ppo_external_reward_scale)
+  config.ppo_external_reward_before_norm = bool(
+      FLAGS.ppo_external_reward_before_norm)
   if FLAGS.ppo_checkpoint_interval >= 0:
     config.ppo_checkpoint_interval = int(FLAGS.ppo_checkpoint_interval)
   if FLAGS.ppo_checkpoint_keep_last >= 0:
@@ -739,6 +841,8 @@ def main(_):
         f'num_minibatches={config.ppo_num_minibatches}, '
         f'clip_coef={config.ppo_clip_coef}, '
         f'actor_min_std={config.ppo_actor_min_std}, '
+        f'deterministic_select_dim={config.ppo_deterministic_select_dim}, '
+        f'categorical_select={config.ppo_categorical_select}, '
         f'ent_coef={config.ppo_ent_coef}, '
         f'anneal_ent_coef={config.ppo_anneal_ent_coef}'
         f'{f"->{config.ppo_ent_coef_final}" if config.ppo_anneal_ent_coef else ""}, '
@@ -752,12 +856,17 @@ def main(_):
         f'repr_norm={config.repr_norm}, '
         f'ppo_anneal_lr={config.ppo_anneal_lr}  '
         f'ppo_repr_mode={config.ppo_repr_mode!r}  '
+        f'ppo_tdinfonce_crl_warmup_iters={config.ppo_tdinfonce_crl_warmup_iters}  '
+        f'ppo_td_infonce_discount={config.ppo_td_infonce_discount}  '
         f'ppo_reward_switch_goal_visits={config.ppo_reward_switch_goal_visits}  '
         f'ppo_reward_switch_blend_iters={config.ppo_reward_switch_blend_iters}  '
         f'ppo_reward_mode={config.ppo_reward_mode!r}  '
         f'ppo_crl_repr_tau={config.ppo_crl_repr_tau}  '
         f'ppo_nf_reward_tau={config.ppo_nf_reward_tau}  '
         f'ppo_gaussian_reward_tau={config.ppo_gaussian_reward_tau}  '
+        f'ppo_fm_reward_tau={config.ppo_fm_reward_tau}  '
+        f'fm_flow_steps={config.fm_flow_steps}  '
+        f'fm_logp_mode={config.fm_logp_mode!r}  '
         f'ppo_td3_tau={config.ppo_td3_tau if config.ppo_td3_tau >= 0 else config.tau}  '
         f'ppo_td3_goal_tol={config.ppo_td3_goal_tol}  '
         f'ppo_td3_use_target_policy={config.ppo_td3_use_target_policy}  '
@@ -769,6 +878,10 @@ def main(_):
         f'max_replay_size={config.max_replay_size}  '
         f'ppo_min_replay_size={config.ppo_min_replay_size}  '
         f'ppo_success_sample_weight={config.ppo_success_sample_weight}  '
+        f'ppo_use_external_reward={config.ppo_use_external_reward}  '
+        f'ppo_external_reward_scale={config.ppo_external_reward_scale}  '
+        f'ppo_external_reward_before_norm='
+        f'{config.ppo_external_reward_before_norm}  '
         f'kde_max_points={config.kde_max_points}  '
         f'kde_refit_interval={config.kde_refit_interval}  '
         f'kde_bandwidth={config.kde_bandwidth}  '
@@ -803,15 +916,22 @@ def main(_):
           env_name, use_pd=True, episode_length_multiplier=_ep_mult)
     _env_kwargs['builderbench_permute_start_boxes'] = bool(
         FLAGS.builderbench_permute_start_boxes)
+    if int(FLAGS.builderbench_mj_episode_length) > 0:
+      _env_kwargs['builderbench_mj_episode_length'] = int(
+          FLAGS.builderbench_mj_episode_length)
     # NOTE: this used to silently recompute ppo_rollout_length /
     # ppo_crl_steps_per_iter a second time (duplicating the block above at
     # ~line 476) whenever the flags were left unset. Removed: for PD mode
     # these must always be explicit --ppo_rollout_length /
     # --ppo_crl_steps_per_iter flags now.
+    _mj_ep = int(FLAGS.builderbench_mj_episode_length)
+    _mj_msg = (
+        f' mj_episode_length={_mj_ep}'
+        if _mj_ep > 0 else ' mj_episode_length=default')
     print(f'[ppo] builderbench: use_pd={FLAGS.builderbench_use_pd} '
           f'pd_duration={FLAGS.builderbench_pd_duration} '
           f'permute_start_boxes={FLAGS.builderbench_permute_start_boxes}'
-          f' episode_length_multiplier={_ep_mult}'
+          f' episode_length_multiplier={_ep_mult} {_mj_msg}'
           + (' pd_policy_obs=pos+select' if FLAGS.builderbench_use_pd else ''))
 
 
@@ -844,6 +964,21 @@ def main(_):
   # PPO updates — SAC gets away with a 1e-6 floor because adaptive-α
   # actively regulates entropy; PPO has no such control loop and relies
   # on (a) an entropy bonus and (b) a hard std floor to stay exploratory.
+  _cat_select_classes = None
+  if bool(config.ppo_categorical_select):
+    from envs.builderbench_utils import (
+        is_builderbench_creative_env,
+        parse_sgcrl_builderbench_env_name,
+    )
+    if not is_builderbench_creative_env(env_name):
+      raise ValueError(
+          '--ppo_categorical_select requires a BuilderBench creative env '
+          f'(got {env_name!r})')
+    _, _num_cubes, _ = parse_sgcrl_builderbench_env_name(env_name)
+    _cat_select_classes = int(_num_cubes)
+    print(f'[ppo_contrastive] categorical select actor: '
+          f'{_cat_select_classes} cube classes, '
+          f'Gaussian on {5 - 1} continuous dims')
   network_factory = functools.partial(
       contrastive.make_networks,
       obs_dim=obs_dim,
@@ -853,7 +988,8 @@ def main(_):
       use_image_obs=config.use_image_obs,
       hidden_layer_sizes=config.hidden_layer_sizes,
       actor_min_std=float(config.ppo_actor_min_std),
-      ppo_cleanrl_actor=bool(FLAGS.ppo_cleanrl_actor)
+      ppo_cleanrl_actor=bool(FLAGS.ppo_cleanrl_actor),
+      categorical_select_classes=_cat_select_classes,
   )
 
   # ---- Logger ------------------------------------------------------------
@@ -902,6 +1038,7 @@ def main(_):
       seed=seed,
       checkpoint_dir=checkpoint_dir,
       builderbench_kwargs=_bb_kwargs,
+      fixed_start_end=fixed_start_end,
   )
 
 

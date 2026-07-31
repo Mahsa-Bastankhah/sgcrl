@@ -15,7 +15,7 @@ from itertools import product
 
 
 # modified Tanh mean to be mapped to tanh(mean) to keep within [-1, 1]
-from distributional import NormalTanhDistribution, StateIndependentNormalTanhDistribution
+from distributional import NormalTanhDistribution, StateIndependentNormalTanhDistribution, NormalTanhCategoricalSelect
 
 
 def _use_residual_mlp(hidden_layer_sizes: Sequence[int]) -> bool:
@@ -169,11 +169,28 @@ def make_networks(
     actor_min_std = 1e-6,
     twin_q = False,
     use_image_obs = False,
-  ppo_cleanrl_actor = False
-):
-  """Creates networks used by the agent."""
+    ppo_cleanrl_actor = False,
+    categorical_select_classes: Optional[int] = None):
+  """Creates networks used by the agent.
+
+  Args:
+    categorical_select_classes: If set (e.g. num_cubes), the policy uses a
+      hybrid actor: shared trunk, tanh-Gaussian mean/std on the first
+      ``action_dim - 1`` dims, and a categorical logits head with this many
+      classes for the select dim (cube ids ``0 .. n-1``).  Sampled select is
+      mapped to the PD center in ``[-1, 1]`` so the env API stays continuous.
+  """
 
   num_dimensions = np.prod(spec.actions.shape, dtype=int)
+  _cat_select = (None if categorical_select_classes is None
+                 else int(categorical_select_classes))
+  if _cat_select is not None and _cat_select < 2:
+    raise ValueError(
+        f'categorical_select_classes must be >= 2, got {_cat_select}')
+  if _cat_select is not None and num_dimensions < 2:
+    raise ValueError(
+        'categorical select actor requires action_dim >= 2 '
+        f'(got {num_dimensions})')
   TORSO = networks_lib.AtariTorso  # pylint: disable=invalid-name
 
   def _unflatten_obs(obs):
@@ -268,8 +285,14 @@ def make_networks(
         activate_final=True,
         w_init=w_init_fn,
     )
-
-    if ppo_cleanrl_actor:
+    if _cat_select is not None:
+      # Shared trunk; Gaussian on continuous dims; categorical over n cubes.
+      return NormalTanhCategoricalSelect(
+          num_continuous=num_dimensions - 1,
+          num_select_classes=_cat_select,
+          min_scale=actor_min_std,
+      )(h)
+    elif ppo_cleanrl_actor:
       return StateIndependentNormalTanhDistribution(
           num_dimensions, 
           min_scale=actor_min_std,
