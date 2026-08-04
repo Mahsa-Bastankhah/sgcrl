@@ -5,7 +5,8 @@ Overview
     z, log_det  = RealNVP(G_encoder(goal) ;  y = SA_encoder(s, a))
     log p_NF(g | s, a) = log N(z;0,I) + Σ log|det J|
 
-SA encoder matches the reference ``SA_encoder`` (4×1024 + LN + swish → rep_size).
+SA encoder: ``sa_num_layers × Dense(sa_hidden) + LN + swish → Dense(rep_size)``.
+  Defaults match the original reference (4×1024). Compact runs use e.g. 3×256.
 Goal encoder is a compact MLP: 2×(Dense(256) + LN + swish) → Dense(goal_enc_size).
   - goal_enc_size=0  disables the encoder (raw normalized goal fed to flow, legacy).
   - goal_enc_size>0  encodes goal first; flow operates in goal_enc_size-dim space.
@@ -34,14 +35,17 @@ from acme.jax import networks as networks_lib
 # ---------------------------------------------------------------------------
 
 def _sa_encoder(state: jnp.ndarray, action: jnp.ndarray,
-                rep_size: int) -> jnp.ndarray:
-    """concat([s,a]) → 4×(Dense1024 + LN + swish) → Dense(rep_size)."""
+                rep_size: int,
+                sa_hidden: int = 1024,
+                sa_num_layers: int = 4) -> jnp.ndarray:
+    """concat([s,a]) → sa_num_layers×(Dense(sa_hidden) + LN + swish) → Dense(rep_size)."""
     lecun = hk.initializers.VarianceScaling(1 / 3, 'fan_in', 'uniform')
     zero_bias = hk.initializers.Constant(0.)
 
     x = jnp.concatenate([state, action], axis=-1)
-    for i in range(4):
-        x = hk.Linear(1024, w_init=lecun, b_init=zero_bias, name=f'dense_{i}')(x)
+    for i in range(int(sa_num_layers)):
+        x = hk.Linear(int(sa_hidden), w_init=lecun, b_init=zero_bias,
+                      name=f'dense_{i}')(x)
         x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
                          name=f'ln_{i}')(x)
         x = jax.nn.swish(x)
@@ -149,6 +153,8 @@ def make_nf_density_networks(
     num_blocks: int = 8,
     channels: int = 256,
     goal_enc_size: int = 0,                   # 0 = no goal encoder (legacy)
+    sa_hidden: int = 1024,
+    sa_num_layers: int = 4,
 ) -> NFDensityNetworks:
     """Build SA encoder + optional goal encoder + conditional RealNVP flow.
 
@@ -159,6 +165,9 @@ def make_nf_density_networks(
     """
     del hidden_layer_sizes
     assert goal_dim >= 1, f'NF density requires goal_dim >= 1, got {goal_dim}'
+    assert int(sa_hidden) >= 1, f'sa_hidden must be >= 1, got {sa_hidden}'
+    assert int(sa_num_layers) >= 1, (
+        f'sa_num_layers must be >= 1, got {sa_num_layers}')
 
     # Effective dimensionality the flow operates in.
     flow_dim = goal_enc_size if goal_enc_size > 0 else goal_dim
@@ -171,9 +180,12 @@ def make_nf_density_networks(
 
     w_init = hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform')
     zero_init = hk.initializers.Constant(0.)
+    _sa_hidden = int(sa_hidden)
+    _sa_num_layers = int(sa_num_layers)
 
     def _sa_fn(state: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
-        return _sa_encoder(state, action, rep_size)
+        return _sa_encoder(state, action, rep_size,
+                           sa_hidden=_sa_hidden, sa_num_layers=_sa_num_layers)
 
     def _goal_enc_fn(goal: jnp.ndarray) -> jnp.ndarray:
         return _goal_encoder(goal, goal_enc_size)

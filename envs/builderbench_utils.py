@@ -221,6 +221,31 @@ def filter_pd_policy_state_obs(state_obs, num_cubes, obs_space_list: Optional[li
     return jnp.concatenate([components[s] for s in requested], axis=-1)
 
 
+def apply_fixed_start_x(creative_cube, fixed_start_x: float | None) -> None:
+  """Collapse start-box x low/high to a constant (in-place on ``_starts_data``).
+
+  ``starts`` shape is ``(num_cubes, 2, 3)`` = [cube, {low,high}, xyz]. Setting
+  both low and high x makes ``jax.random.uniform`` always return that x.
+  Pass ``None`` or a negative value to leave starts unchanged.
+  """
+  if fixed_start_x is None:
+    return
+  x = float(fixed_start_x)
+  if x < 0:
+    return
+  starts = np.asarray(creative_cube._starts_data, dtype=np.float32).copy()
+  if starts.ndim != 3 or starts.shape[-1] < 1:
+    raise ValueError(
+        f'Unexpected _starts_data shape {starts.shape}; expected (N, 2, 3)')
+  starts[:, :, 0] = x
+  # Keep the same array backend as CreativeCube (jax array).
+  try:
+    import jax.numpy as jnp
+    creative_cube._starts_data = jnp.asarray(starts, dtype=jnp.float32)
+  except Exception:
+    creative_cube._starts_data = starts
+
+
 def pd_run_uses_filtered_policy_obs(run_cfg: dict) -> bool:
   flags = run_cfg.get('flags', {})
   if not bool(flags.get('builderbench_use_pd', False)):

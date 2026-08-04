@@ -74,6 +74,7 @@ def _require_builderbench(env_name: str) -> None:
 
 
 from envs.builderbench_utils import (
+    apply_fixed_start_x,
     creative_cube_mj_episode_length,
     filter_pd_policy_state_obs,
     get_filtered_obs_dim,
@@ -159,6 +160,7 @@ class JaxBuilderBenchVecEnv:
       episode_length_multiplier: float = 1.0,
       permute_start_boxes: bool = True,
       mj_episode_length: Optional[int] = None,
+      fixed_start_x: Optional[float] = None,
   ):
     _require_builderbench(env_name)
     self._env_name = str(env_name)
@@ -173,6 +175,9 @@ class JaxBuilderBenchVecEnv:
         None if fixed_target_goal is None
         else jnp.asarray(fixed_target_goal, dtype=jnp.float32).reshape(-1))
     self._permute_start_boxes = bool(permute_start_boxes)
+    self._fixed_start_x = (
+        None if fixed_start_x is None or float(fixed_start_x) < 0
+        else float(fixed_start_x))
 
     num_cubes, task_id = self._num_cubes, self._task_id
     cfg = default_config()
@@ -192,6 +197,7 @@ class JaxBuilderBenchVecEnv:
       cfg.njmax = int(njmax)
 
     base = CreativeCube(config=cfg)
+    apply_fixed_start_x(base, self._fixed_start_x)
     self._mocap_targets = base._mocap_targets
     if self._use_pd:
       validate_pd_episode_length(cfg.episode_length, self._pd_duration)
@@ -226,12 +232,16 @@ class JaxBuilderBenchVecEnv:
         f' pd_policy_obs={self._state_obs_dim}'
         f' (full_state={self._full_state_obs_dim})'
         if self._pd_filter_policy_obs else '')
+    _fx = (
+        f' fixed_start_x={self._fixed_start_x}'
+        if self._fixed_start_x is not None else '')
     print(f'[jax_vec] BuilderBench {self._bb_env_id}: '
           f'E={self._num_envs} obs={self._obs_dim_total} '
           f'act={self._action_dim} ep_len={self._episode_length} '
           f'use_pd={self._use_pd} '
           f'pd_duration={self._pd_duration} '
           f'permute_start_boxes={self._permute_start_boxes}'
+          f'{_fx}'
           f'{_pd_obs_msg}')
 
   def _reset_impl(self, rng: jax.Array) -> State:

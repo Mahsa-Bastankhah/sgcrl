@@ -28,7 +28,7 @@ from typing import Any, Sequence, NamedTuple
 from wandb_osh.hooks import TriggerWandbSyncHook
 
 import utils.running_statistics as running_statistics
-from utils.wrapper import wrap_env
+from utils.wrapper import wrap_env, PDWrapper
 from utils.evaluation import Evaluator
 from utils.networks import MLP, save_params
 from builderbench.env_utils import make_env
@@ -79,6 +79,9 @@ class Args:
     env_early_termination: bool = True
     env_episode_length: int = None
     permutation_invariant_reward: bool = True   # invariance to the order of cubes in any structure
+    # PD waypoint control (matches builderbench ppo_pd / sgcrl CRL jobs).
+    use_pd: bool = False
+    pd_duration: int = 5
 
     # algorithm
     num_timesteps: int = 50000000
@@ -254,15 +257,24 @@ def main(args: Args):
     # BuilderBench defaults to MJX warp; prefer jax unless warp is available.
     default_config.impl = os.environ.get("BUILDERBENCH_MJX_IMPL", "jax")
     print(f"MJX impl={default_config.impl}")
-    env = wrap_env(
-        HardSuccessRewardWrapper(env_class(config=default_config)),
-        default_config.episode_length,
-    )
+    def _make_controlled_env():
+      base = env_class(config=default_config)
+      if args.use_pd:
+        return PDWrapper(base, duration=args.pd_duration)
+      return base
+
+    if args.use_pd:
+      assert default_config.episode_length % args.pd_duration == 0, (
+          "Environment episode length must be divisible by pd_duration")
+      episode_length = default_config.episode_length // args.pd_duration
+      print(f"Control mode: PD waypoint controls (pd_duration={args.pd_duration}) "
+            f"macro_ep_len={episode_length}")
+    else:
+      episode_length = default_config.episode_length
+      print("Control mode: raw controls")
+    env = wrap_env(HardSuccessRewardWrapper(_make_controlled_env()), episode_length)
     eval_env = wrap_env(
-        HardSuccessRewardWrapper(env_class(config=default_config)),
-        default_config.episode_length,
-    )
-    episode_length = default_config.episode_length
+        HardSuccessRewardWrapper(_make_controlled_env()), episode_length)
 
     # Initialize checkpoint folder
     if args.save_checkpoint:

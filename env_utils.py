@@ -155,6 +155,8 @@ def load(env_name, fixed_start_end=None, seed=None, **env_kwargs):
     kwargs['fixed_start_end'] = fixed_start_end
     if 'randomize_gripper_init' in env_kwargs:
       kwargs['randomize_gripper_init'] = env_kwargs['randomize_gripper_init']
+    if 'randomize_init' in env_kwargs:
+      kwargs['randomize_init'] = env_kwargs['randomize_init']
   elif env_name == 'sawyer_box':
     CLASS = SawyerBox
     max_episode_steps = 150
@@ -163,6 +165,8 @@ def load(env_name, fixed_start_end=None, seed=None, **env_kwargs):
     CLASS = SawyerPeg
     max_episode_steps = 150
     kwargs['fixed_start_end'] = fixed_start_end
+    if 'randomize_init' in env_kwargs:
+      kwargs['randomize_init'] = env_kwargs['randomize_init']
   elif env_name == 'sawyer_reach':
     CLASS = SawyerReach
     max_episode_steps = 150
@@ -366,15 +370,22 @@ class SawyerBin(_MW_BIN):
     """Bounds on the goal block appended in ``_get_obs`` (for CRL uniform negs)."""
     return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
 
-  def __init__(self, fixed_start_end=None, randomize_gripper_init=False):
+  def __init__(self, fixed_start_end=None, randomize_gripper_init=False,
+               randomize_init=True):
     _require_metaworld('sawyer_bin')
     self._goal = np.zeros(3)
-    self._randomize_gripper_init = bool(randomize_gripper_init)
+    # Freeze-init runs must also pin the gripper TCP (no offset noise).
+    self._randomize_init = bool(randomize_init)
+    self._randomize_gripper_init = (
+        bool(randomize_gripper_init) and self._randomize_init)
     super(SawyerBin, self).__init__()
     self._partially_observable = False
     self._freeze_rand_vec = False
     self._set_task_called = True
     self._fixed_start_end=fixed_start_end
+    # MetaWorld: random_init controls object XY spawn on reset_model.
+    if not self._randomize_init:
+      self.random_init = False
     self.reset()
 
   def reset(self):
@@ -899,14 +910,18 @@ class SawyerPeg(_MW_PEG):
   def uniform_goal_obs_bounds(self):
     return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
 
-  def __init__(self, fixed_start_end=None):
+  def __init__(self, fixed_start_end=None, randomize_init=True):
     _require_metaworld('sawyer_peg')
     self._goal_pos = np.zeros(3)
+    self._randomize_init = bool(randomize_init)
     super(SawyerPeg, self).__init__()
     self._fixed_start_end=fixed_start_end
     self._set_task_called = True
     self._partially_observable = False
     self._freeze_rand_vec = False
+    # MetaWorld: random_init controls peg + hole box spawn on reset_model.
+    if not self._randomize_init:
+      self.random_init = False
     self.reset()
 
   def reset(self):

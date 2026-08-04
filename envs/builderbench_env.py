@@ -40,6 +40,7 @@ except Exception as _e:  # noqa: BLE001
   _BUILDERBENCH_IMPORT_ERROR = _e
 
 from envs.builderbench_utils import (
+    apply_fixed_start_x,
     creative_cube_mj_episode_length,
     default_fixed_target_goal,
     filter_pd_policy_state_obs,
@@ -90,6 +91,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
       obs_space_list: Optional[list[str]] = None,
       episode_length_multiplier: float = 1.0,
       permute_start_boxes: bool = True,
+      fixed_start_x: Optional[float] = None,
   ):
     super().__init__()
     _require_builderbench(env_id)
@@ -104,6 +106,9 @@ class BuilderBenchCreativeGymEnv(gym.Env):
         None if fixed_target_goal is None
         else np.asarray(fixed_target_goal, dtype=np.float32).reshape(-1))
     self._permute_start_boxes = bool(permute_start_boxes)
+    self._fixed_start_x = (
+        None if fixed_start_x is None or float(fixed_start_x) < 0
+        else float(fixed_start_x))
 
     num_cubes, task_id = parse_creative_env_id(env_id)
     self._num_cubes = num_cubes
@@ -122,6 +127,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
       cfg.nconmax, cfg.njmax = _MJX_PARAMS[env_id]
 
     base = CreativeCube(config=cfg)
+    apply_fixed_start_x(base, self._fixed_start_x)
     if self._use_pd:
       validate_pd_episode_length(cfg.episode_length, self._pd_duration)
       inner = PDWrapper(base, duration=self._pd_duration)
@@ -237,6 +243,7 @@ def make_builderbench_creative_env(
     obs_space_list: Optional[list[str]] = None,
     episode_length_multiplier: float = 1.0,
     permute_start_boxes: bool = True,
+    fixed_start_x: Optional[float] = None,
 ) -> BuilderBenchCreativeGymEnv:
   return BuilderBenchCreativeGymEnv(
       env_id=env_id,
@@ -248,4 +255,5 @@ def make_builderbench_creative_env(
       obs_space_list=obs_space_list,
       episode_length_multiplier=episode_length_multiplier,
       permute_start_boxes=permute_start_boxes,
+      fixed_start_x=fixed_start_x,
   )

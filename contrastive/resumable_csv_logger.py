@@ -28,8 +28,10 @@ class ResumableCSVLogger(base.Logger):
       label: str = '',
       time_delta: float = 0.0,
       add_uid: bool = True,
-      flush_every: int = 30,
+      flush_every: int = 1,
   ):
+    # Default flush_every=1: sparse loggers (e.g. eval every 200 PPO iters)
+    # otherwise buffer for hours and plots/CSV readers see only the first row.
     if flush_every <= 0:
       raise ValueError(
           f'`flush_every` must be a positive integer (got {flush_every}).')
