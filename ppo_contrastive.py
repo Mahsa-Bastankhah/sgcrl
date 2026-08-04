@@ -85,10 +85,11 @@ flags.DEFINE_bool(
     'If True, deactivate policy std on the last action dim (BuilderBench PD '
     'select_action): that dim always uses μ/mode; other dims stay stochastic.')
 flags.DEFINE_bool(
-    'ppo_categorical_select', False,
-    'If True, use hybrid actor: shared trunk, tanh-Gaussian on continuous '
-    'action dims, categorical logits over num_cubes classes for select '
-    '(BuilderBench only).')
+    'ppo_categorical_select', True,
+    'If True (default), use hybrid actor: shared trunk, tanh-Gaussian on '
+    'continuous action dims, categorical logits over num_cubes classes for '
+    'select (BuilderBench creative only; no-op elsewhere). '
+    'Pass --noppo_categorical_select to disable.')
 flags.DEFINE_float(
     'ppo_ent_coef', -1.0,
     'If >=0, overrides PPO entropy bonus coefficient; '
@@ -233,6 +234,12 @@ flags.DEFINE_integer(
 flags.DEFINE_integer(
     'nf_coupling_width', 256,
     'NF mode: width of s/t sub-networks inside each coupling block.')
+flags.DEFINE_integer(
+    'nf_sa_hidden', 1024,
+    'NF mode: SA encoder hidden width (reference 1024; compact runs use 256).')
+flags.DEFINE_integer(
+    'nf_sa_num_layers', 4,
+    'NF mode: SA encoder depth (reference 4; compact runs use 3).')
 flags.DEFINE_float(
     'nf_encoder_lr', 3e-4,
     'NF mode: Adam learning rate for SA encoder (ref actor_lr).')
@@ -257,6 +264,11 @@ flags.DEFINE_string(
 flags.DEFINE_boolean(
     'ppo_skip_first_eval', False,
     'Skip logging the iteration-0 eval (avoids logging the checkpoint result as the first data point when resuming).')
+flags.DEFINE_string(
+    'ppo_frozen_reward_ckpt', '',
+    'Path to a pretrained PPO/CRL checkpoint (.pkl). On a fresh run, load only '
+    'φ/ψ (prefer q_params_ema) as a stationary r=φ(s,a)·ψ(g) reward; policy/'
+    'value start fresh. Forces --ppo_crl_steps_per_iter=0. Empty = disabled.')
 flags.DEFINE_string(
     'ppo_actor_reset_iters', '',
     'Comma-separated PPO iterations at which to force an actor reinit '
@@ -317,8 +329,9 @@ flags.DEFINE_float(
     '1.0 is uniform. <0 keeps config default (1.0).')
 flags.DEFINE_boolean(
     'ppo_use_external_reward', False,
-    'If True, add ppo_external_reward_scale to the PPO reward on steps with '
-    'BuilderBench hard success (metrics["success"]). Off by default.')
+    'If True, add ppo_external_reward_scale to the PPO reward on hard-success '
+    'steps (BuilderBench metrics["success"], or Sawyer sparse env reward). '
+    'Off by default.')
 flags.DEFINE_float(
     'ppo_external_reward_scale', 100.0,
     'Bonus added to the PPO reward when ppo_use_external_reward is True and '
@@ -354,6 +367,11 @@ flags.DEFINE_boolean(
     'bin_randomize_gripper_init', False,
     'SawyerBin: randomize initial gripper TCP offset around the object at reset.')
 flags.DEFINE_boolean(
+    'sawyer_randomize_init', True,
+    'Sawyer bin/peg: if False, freeze MetaWorld object (and peg hole) spawn '
+    'to the default init pose every reset. Also disables bin gripper-init '
+    'noise even when --bin_randomize_gripper_init is set.')
+flags.DEFINE_boolean(
     'builderbench_use_pd', False,
     'BuilderBench: wrap env in PDWrapper (short horizon). Default False = raw control.')
 flags.DEFINE_integer(
@@ -364,6 +382,10 @@ flags.DEFINE_boolean(
     'BuilderBench: if True (default), randomly permute which cube gets which '
     'start-box lane (y assignment) at reset. Set False to freeze lane order '
     'from the task file (still samples x within each lane box).')
+flags.DEFINE_float(
+    'builderbench_fixed_start_x', -1.0,
+    'BuilderBench: if >=0, collapse every start-box x low/high to this value '
+    '(fixed cube init x; y lanes unchanged). <0 keeps the task-file x range.')
 flags.DEFINE_integer(
     'builderbench_mj_episode_length', -1,
     'BuilderBench: if >0, override MuJoCo episode_length (before PD macro '
@@ -712,6 +734,8 @@ def main(_):
   config.nf_rep_size = int(FLAGS.nf_rep_size)
   config.nf_num_blocks = int(FLAGS.nf_num_blocks)
   config.nf_coupling_width = int(FLAGS.nf_coupling_width)
+  config.nf_sa_hidden = int(FLAGS.nf_sa_hidden)
+  config.nf_sa_num_layers = int(FLAGS.nf_sa_num_layers)
   config.nf_encoder_lr = float(FLAGS.nf_encoder_lr)
   config.nf_critic_lr = float(FLAGS.nf_critic_lr)
   config.nf_critic_weight_decay = float(FLAGS.nf_critic_weight_decay)
@@ -720,6 +744,13 @@ def main(_):
   config.nf_goal_std_min = float(FLAGS.nf_goal_std_min)
   config.nf_mix_env_goal_stats = bool(FLAGS.nf_mix_env_goal_stats)
   config.ppo_skip_first_eval = bool(FLAGS.ppo_skip_first_eval)
+  if str(FLAGS.ppo_frozen_reward_ckpt or '').strip():
+    config.ppo_frozen_reward_ckpt = str(FLAGS.ppo_frozen_reward_ckpt).strip()
+    # Stationary reward: never train CRL / density after loading φ/ψ.
+    if int(config.ppo_crl_steps_per_iter) != 0:
+      print(f'[ppo_contrastive] frozen reward ckpt set: forcing '
+            f'ppo_crl_steps_per_iter {config.ppo_crl_steps_per_iter} -> 0')
+      config.ppo_crl_steps_per_iter = 0
   if str(FLAGS.ppo_actor_reset_iters or '').strip():
     config.ppo_actor_reset_iters = str(FLAGS.ppo_actor_reset_iters).strip()
   if FLAGS.ppo_eval_interval >= 0:
@@ -792,6 +823,7 @@ def main(_):
         f'ppo_reward_switch_goal_visits={config.ppo_reward_switch_goal_visits}  '
         f'ppo_reward_switch_blend_iters={config.ppo_reward_switch_blend_iters}  '
         f'ppo_reward_mode={config.ppo_reward_mode!r}  '
+        f'ppo_frozen_reward_ckpt={config.ppo_frozen_reward_ckpt!r}  '
         f'ppo_crl_repr_tau={config.ppo_crl_repr_tau}  '
         f'ppo_nf_reward_tau={config.ppo_nf_reward_tau}  '
         f'ppo_gaussian_reward_tau={config.ppo_gaussian_reward_tau}  '
@@ -835,14 +867,25 @@ def main(_):
       and env_name == 'sawyer_push'):
     _env_kwargs['nf_closed_gripper_init'] = True
     print('[ppo] sawyer_push NF init: closed gripper at reset')
+  if env_name in ('sawyer_bin', 'sawyer_peg'):
+    _env_kwargs['randomize_init'] = bool(FLAGS.sawyer_randomize_init)
+    if not FLAGS.sawyer_randomize_init:
+      print(f'[ppo] {env_name} init: frozen (no MetaWorld object/hole randomness)')
   if env_name == 'sawyer_bin' and FLAGS.bin_randomize_gripper_init:
-    _env_kwargs['randomize_gripper_init'] = True
-    print('[ppo] sawyer_bin init: randomized gripper position at reset')
+    if FLAGS.sawyer_randomize_init:
+      _env_kwargs['randomize_gripper_init'] = True
+      print('[ppo] sawyer_bin init: randomized gripper position at reset')
+    else:
+      print('[ppo] sawyer_bin init: ignoring --bin_randomize_gripper_init '
+            '(frozen by --sawyer_randomize_init=false)')
   if env_name.startswith('builderbench_'):
     _env_kwargs['builderbench_use_pd'] = bool(FLAGS.builderbench_use_pd)
     _env_kwargs['builderbench_pd_duration'] = int(FLAGS.builderbench_pd_duration)
     _env_kwargs['builderbench_permute_start_boxes'] = bool(
         FLAGS.builderbench_permute_start_boxes)
+    if float(FLAGS.builderbench_fixed_start_x) >= 0:
+      _env_kwargs['builderbench_fixed_start_x'] = float(
+          FLAGS.builderbench_fixed_start_x)
     if int(FLAGS.builderbench_mj_episode_length) > 0:
       _env_kwargs['builderbench_mj_episode_length'] = int(
           FLAGS.builderbench_mj_episode_length)
@@ -855,10 +898,12 @@ def main(_):
     _mj_msg = (
         f' mj_episode_length={_mj_ep}'
         if _mj_ep > 0 else ' mj_episode_length=default')
+    _fx = float(FLAGS.builderbench_fixed_start_x)
+    _fx_msg = f' fixed_start_x={_fx}' if _fx >= 0 else ''
     print(f'[ppo] builderbench: use_pd={FLAGS.builderbench_use_pd} '
           f'pd_duration={FLAGS.builderbench_pd_duration} '
           f'permute_start_boxes={FLAGS.builderbench_permute_start_boxes}'
-          f'{_mj_msg}'
+          f'{_fx_msg}{_mj_msg}'
           + (' pd_policy_obs=pos+select' if FLAGS.builderbench_use_pd else ''))
 
   def env_factory(s):
@@ -883,8 +928,9 @@ def main(_):
 
   # ---- Network factory (adds value_network via networks.py changes) -----
   # NOTE: `actor_min_std` is raised from the shared default (1e-6) to the
-  # PPO-specific floor (0.1 by default).  Without this, the tanh-squashed
-  # Gaussian policy collapses to a near-point-mass within a handful of
+  # PPO-specific floor (1e-5 by default; was 0.01 — revisit if collapse /
+  # bad exploration reappears).  Without a floor, the tanh-squashed
+  # Gaussian policy can collapse to a near-point-mass within a handful of
   # PPO updates — SAC gets away with a 1e-6 floor because adaptive-α
   # actively regulates entropy; PPO has no such control loop and relies
   # on (a) an entropy bonus and (b) a hard std floor to stay exploratory.
@@ -895,14 +941,16 @@ def main(_):
         parse_sgcrl_builderbench_env_name,
     )
     if not is_builderbench_creative_env(env_name):
-      raise ValueError(
-          '--ppo_categorical_select requires a BuilderBench creative env '
-          f'(got {env_name!r})')
-    _, _num_cubes, _ = parse_sgcrl_builderbench_env_name(env_name)
-    _cat_select_classes = int(_num_cubes)
-    print(f'[ppo_contrastive] categorical select actor: '
-          f'{_cat_select_classes} cube classes, '
-          f'Gaussian on {5 - 1} continuous dims')
+      print(f'[ppo_contrastive] ppo_categorical_select ignored for non-'
+            f'BuilderBench-creative env {env_name!r} '
+            f'(use a creative_* env to enable)')
+      config.ppo_categorical_select = False
+    else:
+      _, _num_cubes, _ = parse_sgcrl_builderbench_env_name(env_name)
+      _cat_select_classes = int(_num_cubes)
+      print(f'[ppo_contrastive] categorical select actor: '
+            f'{_cat_select_classes} cube classes, '
+            f'Gaussian on {5 - 1} continuous dims')
   network_factory = functools.partial(
       contrastive.make_networks,
       obs_dim=obs_dim,

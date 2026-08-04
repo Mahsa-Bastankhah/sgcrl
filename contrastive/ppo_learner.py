@@ -1645,6 +1645,7 @@ def run_ppo_training(
         permute_start_boxes=bool(
             _bb_kw.get('builderbench_permute_start_boxes', True)),
         mj_episode_length=_bb_kw.get('builderbench_mj_episode_length'),
+        fixed_start_x=_bb_kw.get('builderbench_fixed_start_x'),
     )
     print(f'[ppo] using JAX-batched BuilderBench vec env '
           f'(E={config.ppo_num_envs})')
@@ -1775,6 +1776,8 @@ def run_ppo_training(
     nf_num_blocks    = int(getattr(config, 'nf_num_blocks', 8))
     nf_coupling_w    = int(getattr(config, 'nf_coupling_width', 256))
     nf_goal_enc_size = int(getattr(config, 'nf_goal_enc_size', 0))
+    nf_sa_hidden     = int(getattr(config, 'nf_sa_hidden', 1024))
+    nf_sa_num_layers = int(getattr(config, 'nf_sa_num_layers', 4))
     nf_density_nets = _nf.make_nf_density_networks(
         obs_dim=obs_dim_cfg,
         act_dim=act_dim_cfg,
@@ -1784,6 +1787,8 @@ def run_ppo_training(
         num_blocks=nf_num_blocks,
         channels=nf_coupling_w,
         goal_enc_size=nf_goal_enc_size,
+        sa_hidden=nf_sa_hidden,
+        sa_num_layers=nf_sa_num_layers,
     )
     _goal_enc_desc = (f'goal_encoder=2x256+swish→{nf_goal_enc_size}'
                       if nf_goal_enc_size > 0 else 'goal_encoder=none (raw goal)')
@@ -1791,7 +1796,7 @@ def run_ppo_training(
           f'act_dim={act_dim_cfg}  goal_dim={goal_dim_cfg}  '
           f'rep_size={nf_rep_size}  num_blocks={nf_num_blocks}  '
           f'coupling_width={nf_coupling_w}  flow_dim={nf_density_nets.flow_dim}  '
-          f'sa_encoder=4x1024+swish  {_goal_enc_desc}')
+          f'sa_encoder={nf_sa_num_layers}x{nf_sa_hidden}+swish  {_goal_enc_desc}')
   elif use_td3 or use_crl_td3_switch:
     _td3_bilinear = bool(getattr(config, 'ppo_td3_bilinear', False))
     td3_density_nets = _td3.make_td3_density_networks(
@@ -2035,6 +2040,47 @@ def run_ppo_training(
       for _label in ('learner', 'eval'):
         _csv_path = os.path.join(_run_dir, 'logs', _label, 'logs.csv')
         _truncate_csv_to_iteration(_csv_path, int(_ckpt['iteration']))
+
+  # ---- optional frozen pretrained reward (stationary φ·ψ) ---------------
+  # Load φ/ψ from a successful CRL run and keep them fixed while training a
+  # fresh PPO policy/value. On resume of *this* run, q_params already come
+  # from this run's latest.pkl above, so skip reloading the foreign ckpt.
+  _frozen_reward_ckpt = str(
+      getattr(config, 'ppo_frozen_reward_ckpt', '') or '').strip()
+  if _frozen_reward_ckpt and start_iteration == 0:
+    if not os.path.exists(_frozen_reward_ckpt):
+      raise FileNotFoundError(
+          f'ppo_frozen_reward_ckpt not found: {_frozen_reward_ckpt}')
+    _fr = load_checkpoint(_frozen_reward_ckpt)
+    if (_fr.get('q_params_ema') is not None
+        and not use_gaussian and not use_nf and not use_fm and not use_td3):
+      _frozen_q = _fr['q_params_ema']
+      _frozen_src = 'q_params_ema'
+    else:
+      _frozen_q = _fr['q_params']
+      _frozen_src = 'q_params'
+    q_params = _frozen_q
+    q_params_reward = _tree_copy(_frozen_q)
+    # Stationary: reward reads q_params directly; no EMA / CRL updates.
+    _use_repr_ema = False
+    _repr_tau = 0.0
+    if int(config.ppo_crl_steps_per_iter) != 0:
+      print(f'[ppo] frozen reward: forcing ppo_crl_steps_per_iter '
+            f'{config.ppo_crl_steps_per_iter} -> 0')
+      config.ppo_crl_steps_per_iter = 0
+    # Re-init q optimizer state so it matches the loaded tree (unused when
+    # crl_steps=0, but keeps checkpoint dumps consistent).
+    if use_td3:
+      q_opt_state = q_optimizer.init(_td3.online_td3_params(q_params))
+    else:
+      q_opt_state = q_optimizer.init(q_params)
+    if use_td_infonce:
+      td_infonce_target_q = _tree_copy(q_params)
+    print(f'[ppo] frozen reward from {_frozen_reward_ckpt} '
+          f'(source={_frozen_src}, crl_steps=0, fresh policy/value)')
+  elif _frozen_reward_ckpt and start_iteration > 0:
+    print(f'[ppo] frozen reward ckpt configured but resuming this run '
+          f'(iter={start_iteration}); keeping q_params from latest.pkl')
 
   # TD3 optional Polyak target policy for bootstrap a' ~ π̄(·|s',g).
   _use_td3_target_policy = (
@@ -2351,6 +2397,7 @@ def run_ppo_training(
           permute_start_boxes=bool(
               _bb_kw.get('builderbench_permute_start_boxes', True)),
           mj_episode_length=_bb_kw.get('builderbench_mj_episode_length'),
+          fixed_start_x=_bb_kw.get('builderbench_fixed_start_x'),
       )
 
       @jax.jit
@@ -2481,17 +2528,21 @@ def run_ppo_training(
   external_reward_before_norm = bool(
       getattr(config, 'ppo_external_reward_before_norm', False))
   if use_external_reward:
-    if not _use_jax_bb_vec:
+    _sawyer_extrew = str(_env_name).startswith('sawyer_')
+    if not (_use_jax_bb_vec or _sawyer_extrew):
       raise ValueError(
-          'ppo_use_external_reward requires a BuilderBench jax vec env '
-          '(hard success from metrics["success"])')
+          'ppo_use_external_reward requires BuilderBench (metrics["success"]) '
+          'or a Sawyer MetaWorld env (sparse env reward as hard success)')
     _when = (
         'BEFORE reward normalisation'
         if external_reward_before_norm else
         'AFTER reward normalisation')
+    _src = (
+        'metrics["success"]' if _use_jax_bb_vec else
+        'env_reward>=0.5 (Sawyer sparse success)')
     print('[ppo] external hard-success bonus enabled: '
           f'scale={external_reward_scale:g} '
-          f'(added {_when} on success>=0.5 steps)')
+          f'(added {_when} on {_src} steps)')
 
   # ---- per-env episode buffers (for flushing complete trajectories) -----
   ep_obs: list = [[] for _ in range(E)]
@@ -2590,6 +2641,10 @@ def run_ppo_training(
       if norm_reward else None)
   _nf_normalizer_reset_done = False  # reset once when NF first activates
   _nf_stat_log: Dict[str, float] = {}  # per-dim goal mean/std, updated each iter
+  # Sparse success-step reward dump (intrinsic / extrinsic / full).
+  _extrew_diag_prints = 0
+  _extrew_diag_max = 20
+  _extrew_diag_warmup_iters = 10
 
   # ---- checkpointing ----------------------------------------------------
   ckpt_interval = int(getattr(config, 'ppo_checkpoint_interval', 0))
@@ -2778,6 +2833,12 @@ def run_ppo_training(
         next_done = dones.astype(np.float32)
         global_step += E
 
+      # Sawyer MetaWorld envs use sparse 0/1 env reward as hard success.
+      if use_external_reward and _roll_success is None:
+        _roll_success = (
+            (np.asarray(roll_env_rew, dtype=np.float32) >= 0.5)
+            .astype(np.float32))
+
     _switch_after_this_iteration = (
         use_crl_td3_switch
         and not reward_switched_to_td3
@@ -2878,6 +2939,32 @@ def run_ppo_training(
             and not external_reward_before_norm):
       roll_rew += _ext
 
+    # Occasional success-step dump (after warmup): intrinsic / extrinsic / full.
+    if (use_external_reward and _roll_success is not None
+            and iteration >= _extrew_diag_warmup_iters
+            and _extrew_diag_prints < _extrew_diag_max):
+      _succ_ij = np.argwhere(_roll_success >= 0.5)
+      if _succ_ij.size > 0:
+        _t_i, _e_i = (int(x) for x in _succ_ij[0])
+        if external_reward_before_norm:
+          _intr_raw = float(roll_rew_raw[_t_i, _e_i] - _ext[_t_i, _e_i])
+          _intr_norm = float('nan')  # mixed into return-norm with extrinsic
+        else:
+          _intr_raw = float(roll_rew_raw[_t_i, _e_i])
+          _intr_norm = float(roll_rew[_t_i, _e_i] - _ext[_t_i, _e_i])
+        _extr = float(_ext[_t_i, _e_i])
+        _full = float(roll_rew[_t_i, _e_i])
+        _extrew_diag_prints += 1
+        print(
+            f'[ppo][extrew] goal seen iter={iteration} '
+            f't={_t_i} env={_e_i} '
+            f'({_extrew_diag_prints}/{_extrew_diag_max}) '
+            f'intrinsic_raw={_intr_raw:.4g} '
+            f'extrinsic={_extr:.4g} '
+            f'intrinsic_after_norm={_intr_norm:.4g} '
+            f'full_reward={_full:.4g}',
+            flush=True)
+
     # =================================================================
     # 2. GAE advantages / returns
     # =================================================================
@@ -2970,7 +3057,11 @@ def run_ppo_training(
           _nf_stat_log[f'nf/goal_std_{_di}']  = float(_gs)
 
       _n_crl = int(config.ppo_crl_steps_per_iter)
-      if use_crl_td3_switch:
+      # Frozen-reward / stationary φ·ψ sets crl_steps=0: skip updates. The
+      # pre-sample+stack paths below would IndexError on an empty _samples.
+      if _n_crl <= 0:
+        pass
+      elif use_crl_td3_switch:
         # TD3 learns from the beginning and continues after the reward switch.
         for _ in range(_n_crl):
           if uniform_sampling:

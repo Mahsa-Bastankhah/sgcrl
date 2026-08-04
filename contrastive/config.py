@@ -184,18 +184,20 @@ class ContrastiveConfig:
   ppo_target_kl: Optional[float] = None
   # Minimum policy std for the PPO actor.  The shared `make_networks`
   # floor is 1e-6 (fine for SAC where adaptive-α controls entropy); PPO
-  # has no such mechanism and needs a larger floor (~0.05-0.1) to prevent
-  # the tanh-squashed Gaussian from collapsing to a point mass.  Passed
-  # through `network_factory` in `ppo_contrastive.py`.
-  ppo_actor_min_std: float = 0.01
+  # has no such mechanism and historically used a larger floor (~0.01)
+  # to prevent tanh-Gaussian collapse.  Currently 1e-5 — revisit if
+  # policy collapse / bad exploration shows up again.  Passed through
+  # `network_factory` in `ppo_contrastive.py`.
+  ppo_actor_min_std: float = 1e-5
   # If True, force the last action dim (BuilderBench PD `select_action`) to
   # use μ / mode only: policy std on that dim is deactivated for sampling,
   # log-prob, and entropy. Other action dims keep their stochastic policy.
   ppo_deterministic_select_dim: bool = False
-  # If True, use a hybrid actor: shared policy trunk, tanh-Gaussian mean/std
-  # on continuous action dims, and a categorical logits head over num_cubes
-  # classes for the select dim (cube ids 0..n-1).  Requires BuilderBench.
-  ppo_categorical_select: bool = False
+  # If True (default), use a hybrid actor: shared policy trunk, tanh-Gaussian
+  # mean/std on continuous action dims, and a categorical logits head over
+  # num_cubes classes for the select dim (cube ids 0..n-1).  BuilderBench
+  # creative only; ignored on other envs.  Pass --noppo_categorical_select.
+  ppo_categorical_select: bool = True
   # CRL updates per PPO iteration (InfoNCE on φ, ψ over replay).
   ppo_crl_steps_per_iter: int = 64
   # InfoNCE direction for PPO-CRL. 'forward': fix anchor sᵢ, vary goal gⱼ
@@ -227,11 +229,12 @@ class ContrastiveConfig:
   # with probability w_k / sum_i w_i. Default 1.0 recovers uniform sampling.
   ppo_success_sample_weight: float = 1.0
   # If True, add `ppo_external_reward_scale` to the PPO reward on steps where
-  # BuilderBench hard success fires (metrics['success'], threshold 0.02).
-  # By default applied after shaped-reward computation (CRL/NF/…) and after
-  # reward normalisation so the bonus is not washed out by return-std scaling.
-  # Set `ppo_external_reward_before_norm=True` to add the bonus to the raw
-  # shaped reward before return-norm instead.
+  # hard success fires: BuilderBench metrics['success'], or Sawyer MetaWorld
+  # sparse env reward (>=0.5). By default applied after shaped-reward
+  # computation (CRL/NF/…) and after reward normalisation so the bonus is not
+  # washed out by return-std scaling. Set
+  # `ppo_external_reward_before_norm=True` to add the bonus to the raw shaped
+  # reward before return-norm instead.
   ppo_use_external_reward: bool = False
   ppo_external_reward_scale: float = 100.0
   ppo_external_reward_before_norm: bool = False
@@ -325,6 +328,8 @@ class ContrastiveConfig:
   nf_rep_size: int = 256       # SA encoder output dim (conditioning vector)
   nf_num_blocks: int = 12      # number of affine coupling blocks
   nf_coupling_width: int = 512  # width of s/t sub-networks inside each block
+  nf_sa_hidden: int = 1024     # SA encoder hidden width (reference: 1024)
+  nf_sa_num_layers: int = 4    # SA encoder depth (reference: 4)
   nf_encoder_lr: float = 3e-4   # Adam lr for SA encoder (ref: actor_lr)
   nf_critic_lr: float = 1e-4    # AdamW lr for RealNVP flow (ref: critic_lr)
   nf_critic_weight_decay: float = 1e-6  # AdamW wd for RealNVP (ref)
@@ -338,6 +343,11 @@ class ContrastiveConfig:
   nf_goal_norm_low: Optional[Any] = None   # deprecated; unused
   nf_goal_norm_high: Optional[Any] = None  # deprecated; unused
   ppo_skip_first_eval: bool = False  # skip logging the iteration-0 eval (avoids artificially high checkpoint result)
+  # Path to a pretrained PPO/CRL checkpoint (.pkl). On a fresh run (no resume),
+  # load only φ/ψ (preferring q_params_ema when present) and use r=φ(s,a)·ψ(g)
+  # as a *stationary* reward. Policy/value are freshly initialized. Forces
+  # ppo_crl_steps_per_iter=0 so representations never update. Empty = disabled.
+  ppo_frozen_reward_ckpt: str = ''
   # Comma-separated PPO iterations at which to force an actor reinit
   # (in addition to the short-episode guard). Empty = schedule disabled.
   ppo_actor_reset_iters: str = ''

@@ -5,7 +5,8 @@ Run with the builderbench venv and PYTHONPATH including builderbench root, e.g.:
 
   python /n/fs/mislresearch/sgcrl/scripts/ppo_rnd_builderbench_rollout_video.py \\
       --checkpoint_dir=/abs/path/to/checkpoints/creative-4-task2__0__ppo-rnd__... \\
-      --env_id=creative-4-task2 --output=/abs/path/out --stochastic --num_episodes=2
+      --env_id=creative-4-task2 --output=/abs/path/out --stochastic --num_episodes=2 \\
+      --use_pd --pd_duration=5
 """
 
 from __future__ import annotations
@@ -35,6 +36,10 @@ def _parse_args(argv=None):
                  help='If >0, only the latest N checkpoints by index')
   p.add_argument('--skip_existing', action='store_true',
                  help='Skip outputs that already exist on disk')
+  p.add_argument('--use_pd', action='store_true',
+                 help='Match training: wrap env with PD waypoint control')
+  p.add_argument('--pd_duration', type=int, default=5,
+                 help='PD duration (must match training; default 5)')
   return p.parse_args(argv)
 
 
@@ -62,7 +67,7 @@ def main(args):
   out_dir.mkdir(parents=True, exist_ok=True)
 
   from builderbench.env_utils import make_env
-  from utils.wrapper import wrap_env
+  from utils.wrapper import wrap_env, PDWrapper
   from utils.networks import load_params
   from utils.evaluation import get_video
   from ppo_rnd import Args as RndArgs, PPONetworks, Actor, Value, make_inference_fn
@@ -72,7 +77,20 @@ def main(args):
   # BuilderBench defaults to MJX warp; match training (BUILDERBENCH_MJX_IMPL=jax).
   default_config.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
   print(f'[rnd_video] MJX impl={default_config.impl} ckpt_dir={ckpt_dir}')
-  env = wrap_env(env_class(config=default_config), default_config.episode_length)
+
+  base = env_class(config=default_config)
+  if args.use_pd:
+    assert default_config.episode_length % args.pd_duration == 0, (
+        f'episode_length {default_config.episode_length} must divide '
+        f'pd_duration {args.pd_duration}')
+    episode_length = default_config.episode_length // args.pd_duration
+    env = wrap_env(PDWrapper(base, duration=args.pd_duration), episode_length)
+    print(f'[rnd_video] PD waypoint controls pd_duration={args.pd_duration} '
+          f'macro_ep_len={episode_length}')
+  else:
+    episode_length = default_config.episode_length
+    env = wrap_env(base, episode_length)
+    print('[rnd_video] raw controls')
   action_size = env.action_size
 
   # make_inference_fn only uses policy_network; other fields unused for video.
@@ -97,7 +115,7 @@ def main(args):
     ckpts = ckpts[-args.max_ckpts:]
 
   mode = 'stoch' if args.stochastic else 'det'
-  print(f'[rnd_video] env={args.env_id} mode={mode} ep_len={default_config.episode_length}')
+  print(f'[rnd_video] env={args.env_id} mode={mode} ep_len={episode_length}')
   print(f'[rnd_video] ckpts={[c.name for c in ckpts]}')
   print(f'[rnd_video] out={out_dir}')
   print(f'[rnd_video] jax={jax.default_backend()} devices={jax.devices()}')
@@ -122,7 +140,7 @@ def main(args):
       print(f'[rnd_video] rendering {param_file.name} ep={ep} -> {out_path.name}',
             flush=True)
       frames = get_video(
-          args.env_id, policy_fn, env, video_key, default_config.episode_length)
+          args.env_id, policy_fn, env, video_key, episode_length)
       _write_video(frames, str(out_path), args.fps)
       print(f'[rnd_video] wrote {out_path} ({len(frames)} frames)')
 
