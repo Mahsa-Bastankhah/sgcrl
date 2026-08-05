@@ -3644,6 +3644,8 @@ def run_ppo_training(
           ep_metrics_list.append(ep_metrics)
 
       agg = _cu.aggregate_eval_metrics(ep_metrics_list, iteration)
+      if 'steps' in log:
+        agg['steps'] = log['steps']
       eval_logger.write(agg)
       _eval_total_s = time.time() - _eval_t0
       _gpu_part = (f'gpu={_eval_gpu_s:.2f}s '
@@ -3656,9 +3658,10 @@ def run_ppo_training(
     # =================================================================
     # 6b. Periodic deterministic video (same frozen obs_rms as eval)
     # =================================================================
+    _is_final_iter = (iteration == num_iterations - 1 or ppo_sgd_step >= total_steps)
     if (bb_video_env is not None
         and _video_interval > 0
-        and iteration % _video_interval == 0
+        and (iteration % _video_interval == 0 or _is_final_iter)
         and not (iteration == 0 and _skip_first_video)):
       from contrastive import builderbench_video as _bb_vid
       _vid_t0 = time.time()
@@ -3688,6 +3691,18 @@ def run_ppo_training(
         print(f'[ppo] video iter={iteration}: wrote {_out} '
               f'({_n_frames} frames) in {time.time() - _vid_t0:.1f}s',
               flush=True)
+        try:
+          import wandb
+          if wandb.run is not None:
+            _run_root = os.path.dirname(bb_video_dir) if bb_video_dir else None
+            if _run_root:
+              wandb.save(str(_vid_path), base_path=str(_run_root), policy="now")
+            wandb.log(
+                {"rollout_videos": wandb.Video(str(_vid_path), fps=int(_video_fps), format="mp4")},
+                step=int(iteration),
+            )
+        except Exception as _wb_v_err:
+          print(f'[ppo] video wandb log failed at iter={iteration}: {_wb_v_err}', flush=True)
       except Exception as _vid_exc:
         print(f'[ppo] video iter={iteration}: FAILED after '
               f'{time.time() - _vid_t0:.1f}s: {_vid_exc}', flush=True)

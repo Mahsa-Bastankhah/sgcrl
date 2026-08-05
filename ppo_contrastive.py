@@ -317,6 +317,21 @@ flags.DEFINE_boolean(
     'ppo_skip_first_video', True,
     'Skip the iteration-0 in-train video (random init policy).')
 flags.DEFINE_boolean(
+    'use_wandb', True,
+    'Whether to log metrics and videos online to Weights & Biases.')
+flags.DEFINE_string(
+    'wandb_project', 'dist-matching',
+    'Weights & Biases project name.')
+flags.DEFINE_string(
+    'wandb_entity', 'doina-precup',
+    'Weights & Biases entity/team name.')
+flags.DEFINE_string(
+    'wandb_mode', 'online',
+    'Weights & Biases mode: online, offline, or disabled.')
+flags.DEFINE_string(
+    'wandb_group', '',
+    'Weights & Biases group name (defaults to exp_name).')
+flags.DEFINE_boolean(
     'ppo_norm_reward', True,
     'Normalize the repr reward by the running std of discounted returns. Set False to pass raw reward directly to PPO.')
 flags.DEFINE_boolean(
@@ -830,9 +845,18 @@ def main(_):
     config.ppo_eval_episodes = int(FLAGS.ppo_eval_episodes)
   if FLAGS.ppo_video_interval >= 0:
     config.ppo_video_interval = int(FLAGS.ppo_video_interval)
+  else:
+    ckpt_iv = int(getattr(config, 'ppo_checkpoint_interval', 0) or 0)
+    eval_iv = int(getattr(config, 'ppo_eval_interval', 0) or 0)
+    config.ppo_video_interval = ckpt_iv if ckpt_iv > 0 else eval_iv
   if FLAGS.ppo_video_fps >= 0:
     config.ppo_video_fps = int(FLAGS.ppo_video_fps)
   config.ppo_skip_first_video = bool(FLAGS.ppo_skip_first_video)
+  config.use_wandb = bool(FLAGS.use_wandb)
+  config.wandb_project = str(FLAGS.wandb_project)
+  config.wandb_entity = str(FLAGS.wandb_entity)
+  config.wandb_mode = str(FLAGS.wandb_mode)
+  config.wandb_group = str(FLAGS.wandb_group)
   config.ppo_norm_reward = bool(FLAGS.ppo_norm_reward)
   config.ppo_norm_obs = bool(FLAGS.ppo_norm_obs)
   config.ppo_obs_norm_clip = float(FLAGS.ppo_obs_norm_clip)
@@ -1047,6 +1071,30 @@ def main(_):
   with open(run_config_path, 'w', encoding='utf-8') as fh:
     json.dump(run_cfg_payload, fh, indent=2, sort_keys=True)
   print(f'[ppo_contrastive] wrote run config: {run_config_path}')
+
+  # ---- WandB -------------------------------------------------------------
+  if FLAGS.use_wandb:
+    try:
+      import wandb
+      parent_name = os.path.basename(os.path.normpath(config.log_dir))
+      folder_name = f'{config.alg_name}_{config.env_name}_{seed}'
+      wandb_run_name = f'{parent_name}--{folder_name}' if parent_name else folder_name
+      wandb_group = FLAGS.wandb_group or FLAGS.exp_name or parent_name
+      wandb_run_id = f'{parent_name}_{folder_name}'.replace('/', '_')
+      wandb.init(
+          project=FLAGS.wandb_project,
+          entity=FLAGS.wandb_entity or None,
+          mode=FLAGS.wandb_mode,
+          group=wandb_group,
+          name=wandb_run_name,
+          id=wandb_run_id,
+          resume="allow",
+          config=run_cfg_payload,
+      )
+      print(f'[ppo_contrastive] initialized wandb run: {wandb_run_name} (id={wandb_run_id}, mode={FLAGS.wandb_mode})')
+    except Exception as _wb_err:
+      print(f'[ppo_contrastive] WARNING: Failed to initialize WandB: {_wb_err}')
+
   from default import make_default_logger
   logger_fn = functools.partial(
       make_default_logger,

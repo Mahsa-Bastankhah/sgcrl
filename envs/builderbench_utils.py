@@ -195,8 +195,10 @@ def get_filtered_obs_dim(num_cubes: int, obs_space_list: list[str]) -> int:
         requested.append("select")
     return sum(dim_map[s] for s in requested)
 
-def filter_pd_policy_state_obs(state_obs, num_cubes, obs_space_list: list[str]):
+def filter_pd_policy_state_obs(state_obs, num_cubes, obs_space_list: Optional[list[str]] = None):
     """Drop unwanted state components; keep components based on obs_space_list."""
+    if obs_space_list is None:
+        obs_space_list = ["xy", "select"]
     nc = int(num_cubes)
     components = {
         "xy": state_obs[..., :3 * nc],

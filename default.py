@@ -40,6 +40,47 @@ def make_serialize_fn(precision: int = 3):
   return serialize
 
 
+class WandbLogger(base.Logger):
+  """Acme logger that writes key-value dictionary metrics to wandb if active."""
+  def __init__(self, label: str):
+    self._label = label
+
+  def write(self, values: base.LoggingData) -> None:
+    try:
+      import wandb
+      if wandb.run is None:
+        return
+    except ImportError:
+      return
+
+    step = None
+    if 'iteration' in values:
+      step = int(values['iteration'])
+    elif 'learner_steps' in values:
+      step = int(values['learner_steps'])
+    elif 'steps' in values:
+      step = int(values['steps'])
+
+    formatted_values = {}
+    prefix = 'train' if self._label == 'learner' else self._label
+    for k, v in values.items():
+      v_np = base.to_numpy(v)
+      if isinstance(v_np, (int, float, np.number)):
+        v_float = float(v_np)
+        if not (np.isnan(v_float) or np.isinf(v_float)):
+          key = f"{prefix}/{k}" if '/' not in k else f"{prefix}/{k}"
+          formatted_values[key] = v_float
+
+    if formatted_values:
+      if step is not None:
+        wandb.log(formatted_values, step=step)
+      else:
+        wandb.log(formatted_values)
+
+  def close(self) -> None:
+    pass
+
+
 def make_default_logger(
     label: str,
     save_data: bool = True,
@@ -81,6 +122,8 @@ def make_default_logger(
     loggers.append(resumable_csv_logger.ResumableCSVLogger(
         label=label, directory_or_file=save_dir, add_uid=add_uid))
 
+  loggers.append(WandbLogger(label=label))
+
   # Dispatch to all writers and filter Nones and by time.
   logger = aggregators.Dispatcher(loggers, serialize_fn)
   logger = filters.NoneFilter(logger)
@@ -89,3 +132,4 @@ def make_default_logger(
   logger = filters.TimeFilter(logger, time_delta)
 
   return logger
+
