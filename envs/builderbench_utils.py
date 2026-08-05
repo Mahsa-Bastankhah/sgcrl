@@ -92,8 +92,11 @@ def list_creative_env_names() -> List[str]:
 
 
 @lru_cache(maxsize=None)
-def load_task_goal_offsets(num_cubes: int, task_index: int) -> np.ndarray:
-  """Load per-cube goal offsets from ``builderbench/tasks/creative-{N}.npz``."""
+def load_task_cube_mask(num_cubes: int, task_index: int) -> np.ndarray:
+  """Per-cube goal mask (True = cube in target/achieved goal).
+
+  Missing ``masks`` in the npz → all-True (full goal, backward compatible).
+  """
   path = _creative_task_npz_path(num_cubes)
   if not os.path.isfile(path):
     raise FileNotFoundError(
@@ -107,15 +110,69 @@ def load_task_goal_offsets(num_cubes: int, task_index: int) -> np.ndarray:
         f'got task index {task_index} (task{task_index + 1}). '
         f'Valid env names: '
         f'{", ".join(f"builderbench_creative_{num_cubes}_task{t}" for t in range(1, n_tasks + 1))}')
-  goals = np.asarray(data['goals'][task_index], dtype=np.float32)
-  return goals.reshape(-1, 3)
+  if 'masks' in data:
+    mask = np.asarray(data['masks'][task_index], dtype=bool).reshape(-1)
+  else:
+    mask = np.ones(int(num_cubes), dtype=bool)
+  if mask.shape[0] != int(num_cubes):
+    raise ValueError(
+        f'creative-{num_cubes} task{task_index + 1} mask length '
+        f'{mask.shape[0]} != num_cubes={num_cubes}')
+  if not np.any(mask):
+    raise ValueError(
+        f'creative-{num_cubes} task{task_index + 1} mask is empty')
+  return mask
+
+
+def goal_xyz_state_indices(
+    num_cubes: int,
+    task_index: int,
+    start_index: int = 0,
+) -> np.ndarray:
+  """Flat state indices of masked-in cube xyz (for LHER ``obs_to_goal``)."""
+  mask = load_task_cube_mask(num_cubes, task_index)
+  idxs: list[int] = []
+  base = int(start_index)
+  for i, keep in enumerate(mask.tolist()):
+    if keep:
+      idxs.extend([base + 3 * i, base + 3 * i + 1, base + 3 * i + 2])
+  return np.asarray(idxs, dtype=np.int32)
+
+
+@lru_cache(maxsize=None)
+def load_task_goal_offsets(num_cubes: int, task_index: int) -> np.ndarray:
+  """Load masked-in per-cube goal offsets from ``creative-{N}.npz``.
+
+  Returns shape ``(num_task_cubes, 3)`` — only cubes with mask True.
+  """
+  path = _creative_task_npz_path(num_cubes)
+  if not os.path.isfile(path):
+    raise FileNotFoundError(
+        f'BuilderBench task file not found: {path!r} '
+        f'(set BUILDERBENCH_ROOT if the repo lives elsewhere).')
+  data = np.load(path)
+  n_tasks = int(data['goals'].shape[0])
+  if task_index < 0 or task_index >= n_tasks:
+    raise ValueError(
+        f'creative-{num_cubes} has {n_tasks} task(s) (task1..task{n_tasks}); '
+        f'got task index {task_index} (task{task_index + 1}). '
+        f'Valid env names: '
+        f'{", ".join(f"builderbench_creative_{num_cubes}_task{t}" for t in range(1, n_tasks + 1))}')
+  goals = np.asarray(data['goals'][task_index], dtype=np.float32).reshape(-1, 3)
+  mask = load_task_cube_mask(num_cubes, task_index)
+  return goals[mask]
 
 
 def default_fixed_target_goal(num_cubes: int, task_index: int) -> np.ndarray:
-  """Fixed ``target_goal`` = sampling midpoint + task offsets (all creative tasks)."""
+  """Fixed ``target_goal`` = sampling midpoint + masked task offsets."""
   offsets = load_task_goal_offsets(num_cubes, task_index)
   return (_TARGET_SAMPLING_MID.reshape(1, 3) + offsets).reshape(-1).astype(
       np.float32)
+
+
+def creative_goal_dim(num_cubes: int, task_index: int = 0) -> int:
+  """Goal vector length = ``3 * num_masked_in_cubes``."""
+  return int(3 * int(np.sum(load_task_cube_mask(num_cubes, task_index))))
 
 
 def creative_cube_mj_episode_length(num_cubes: int, task_index: int = 0) -> int:
@@ -167,6 +224,27 @@ def filter_pd_policy_state_obs(state_obs, num_cubes: int):
     return np.concatenate([pos, select], axis=-1)
   import jax.numpy as jnp
   return jnp.concatenate([pos, select], axis=-1)
+
+
+def set_task_mocap_pos(mocap_pos, mocap_targets, fixed_pos):
+  """Write task-cube xyz into ``mocap_pos`` for unbatched or batched states.
+
+  Batched MJX states have ``mocap_pos`` shape ``[E, n_mocap, 3]``. Indexing
+  with ``.at[mocap_targets]`` incorrectly scatters along the *env* axis, which
+  breaks masked tasks (e.g. creative-5-task3 with targets ``[1,3,4]``) and only
+  updates the first ``n_task`` envs on full-mask tasks. Always index the mocap
+  axis for rank-3 arrays.
+  """
+  import jax.numpy as jnp
+  pos = jnp.asarray(mocap_pos)
+  targets = jnp.asarray(mocap_targets)
+  fixed = jnp.asarray(fixed_pos, dtype=jnp.float32)
+  if pos.ndim == 2:
+    return pos.at[targets].set(fixed)
+  if pos.ndim != 3:
+    raise ValueError(f'Unexpected mocap_pos rank {pos.ndim}; expected 2 or 3')
+  fixed_b = jnp.broadcast_to(fixed, (pos.shape[0],) + tuple(fixed.shape))
+  return pos.at[:, targets].set(fixed_b)
 
 
 def apply_fixed_start_x(creative_cube, fixed_start_x: float | None) -> None:
@@ -265,23 +343,36 @@ def ppo_env_defaults(
   fallback defaults if neither is a passed.
   """
   episode_length = creative_cube_mj_episode_length(num_cubes, task_index)
-  goal_dim = num_cubes * 3
+  # Full cube-xyz region in state (used when mask is all-True).
+  pos_end = int(num_cubes) * 3
+  goal_dim = creative_goal_dim(num_cubes, task_index)
+  mask = load_task_cube_mask(num_cubes, task_index)
+  # Non-contiguous masks need explicit gather indices for LHER obs_to_goal.
+  goal_state_indices = None
+  if int(np.sum(mask)) < int(num_cubes):
+    goal_state_indices = goal_xyz_state_indices(
+        num_cubes, task_index, start_index=0).tolist()
   if use_pd:
-    return dict(
+    out = dict(
         start_index=0,
-        end_index=goal_dim,
+        end_index=pos_end if goal_state_indices is not None else goal_dim,
         checkpoint_interval=150,
     )
-  rollout_length = min(512, max(256, episode_length))
-  return dict(
-      rollout_length=rollout_length,
-      crl_steps_per_iter=rollout_length // 2,
-      start_index=0,
-      end_index=goal_dim,
-      num_envs=64,
-      eval_interval=0,
-      checkpoint_interval=150,
-  )
+  else:
+    rollout_length = min(512, max(256, episode_length))
+    out = dict(
+        rollout_length=rollout_length,
+        crl_steps_per_iter=rollout_length // 2,
+        start_index=0,
+        end_index=pos_end if goal_state_indices is not None else goal_dim,
+        num_envs=64,
+        eval_interval=0,
+        checkpoint_interval=150,
+    )
+  if goal_state_indices is not None:
+    out['goal_state_indices'] = goal_state_indices
+    out['goal_dim'] = goal_dim
+  return out
 
 
 BUILDERBENCH_NUM_STEPS = 200_000_000

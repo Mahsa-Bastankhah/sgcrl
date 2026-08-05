@@ -168,6 +168,7 @@ def _normalize_packed_obs(
     end_index: int,
     clip: float,
     enabled: bool,
+    goal_state_indices=None,
 ) -> jnp.ndarray:
   """Normalize packed ``[state; goal]`` observations from state-only stats."""
   if not enabled:
@@ -177,8 +178,13 @@ def _normalize_packed_obs(
   state = obs[..., :obs_dim]
   goal = obs[..., obs_dim:]
   state_norm = (state - mean) / jnp.sqrt(jnp.maximum(var, 1e-8))
-  goal_mean = mean[start_index:end_index]
-  goal_var = var[start_index:end_index]
+  if goal_state_indices is not None:
+    idx = jnp.asarray(goal_state_indices, dtype=jnp.int32)
+    goal_mean = mean[idx]
+    goal_var = var[idx]
+  else:
+    goal_mean = mean[start_index:end_index]
+    goal_var = var[start_index:end_index]
   goal_norm = (goal - goal_mean) / jnp.sqrt(jnp.maximum(goal_var, 1e-8))
   normalized = jnp.clip(
       jnp.concatenate([state_norm, goal_norm], axis=-1), -clip, clip)
@@ -279,12 +285,18 @@ class EpisodeReplay:
 
   def __init__(self, capacity: int, obs_dim: int, discount: float,
                start_index: int, end_index: int,
-               success_sample_weight: float = 1.0):
+               success_sample_weight: float = 1.0,
+               goal_state_indices=None):
     self._cap = capacity
     self._obs_dim = obs_dim               # state slice size
     self._discount = float(discount)
     self._start_index = start_index
     self._end_index = end_index
+    if goal_state_indices is None:
+      self._goal_state_indices = None
+    else:
+      self._goal_state_indices = np.asarray(
+          goal_state_indices, dtype=np.int32).reshape(-1)
     self._success_sample_weight = float(success_sample_weight)
     if self._success_sample_weight <= 0.0:
       raise ValueError(
@@ -345,7 +357,13 @@ class EpisodeReplay:
   # Internal helpers
   # ---------------------------------------------------------------------
   def _obs_to_goal(self, states: np.ndarray) -> np.ndarray:
-    """Equivalent to `contrastive/utils.py::obs_to_goal_2d`."""
+    """Equivalent to `contrastive/utils.py::obs_to_goal_2d`.
+
+    When ``goal_state_indices`` is set (BuilderBench cube masks), gather those
+    coordinates instead of a contiguous ``start:end`` slice.
+    """
+    if self._goal_state_indices is not None:
+      return states[:, self._goal_state_indices]
     if self._end_index == -1:
       return states[:, self._start_index:]
     return states[:, self._start_index:self._end_index]
@@ -576,6 +594,7 @@ def make_reward_fn(
   si = int(config.start_index)
   ei = int(config.end_index if config.end_index != -1 else obs_dim)
   norm_clip = float(getattr(config, 'ppo_obs_norm_clip', 10.0))
+  gidx = getattr(config, 'goal_state_indices', None)
 
   @jax.jit
   def reward_fn(q_params: networks_lib.Params,
@@ -583,7 +602,8 @@ def make_reward_fn(
                 obs_mean: jnp.ndarray, obs_var: jnp.ndarray) -> jnp.ndarray:
     obs = _normalize_packed_obs(
         obs, obs_mean, obs_var, obs_dim=obs_dim, start_index=si,
-        end_index=ei, clip=norm_clip, enabled=norm_obs)
+        end_index=ei, clip=norm_clip, enabled=norm_obs,
+        goal_state_indices=gidx)
     _, sa_repr, g_repr = networks.q_network.apply(q_params, obs, action)
     return jnp.sum(sa_repr * g_repr, axis=-1)  # (B,)
   return reward_fn
@@ -744,6 +764,7 @@ def make_ppo_update_fn(
   si = int(config.start_index)
   ei = int(config.end_index if config.end_index != -1 else obs_dim)
   norm_clip = float(getattr(config, 'ppo_obs_norm_clip', 10.0))
+  gidx = getattr(config, 'goal_state_indices', None)
   det_select = bool(getattr(config, 'ppo_deterministic_select_dim', False))
 
   def ppo_loss(params, batch, key, obs_mean, obs_var, step=None):
@@ -751,7 +772,8 @@ def make_ppo_update_fn(
                 else ent_coef_const)
     network_obs = _normalize_packed_obs(
         batch['obs'], obs_mean, obs_var, obs_dim=obs_dim, start_index=si,
-        end_index=ei, clip=norm_clip, enabled=norm_obs)
+        end_index=ei, clip=norm_clip, enabled=norm_obs,
+        goal_state_indices=gidx)
     # ---- policy forward ----
     dist = _policy_dist_maybe_det_select(
         networks.policy_network.apply(params['policy'], network_obs),
@@ -879,12 +901,16 @@ def make_crl_update_fn(
   norm_clip = float(
       getattr(config, 'ppo_obs_norm_clip', 10.0)
       if config is not None else 10.0)
+  gidx = (
+      getattr(config, 'goal_state_indices', None)
+      if config is not None else None)
 
   def critic_loss(q_params, batch, key, obs_mean, obs_var):
     del key
     obs = _normalize_packed_obs(
         batch['obs'], obs_mean, obs_var, obs_dim=obs_dim, start_index=si,
-        end_index=ei, clip=norm_clip, enabled=norm_obs)
+        end_index=ei, clip=norm_clip, enabled=norm_obs,
+        goal_state_indices=gidx)
     action = batch['action']
     batch_size = obs.shape[0]
     labels = jnp.eye(batch_size)
@@ -1001,6 +1027,7 @@ def make_td_infonce_update_fn(
     action_high: Optional[np.ndarray] = None,
     n_action_bins: int = 100,
     logsumexp_penalty_coef: float = 0.01,
+    goal_state_indices=None,
 ):
   """TD InfoNCE CRL critic update (Zheng et al. 2023 style).
 
@@ -1037,8 +1064,12 @@ def make_td_infonce_update_fn(
     → ``(new_q_params, new_q_opt_state, new_target_q_params, metrics_dict)``
   """
   del twin_q  # twin vs single inferred from logit ndim at runtime
+  _gidx = None if goal_state_indices is None else jnp.asarray(
+      goal_state_indices, dtype=jnp.int32)
 
   def obs_to_goal(obs):
+    if _gidx is not None:
+      return obs[:, _gidx]
     if end_index == -1:
       return obs[:, start_index:]
     return obs[:, start_index:end_index]
@@ -1534,16 +1565,36 @@ def _bb_ep_metrics_from_eval_steps(
     start_index: int,
     end_index: int,
     episode_length: int,
+    goal_state_indices=None,
 ) -> list:
-  """Per-env eval metrics from a BuilderBench GPU eval scan."""
+  """Per-env eval metrics from a BuilderBench GPU eval scan.
+
+  When ``goal_state_indices`` is set (masked creative tasks), gather those
+  state coords so distances match the (shorter) goal vector. Contiguous
+  ``start_index:end_index`` alone is wrong for non-contiguous masks — e.g.
+  creative-5-task3 state xyz is 15-D while goals are 9-D.
+  """
+  del obs_dim  # kept for call-site compat; width comes from goals / indices
   rewards = np.asarray(steps['reward'], dtype=np.float32)
   success = np.asarray(steps['success'], dtype=np.float32)
   state_obs = np.asarray(steps['state_obs'], dtype=np.float32)
   goals = np.asarray(steps['goal'], dtype=np.float32)
-  ei = int(obs_dim if end_index == -1 else end_index)
-  si = int(start_index)
-  goal_slice = goals[..., : max(1, ei - si)]
-  state_slice = state_obs[..., si:ei]
+  if goal_state_indices is not None:
+    gidx = np.asarray(goal_state_indices, dtype=np.int32).reshape(-1)
+    state_slice = state_obs[..., gidx]
+    goal_slice = goals[..., : int(gidx.shape[0])]
+  else:
+    ei = int(goals.shape[-1] if end_index == -1 else end_index)
+    si = int(start_index)
+    gdim = int(goals.shape[-1])
+    # Clamp to goal width so a too-wide end_index cannot crash dist metrics.
+    state_slice = state_obs[..., si:si + gdim]
+    goal_slice = goals[..., :gdim]
+    if state_slice.shape[-1] != goal_slice.shape[-1]:
+      raise ValueError(
+          'eval dist slice mismatch: '
+          f'state{state_slice.shape} vs goal{goal_slice.shape} '
+          f'(start_index={si}, end_index={ei}, goal_dim={gdim})')
   dists = np.linalg.norm(state_slice - goal_slice, axis=-1)
 
   ep_metrics_list = []
@@ -1710,19 +1761,35 @@ def run_ppo_training(
   norm_si = int(config.start_index)
   norm_ei = int(
       config.end_index if int(config.end_index) != -1 else obs_dim_cfg)
+  _goal_state_indices = getattr(config, 'goal_state_indices', None)
+  if _goal_state_indices is not None:
+    _goal_state_indices = tuple(int(x) for x in _goal_state_indices)
+    if len(_goal_state_indices) != goal_dim_cfg:
+      raise ValueError(
+          'goal_state_indices length must equal goal_dim; '
+          f'got len={len(_goal_state_indices)}, goal_dim={goal_dim_cfg}')
+    if (min(_goal_state_indices) < 0
+        or max(_goal_state_indices) >= obs_dim_cfg):
+      raise ValueError(
+          'goal_state_indices must lie in [0, obs_dim); '
+          f'got {_goal_state_indices}, obs_dim={obs_dim_cfg}')
   _configured_reward_mode = (
       getattr(config, 'ppo_reward_mode', '') or '').strip().lower()
   if norm_obs:
-    if not 0 <= norm_si < norm_ei <= obs_dim_cfg:
-      raise ValueError(
-          'ppo_norm_obs requires 0 <= start_index < end_index <= obs_dim; '
-          f'got start_index={norm_si}, end_index={norm_ei}, '
-          f'obs_dim={obs_dim_cfg}')
-    if goal_dim_cfg != norm_ei - norm_si:
-      raise ValueError(
-          'ppo_norm_obs maps each goal coordinate to state stats from '
-          'start_index:end_index, so dimensions must match; '
-          f'goal_dim={goal_dim_cfg}, state slice={norm_ei - norm_si}')
+    if _goal_state_indices is None:
+      if not 0 <= norm_si < norm_ei <= obs_dim_cfg:
+        raise ValueError(
+            'ppo_norm_obs requires 0 <= start_index < end_index <= obs_dim; '
+            f'got start_index={norm_si}, end_index={norm_ei}, '
+            f'obs_dim={obs_dim_cfg}')
+      if goal_dim_cfg != norm_ei - norm_si:
+        raise ValueError(
+            'ppo_norm_obs maps each goal coordinate to state stats from '
+            'start_index:end_index, so dimensions must match; '
+            f'goal_dim={goal_dim_cfg}, state slice={norm_ei - norm_si}')
+      _goal_stats_msg = f'state[{norm_si}:{norm_ei}]'
+    else:
+      _goal_stats_msg = f'state[goal_state_indices]={_goal_state_indices}'
     if not np.isfinite(obs_norm_clip) or obs_norm_clip <= 0.0:
       raise ValueError(
           f'ppo_obs_norm_clip must be finite and > 0, got {obs_norm_clip}')
@@ -1735,10 +1802,13 @@ def run_ppo_training(
           'separate density-coordinate semantics and are intentionally '
           'rejected.')
     print(f'[ppo] observation normalization enabled: state_dim={obs_dim_cfg}, '
-          f'goal_stats=state[{norm_si}:{norm_ei}], clip={obs_norm_clip}; '
+          f'goal_stats={_goal_stats_msg}, clip={obs_norm_clip}; '
           'rollout/replay storage remains raw')
   else:
     print('[ppo] observation normalization disabled')
+  if _goal_state_indices is not None:
+    print(f'[ppo] LHER obs_to_goal uses goal_state_indices='
+          f'{_goal_state_indices} (goal_dim={goal_dim_cfg})')
   # Zero pseudo-count plus mean=0/var=1 makes iteration zero exactly identity.
   obs_rms = RunningMeanStd(shape=(obs_dim_cfg,), epsilon=0.0)
 
@@ -2180,6 +2250,7 @@ def run_ppo_training(
             getattr(config, 'ppo_td3_cross_batch_goals', False)),
         normalize_obs=norm_obs,
         obs_norm_clip=obs_norm_clip,
+        goal_state_indices=_goal_state_indices,
     )
     print('[ppo] init: make_td3_reward_fn...', flush=True)
     td3_reward_fn = _td3.make_td3_reward_fn(
@@ -2191,6 +2262,7 @@ def run_ppo_training(
         end_index=norm_ei,
         normalize_obs=norm_obs,
         obs_norm_clip=obs_norm_clip,
+        goal_state_indices=_goal_state_indices,
     )
     gaussian_reward_fn = None
     nf_reward_fn = None
@@ -2269,6 +2341,7 @@ def run_ppo_training(
           action_low=_act_low,
           action_high=_act_high,
           logsumexp_penalty_coef=_tdi_lse,
+          goal_state_indices=_goal_state_indices,
       )
       del td_infonce_update_uniform  # unused (policy bootstrap only)
       crl_update = td_infonce_update  # policy-bootstrap variant
@@ -2328,6 +2401,7 @@ def run_ppo_training(
             getattr(config, 'ppo_td3_cross_batch_goals', False)),
         normalize_obs=norm_obs,
         obs_norm_clip=obs_norm_clip,
+        goal_state_indices=_goal_state_indices,
     )
     hybrid_td3_reward_fn = _td3.make_td3_reward_fn(
         td3_density_nets,
@@ -2338,6 +2412,7 @@ def run_ppo_training(
         end_index=norm_ei,
         normalize_obs=norm_obs,
         obs_norm_clip=obs_norm_clip,
+        goal_state_indices=_goal_state_indices,
     )
     print(f'[ppo] CRL→TD3 switch enabled: threshold='
           f'{_switch_goal_visits} completed hard-goal visits; '
@@ -2365,7 +2440,8 @@ def run_ppo_training(
   def act_and_value(policy_p, value_p, obs, rng, obs_mean, obs_var):
     network_obs = _normalize_packed_obs(
         obs, obs_mean, obs_var, obs_dim=obs_dim_cfg, start_index=norm_si,
-        end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs)
+        end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs,
+        goal_state_indices=_goal_state_indices)
     dist = _policy_dist_maybe_det_select(
         networks.policy_network.apply(policy_p, network_obs), _det_select)
     action = networks.sample(dist, rng)
@@ -2404,7 +2480,8 @@ def run_ppo_training(
       def eval_policy_action(policy_p, obs, obs_mean, obs_var):
         network_obs = _normalize_packed_obs(
             obs, obs_mean, obs_var, obs_dim=obs_dim_cfg, start_index=norm_si,
-            end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs)
+            end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs,
+        goal_state_indices=_goal_state_indices)
         dist = networks.policy_network.apply(policy_p, network_obs)
         return dist.mode()
 
@@ -2471,7 +2548,8 @@ def run_ppo_training(
   def value_only(value_p, obs, obs_mean, obs_var):
     obs = _normalize_packed_obs(
         obs, obs_mean, obs_var, obs_dim=obs_dim_cfg, start_index=norm_si,
-        end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs)
+        end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs,
+        goal_state_indices=_goal_state_indices)
     return networks.value_network.apply(value_p, obs)
 
   @jax.jit
@@ -2479,7 +2557,8 @@ def run_ppo_training(
     # Deterministic policy mean for evaluation.
     obs = _normalize_packed_obs(
         obs, obs_mean, obs_var, obs_dim=obs_dim_cfg, start_index=norm_si,
-        end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs)
+        end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs,
+        goal_state_indices=_goal_state_indices)
     dist = networks.policy_network.apply(policy_p, obs)
     return networks.sample(dist, jax.random.PRNGKey(0))  # sample still; we log both below
 
@@ -2490,11 +2569,18 @@ def run_ppo_training(
     import env_utils as _env_utils
     if hasattr(vec_env, 'uniform_goal_obs_bounds'):
       glo, ghi = vec_env.uniform_goal_obs_bounds()
-      si, ei = int(config.start_index), int(config.end_index)
-      if ei == -1:
-        ei = int(config.obs_dim)
-      goal_low = np.asarray(glo[si:ei], dtype=np.float32)
-      goal_high = np.asarray(ghi[si:ei], dtype=np.float32)
+      glo = np.asarray(glo, dtype=np.float32).reshape(-1)
+      ghi = np.asarray(ghi, dtype=np.float32).reshape(-1)
+      # Bounds are already in goal space (masked offsets). Use directly when
+      # length matches goal_dim; otherwise fall back to state-slice indexing.
+      if glo.shape[0] == goal_dim_cfg:
+        goal_low, goal_high = glo, ghi
+      else:
+        si, ei = int(config.start_index), int(config.end_index)
+        if ei == -1:
+          ei = int(config.obs_dim)
+        goal_low = glo[si:ei]
+        goal_high = ghi[si:ei]
     else:
       goal_low, goal_high = _env_utils.resolve_uniform_goal_bounds(
           spec, vec_env._envs[0], int(config.obs_dim),
@@ -2514,7 +2600,8 @@ def run_ppo_training(
       discount=float(config.discount),
       start_index=int(config.start_index),
       end_index=int(config.end_index),
-      success_sample_weight=_success_sample_weight)
+      success_sample_weight=_success_sample_weight,
+      goal_state_indices=_goal_state_indices)
   np_rng = np.random.default_rng(seed + 12345)
   if _success_sample_weight != 1.0:
     print('[ppo] CRL episode sampling: successful trajectories weight='
@@ -2850,7 +2937,8 @@ def run_ppo_training(
       _norm = np.asarray(_normalize_packed_obs(
           jnp.asarray(_raw[None]), iter_obs_mean_j, iter_obs_var_j,
           obs_dim=obs_dim_cfg, start_index=norm_si, end_index=norm_ei,
-          clip=obs_norm_clip, enabled=True)[0])
+          clip=obs_norm_clip, enabled=True,
+          goal_state_indices=_goal_state_indices)[0])
       print(f'[ppo][obs_norm] iter={iteration} raw  '
             f'state={np.array2string(_raw[:obs_dim_cfg], precision=3)} '
             f'goal={np.array2string(_raw[obs_dim_cfg:], precision=3)}')
@@ -3409,6 +3497,7 @@ def run_ppo_training(
             start_index=int(config.start_index),
             end_index=int(config.end_index),
             episode_length=int(bb_eval_vec.episode_length),
+            goal_state_indices=_goal_state_indices,
         )
         ep_metrics_list = _smooth_bb_eval_metrics(
             ep_metrics_list, eval_success_obs, eval_dist_obs)
@@ -3490,6 +3579,7 @@ def run_ppo_training(
             obs_norm_clip=float(obs_norm_clip),
             fps=int(_video_fps),
             out_path=_vid_path,
+            goal_state_indices=_goal_state_indices,
         )
         print(f'[ppo] video iter={iteration}: wrote {_out} '
               f'({_n_frames} frames) in {time.time() - _vid_t0:.1f}s',

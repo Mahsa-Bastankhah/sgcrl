@@ -52,6 +52,7 @@ from envs.builderbench_utils import (
     is_builderbench_creative_env,
     parse_bb_env_id,
     pd_policy_state_obs_dim,
+    set_task_mocap_pos,
     sgcrl_env_name_to_bb_env_id,
     video_render_skip_reason,
 )
@@ -119,16 +120,18 @@ def _maybe_force_target(
     mocap_targets,
     num_cubes: int,
 ):
+  del num_cubes  # full scene count; masked goals may be shorter
   if fixed_target_goal is None:
     return state
   fixed = jnp.asarray(fixed_target_goal, dtype=jnp.float32).reshape(-1)
-  fixed_pos = fixed.reshape(num_cubes, 3)
+  fixed_pos = fixed.reshape(int(fixed.shape[0] // 3), 3)
   info = dict(state.info)
   info['target_goal'] = jnp.broadcast_to(
       fixed, state.info['target_goal'].shape)
   info['target_mocap_pos'] = jnp.broadcast_to(
       fixed_pos, state.info['target_mocap_pos'].shape)
-  mocap_pos = state.data.mocap_pos.at[mocap_targets].set(fixed_pos)
+  mocap_pos = set_task_mocap_pos(
+      state.data.mocap_pos, mocap_targets, fixed_pos)
   data = state.data.replace(mocap_pos=mocap_pos)
   return state.replace(data=data, info=info)
 
@@ -313,7 +316,7 @@ def _make_bb_env(env_id: str, ctx: _TrainCtx):
     cfg.nconmax, cfg.njmax = _MJX_PARAMS[env_id]
 
   base = CreativeCube(config=cfg)
-  mocap_targets = base._mocap_targets
+  mocap_targets = base._task_mocap_targets
 
   if ctx.use_pd:
     assert cfg.episode_length % ctx.pd_duration == 0, (

@@ -633,6 +633,13 @@ def main(_):
       config.start_index = int(env_defaults['start_index'])
     if 'end_index' in env_defaults:
       config.end_index = int(env_defaults['end_index'])
+    if 'goal_state_indices' in env_defaults:
+      config.goal_state_indices = tuple(
+          int(x) for x in env_defaults['goal_state_indices'])
+      print(f'[ppo_contrastive] goal_state_indices='
+            f'{config.goal_state_indices} '
+            f'(masked LHER goal_dim='
+            f'{len(config.goal_state_indices)})')
     if 'num_envs' in env_defaults and FLAGS.ppo_num_envs < 0:
       config.ppo_num_envs = int(env_defaults['num_envs'])
     if ('eval_interval' in env_defaults

@@ -236,7 +236,7 @@ class ContrastiveConfig:
   # `ppo_external_reward_before_norm=True` to add the bonus to the raw shaped
   # reward before return-norm instead.
   ppo_use_external_reward: bool = False
-  ppo_external_reward_scale: float = 100.0
+  ppo_external_reward_scale: float = 1.0
   ppo_external_reward_before_norm: bool = False
   # Checkpointing: save policy/value/CRL params every N PPO iterations.
   # At default settings (8 envs × 128 steps = 1024 env-steps/iter), 100
@@ -378,6 +378,10 @@ class ContrastiveConfig:
   max_episode_steps: int = -1
   start_index: int = 0
   end_index: int = -1
+  # Optional non-contiguous state indices for LHER ``obs_to_goal`` (e.g.
+  # BuilderBench cube masks). When set, HER gathers ``state[:, indices]``
+  # instead of ``state[:, start_index:end_index]``.
+  goal_state_indices: Optional[Tuple[int, ...]] = None
 
   def __post_init__(self):
     # Map legacy mode strings to current vocabulary.

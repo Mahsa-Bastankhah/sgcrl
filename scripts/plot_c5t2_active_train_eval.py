@@ -31,14 +31,12 @@ SLURM_DIR = base.SLURM_DIR
 FIGS_DIR = base.FIGS_DIR
 GROUP = 'creative5_task2'
 
-# Keep legend order: live norand runs first, then prior NF overlays.
+# Keep legend order: live norand / nopermute NF runs only (drop weak
+# catselect-only / cat+ext1 / noperm+cat+ext1 baselines).
 C5T2_RUNS = [
     'ppo_builderbench_creative5_task2_e1024_pd_nf_tiny_sa2x128_r32_b4_w128_tau05_actorreset_nopermute_norand_evalvid_catselect_extrew1',
     'ppo_builderbench_creative5_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_actorreset_nopermute_norand_evalvid_catselect_extrew1',
     'ppo_builderbench_creative5_task2_e1024_pd_nf_tau05_actorreset_nopermute_norand_evalvid_catselect_extrew1',
-    'ppo_builderbench_creative5_task2_e1024_pd_nf_tau05_actorreset_evalvid_catselect',
-    'ppo_builderbench_creative5_task2_e1024_pd_nf_tau05_actorreset_evalvid_catselect_extrew1',
-    'ppo_builderbench_creative5_task2_e1024_pd_nf_tau05_actorreset_nopermute_evalvid_catselect_extrew1',
 ]
 
 
