@@ -48,6 +48,8 @@ from envs.builderbench_utils import (
     parse_bb_env_id,
     scaled_episode_length,
     validate_pd_episode_length,
+    pd_policy_state_obs_dim,
+    set_task_mocap_pos,
     uniform_goal_obs_bounds as _uniform_goal_obs_bounds,
 )
 
@@ -192,14 +194,14 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     if self._fixed_target_goal is None:
       return state
     fixed = jnp.asarray(self._fixed_target_goal, dtype=jnp.float32).reshape(-1)
-    num_cubes = self._num_cubes
-    fixed_pos = fixed.reshape(num_cubes, 3)
+    num_task_cubes = int(self._base_env._num_task_cubes)
+    fixed_pos = fixed.reshape(num_task_cubes, 3)
     info = dict(state.info)
     info['target_goal'] = fixed
     # Video / render_from_info reads info['target_mocap_pos'], not data.mocap_pos.
     info['target_mocap_pos'] = fixed_pos
-    mocap_pos = state.data.mocap_pos.at[self._base_env._mocap_targets].set(
-        fixed_pos)
+    mocap_pos = set_task_mocap_pos(
+        state.data.mocap_pos, self._base_env._task_mocap_targets, fixed_pos)
     data = state.data.replace(mocap_pos=mocap_pos)
     return state.replace(data=data, info=info)
 

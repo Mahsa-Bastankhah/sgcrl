@@ -1,23 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=xyz_reeval_axyood
-#SBATCH --output=slurm/xyz_reeval_axyood_%A_%a.log
-#SBATCH --error=slurm/xyz_reeval_axyood_%A_%a.log
+#SBATCH --job-name=xyz_reeval_axyood_fm
+#SBATCH --output=slurm/xyz_reeval_axyood_fm_%j.log
+#SBATCH --error=slurm/xyz_reeval_axyood_fm_%j.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem=48G
 #SBATCH --gres=gpu:1
-#SBATCH --time=03:00:00
+#SBATCH --time=12:00:00
 #SBATCH --account=seas
-#SBATCH --array=0-6
 
-# Parallel axy-OOD reeval (one mode per array task), then a dependent
-# plot job reads the saved metrics/probes:
-#   array 0=crl,1=nf,2=nf_compact,3=td3,4=fm,5=tdinfonce,6=nf_tiny
-#
-# Submit with plot dependency, e.g.:
-#   J=$(sbatch --parsable jobs/job_xyz_density_reeval_axy_ood.slurm)
-#   sbatch --dependency=afterok:${J} jobs/job_xyz_density_plot_refresh.slurm
+# Finish FM axy-OOD reeval (a_x,a_y ~ U[2,4], a_z=0). The 16G array
+# task OOMed after iter 800; this job uses 48G and then refreshes plots.
 unset LD_PRELOAD
 
 module purge
@@ -81,22 +75,20 @@ export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 LOG_ROOT="${LOG_ROOT:-logs/xyz_density_az0_g05_100m}"
+FIG_DIR="${FIG_DIR:-figs/xyz_density_az0_g05_100m}"
 AXY_LOW="${AXY_LOW:-2}"
 AXY_HIGH="${AXY_HIGH:-4}"
-MODES=(crl nf nf_compact td3 fm tdinfonce nf_tiny)
-MODE=${MODE:-${MODES[${SLURM_ARRAY_TASK_ID:-0}]}}
 
-mkdir -p slurm
+mkdir -p slurm "${FIG_DIR}"
 
-echo "SLURM_JOB_ID=${SLURM_JOB_ID} array=${SLURM_ARRAY_TASK_ID}"
-echo "log_root=${LOG_ROOT} mode=${MODE}"
-echo "axy_ood eval: a_x,a_y ~ U[${AXY_LOW},${AXY_HIGH}], a_z=0"
+echo "SLURM_JOB_ID=${SLURM_JOB_ID}"
+echo "log_root=${LOG_ROOT} mode=fm axy=[${AXY_LOW},${AXY_HIGH}]"
 nvidia-smi || true
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX', jax.default_backend(), jax.devices())"
 
 set -e
 
-echo "=== reeval axy-OOD cat-acc + density probes (${MODE}) ==="
+echo "=== reeval axy-OOD cat-acc + density probes (fm) ==="
 python -u xyz_density/reeval_state_ood.py \
   --log_root="${LOG_ROOT}" \
   --target=axy_ood \
@@ -106,7 +98,13 @@ python -u xyz_density/reeval_state_ood.py \
   --val_batch_size=256 \
   --val_num_envs=128 \
   --noise_std=0.01 \
-  --modes="${MODE}"
+  --modes=fm
 
-echo "=== done (${MODE}) ==="
+echo "=== refresh plots (incl. axy_ood) ==="
+python -u xyz_density/plot_results.py \
+  --log_root="${LOG_ROOT}" \
+  --out_dir="${FIG_DIR}" \
+  --batch_size=256
+
+echo "=== done ==="
 pkill -P $$ 2>/dev/null || true

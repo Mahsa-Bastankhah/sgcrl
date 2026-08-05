@@ -223,6 +223,7 @@ def make_td3_density_update_fn(
     cross_batch_goals: bool = True,
     normalize_obs: bool = False,
     obs_norm_clip: float = 10.0,
+    goal_state_indices=None,
 ):
   """Jitted TD3 twin-Q update over one EpisodeReplay batch.
 
@@ -254,8 +255,12 @@ def make_td3_density_update_fn(
   use_obs_norm = bool(normalize_obs)
   norm_clip = float(obs_norm_clip)
   norm_ei = int(obs_dim if ei == -1 else ei)
+  _gidx = None if goal_state_indices is None else jnp.asarray(
+      goal_state_indices, dtype=jnp.int32)
 
   def _state_as_goal(state: jnp.ndarray) -> jnp.ndarray:
+    if _gidx is not None:
+      return state[:, _gidx]
     if ei == -1:
       return state[:, si:]
     return state[:, si:ei]
@@ -268,8 +273,11 @@ def make_td3_density_update_fn(
     state = obs[..., :obs_dim]
     goal = obs[..., obs_dim:]
     state = (state - obs_mean) / jnp.sqrt(jnp.maximum(obs_var, 1e-8))
-    goal = ((goal - obs_mean[si:norm_ei])
-            / jnp.sqrt(jnp.maximum(obs_var[si:norm_ei], 1e-8)))
+    if _gidx is not None:
+      g_mean, g_var = obs_mean[_gidx], obs_var[_gidx]
+    else:
+      g_mean, g_var = obs_mean[si:norm_ei], obs_var[si:norm_ei]
+    goal = (goal - g_mean) / jnp.sqrt(jnp.maximum(g_var, 1e-8))
     normalized = jnp.clip(jnp.concatenate([state, goal], axis=-1),
                           -norm_clip, norm_clip)
     return jnp.where(active, normalized, obs)
@@ -426,6 +434,7 @@ def make_td3_reward_fn(
     end_index: int = -1,
     normalize_obs: bool = False,
     obs_norm_clip: float = 10.0,
+    goal_state_indices=None,
 ):
   """Jitted PPO reward from the online (or EMA) twin critic.
 
@@ -439,6 +448,8 @@ def make_td3_reward_fn(
   ei = int(obs_dim if end_index == -1 else end_index)
   use_obs_norm = bool(normalize_obs)
   norm_clip = float(obs_norm_clip)
+  _gidx = None if goal_state_indices is None else jnp.asarray(
+      goal_state_indices, dtype=jnp.int32)
 
   @jax.jit
   def reward_fn(
@@ -451,8 +462,12 @@ def make_td3_reward_fn(
       raw_obs = obs
       state = ((obs[..., :obs_dim] - obs_mean)
                / jnp.sqrt(jnp.maximum(obs_var, 1e-8)))
-      goal = ((obs[..., obs_dim:] - obs_mean[si:ei])
-              / jnp.sqrt(jnp.maximum(obs_var[si:ei], 1e-8)))
+      if _gidx is not None:
+        g_mean, g_var = obs_mean[_gidx], obs_var[_gidx]
+      else:
+        g_mean, g_var = obs_mean[si:ei], obs_var[si:ei]
+      goal = ((obs[..., obs_dim:] - g_mean)
+              / jnp.sqrt(jnp.maximum(g_var, 1e-8)))
       obs = jnp.clip(
           jnp.concatenate([state, goal], axis=-1), -norm_clip, norm_clip)
       obs = jnp.where(active, obs, raw_obs)

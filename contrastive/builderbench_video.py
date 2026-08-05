@@ -25,6 +25,7 @@ from envs.builderbench_utils import (
     creative_cube_mj_episode_length,
     filter_pd_policy_state_obs,
     parse_bb_env_id,
+    set_task_mocap_pos,
     sgcrl_env_name_to_bb_env_id,
 )
 
@@ -59,7 +60,8 @@ def make_bb_video_env(
     cfg.nconmax, cfg.njmax = _MJX_PARAMS[env_id]
 
   base = CreativeCube(config=cfg)
-  mocap_targets = base._mocap_targets
+  # Masked-in goal mocaps only (equals all mocaps when mask is all-True).
+  mocap_targets = base._task_mocap_targets
 
   if use_pd:
     assert cfg.episode_length % pd_duration == 0, (
@@ -81,16 +83,24 @@ def make_bb_video_env(
 
 
 def _maybe_fix_target(state, fixed_target_goal, mocap_targets, num_cubes: int):
+  """Overwrite target goal / mocaps. ``num_cubes`` kept for call-site compat.
+
+  Goal length may be ``3 * num_task_cubes`` when cube masks are active; reshape
+  uses ``len(fixed) // 3`` rather than ``num_cubes``.
+  """
+  del num_cubes  # full scene cube count; goal may be shorter under masks
   if fixed_target_goal is None:
     return state
   fixed = jnp.asarray(fixed_target_goal, dtype=jnp.float32).reshape(-1)
-  fixed_pos = fixed.reshape(num_cubes, 3)
+  num_task_cubes = int(fixed.shape[0] // 3)
+  fixed_pos = fixed.reshape(num_task_cubes, 3)
   info = dict(state.info)
   info['target_goal'] = jnp.broadcast_to(
       fixed, state.info['target_goal'].shape)
   info['target_mocap_pos'] = jnp.broadcast_to(
       fixed_pos, state.info['target_mocap_pos'].shape)
-  mocap_pos = state.data.mocap_pos.at[mocap_targets].set(fixed_pos)
+  mocap_pos = set_task_mocap_pos(
+      state.data.mocap_pos, mocap_targets, fixed_pos)
   data = state.data.replace(mocap_pos=mocap_pos)
   return state.replace(data=data, info=info)
 
@@ -123,6 +133,7 @@ def render_deterministic_episode(
     obs_norm_clip: float = 10.0,
     fps: int = 10,
     out_path: str,
+    goal_state_indices=None,
 ) -> Tuple[str, int]:
   """Roll out one deterministic episode with live obs stats and write mp4.
 
@@ -136,6 +147,7 @@ def render_deterministic_episode(
   _si = int(start_index)
   _ei = int(end_index if end_index != -1 else obs_dim)
   _clip = float(obs_norm_clip)
+  _gidx = goal_state_indices
   policy_apply = networks.policy_network.apply
 
   @jax.jit
@@ -146,7 +158,7 @@ def render_deterministic_episode(
     packed = _normalize_packed_obs(
         packed, obs_mean, obs_var,
         obs_dim=_obs_dim, start_index=_si, end_index=_ei,
-        clip=_clip, enabled=_norm)
+        clip=_clip, enabled=_norm, goal_state_indices=_gidx)
     dist = policy_apply(policy_params, packed)
     return dist.mode()
 

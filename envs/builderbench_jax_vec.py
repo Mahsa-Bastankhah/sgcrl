@@ -79,6 +79,8 @@ from envs.builderbench_utils import (
     filter_pd_policy_state_obs,
     get_filtered_obs_dim,
     parse_bb_env_id,
+    pd_policy_state_obs_dim,
+    set_task_mocap_pos,
     sgcrl_env_name_to_bb_env_id,
     uniform_goal_obs_bounds as _uniform_goal_obs_bounds,
 )
@@ -127,19 +129,20 @@ def _maybe_fix_target(
     state: State,
     fixed_target_goal: Optional[jax.Array],
     mocap_targets: jax.Array,
-    num_cubes: int,
+    num_task_cubes: int,
 ) -> State:
   if fixed_target_goal is None:
     return state
   fixed = jnp.asarray(fixed_target_goal, dtype=jnp.float32).reshape(-1)
-  fixed_pos = fixed.reshape(num_cubes, 3)
+  fixed_pos = fixed.reshape(int(num_task_cubes), 3)
   goal = jnp.broadcast_to(fixed, state.info['target_goal'].shape)
   info = dict(state.info)
   info['target_goal'] = goal
   # Keep render key in sync (video uses info['target_mocap_pos']).
   info['target_mocap_pos'] = jnp.broadcast_to(
       fixed_pos, state.info['target_mocap_pos'].shape)
-  mocap_pos = state.data.mocap_pos.at[mocap_targets].set(fixed_pos)
+  mocap_pos = set_task_mocap_pos(
+      state.data.mocap_pos, mocap_targets, fixed_pos)
   data = state.data.replace(mocap_pos=mocap_pos)
   return state.replace(data=data, info=info)
 
@@ -198,7 +201,9 @@ class JaxBuilderBenchVecEnv:
 
     base = CreativeCube(config=cfg)
     apply_fixed_start_x(base, self._fixed_start_x)
-    self._mocap_targets = base._mocap_targets
+    # Masked-in goal mocaps only (equals all mocaps when mask is all-True).
+    self._mocap_targets = base._task_mocap_targets
+    self._num_task_cubes = int(base._num_task_cubes)
     if self._use_pd:
       validate_pd_episode_length(cfg.episode_length, self._pd_duration)
       inner = PDWrapper(base, duration=self._pd_duration)
@@ -247,13 +252,15 @@ class JaxBuilderBenchVecEnv:
   def _reset_impl(self, rng: jax.Array) -> State:
     state = self._env.reset(rng)
     return _maybe_fix_target(
-        state, self._fixed_target_goal, self._mocap_targets, self._num_cubes)
+        state, self._fixed_target_goal, self._mocap_targets,
+        self._num_task_cubes)
 
   def _step_impl(self, state: State, actions: jax.Array) -> State:
     actions = jnp.clip(actions, -1.0, 1.0)
     state = self._env.step(state, actions)
     return _maybe_fix_target(
-        state, self._fixed_target_goal, self._mocap_targets, self._num_cubes)
+        state, self._fixed_target_goal, self._mocap_targets,
+        self._num_task_cubes)
 
   def uniform_goal_obs_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
     return _uniform_goal_obs_bounds(self._num_cubes, self._task_id)

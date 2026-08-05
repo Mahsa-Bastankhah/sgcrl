@@ -408,8 +408,16 @@ def make_environment(env_name, start_index, end_index,
   np.random.seed(seed)
   gym_env, obs_dim, max_episode_steps = env_utils.load(
       env_name, fixed_start_end, seed, **env_kwargs)
-  goal_indices = obs_dim + obs_to_goal_1d(np.arange(obs_dim), start_index,
-                                          end_index)
+  # Classic envs pack obs = [state | state_as_goal] and the filter keeps
+  # state plus goal[start_index:end_index]. BuilderBench (and similar)
+  # pack a compact goal of length ``goal_dim`` (e.g. masked cube xyz), so
+  # slicing with end_index=num_cubes*3 would index past the packed goal.
+  packed_goal_dim = getattr(gym_env, 'goal_dim', None)
+  if packed_goal_dim is not None:
+    goal_indices = obs_dim + np.arange(int(packed_goal_dim))
+  else:
+    goal_indices = obs_dim + obs_to_goal_1d(
+        np.arange(obs_dim), start_index, end_index)
   indices = np.concatenate([
       np.arange(obs_dim),
       goal_indices
