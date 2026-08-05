@@ -239,6 +239,30 @@ flags.DEFINE_integer(
 flags.DEFINE_boolean(
     'fm_layer_norm', False,
     'FM mode: apply LayerNorm inside the velocity MLP (FAC-style).')
+flags.DEFINE_boolean(
+    'fm_time_embedding', False,
+    'FM mode: apply Fourier sinusoidal embeddings to scalar time t.')
+flags.DEFINE_integer(
+    'fm_time_embed_dim', 32,
+    'FM mode: output dimension for Fourier time embedding.')
+flags.DEFINE_string(
+    'fm_ode_solver', 'euler',
+    "FM mode: ODE solver for reverse-ODE log-density & sampling ('euler' | 'heun').")
+flags.DEFINE_string(
+    'fm_t_sample_mode', 'uniform',
+    "FM mode: timestep sampling distribution for training ('uniform' | 'logit_normal').")
+flags.DEFINE_float(
+    'fm_t_logit_loc', 0.0,
+    'FM mode: location (mean) for Logit-Normal timestep sampling.')
+flags.DEFINE_float(
+    'fm_t_logit_scale', 1.0,
+    'FM mode: scale (std) for Logit-Normal timestep sampling.')
+flags.DEFINE_float(
+    'fm_goal_noise_std', 0.0,
+    'FM mode: Gaussian noise std added to future goals s_f during training updates (0 = disabled).')
+flags.DEFINE_boolean(
+    'fm_norm_goals', False,
+    'FM mode: normalize goal vectors s_f to unit variance before flow density updates.')
 flags.DEFINE_integer(
     'nf_rep_size', 64,
     'NF mode: SA encoder output dim (conditioning vector size).')
@@ -775,6 +799,17 @@ def main(_):
   if FLAGS.fm_hutch_probes >= 0:
     config.fm_hutch_probes = int(FLAGS.fm_hutch_probes)
   config.fm_layer_norm = bool(FLAGS.fm_layer_norm)
+  config.fm_time_embedding = bool(FLAGS.fm_time_embedding)
+  if FLAGS.fm_time_embed_dim > 0:
+    config.fm_time_embed_dim = int(FLAGS.fm_time_embed_dim)
+  if str(FLAGS.fm_ode_solver or '').strip():
+    config.fm_ode_solver = str(FLAGS.fm_ode_solver).strip().lower()
+  if str(FLAGS.fm_t_sample_mode or '').strip():
+    config.fm_t_sample_mode = str(FLAGS.fm_t_sample_mode).strip().lower()
+  config.fm_t_logit_loc = float(FLAGS.fm_t_logit_loc)
+  config.fm_t_logit_scale = float(FLAGS.fm_t_logit_scale)
+  config.fm_goal_noise_std = float(FLAGS.fm_goal_noise_std)
+  config.fm_norm_goals = bool(FLAGS.fm_norm_goals)
   config.ppo_dirac_eps = float(FLAGS.ppo_dirac_eps)
   config.nf_rep_size = int(FLAGS.nf_rep_size)
   config.nf_num_blocks = int(FLAGS.nf_num_blocks)

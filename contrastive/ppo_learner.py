@@ -1591,6 +1591,7 @@ def _save_checkpoint(path: str,
                      ppo_opt_state, q_opt_state,
                      iteration: int, global_step: int, key,
                      q_params_ema=None,
+                     td3_policy_target=None,
                      obs_norm_mean=None,
                      obs_norm_var=None,
                      obs_norm_count=None,
@@ -1922,6 +1923,9 @@ def run_ppo_training(
         getattr(config, 'fm_logp_mode', 'exact') or 'exact').strip().lower()
     _fm_hutch_probes = int(getattr(config, 'fm_hutch_probes', 8))
     _fm_layer_norm = bool(getattr(config, 'fm_layer_norm', False))
+    _fm_time_embed = bool(getattr(config, 'fm_time_embedding', False))
+    _fm_embed_dim = int(getattr(config, 'fm_time_embed_dim', 32))
+    _fm_ode_solver = str(getattr(config, 'fm_ode_solver', 'euler') or 'euler').strip().lower()
     fm_density_nets = _fm.make_fm_density_networks(
         obs_dim=obs_dim_cfg,
         act_dim=act_dim_cfg,
@@ -1929,12 +1933,16 @@ def run_ppo_training(
         hidden_layer_sizes=config.hidden_layer_sizes,
         flow_steps=_fm_flow_steps,
         layer_norm=_fm_layer_norm,
+        time_embedding=_fm_time_embed,
+        time_embed_dim=_fm_embed_dim,
+        ode_solver=_fm_ode_solver,
     )
     print(f'[ppo] repr_mode=fm (OT flow matching)  obs_dim={obs_dim_cfg}  '
           f'act_dim={act_dim_cfg}  goal_dim={goal_dim_cfg}  '
           f'hidden_layers={config.hidden_layer_sizes}  '
           f'flow_steps={_fm_flow_steps}  logp_mode={_fm_logp_mode}  '
-          f'velocity=ResidualMLP')
+          f'time_embed={_fm_time_embed}(dim={_fm_embed_dim})  '
+          f'ode_solver={_fm_ode_solver}')
   elif use_nf:
     nf_rep_size      = int(getattr(config, 'nf_rep_size', 64))
     nf_num_blocks    = int(getattr(config, 'nf_num_blocks', 8))
@@ -2260,14 +2268,26 @@ def run_ppo_training(
       print(f'[ppo] Gaussian reward param EMA: tau={_repr_tau} '
             f'(density training still uses online Gaussian params)')
   elif use_fm:
+    _fm_t_sample_mode = str(getattr(config, 'fm_t_sample_mode', 'uniform') or 'uniform').strip().lower()
+    _fm_t_logit_loc = float(getattr(config, 'fm_t_logit_loc', 0.0))
+    _fm_t_logit_scale = float(getattr(config, 'fm_t_logit_scale', 1.0))
+    _fm_ode_solver = str(getattr(config, 'fm_ode_solver', 'euler') or 'euler').strip().lower()
+    _fm_goal_noise_std = float(getattr(config, 'fm_goal_noise_std', 0.0))
+
     crl_update = _fm.make_fm_density_update_fn(
-        fm_density_nets, q_optimizer, obs_dim=int(config.obs_dim))
+        fm_density_nets, q_optimizer, obs_dim=int(config.obs_dim),
+        t_sample_mode=_fm_t_sample_mode,
+        t_logit_loc=_fm_t_logit_loc,
+        t_logit_scale=_fm_t_logit_scale,
+        goal_noise_std=_fm_goal_noise_std,
+    )
     fm_reward_fn = _fm.make_fm_reward_fn(
         fm_density_nets,
         obs_dim=int(config.obs_dim),
         logp_mode=str(getattr(config, 'fm_logp_mode', 'exact') or 'exact'),
         flow_steps=int(getattr(config, 'fm_flow_steps', 10)),
         hutch_probes=int(getattr(config, 'fm_hutch_probes', 8)),
+        ode_solver=_fm_ode_solver,
     )
     gaussian_reward_fn = None
     nf_reward_fn = None

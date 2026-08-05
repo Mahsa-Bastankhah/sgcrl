@@ -322,6 +322,14 @@ class ContrastiveConfig:
   fm_logp_mode: str = 'exact'      # 'exact' | 'hutch-rade' | 'hutch-gaus'
   fm_hutch_probes: int = 8         # Hutchinson probes when using hutch-* modes
   fm_layer_norm: bool = False      # LayerNorm inside velocity MLP (FAC-style)
+  fm_time_embedding: bool = False  # Fourier sinusoidal time embedding for t
+  fm_time_embed_dim: int = 32      # Dim for Fourier time embedding
+  fm_ode_solver: str = 'euler'     # ODE solver: 'euler' | 'heun'
+  fm_t_sample_mode: str = 'uniform'# Timestep sampling: 'uniform' | 'logit_normal'
+  fm_t_logit_loc: float = 0.0      # Logit-Normal mean
+  fm_t_logit_scale: float = 1.0    # Logit-Normal std scale
+  fm_goal_noise_std: float = 0.0   # Gaussian noise added to future goals s_f during training (0 = disabled)
+  fm_norm_goals: bool = False      # Normalize goal vectors s_f to unit variance before flow estimation
   # NF-specific options (only used when ppo_repr_mode == 'nf').
   nf_rep_size: int = 256       # SA encoder output dim (conditioning vector)
   nf_num_blocks: int = 12      # number of affine coupling blocks
