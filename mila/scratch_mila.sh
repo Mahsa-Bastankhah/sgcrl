@@ -59,16 +59,55 @@ EXPERIMENTS=(
     # "td3_tol|--env=builderbench_creative_4_task1 --ppo_repr_mode=td3 --ppo_td3_goal_tol=0.04 --noppo_td3_cross_batch_goals --ppo_td3_log_reward --ppo_td3_reward_tau=0.5 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=300000000"
 
     # --- Active Experiments: Extended Timesteps & Multi-Stage Entropy Annealing (600M Steps) ---
-    "ext_ent_anneal_05_to_01|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000"
-    "ext_ent_anneal_05_to_005|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.005 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000"
-    "ext_ent_anneal_10_to_005|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.10 --ppo_ent_coef_final=0.005 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000"
-    "ext_ent_anneal_05_precision|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.01 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000"
+    # "ext_ent_anneal_05_to_01|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000"
+    # "ext_ent_anneal_05_to_005|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.005 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000"
+    # "ext_ent_anneal_10_to_005|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.10 --ppo_ent_coef_final=0.005 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000"
+    # "ext_ent_anneal_05_precision|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.01 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000"
+    #
+    # # --- Active Experiments: Good Experience Replay & Bootstrapping (SIL & Mixed) ---
+    # "good_buf_sil|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_use_good_buffer=True --ppo_good_buffer_mode=sil --ppo_good_buffer_min_cubes=2 --ppo_good_buffer_coef=0.1 --num_steps=600000000"
+    # "good_buf_sil|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_use_good_buffer=True --ppo_good_buffer_mode=sil --ppo_good_buffer_min_cubes=4 --ppo_good_buffer_coef=0.1 --num_steps=600000000"
+    # "good_buf_mixed|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_use_good_buffer=True --ppo_good_buffer_mode=mixed --ppo_good_buffer_min_cubes=2 --ppo_good_buffer_coef=0.5 --num_steps=600000000"
+    # "good_buf_mixed|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_use_good_buffer=True --ppo_good_buffer_mode=mixed --ppo_good_buffer_min_cubes=4 --ppo_good_buffer_coef=0.5 --num_steps=600000000"
 
-    # --- Active Experiments: Good Experience Replay & Bootstrapping (SIL & Mixed) ---
-    "good_buf_sil|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_use_good_buffer=True --ppo_good_buffer_mode=sil --ppo_good_buffer_min_cubes=2 --ppo_good_buffer_coef=0.1 --num_steps=600000000"
-    "good_buf_sil|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_use_good_buffer=True --ppo_good_buffer_mode=sil --ppo_good_buffer_min_cubes=4 --ppo_good_buffer_coef=0.1 --num_steps=600000000"
-    "good_buf_mixed|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_use_good_buffer=True --ppo_good_buffer_mode=mixed --ppo_good_buffer_min_cubes=2 --ppo_good_buffer_coef=0.5 --num_steps=600000000"
-    "good_buf_mixed|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.03 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_use_good_buffer=True --ppo_good_buffer_mode=mixed --ppo_good_buffer_min_cubes=4 --ppo_good_buffer_coef=0.5 --num_steps=600000000"
+    # --- Active Flow Matching Experiments ---
+    # Hue: Baseline
+    # "pd_fm_creative3_task1_baseline|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select"
+
+    # # Hue: Time Embedding (dim=32)
+    # "pd_fm_creative3_task1_time_embed|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32"
+    #
+    # # Hue: Time Embedding (dim=64)
+    # "pd_fm_creative3_task1_time_embed|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=64"
+    #
+    # # Hue: ODE Solver (Heun 2nd-Order)
+    # "pd_fm_creative3_task1_heun|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_ode_solver=heun"
+    #
+    # # Hue: Timestep Sampling (LogitNormal scale=1.0)
+    # "pd_fm_creative3_task1_logit_normal|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0"
+    #
+    # # Hue: Timestep Sampling (LogitNormal scale=1.5)
+    # "pd_fm_creative3_task1_logit_normal|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.5"
+    #
+    # # Hue: All Techniques Combined
+    # "pd_fm_creative3_task1_all_tricks|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0"
+
+    #
+    # "pd_fm_creative3_task1_baseline_anneal_ent_coeff|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
+    # "pd_fm_creative3_task1_all_tricks_anneal_ent_coeff|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
+    # "pd_fm_creative3_task1_all_tricks_anneal_ent_coeff_fm_steps|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=20 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
+    #
+    #
+    # "pd_fm_creative3_task1_all_tricks|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --num_steps=600000_000"
+
+    # Hue: Goal Noise Augmentation (std=0.02)
+    "pd_fm_creative3_task1_goal_noise|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_goal_noise_std=0.02"
+
+    # Hue: Goal Normalization
+    "pd_fm_creative3_task1_goal_norm|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_norm_goals=True"
+
+    # Hue: All Tricks + Goal Noise + Goal Norm
+    "pd_fm_creative3_task1_all_tricks_noise_norm|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --fm_goal_noise_std=0.02 --fm_norm_goals=True"
 )
 
 mkdir -p "$SCRIPT_DIR/slurm_logs"
@@ -130,7 +169,7 @@ ${CMD}
 EOT
 
             echo "Submitting ${EXP_NAME} | env=${ENV_ID} | seed=${seed}..."
-            # TRAIN_OUTPUT=$(sbatch "$SLURM_SCRIPT")
+            TRAIN_OUTPUT=$(sbatch "$SLURM_SCRIPT")
             TRAIN_JOB_ID=$(echo "$TRAIN_OUTPUT" | awk '{print $4}')
             echo "  Training Job ID: $TRAIN_JOB_ID"
 
@@ -145,7 +184,7 @@ EOT
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G
 #SBATCH --output=%j.out
-##SBATCH --dependency=afterany:${TRAIN_JOB_ID}
+#SBATCH --dependency=afterany:${TRAIN_JOB_ID}
 
 module unload python; module load anaconda/3
 conda activate sgcrl_builderbench
