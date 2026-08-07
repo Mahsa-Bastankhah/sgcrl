@@ -427,7 +427,162 @@ def make_fm_density_update_fn(
     metrics = dict(metrics)
     metrics['grad_norm'] = _tree_l2_norm(grads)
     metrics['update_skipped_nonfinite'] = 1.0 - do_update.astype(jnp.float32)
-    return new_params, new_opt_state, metrics
+  return jax.jit(update)
+
+
+# ---------------------------------------------------------------------------
+# 5b. TD-Flow Bellman Probability Path Training Update
+# ---------------------------------------------------------------------------
+
+def generate_target_goals_bootstrapped(
+    fm_networks: FMDensityNetworks,
+    target_params: networks_lib.Params,
+    next_state: jnp.ndarray,
+    next_action: jnp.ndarray,
+    key: jax.random.PRNGKey,
+    boot_steps: int = 1,
+    ode_solver: str = 'euler',
+    goal_dim: Optional[int] = None,
+) -> jnp.ndarray:
+  """Integrate target velocity field v_phi starting from Gaussian noise x_0 ~ N(0, I)
+  for `boot_steps` to produce bootstrapped goal samples x_1_boot from next_state s_1."""
+  b = next_state.shape[0]
+  if goal_dim is None:
+    g_dim = next_state.shape[-1]
+  else:
+    g_dim = goal_dim
+
+  key_x0, key_loop = jax.random.split(key)
+  x_0 = jax.random.normal(key_x0, (b, g_dim), dtype=next_state.dtype)
+
+  n = max(1, boot_steps)
+  dt = 1.0 / float(n)
+
+  if ode_solver == 'heun' and n > 1:
+    def body_fun_heun(i, x_cur):
+      t1 = i * dt
+      t2 = (i + 1) * dt
+      t1_vec = jnp.full((b, 1), t1, dtype=x_cur.dtype)
+      t2_vec = jnp.full((b, 1), t2, dtype=x_cur.dtype)
+      v1 = fm_networks.velocity_net.apply(
+          target_params, next_state, next_action, x_cur, t1_vec)
+      x_pred = x_cur + dt * v1
+      v2 = fm_networks.velocity_net.apply(
+          target_params, next_state, next_action, x_pred, t2_vec)
+      return x_cur + 0.5 * dt * (v1 + v2)
+
+    return jax.lax.fori_loop(0, n, body_fun_heun, x_0)
+  else:
+    def body_fun_euler(i, x_cur):
+      t_val = i * dt
+      t_vec = jnp.full((b, 1), t_val, dtype=x_cur.dtype)
+      vel = fm_networks.velocity_net.apply(
+          target_params, next_state, next_action, x_cur, t_vec)
+      return x_cur + dt * vel
+
+    return jax.lax.fori_loop(0, n, body_fun_euler, x_0)
+
+
+def make_td_fm_density_update_fn(
+    fm_networks: FMDensityNetworks,
+    optimizer: optax.GradientTransformation,
+    obs_dim: int,
+    gamma: float = 0.99,
+    target_tau: float = 0.005,
+    boot_steps: int = 1,
+    ode_solver: str = 'euler',
+    t_sample_mode: str = 'uniform',
+    t_logit_loc: float = 0.0,
+    t_logit_scale: float = 1.0,
+    goal_noise_std: float = 0.0,
+):
+  """Jitted TD-Flow update function leveraging Bellman targets on probability paths."""
+
+  def _loss(online_params, target_params, batch, key):
+    obs = batch['obs']
+    action = batch['action']
+    next_obs = batch['next_obs']
+
+    state = obs[:, :obs_dim]
+    goal_dim = obs.shape[-1] - obs_dim
+
+    # 1-step next state and action
+    next_state = next_obs[:, :obs_dim]
+    next_action = batch.get('next_action', action)
+
+    # 1-step next state goal: g_1 = obs_to_goal(s_1)
+    g_1 = next_obs[:, obs_dim:]
+
+    b = state.shape[0]
+    key_x0, key_t, key_m, key_boot, key_g = jax.random.split(key, 5)
+
+    if goal_noise_std > 0.0:
+      g_1 = g_1 + jax.random.normal(key_g, g_1.shape, dtype=g_1.dtype) * goal_noise_std
+
+    # Bootstrapped goal sample x_1_boot starting from s_1
+    x_1_boot = generate_target_goals_bootstrapped(
+        fm_networks, target_params, next_state, next_action,
+        key_boot, boot_steps=boot_steps, ode_solver=ode_solver,
+        goal_dim=goal_dim)
+
+    # Bernoulli mixture mask m ~ Bernoulli(1 - gamma)
+    # True -> 1-step immediate target g_1 = obs_to_goal(s_1)
+    # False -> Bootstrapped target x_1_boot
+    mask_1step = jax.random.bernoulli(key_m, p=1.0 - gamma, shape=(b, 1))
+    x_1_target = jnp.where(mask_1step, g_1, x_1_boot)
+
+    x_0 = jax.random.normal(key_x0, x_1_target.shape, dtype=x_1_target.dtype)
+    t = sample_timesteps(
+        key_t, (b, 1), mode=t_sample_mode,
+        logit_loc=t_logit_loc, logit_scale=t_logit_scale, dtype=x_1_target.dtype)
+
+    x_t = (1.0 - t) * x_0 + t * x_1_target
+    vel_target = x_1_target - x_0
+
+    vel_pred = fm_networks.velocity_net.apply(
+        online_params, state, action, x_t, t)
+    sq_err = jnp.mean((vel_pred - vel_target) ** 2, axis=-1)
+    loss = jnp.mean(sq_err)
+
+    metrics = {
+        'density_loss': loss,
+        'td_fm_loss': loss,
+        'vel_pred_norm': jnp.mean(jnp.linalg.norm(vel_pred, axis=-1)),
+        'vel_target_norm': jnp.mean(jnp.linalg.norm(vel_target, axis=-1)),
+        'x1_target_norm': jnp.mean(jnp.linalg.norm(x_1_target, axis=-1)),
+        'x1_boot_norm': jnp.mean(jnp.linalg.norm(x_1_boot, axis=-1)),
+        'ratio_1step': jnp.mean(mask_1step.astype(jnp.float32)),
+    }
+    return loss, metrics
+
+  grad_fn = jax.value_and_grad(_loss, has_aux=True)
+
+  def update(online_params, target_params, opt_state, batch, key):
+    (_, metrics), grads = grad_fn(online_params, target_params, batch, key)
+
+    grads_finite = jnp.all(jnp.asarray(jax.tree_util.tree_leaves(
+        jax.tree_util.tree_map(lambda g: jnp.all(jnp.isfinite(g)), grads))))
+    loss_finite = jnp.isfinite(metrics['density_loss'])
+    do_update = jnp.logical_and(grads_finite, loss_finite)
+
+    def _apply(_):
+      updates, new_opt_state = optimizer.update(grads, opt_state, online_params)
+      new_online = optax.apply_updates(online_params, updates)
+      new_target = jax.tree_util.tree_map(
+          lambda t, o: (1.0 - target_tau) * t + target_tau * o,
+          target_params, new_online)
+      return new_online, new_target, new_opt_state
+
+    def _skip(_):
+      return online_params, target_params, opt_state
+
+    new_online, new_target, new_opt_state = jax.lax.cond(
+        do_update, _apply, _skip, operand=None)
+
+    metrics = dict(metrics)
+    metrics['grad_norm'] = _tree_l2_norm(grads)
+    metrics['update_skipped_nonfinite'] = 1.0 - do_update.astype(jnp.float32)
+    return new_online, new_target, new_opt_state, metrics
 
   return jax.jit(update)
 

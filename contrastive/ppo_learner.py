@@ -2018,6 +2018,7 @@ def run_ppo_training(
     q_params = density_nets.density_net.init(k_q)
   elif use_fm:
     q_params = _fm.init_fm_params(fm_density_nets, k_q)
+    target_fm_params = q_params if bool(getattr(config, 'fm_td_mode', False)) else None
   elif use_nf:
     q_params = _nf.init_nf_params(nf_density_nets, k_q)
   elif use_td3:
@@ -2273,14 +2274,33 @@ def run_ppo_training(
     _fm_t_logit_scale = float(getattr(config, 'fm_t_logit_scale', 1.0))
     _fm_ode_solver = str(getattr(config, 'fm_ode_solver', 'euler') or 'euler').strip().lower()
     _fm_goal_noise_std = float(getattr(config, 'fm_goal_noise_std', 0.0))
+    _fm_td_mode = bool(getattr(config, 'fm_td_mode', False))
 
-    crl_update = _fm.make_fm_density_update_fn(
-        fm_density_nets, q_optimizer, obs_dim=int(config.obs_dim),
-        t_sample_mode=_fm_t_sample_mode,
-        t_logit_loc=_fm_t_logit_loc,
-        t_logit_scale=_fm_t_logit_scale,
-        goal_noise_std=_fm_goal_noise_std,
-    )
+    if _fm_td_mode:
+      _fm_td_gamma = float(getattr(config, 'fm_td_gamma', 0.99))
+      _fm_td_target_tau = float(getattr(config, 'fm_td_target_tau', 0.005))
+      _fm_td_boot_steps = int(getattr(config, 'fm_td_boot_steps', 1))
+      crl_update = _fm.make_td_fm_density_update_fn(
+          fm_density_nets, q_optimizer, obs_dim=int(config.obs_dim),
+          gamma=_fm_td_gamma,
+          target_tau=_fm_td_target_tau,
+          boot_steps=_fm_td_boot_steps,
+          ode_solver=_fm_ode_solver,
+          t_sample_mode=_fm_t_sample_mode,
+          t_logit_loc=_fm_t_logit_loc,
+          t_logit_scale=_fm_t_logit_scale,
+          goal_noise_std=_fm_goal_noise_std,
+      )
+      print(f'[ppo] FM density using TD-Flow (Bellman probability path targets: '
+            f'gamma={_fm_td_gamma}, target_tau={_fm_td_target_tau}, boot_steps={_fm_td_boot_steps})')
+    else:
+      crl_update = _fm.make_fm_density_update_fn(
+          fm_density_nets, q_optimizer, obs_dim=int(config.obs_dim),
+          t_sample_mode=_fm_t_sample_mode,
+          t_logit_loc=_fm_t_logit_loc,
+          t_logit_scale=_fm_t_logit_scale,
+          goal_noise_std=_fm_goal_noise_std,
+      )
     fm_reward_fn = _fm.make_fm_reward_fn(
         fm_density_nets,
         obs_dim=int(config.obs_dim),
@@ -3345,6 +3365,9 @@ def run_ppo_training(
             q_params, q_opt_state, td_infonce_target_q, m = crl_update(
                 q_params, q_opt_state, td_infonce_target_q,
                 ppo_params['policy'], crl_batch, k_crl)
+          elif use_fm and _fm_td_mode:
+            q_params, target_fm_params, q_opt_state, m = crl_update(
+                q_params, target_fm_params, q_opt_state, crl_batch, k_crl)
           else:
             q_params, q_opt_state, m = crl_update(
                 q_params, q_opt_state, crl_batch, k_crl)

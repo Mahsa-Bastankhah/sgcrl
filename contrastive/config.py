@@ -330,6 +330,10 @@ class ContrastiveConfig:
   fm_t_logit_scale: float = 1.0    # Logit-Normal std scale
   fm_goal_noise_std: float = 0.0   # Gaussian noise added to future goals s_f during training (0 = disabled)
   fm_norm_goals: bool = False      # Normalize goal vectors s_f to unit variance before flow estimation
+  fm_td_mode: bool = False         # If True, use TD-Flow (Bellman probability path targets)
+  fm_td_gamma: float = 0.99        # Discount factor gamma for TD-Flow Bellman target mixture
+  fm_td_target_tau: float = 0.005  # Polyak EMA soft update rate for target vector field v_phi
+  fm_td_boot_steps: int = 1        # ODE steps for train-time bootstrapped target state generation
   # NF-specific options (only used when ppo_repr_mode == 'nf').
   nf_rep_size: int = 256       # SA encoder output dim (conditioning vector)
   nf_num_blocks: int = 12      # number of affine coupling blocks
