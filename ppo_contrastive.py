@@ -264,6 +264,18 @@ flags.DEFINE_float(
 flags.DEFINE_boolean(
     'fm_norm_goals', False,
     'FM mode: normalize goal vectors s_f to unit variance before flow density updates.')
+flags.DEFINE_boolean(
+    'fm_td_mode', False,
+    'FM mode: use TD-Flow (Bellman probability path targets) for density updates.')
+flags.DEFINE_float(
+    'fm_td_gamma', 0.99,
+    'FM mode: discount factor gamma for TD-Flow Bellman probability path targets.')
+flags.DEFINE_float(
+    'fm_td_target_tau', 0.005,
+    'FM mode: Polyak soft-update rate for TD-Flow target vector field v_phi.')
+flags.DEFINE_integer(
+    'fm_td_boot_steps', 1,
+    'FM mode: ODE integration steps for target goal bootstrapping during training.')
 flags.DEFINE_integer(
     'nf_rep_size', 64,
     'NF mode: SA encoder output dim (conditioning vector size).')
@@ -854,6 +866,10 @@ def main(_):
   config.fm_t_logit_scale = float(FLAGS.fm_t_logit_scale)
   config.fm_goal_noise_std = float(FLAGS.fm_goal_noise_std)
   config.fm_norm_goals = bool(FLAGS.fm_norm_goals)
+  config.fm_td_mode = bool(FLAGS.fm_td_mode)
+  config.fm_td_gamma = float(FLAGS.fm_td_gamma)
+  config.fm_td_target_tau = float(FLAGS.fm_td_target_tau)
+  config.fm_td_boot_steps = int(FLAGS.fm_td_boot_steps)
   config.ppo_dirac_eps = float(FLAGS.ppo_dirac_eps)
   config.nf_rep_size = int(FLAGS.nf_rep_size)
   config.nf_num_blocks = int(FLAGS.nf_num_blocks)

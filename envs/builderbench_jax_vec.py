@@ -201,9 +201,8 @@ class JaxBuilderBenchVecEnv:
 
     base = CreativeCube(config=cfg)
     apply_fixed_start_x(base, self._fixed_start_x)
-    # Masked-in goal mocaps only (equals all mocaps when mask is all-True).
-    self._mocap_targets = base._task_mocap_targets
-    self._num_task_cubes = int(base._num_task_cubes)
+    self._mocap_targets = getattr(base, '_task_mocap_targets', getattr(base, '_mocap_targets', getattr(base, 'mocap_targets', None)))
+    self._num_task_cubes = int(getattr(base, '_num_task_cubes', getattr(base, '_num_cubes', getattr(base, 'num_cubes', self._num_cubes))))
     if self._use_pd:
       validate_pd_episode_length(cfg.episode_length, self._pd_duration)
       inner = PDWrapper(base, duration=self._pd_duration)
