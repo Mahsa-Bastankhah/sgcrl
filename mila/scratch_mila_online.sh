@@ -14,25 +14,44 @@ LOG_ROOT="/network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs"
 BASE_FLAGS="--num_steps=200000000 --ppo_num_envs=1024 --ppo_ent_coef=0.05 --ppo_actor_min_std=0.01 --ppo_discount=0.99 --ppo_clip_coef=0.2 --ppo_checkpoint_interval=150 --builderbench_use_pd=true --builderbench_pd_duration=5 --ppo_skip_first_eval=true --ppo_eval_interval=150 --ppo_video_interval=150 --ppo_video_fps=10 --max_replay_size=10000000 --ppo_crl_repr_tau=0 --hidden_layer_sizes=\"256,256,256,256,256,256\" --env=builderbench_creative_3_task1 --ppo_rollout_length=50 --ppo_crl_steps_per_iter=25 --use_wandb=true --wandb_project=dist-matching --wandb_entity=doina-precup --wandb_mode=online"
 
 EXPERIMENTS=( 
+    # "ext_ent_anneal_05_precision_online|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.01 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000"
+    # "ext_ent_anneal_05_precision_online_cat_select|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.01 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000 --ppo_categorical_select"
+    # "ext_ent_anneal_05_precision_online_cat_select_ext_reward|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.01 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=400000000 --ppo_categorical_select --ppo_external_reward_scale=1"
     # --- Active Flow Matching Experiments ---
     # Baseline
-    "pd_fm_creative3_task1_baseline|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select"
+    # "pd_fm_creative3_task1_baseline|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select"
+    "pd_fm_creative3_task1_baseline_ext_reward_cat_select_anneal_ent|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1 --num_steps=400000000 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
+    "pd_fm_creative3_task1_baseline_ext_reward_cat_select_no_permute_anneal_ent|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1 --num_steps=400000000 --builderbench_permute_start_boxes=false --builderbench_fixed_start_x=0.1 ---ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
+    "pd_fm_creative3_task1_all_tricks|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0"
+    "pd_fm_creative3_task1_all_tricks_ext_reward_cat_select_anneal_ent|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_external_reward_scale=1 --num_steps=400000000 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
+    "pd_fm_creative3_task1_all_tricks_ext_reward_cat_select_no_permute_anneal_ent|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_external_reward_scale=1 --num_steps=400000000 --builderbench_permute_start_boxes=false --builderbench_fixed_start_x=0.1 ---ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
+    #
+    # # Goal Normalization
+    # "pd_fm_creative3_task1_goal_norm|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_norm_goals=True"
+    #
+    # # All Tricks + Goal Noise + Goal Norm
+    # "pd_fm_creative3_task1_all_tricks_noise_norm|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --fm_goal_noise_std=0.02 --fm_norm_goals=True"
 
-    # Goal Normalization
-    "pd_fm_creative3_task1_goal_norm|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_norm_goals=True"
+    # --- TD-Flow (Bellman Probability Path) Experiments ---
+    # Baseline TD-Flow (best guestimate defaults: gamma=0.99, target_tau=0.005, boot_steps=1)
+    # "pd_fm_td_creative3_task1_baseline_ext_scale1|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --fm_td_mode=True --fm_td_gamma=0.99 --fm_td_target_tau=0.005 --fm_td_boot_steps=1 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1"
 
-    # All Tricks + Goal Noise + Goal Norm
-    "pd_fm_creative3_task1_all_tricks_noise_norm|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --fm_goal_noise_std=0.02 --fm_norm_goals=True"
+    # Baseline TD-Flow with Fixed Start Flags (--builderbench_permute_start_boxes=false --builderbench_fixed_start_x=0.1)
+    # "pd_fm_td_creative3_task1_fixed_start_ext_scale1|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --fm_td_mode=True --fm_td_gamma=0.99 --fm_td_target_tau=0.005 --fm_td_boot_steps=1 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1 --builderbench_permute_start_boxes=false --builderbench_fixed_start_x=0.1"
 
-    # --- External Reward Scale = 1 Variants ---
-    # Baseline (scale=1)
-    "pd_fm_creative3_task1_baseline_ext_scale1|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1"
+    # Hyperparameter Variation 1: Discount factor gamma = 0.95 (shorter horizon)
+    # "pd_fm_td_creative3_task1_gamma095_ext_scale1|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --fm_td_mode=True --fm_td_gamma=0.95 --fm_td_target_tau=0.005 --fm_td_boot_steps=1 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1"
 
-    # Goal Normalization (scale=1)
-    "pd_fm_creative3_task1_goal_norm_ext_scale1|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_norm_goals=True --ppo_external_reward_scale=1"
+    # Hyperparameter Variation 2: Target Polyak tau = 0.01 (faster target updates)
+    # "pd_fm_td_creative3_task1_tau001_ext_scale1|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --fm_td_mode=True --fm_td_gamma=0.99 --fm_td_target_tau=0.01 --fm_td_boot_steps=1 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1"
 
-    # All Tricks + Goal Noise + Goal Norm (scale=1)
-    "pd_fm_creative3_task1_all_tricks_noise_norm_ext_scale1|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --fm_goal_noise_std=0.02 --fm_norm_goals=True --ppo_external_reward_scale=1"
+    # Hyperparameter Variation 3: Target Polyak tau = 0.001 (slower, smoother target updates)
+    # "pd_fm_td_creative3_task1_tau0001_ext_scale1|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --fm_td_mode=True --fm_td_gamma=0.99 --fm_td_target_tau=0.001 --fm_td_boot_steps=1 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1"
+
+    # # High-precision TD-Flow (Fourier time embedding + Heun solver)
+    # "pd_fm_td_creative3_task1_time_embed_heun_ext_scale1|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --fm_td_mode=True --fm_td_gamma=0.99 --fm_td_target_tau=0.005 --fm_td_boot_steps=1 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1 --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun"
+    # "pd_fm_td_creative3_task1_gamma095_tricks_ext_scale1|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --fm_td_mode=True --fm_td_gamma=0.95 --fm_td_target_tau=0.001 --fm_td_boot_steps=3 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1 --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_norm_goals=True"
+    # "pd_fm_td_creative3_task1_gamma095_tricks_ext_scale1_anneal_ent|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --fm_td_mode=True --fm_td_gamma=0.95 --fm_td_target_tau=0.001 --fm_td_boot_steps=3 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1 --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_norm_goals=True --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
 )
 
 mkdir -p "$SCRIPT_DIR/slurm_logs"
