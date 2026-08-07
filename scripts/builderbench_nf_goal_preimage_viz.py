@@ -103,6 +103,7 @@ class _TrainCtx:
   nf_coupling_width: int
   nf_goal_enc_size: int
   nf_goal_std_min: float
+  nf_state_only: bool
   act_dim: int
 
 
@@ -171,6 +172,7 @@ def _load_train_ctx(env_name: str, run_dir: str) -> Tuple[_TrainCtx, Dict[str, A
       nf_coupling_width=int(resolved.get('nf_coupling_width', 512)),
       nf_goal_enc_size=int(resolved.get('nf_goal_enc_size', 0)),
       nf_goal_std_min=float(resolved.get('nf_goal_std_min', 0.02)),
+      nf_state_only=bool(resolved.get('nf_state_only', False)),
       act_dim=0,
   )
   return ctx, run_cfg
@@ -247,6 +249,7 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx, repr_mode: str):
         num_blocks=ctx.nf_num_blocks,
         channels=ctx.nf_coupling_width,
         goal_enc_size=ctx.nf_goal_enc_size,
+        state_only=bool(ctx.nf_state_only),
     )
   return networks, nf_nets, act_dim, int(obs_dim)
 

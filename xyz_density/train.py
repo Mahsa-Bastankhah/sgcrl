@@ -698,6 +698,7 @@ def train(args: argparse.Namespace) -> None:
           f'twin_q={args.twin_q}', flush=True)
 
   elif mode == 'nf':
+    nf_state_only = bool(getattr(args, 'nf_state_only', False))
     nf_nets = _nf.make_nf_density_networks(
         obs_dim=obs_dim,
         act_dim=act_dim,
@@ -708,6 +709,7 @@ def train(args: argparse.Namespace) -> None:
         goal_enc_size=int(args.nf_goal_enc_size),
         sa_hidden=int(args.nf_sa_hidden),
         sa_num_layers=int(args.nf_sa_num_layers),
+        state_only=nf_state_only,
     )
     key, k_q = jax.random.split(key)
     q_params = _nf.init_nf_params(nf_nets, k_q)
@@ -722,9 +724,11 @@ def train(args: argparse.Namespace) -> None:
     density_update = _nf.make_nf_density_update_fn(
         nf_nets, q_optimizer, obs_dim=obs_dim,
         noise_std=float(args.nf_noise_std))
+    _cond = 'p(g|s)' if nf_state_only else 'p(g|s,a)'
     print(f'[xyz] NF RealNVP  rep_size={args.nf_rep_size}  '
           f'blocks={args.nf_num_blocks}  width={args.nf_coupling_width}  '
           f'sa={args.nf_sa_num_layers}x{args.nf_sa_hidden}  '
+          f'state_only={nf_state_only} ({_cond})  '
           f'flow_dim={nf_nets.flow_dim}', flush=True)
 
   elif mode == 'fm':
@@ -1146,6 +1150,8 @@ def build_parser() -> argparse.ArgumentParser:
   p.add_argument('--nf_coupling_width', type=int, default=512)
   p.add_argument('--nf_sa_hidden', type=int, default=1024)
   p.add_argument('--nf_sa_num_layers', type=int, default=4)
+  p.add_argument('--nf_state_only', action='store_true',
+                 help='NF: condition on state only (p(g|s) instead of p(g|s,a)).')
   p.add_argument('--nf_goal_enc_size', type=int, default=0)
   p.add_argument('--nf_encoder_lr', type=float, default=3e-4)
   p.add_argument('--nf_critic_lr', type=float, default=1e-4)

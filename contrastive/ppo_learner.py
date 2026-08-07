@@ -572,7 +572,8 @@ def make_reward_fn(
   """Factory for the per-step PPO reward used during rollouts.
 
   Modes (``config.ppo_reward_mode``):
-    * ``''`` (default): r = φ(s,a) · ψ(g).
+    * ``''`` (default): r = φ(s,a) · ψ(g)
+      (or r = φ(s)·ψ(g) when networks were built with state_only / crl_state_only).
     * ``'dirac_target'``: for s ≠ g, r = log(eps) − φ(s0,a)·ψ(s);
       at s = g, r = −φ(s0,a)·ψ(g).  s0 is fixed per episode; a ~ π(·|s).
     * ``'kde_dirac'``: same formula as ``dirac_target`` but the CRL dot
@@ -1715,7 +1716,8 @@ def run_ppo_training(
   # ---- density estimator mode ------------------------------------------
   # 'crl'      (default) — φ(s,a)·ψ(g) contrastive representations.
   # 'gaussian' — diagonal Gaussian p_θ(g|s,a);  reward = log p_θ(g|s_t,a_t).
-  # 'nf'       — conditional RealNVP  log p_NF(g|s,a).
+  # 'nf'       — conditional RealNVP  log p_NF(g|s,a)
+  #              (or log p_NF(g|s) when nf_state_only=True).
   # 'fm'       — OT flow-matching; reward = log p_FM(g|s,a) via reverse ODE.
   # 'td3'      — twin Q(s,a,s_f) TD3-style; reward = Q1(s,a,g).
   repr_mode    = (getattr(config, 'ppo_repr_mode', 'crl') or 'crl').strip().lower()
@@ -1848,6 +1850,7 @@ def run_ppo_training(
     nf_goal_enc_size = int(getattr(config, 'nf_goal_enc_size', 0))
     nf_sa_hidden     = int(getattr(config, 'nf_sa_hidden', 1024))
     nf_sa_num_layers = int(getattr(config, 'nf_sa_num_layers', 4))
+    nf_state_only    = bool(getattr(config, 'nf_state_only', False))
     nf_density_nets = _nf.make_nf_density_networks(
         obs_dim=obs_dim_cfg,
         act_dim=act_dim_cfg,
@@ -1859,14 +1862,17 @@ def run_ppo_training(
         goal_enc_size=nf_goal_enc_size,
         sa_hidden=nf_sa_hidden,
         sa_num_layers=nf_sa_num_layers,
+        state_only=nf_state_only,
     )
     _goal_enc_desc = (f'goal_encoder=2x256+swish→{nf_goal_enc_size}'
                       if nf_goal_enc_size > 0 else 'goal_encoder=none (raw goal)')
+    _cond_desc = 'p(g|s) / r(s)' if nf_state_only else 'p(g|s,a) / r(s,a)'
     print(f'[ppo] repr_mode=nf (RealNVP)  obs_dim={obs_dim_cfg}  '
           f'act_dim={act_dim_cfg}  goal_dim={goal_dim_cfg}  '
           f'rep_size={nf_rep_size}  num_blocks={nf_num_blocks}  '
           f'coupling_width={nf_coupling_w}  flow_dim={nf_density_nets.flow_dim}  '
-          f'sa_encoder={nf_sa_num_layers}x{nf_sa_hidden}+swish  {_goal_enc_desc}')
+          f'sa_encoder={nf_sa_num_layers}x{nf_sa_hidden}+swish  '
+          f'state_only={nf_state_only} ({_cond_desc})  {_goal_enc_desc}')
   elif use_td3 or use_crl_td3_switch:
     _td3_bilinear = bool(getattr(config, 'ppo_td3_bilinear', False))
     td3_density_nets = _td3.make_td3_density_networks(
