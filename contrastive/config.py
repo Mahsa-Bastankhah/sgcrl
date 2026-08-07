@@ -366,6 +366,12 @@ class ContrastiveConfig:
   nf_noise_std: float = 0.05   # Gaussian noise added to goals during NF training (0 = disabled)
   nf_goal_std_min: float = 0.1  # floor on per-dim replay std (avoids blow-ups on static dims)
   nf_mix_env_goal_stats: bool = False  # also include rollout env goals when computing NF normalisation stats
+  # If True, NF learns p(g|s) / reward r(s) instead of p(g|s,a) / r(s,a).
+  # Encoder input is state only; action is ignored at train and reward time.
+  nf_state_only: bool = False
+  # If True, CRL φ encodes state only → r(s)=φ(s)·ψ(g) instead of r(s,a)=φ(s,a)·ψ(g).
+  # InfoNCE training uses the same φ(s). Default False keeps φ(s,a).
+  crl_state_only: bool = False
   nf_goal_enc_size: int = 0     # >0 enables goal encoder (maps goal → goal_enc_size-dim latent)
   ppo_return_norm_window: int = 0  # >0 caps effective count in return normalizer (soft sliding window)
   nf_no_norm_goal_dims: tuple = ()  # deprecated; unused (running stats + std floor only)

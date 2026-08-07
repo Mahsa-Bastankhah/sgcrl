@@ -403,9 +403,16 @@ def main():
   if width % 2:
     width -= 1
 
-  title = args.title or (
-      r'frozen CRL reward  $r=\varphi(s,a)\cdot\psi(g)$'
-      f'  ·  {args.tag}')
+  if args.title:
+    title = args.title
+  elif bool(getattr(ctx, 'crl_state_only', False)):
+    title = (
+        r'CRL reward  $r=\varphi(s)\cdot\psi(g)$'
+        f'  ·  {args.tag}')
+  else:
+    title = (
+        r'CRL reward  $r=\varphi(s,a)\cdot\psi(g)$'
+        f'  ·  {args.tag}')
 
   print('[vid] composing reward overlays...', flush=True)
   frames = []

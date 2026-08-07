@@ -5,6 +5,9 @@ Overview
     z, log_det  = RealNVP(G_encoder(goal) ;  y = SA_encoder(s, a))
     log p_NF(g | s, a) = log N(z;0,I) + Σ log|det J|
 
+With ``state_only=True`` the encoder drops the action:
+    y = S_encoder(s)   →   log p_NF(g | s)   (PPO reward r(s) instead of r(s,a)).
+
 SA encoder: ``sa_num_layers × Dense(sa_hidden) + LN + swish → Dense(rep_size)``.
   Defaults match the original reference (4×1024). Compact runs use e.g. 3×256.
 Goal encoder is a compact MLP: 2×(Dense(256) + LN + swish) → Dense(goal_enc_size).
@@ -37,12 +40,16 @@ from acme.jax import networks as networks_lib
 def _sa_encoder(state: jnp.ndarray, action: jnp.ndarray,
                 rep_size: int,
                 sa_hidden: int = 1024,
-                sa_num_layers: int = 4) -> jnp.ndarray:
-    """concat([s,a]) → sa_num_layers×(Dense(sa_hidden) + LN + swish) → Dense(rep_size)."""
+                sa_num_layers: int = 4,
+                state_only: bool = False) -> jnp.ndarray:
+    """Conditioning encoder → sa_num_layers×(Dense(sa_hidden) + LN + swish) → Dense(rep_size).
+
+    Default: concat([s, a]).  With state_only=True: state only (action unused).
+    """
     lecun = hk.initializers.VarianceScaling(1 / 3, 'fan_in', 'uniform')
     zero_bias = hk.initializers.Constant(0.)
 
-    x = jnp.concatenate([state, action], axis=-1)
+    x = state if state_only else jnp.concatenate([state, action], axis=-1)
     for i in range(int(sa_num_layers)):
         x = hk.Linear(int(sa_hidden), w_init=lecun, b_init=zero_bias,
                       name=f'dense_{i}')(x)
@@ -133,11 +140,13 @@ class NFDensityNetworks(NamedTuple):
     flow_dim reflects the actual dimensionality the flow operates in:
         goal_enc_size > 0 → flow_dim = goal_enc_size
         goal_enc_size == 0 → flow_dim = goal_dim
+    state_only=True means the conditioning encoder ignores action (p(g|s)).
     """
     sa_encoder_net: networks_lib.FeedForwardNetwork
     flow_net: networks_lib.FeedForwardNetwork
     goal_encoder_net: Optional[networks_lib.FeedForwardNetwork]
     flow_dim: int   # dimension of the space the flow operates in
+    state_only: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +164,7 @@ def make_nf_density_networks(
     goal_enc_size: int = 0,                   # 0 = no goal encoder (legacy)
     sa_hidden: int = 1024,
     sa_num_layers: int = 4,
+    state_only: bool = False,
 ) -> NFDensityNetworks:
     """Build SA encoder + optional goal encoder + conditional RealNVP flow.
 
@@ -162,6 +172,10 @@ def make_nf_density_networks(
     goal_enc_size-dimensional latent and the flow operates in that latent space.
     When goal_enc_size == 0 the raw normalized goal is fed directly to the flow
     (original behaviour).
+
+    state_only=False (default): learn log p_NF(g|s,a); encoder input is concat([s,a]).
+    state_only=True: learn log p_NF(g|s); encoder input is s only (action ignored
+    at apply time so call-site APIs stay the same).
     """
     del hidden_layer_sizes
     assert goal_dim >= 1, f'NF density requires goal_dim >= 1, got {goal_dim}'
@@ -182,10 +196,12 @@ def make_nf_density_networks(
     zero_init = hk.initializers.Constant(0.)
     _sa_hidden = int(sa_hidden)
     _sa_num_layers = int(sa_num_layers)
+    _state_only = bool(state_only)
 
     def _sa_fn(state: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
         return _sa_encoder(state, action, rep_size,
-                           sa_hidden=_sa_hidden, sa_num_layers=_sa_num_layers)
+                           sa_hidden=_sa_hidden, sa_num_layers=_sa_num_layers,
+                           state_only=_state_only)
 
     def _goal_enc_fn(goal: jnp.ndarray) -> jnp.ndarray:
         return _goal_encoder(goal, goal_enc_size)
@@ -267,6 +283,7 @@ def make_nf_density_networks(
         flow_net=flow_net,
         goal_encoder_net=goal_encoder_net,
         flow_dim=flow_dim,
+        state_only=_state_only,
     )
 
 
@@ -336,7 +353,11 @@ def _encode_goal(nf_networks: NFDensityNetworks, params: dict,
 
 
 def nf_log_prob(nf_networks: NFDensityNetworks, params, state, action, goal):
-    """log p_NF(goal | state, action).  goal must already be normalized."""
+    """log p_NF(goal | state, action) or log p_NF(goal | state) if state_only.
+
+    goal must already be normalized.  ``action`` is ignored when
+    ``nf_networks.state_only`` is True (kept in the signature for call-site compat).
+    """
     y = nf_networks.sa_encoder_net.apply(params['sa_encoder'], state, action)
     g = _encode_goal(nf_networks, params, goal)
     return nf_networks.flow_net.apply(params['nf_flow'], g, y)
@@ -423,10 +444,11 @@ def make_nf_density_update_fn(
 # ---------------------------------------------------------------------------
 
 def make_nf_reward_fn(nf_networks: NFDensityNetworks, obs_dim: int):
-    """Jitted reward: (params, obs, action, goal_mean, goal_std) → log p_NF(g | s, a).
+    """Jitted reward: (params, obs, action, goal_mean, goal_std) → log p_NF.
 
-    goal_mean / goal_std must match those used during training so that the
-    flow sees the same normalized input distribution.
+    Default: r(s,a) = log p_NF(g|s,a).  With state_only nets: r(s) = log p_NF(g|s)
+    (action is ignored).  goal_mean / goal_std must match those used during
+    training so that the flow sees the same normalized input distribution.
     """
 
     @jax.jit

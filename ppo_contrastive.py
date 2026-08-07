@@ -144,7 +144,8 @@ flags.DEFINE_string(
     "Density estimator for the PPO shaped reward. "
     "'crl' (default) = contrastive φ(s,a)·ψ(g) representations; "
     "'gaussian' = diagonal Gaussian p_θ(g|s), reward = log p_θ(g|s_t); "
-    "'nf' = conditional RealNVP log p_NF(g|s,a), reward = log p_NF; "
+    "'nf' = conditional RealNVP log p_NF(g|s,a) (or g|s with --nf_state_only), "
+    "reward = log p_NF; "
     "'fm' = OT flow-matching log p_FM(g|s,a) via reverse ODE, "
     "reward = log p_FM (uses --ppo_fm_reward_tau for reward EMA); "
     "'td3' = twin Q(s,a,s_f) TD3-style on r=1{s≈s_f}, reward = Q1(s,a,g) "
@@ -410,6 +411,14 @@ flags.DEFINE_boolean(
     'nf_mix_env_goal_stats', False,
     'NF mode: when computing normalisation stats, also include the actual env goals '
     '(obs[obs_dim:] from current rollout) so the normaliser covers reward goals too.')
+flags.DEFINE_boolean(
+    'nf_state_only', False,
+    'NF mode: if True, learn log p_NF(g|s) and use reward r(s)=log p_NF(g|s) '
+    '(conditioning encoder ignores action). Default False keeps log p_NF(g|s,a) / r(s,a).')
+flags.DEFINE_boolean(
+    'crl_state_only', False,
+    'CRL mode: if True, φ encodes state only so reward is r(s)=φ(s)·ψ(g) '
+    '(InfoNCE also uses φ(s)). Default False keeps r(s,a)=φ(s,a)·ψ(g).')
 flags.DEFINE_integer(
     'nf_goal_enc_size', 0,
     'Goal encoder output dim for NF mode. 0 = disabled (raw normalized goal fed to flow). '
@@ -953,6 +962,8 @@ def main(_):
   config.nf_noise_std = float(FLAGS.nf_noise_std)
   config.nf_goal_std_min = float(FLAGS.nf_goal_std_min)
   config.nf_mix_env_goal_stats = bool(FLAGS.nf_mix_env_goal_stats)
+  config.nf_state_only = bool(FLAGS.nf_state_only)
+  config.crl_state_only = bool(FLAGS.crl_state_only)
   config.ppo_skip_first_eval = bool(FLAGS.ppo_skip_first_eval)
   if str(FLAGS.ppo_frozen_reward_ckpt or '').strip():
     config.ppo_frozen_reward_ckpt = str(FLAGS.ppo_frozen_reward_ckpt).strip()
@@ -1057,6 +1068,8 @@ def main(_):
         f'ppo_frozen_reward_ckpt={config.ppo_frozen_reward_ckpt!r}  '
         f'ppo_crl_repr_tau={config.ppo_crl_repr_tau}  '
         f'ppo_nf_reward_tau={config.ppo_nf_reward_tau}  '
+        f'nf_state_only={config.nf_state_only}  '
+        f'crl_state_only={config.crl_state_only}  '
         f'ppo_gaussian_reward_tau={config.ppo_gaussian_reward_tau}  '
         f'ppo_fm_reward_tau={config.ppo_fm_reward_tau}  '
         f'fm_flow_steps={config.fm_flow_steps}  '
@@ -1190,6 +1203,9 @@ def main(_):
       print(f'[ppo_contrastive] categorical select actor: '
             f'{_cat_select_classes} cube classes, '
             f'Gaussian on {5 - 1} continuous dims')
+  if bool(config.crl_state_only):
+    print('[ppo_contrastive] crl_state_only=True: φ encodes state only '
+          '(r(s)=φ(s)·ψ(g); InfoNCE uses φ(s))')
   network_factory = functools.partial(
       contrastive.make_networks,
       obs_dim=obs_dim,
@@ -1201,6 +1217,7 @@ def main(_):
       actor_min_std=float(config.ppo_actor_min_std),
       ppo_cleanrl_actor=bool(FLAGS.ppo_cleanrl_actor),
       categorical_select_classes=_cat_select_classes,
+      state_only=bool(config.crl_state_only),
   )
 
   # ---- Logger ------------------------------------------------------------

@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=c7t2_crl_e1_no
-#SBATCH --output=slurm/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_normobs_catselect_extrew1_ep70_300m_%A_%a.log
-#SBATCH --error=slurm/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_normobs_catselect_extrew1_ep70_300m_%A_%a.log
+#SBATCH --job-name=c7t2_nfc_e10
+#SBATCH --output=slurm/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew10_ep70_300m_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew10_ep70_300m_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -11,7 +11,7 @@
 #SBATCH --account=seas
 #SBATCH --array=0-0
 
-# c7t2 crl nopermute fixedx01 catselect seed0. config=normobs_extrew1_ep70_300m.
+# c7t2 nf nopermute fixedx01 catselect seed0. config=extrew10_ep70_300m.
 unset LD_PRELOAD
 
 module purge
@@ -97,23 +97,23 @@ MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
 REWARD_TAU=${REWARD_TAU:-0.5}
-EXT_REW_SCALE=${EXT_REW_SCALE:-1}
+EXT_REW_SCALE=${EXT_REW_SCALE:-10}
 FIXED_START_X=${FIXED_START_X:-0.1}
 EP_LEN=${EP_LEN:-70}
 PD_DURATION=${PD_DURATION:-5}
 MJ_EP_LEN=$((EP_LEN * PD_DURATION))
 
-LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_normobs_catselect_extrew1_ep70_300m/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew10_ep70_300m/}"
 
 mkdir -p slurm "${LOG_DIR}"
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=crl reward_tau=${REWARD_TAU}"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=nf reward_tau=${REWARD_TAU}"
 echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
 echo "max_replay_size=${MAX_REPLAY_SIZE}"
 echo "builderbench_use_pd=true pd_duration=${PD_DURATION} permute_start_boxes=false fixed_start_x=${FIXED_START_X} goals=MID+offsets(task2)"
 echo "episode_length=${EP_LEN} (mj_episode_length=${MJ_EP_LEN}, rollout_length=${EP_LEN})"
-echo "ppo_norm_obs=true"
+echo "ppo_norm_obs=false"
 echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} (AFTER return-norm)"
 echo "ppo_actor_min_std=${MIN_STD}"
 echo "ppo_anneal_lr=true ppo_anneal_ent_coef=false"
@@ -121,6 +121,7 @@ echo "ppo_categorical_select=true"
 echo "ppo_eval_interval=200 ppo_video_interval=400"
 echo "steps_per_iter=$((PPO_NUM_ENVS * EP_LEN))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * EP_LEN)))"
+echo "nf_compact: sa3x256 r64 b6 w256"
 
 python -u -c "
 from envs.builderbench_utils import default_fixed_target_goal, num_creative_tasks, load_task_goal_offsets
@@ -160,9 +161,17 @@ python -u ppo_contrastive.py \
   --ppo_video_fps=10 \
   --ppo_skip_first_video=true \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
-  --ppo_repr_mode=crl \
-  --ppo_crl_repr_tau="${REWARD_TAU}" \
-  --ppo_norm_obs \
+  --ppo_repr_mode=nf \
+  --ppo_nf_reward_tau="${REWARD_TAU}" \
+  --nf_rep_size=64 \
+  --nf_num_blocks=6 \
+  --nf_coupling_width=256 \
+  --nf_sa_hidden=256 \
+  --nf_sa_num_layers=3 \
+  --nf_grad_clip=1.0 \
+  --nf_noise_std=0.05 \
+  --nf_goal_std_min=0.02 \
+  --nf_goal_enc_size=0 \
   --ppo_use_external_reward \
   --ppo_external_reward_scale="${EXT_REW_SCALE}" \
   --ppo_categorical_select \

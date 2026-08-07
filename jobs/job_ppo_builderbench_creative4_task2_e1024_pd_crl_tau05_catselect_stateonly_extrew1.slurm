@@ -1,19 +1,22 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_td3lq_drawer_t05
-#SBATCH --output=slurm/ppo_td3_logq_drawer_tau05_e8_c64_%A_%a.log
-#SBATCH --error=slurm/ppo_td3_logq_drawer_tau05_e8_c64_%A_%a.log
+#SBATCH --job-name=c4t2_crl_so_e1
+#SBATCH --output=slurm/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_catselect_stateonly_extrew1_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_catselect_stateonly_extrew1_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=10:00:00
+#SBATCH --time=15:00:00
 #SBATCH --account=seas
 #SBATCH --array=0-1
 
-# sawyer_drawer_open: TD3 log((1-γ)Q1) reward + td3_reward_tau=0.5; cross_batch_goals=off
-# Shared Metaworld sweep knobs: num_envs=8, rollout=256, crl_steps=64,
-# reward EMA tau=0.5, seeds 0-1, hidden=256x6, 10M steps.
+# 4-cube creative-4-task2, PD + CRL with crl_state_only (r(s)=φ(s)·ψ(g)), tau=0.5.
+# Permute + random init ENABLED (no nopermute / no fixed_start_x).
+# External hard-success bonus scale=1. Catselect. Seeds 0-1.
+# Eval every 200 PPO iters.
+unset LD_PRELOAD
+
 module purge
 
 if [ -n "${LD_LIBRARY_PATH:-}" ]; then
@@ -72,41 +75,54 @@ fi
 
 cd /n/fs/mislresearch/sgcrl
 source /n/fs/mislresearch/miniconda3/etc/profile.d/conda.sh
-conda activate sgcrl_flow
+conda activate sgcrl_builderbench
 
-export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export LD_LIBRARY_PATH=/n/fs/mislresearch/miniconda3/envs/sgcrl_flow/lib:${LD_LIBRARY_PATH}
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${HOME}/.mujoco/mujoco210/bin
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
-export MUJOCO_PY_MUJOCO_PATH=${HOME}/.mujoco/mujoco210
-export MUJOCO_GL=osmesa
+source /n/fs/mislresearch/sgcrl/scripts/sgcrl_builderbench_cuda_env.sh
+
+export BUILDERBENCH_ROOT=/n/fs/mislresearch/builderbench
+export BUILDERBENCH_MJX_IMPL=jax
+export MUJOCO_GL=egl
 export PYTHONUNBUFFERED=1
 export TMPDIR=/n/fs/mislresearch/mb6458-tmp
+export MPLCONFIGDIR=/n/fs/mislresearch/mb6458-tmp/mpl-cache
+export PIP_CACHE_DIR=/n/fs/mislresearch/mb6458-tmp/pip-cache
 export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-ENV=sawyer_drawer_open
-NUM_STEPS=${NUM_STEPS:-10000000}
-SEED_OFFSET=${SEED_OFFSET:-0}
-SEED=$(( SEED_OFFSET + ${SLURM_ARRAY_TASK_ID:-0} ))
-
-LOG_DIR="${LOG_DIR:-logs/ppo_td3_logq_drawer_tau05_e8_c64/}"
-PPO_NUM_ENVS=${PPO_NUM_ENVS:-8}
-ROLLOUT_LENGTH=${ROLLOUT_LENGTH:-256}
-CRL_STEPS=${CRL_STEPS:-64}
+ENV=${ENV:-builderbench_creative_4_task2}
+SEED=${SEED:-${SLURM_ARRAY_TASK_ID:-0}}
+NUM_STEPS=${NUM_STEPS:-200000000}
+PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
+MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
 ENT_COEF=0.05
 MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
-REWARD_TAU=${REWARD_TAU:-0.5}
+CRL_REPR_TAU=${CRL_REPR_TAU:-0.5}
 
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_catselect_stateonly_extrew1/}"
+EXT_REW_SCALE=${EXT_REW_SCALE:-1}
 
 mkdir -p slurm "${LOG_DIR}"
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=td3 td3_log_reward td3_reward_tau=${REWARD_TAU}"
-echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS} rollout=${ROLLOUT_LENGTH} crl_steps=${CRL_STEPS} reward_tau=${REWARD_TAU}"
-echo "td3: cross_batch_goals=false, mlp Q, log_reward=true"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=crl crl_repr_tau=${CRL_REPR_TAU} crl_state_only=true"
+echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
+echo "max_replay_size=${MAX_REPLAY_SIZE}"
+echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=true (random init) goals=MID+offsets(default)"
+echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE}"
+echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
+echo "ppo_eval_interval=200"
+echo "steps_per_iter=$((PPO_NUM_ENVS * 50))"
+echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * 50)))"
+python -u -c "
+from envs.builderbench_utils import default_fixed_target_goal
+import numpy as np
+g = default_fixed_target_goal(4, 1)
+print('hard_goal (flat)=', g.tolist())
+print('hard_goal (cubes)=')
+print(np.asarray(g).reshape(-1, 3))
+"
 nvidia-smi || true
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
 
@@ -116,18 +132,26 @@ python -u ppo_contrastive.py \
   --num_steps="${NUM_STEPS}" \
   --log_dir_path="${LOG_DIR}" \
   --ppo_num_envs="${PPO_NUM_ENVS}" \
-  --ppo_rollout_length="${ROLLOUT_LENGTH}" \
-  --ppo_crl_steps_per_iter="${CRL_STEPS}" \
   --ppo_ent_coef="${ENT_COEF}" \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
+  --ppo_checkpoint_interval=150 \
+  --builderbench_use_pd=true \
+  --builderbench_pd_duration=5 \
+  --builderbench_permute_start_boxes=true \
+  --ppo_rollout_length=50 \
+  --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --hidden_layer_sizes="256,256,256,256,256,256" \
-  --ppo_repr_mode=td3 \
-  --noppo_td3_cross_batch_goals \
-  --ppo_td3_log_reward \
-  --ppo_td3_reward_tau="${REWARD_TAU}"
+  --ppo_eval_interval=200 \
+  --max_replay_size="${MAX_REPLAY_SIZE}" \
+  --ppo_repr_mode=crl \
+  --crl_state_only \
+  --ppo_crl_repr_tau="${CRL_REPR_TAU}" \
+  --ppo_use_external_reward \
+  --ppo_external_reward_scale="${EXT_REW_SCALE}" \
+  --ppo_categorical_select \
+  --hidden_layer_sizes="256,256,256,256,256,256"
 PY_EXIT=$?
 pkill -P $$ 2>/dev/null || true
 exit $PY_EXIT

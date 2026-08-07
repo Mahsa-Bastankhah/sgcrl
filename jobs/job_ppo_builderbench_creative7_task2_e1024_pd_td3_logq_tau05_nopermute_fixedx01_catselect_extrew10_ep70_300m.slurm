@@ -1,19 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_bb_c1t1_gauss_t05_2pi
-#SBATCH --output=slurm/ppo_builderbench_creative1_task1_e1024_pd_gaussian_tau05_log2pi_%A_%a.log
-#SBATCH --error=slurm/ppo_builderbench_creative1_task1_e1024_pd_gaussian_tau05_log2pi_%A_%a.log
+#SBATCH --job-name=c7t2_td3_e10
+#SBATCH --output=slurm/ppo_builderbench_creative7_task2_e1024_pd_td3_logq_tau05_nopermute_fixedx01_catselect_extrew10_ep70_300m_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative7_task2_e1024_pd_td3_logq_tau05_nopermute_fixedx01_catselect_extrew10_ep70_300m_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=07:00:00
+#SBATCH --time=24:00:00
 #SBATCH --account=seas
 #SBATCH --array=0-0
 
-# 1-cube (creative-1-task1): PD + Gaussian density reward with EMA tau=0.5.
-# Same as gaussian_tau05, but log p includes the −0.5·D·log(2π) constant
-# (full Gaussian normalizing term). Seed 0.
+# c7t2 td3 nopermute fixedx01 catselect seed0. config=extrew10_ep70_300m.
 unset LD_PRELOAD
 
 module purge
@@ -88,31 +86,53 @@ export PIP_CACHE_DIR=/n/fs/mislresearch/mb6458-tmp/pip-cache
 export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-ENV=${ENV:-builderbench_creative_1_task1}
-SEED=${SEED:-0}
-NUM_STEPS=${NUM_STEPS:-200000000}
+ENV=${ENV:-builderbench_creative_7_task2}
+SEED=${SEED:-${SLURM_ARRAY_TASK_ID:-0}}
+NUM_STEPS=${NUM_STEPS:-300000000}
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
 MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
 ENT_COEF=0.05
+ENT_COEF_FINAL=0.0
 MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
-GAUSSIAN_REWARD_TAU=${GAUSSIAN_REWARD_TAU:-0.5}
-# creative-1 PD: MJ=150 / pd_duration=5 → ep_len=30; rollout floor=32
-ROLLOUT_T=${ROLLOUT_T:-32}
+REWARD_TAU=${REWARD_TAU:-0.5}
+EXT_REW_SCALE=${EXT_REW_SCALE:-10}
+FIXED_START_X=${FIXED_START_X:-0.1}
+EP_LEN=${EP_LEN:-70}
+PD_DURATION=${PD_DURATION:-5}
+MJ_EP_LEN=$((EP_LEN * PD_DURATION))
 
-LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative1_task1_e1024_pd_gaussian_tau05_log2pi/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative7_task2_e1024_pd_td3_logq_tau05_nopermute_fixedx01_catselect_extrew10_ep70_300m/}"
 
 mkdir -p slurm "${LOG_DIR}"
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=gaussian gaussian_reward_tau=${GAUSSIAN_REWARD_TAU}"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=td3 reward_tau=${REWARD_TAU}"
 echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
 echo "max_replay_size=${MAX_REPLAY_SIZE}"
-echo "builderbench_use_pd=true pd_duration=5"
-echo "gaussian: reward = full log p_θ(g|s) incl. -0.5·D·log(2π); EMA tau=${GAUSSIAN_REWARD_TAU}"
-echo "steps_per_iter=$((PPO_NUM_ENVS * ROLLOUT_T))"
-echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * ROLLOUT_T)))"
+echo "builderbench_use_pd=true pd_duration=${PD_DURATION} permute_start_boxes=false fixed_start_x=${FIXED_START_X} goals=MID+offsets(task2)"
+echo "episode_length=${EP_LEN} (mj_episode_length=${MJ_EP_LEN}, rollout_length=${EP_LEN})"
+echo "ppo_norm_obs=false"
+echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} (AFTER return-norm)"
+echo "ppo_actor_min_std=${MIN_STD}"
+echo "ppo_anneal_lr=true ppo_anneal_ent_coef=false"
+echo "ppo_categorical_select=true"
+echo "ppo_eval_interval=200 ppo_video_interval=400"
+echo "steps_per_iter=$((PPO_NUM_ENVS * EP_LEN))"
+echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * EP_LEN)))"
+echo "td3: logq reward_tau=${REWARD_TAU}"
+
+python -u -c "
+from envs.builderbench_utils import default_fixed_target_goal, num_creative_tasks, load_task_goal_offsets
+import numpy as np
+load_task_goal_offsets.cache_clear()
+print('creative-7 n_tasks=', num_creative_tasks(7))
+g = default_fixed_target_goal(7, 1)
+print('hard_goal (flat)=', g.tolist())
+print('hard_goal (cubes)=')
+print(np.asarray(g).reshape(-1, 3))
+"
 nvidia-smi || true
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
 
@@ -128,14 +148,26 @@ python -u ppo_contrastive.py \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
   --ppo_checkpoint_interval=150 \
   --builderbench_use_pd=true \
-  --builderbench_pd_duration=5 \
-  --ppo_rollout_length=32 \
-  --ppo_crl_steps_per_iter=16 \
+  --builderbench_pd_duration="${PD_DURATION}" \
+  --builderbench_permute_start_boxes=false \
+  --builderbench_fixed_start_x="${FIXED_START_X}" \
+  --builderbench_mj_episode_length="${MJ_EP_LEN}" \
+  --ppo_rollout_length="${EP_LEN}" \
+  --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=0 \
+  --ppo_eval_interval=200 \
+  --ppo_eval_episodes=5 \
+  --ppo_video_interval=400 \
+  --ppo_video_fps=10 \
+  --ppo_skip_first_video=true \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
-  --ppo_repr_mode=gaussian \
-  --ppo_gaussian_reward_tau="${GAUSSIAN_REWARD_TAU}" \
+  --ppo_repr_mode=td3 \
+  --noppo_td3_cross_batch_goals \
+  --ppo_td3_log_reward \
+  --ppo_td3_reward_tau="${REWARD_TAU}" \
+  --ppo_use_external_reward \
+  --ppo_external_reward_scale="${EXT_REW_SCALE}" \
+  --ppo_categorical_select \
   --hidden_layer_sizes="256,256,256,256,256,256"
 PY_EXIT=$?
 pkill -P $$ 2>/dev/null || true

@@ -271,7 +271,8 @@ def _build_nf_networks(env_name: str, seed: int, run_cfg: dict, q_params: dict):
         nf_nets = _nf.make_nf_density_networks(
             obs_dim=obs_dim, act_dim=act_dim, goal_dim=obs_dim,
             hidden_layer_sizes=hidden, rep_size=rep_size,
-            num_blocks=num_blocks, channels=channels)
+            num_blocks=num_blocks, channels=channels,
+            state_only=bool(run_cfg.get('nf_state_only', False)))
     return nf_nets, obs_dim, act_dim
 
 

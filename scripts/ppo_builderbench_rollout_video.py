@@ -86,6 +86,16 @@ class _TrainCtx:
   ppo_norm_obs: bool = False
   ppo_obs_norm_clip: float = 10.0
   categorical_select_classes: Optional[int] = None
+  crl_state_only: bool = False
+
+
+def _episode_success_from_states(states) -> float:
+  """Max per-step success over the episode (1.0 if any step succeeded)."""
+  if hasattr(states, 'metrics') and states.metrics is not None:
+    succ = states.metrics.get('success')
+    if succ is not None:
+      return float(np.max(np.asarray(succ)))
+  return float('nan')
 
 
 def _get_video(
@@ -98,7 +108,11 @@ def _get_video(
     mocap_targets,
     num_cubes: int,
 ):
-  """Roll out one episode and render frames (matches training PD macro steps)."""
+  """Roll out one episode and render frames (matches training PD macro steps).
+
+  Returns:
+    (frames, success) where success is max step success in [0, 1].
+  """
   video_env_states = _get_trajectory(
       inference_policy,
       video_env,
@@ -118,7 +132,7 @@ def _get_video(
           np.asarray(video_env_states.info[f'{mocap_key}_pos'][i][0]),
           np.asarray(video_env_states.info[f'{mocap_key}_quat'][i][0]),
       ))
-  return video_images
+  return video_images, _episode_success_from_states(video_env_states)
 
 
 def _maybe_fix_target(
@@ -251,6 +265,9 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
         'ppo_categorical_select',
         resolved.get('ppo_categorical_select', False)))
     categorical_select_classes = int(num_cubes) if cat_select else None
+    crl_state_only = bool(flags.get(
+        'crl_state_only',
+        resolved.get('crl_state_only', False)))
   else:
     use_pd = False
     pd_duration = 5
@@ -273,6 +290,7 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     ppo_norm_obs = False
     ppo_obs_norm_clip = 10.0
     categorical_select_classes = None
+    crl_state_only = False
 
   if use_pd:
     macro_ep_len = mj_ep_len // pd_duration
@@ -314,6 +332,7 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
       ppo_norm_obs=ppo_norm_obs,
       ppo_obs_norm_clip=ppo_obs_norm_clip,
       categorical_select_classes=categorical_select_classes,
+      crl_state_only=crl_state_only,
   )
 
 
@@ -342,6 +361,8 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
   del probe_env
 
   cfg = contrastive.ContrastiveConfig()
+  if ctx.crl_state_only:
+    print('[bb_video] crl_state_only=True → φ(s)·ψ(g) networks', flush=True)
   networks = contrastive.make_networks(
       spec=env_spec,
       obs_dim=int(ctx.obs_dim),
@@ -353,6 +374,7 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
       actor_min_std=ctx.actor_min_std,
       ppo_cleanrl_actor=ctx.ppo_cleanrl_actor,
       categorical_select_classes=ctx.categorical_select_classes,
+      state_only=bool(ctx.crl_state_only),
   )
   return networks
 
@@ -499,12 +521,21 @@ def main():
   parser.add_argument('--fps', type=int, default=10)
   parser.add_argument('--stochastic', action='store_true')
   parser.add_argument('--seed', type=int, default=0)
+  parser.add_argument(
+      '--max_seed_attempts', type=int, default=1,
+      help='Try seed, seed+1, ... until a video is written (or attempts exhausted).')
+  parser.add_argument(
+      '--require_success', action='store_true',
+      help='Only write a video if the episode hits metrics["success"]=1. '
+           'Combine with --max_seed_attempts to search seeds.')
   parser.add_argument('--run_tag', default=None,
                       help='Prefix for output filenames (default: env name).')
   parser.add_argument(
       '--skip_existing', action='store_true',
       help='Skip checkpoints whose output mp4 already exists.')
   args = parser.parse_args()
+  if args.max_seed_attempts < 1:
+    parser.error('--max_seed_attempts must be >= 1')
 
   if not is_builderbench_creative_env(args.env):
     parser.error(
@@ -538,7 +569,6 @@ def main():
   video_env, _base, mocap_targets, episode_length = _make_bb_env(env_id, ctx)
   print(f'[bb_video] env_id={env_id}  episode_length={episode_length}')
 
-  key = jax.random.PRNGKey(args.seed)
   multi = len(ckpt_entries) > 1
   out_dir = args.output
   if out_dir.endswith(os.sep) or not out_dir.endswith('.mp4'):
@@ -547,10 +577,6 @@ def main():
   from envs.builderbench_obs_norm import BuilderBenchObsNormalizer
 
   for label, path in ckpt_entries:
-    out_path = _resolve_output_path(out_dir, run_tag, label, multi)
-    if args.skip_existing and os.path.isfile(out_path):
-      print(f'[bb_video] skip existing {out_path}', flush=True)
-      continue
     print(f'[bb_video] === {label}  ({path}) ===')
     ckpt = ppo_learner.load_checkpoint(path)
     policy_params = ckpt['policy_params']
@@ -596,20 +622,46 @@ def main():
         obs_mean=obs_mean,
         obs_var=obs_var,
     )
-    key, video_key = jax.random.split(key)
-    frames = _get_video(
-        policy,
-        video_env,
-        video_key,
-        episode_length,
-        fixed_target_goal=ctx.fixed_target_goal,
-        mocap_targets=mocap_targets,
-        num_cubes=num_cubes,
-    )
-    print(f'[bb_video]   frames={len(frames)}')
 
-    _write_video(frames, out_path, args.fps)
-    print(f'[bb_video]   wrote {out_path}')
+    wrote = False
+    for attempt in range(int(args.max_seed_attempts)):
+      seed_i = int(args.seed) + attempt
+      tag_i = run_tag if args.max_seed_attempts == 1 else f'{run_tag}_s{seed_i}'
+      if args.require_success:
+        tag_i = f'{tag_i}_succ'
+      out_path = _resolve_output_path(out_dir, tag_i, label, multi)
+      if args.skip_existing and os.path.isfile(out_path):
+        print(f'[bb_video] skip existing {out_path}', flush=True)
+        wrote = True
+        break
+
+      key = jax.random.PRNGKey(seed_i)
+      frames, success = _get_video(
+          policy,
+          video_env,
+          key,
+          episode_length,
+          fixed_target_goal=ctx.fixed_target_goal,
+          mocap_targets=mocap_targets,
+          num_cubes=num_cubes,
+      )
+      print(f'[bb_video]   seed={seed_i} frames={len(frames)} '
+            f'success={success:.3f}', flush=True)
+      if args.require_success and not (success >= 0.5):
+        continue
+
+      _write_video(frames, out_path, args.fps)
+      print(f'[bb_video]   wrote {out_path}', flush=True)
+      wrote = True
+      break
+
+    if not wrote:
+      if args.require_success:
+        print(f'[bb_video]   no successful episode in '
+              f'{args.max_seed_attempts} seed attempt(s) '
+              f'(start_seed={args.seed})', flush=True)
+      else:
+        print(f'[bb_video]   no video written for {label}', flush=True)
 
 
 if __name__ == '__main__':

@@ -170,7 +170,8 @@ def make_networks(
     twin_q = False,
     use_image_obs = False,
     ppo_cleanrl_actor = False,
-    categorical_select_classes: Optional[int] = None):
+    categorical_select_classes: Optional[int] = None,
+    state_only: bool = False):
   """Creates networks used by the agent.
 
   Args:
@@ -179,11 +180,15 @@ def make_networks(
       ``action_dim - 1`` dims, and a categorical logits head with this many
       classes for the select dim (cube ids ``0 .. n-1``).  Sampled select is
       mapped to the PD center in ``[-1, 1]`` so the env API stays continuous.
+    state_only: If True, φ encodes state only (not concat[s,a]), so CRL
+      learns / rewards with φ(s)·ψ(g) instead of φ(s,a)·ψ(g).  Action is
+      still accepted by the critic apply API but ignored by the SA encoder.
   """
 
   num_dimensions = np.prod(spec.actions.shape, dtype=int)
   _cat_select = (None if categorical_select_classes is None
                  else int(categorical_select_classes))
+  _state_only = bool(state_only)
   if _cat_select is not None and _cat_select < 2:
     raise ValueError(
         f'categorical_select_classes must be >= 2, got {_cat_select}')
@@ -214,8 +219,9 @@ def make_networks(
     else:
       state, goal = hidden
 
+    sa_in = state if _state_only else jnp.concatenate([state, action], axis=-1)
     sa_repr = _mlp_or_residual(
-        jnp.concatenate([state, action], axis=-1),
+        sa_in,
         list(hidden_layer_sizes) + [repr_dim],
         hidden_layer_sizes=hidden_layer_sizes,
         name='sa_encoder',

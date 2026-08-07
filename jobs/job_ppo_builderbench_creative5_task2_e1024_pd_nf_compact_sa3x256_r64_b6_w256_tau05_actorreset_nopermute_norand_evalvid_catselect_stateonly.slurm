@@ -1,17 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=c7t2_crl_e1_no
-#SBATCH --output=slurm/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_normobs_catselect_extrew1_ep70_300m_%A_%a.log
-#SBATCH --error=slurm/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_normobs_catselect_extrew1_ep70_300m_%A_%a.log
+#SBATCH --job-name=c5t2_nf_so_nx
+#SBATCH --output=slurm/ppo_builderbench_creative5_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_actorreset_nopermute_norand_evalvid_catselect_stateonly_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative5_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_actorreset_nopermute_norand_evalvid_catselect_stateonly_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
+#SBATCH --time=15:00:00
 #SBATCH --account=seas
-#SBATCH --array=0-0
+#SBATCH --array=2-3
 
-# c7t2 crl nopermute fixedx01 catselect seed0. config=normobs_extrew1_ep70_300m.
+# Compact NF + nf_state_only (p(g|s) / r(s)), nopermute + norand (fixed_start_x=0.1),
+# catselect + evalvid, NO external reward. Seeds 2-3.
 unset LD_PRELOAD
 
 module purge
@@ -86,48 +87,50 @@ export PIP_CACHE_DIR=/n/fs/mislresearch/mb6458-tmp/pip-cache
 export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-ENV=${ENV:-builderbench_creative_7_task2}
+ENV=${ENV:-builderbench_creative_5_task2}
 SEED=${SEED:-${SLURM_ARRAY_TASK_ID:-0}}
-NUM_STEPS=${NUM_STEPS:-300000000}
+NUM_STEPS=${NUM_STEPS:-200000000}
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
 MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
 ENT_COEF=0.05
-ENT_COEF_FINAL=0.0
 MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
-REWARD_TAU=${REWARD_TAU:-0.5}
-EXT_REW_SCALE=${EXT_REW_SCALE:-1}
+NF_REWARD_TAU=${NF_REWARD_TAU:-0.5}
 FIXED_START_X=${FIXED_START_X:-0.1}
-EP_LEN=${EP_LEN:-70}
-PD_DURATION=${PD_DURATION:-5}
-MJ_EP_LEN=$((EP_LEN * PD_DURATION))
 
-LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_normobs_catselect_extrew1_ep70_300m/}"
+NF_REP_SIZE=${NF_REP_SIZE:-64}
+NF_NUM_BLOCKS=${NF_NUM_BLOCKS:-6}
+NF_COUPLING_WIDTH=${NF_COUPLING_WIDTH:-256}
+NF_SA_HIDDEN=${NF_SA_HIDDEN:-256}
+NF_SA_NUM_LAYERS=${NF_SA_NUM_LAYERS:-3}
+NF_GRAD_CLIP=${NF_GRAD_CLIP:-1.0}
+NF_NOISE_STD=${NF_NOISE_STD:-0.05}
+NF_GOAL_STD_MIN=${NF_GOAL_STD_MIN:-0.02}
+
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative5_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_actorreset_nopermute_norand_evalvid_catselect_stateonly/}"
 
 mkdir -p slurm "${LOG_DIR}"
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=crl reward_tau=${REWARD_TAU}"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=nf nf_reward_tau=${NF_REWARD_TAU} nf_state_only=true"
 echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
 echo "max_replay_size=${MAX_REPLAY_SIZE}"
-echo "builderbench_use_pd=true pd_duration=${PD_DURATION} permute_start_boxes=false fixed_start_x=${FIXED_START_X} goals=MID+offsets(task2)"
-echo "episode_length=${EP_LEN} (mj_episode_length=${MJ_EP_LEN}, rollout_length=${EP_LEN})"
-echo "ppo_norm_obs=true"
-echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} (AFTER return-norm)"
-echo "ppo_actor_min_std=${MIN_STD}"
-echo "ppo_anneal_lr=true ppo_anneal_ent_coef=false"
-echo "ppo_categorical_select=true"
+echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=false fixed_start_x=${FIXED_START_X} (norand) goals=MID+offsets(default)"
+echo "actor_reset=true (ep_length_mean < 0.8 * nominal)"
+echo "ppo_norm_obs=false"
+echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
+echo "ppo_use_external_reward=false"
 echo "ppo_eval_interval=200 ppo_video_interval=400"
-echo "steps_per_iter=$((PPO_NUM_ENVS * EP_LEN))"
-echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * EP_LEN)))"
-
+echo "nf_rep_size=${NF_REP_SIZE} nf_num_blocks=${NF_NUM_BLOCKS} nf_coupling_width=${NF_COUPLING_WIDTH}"
+echo "nf_sa_hidden=${NF_SA_HIDDEN} nf_sa_num_layers=${NF_SA_NUM_LAYERS}"
+echo "nf_grad_clip=${NF_GRAD_CLIP} nf_noise_std=${NF_NOISE_STD} nf_goal_std_min=${NF_GOAL_STD_MIN}"
+echo "steps_per_iter=$((PPO_NUM_ENVS * 50))"
+echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * 50)))"
 python -u -c "
-from envs.builderbench_utils import default_fixed_target_goal, num_creative_tasks, load_task_goal_offsets
+from envs.builderbench_utils import default_fixed_target_goal
 import numpy as np
-load_task_goal_offsets.cache_clear()
-print('creative-7 n_tasks=', num_creative_tasks(7))
-g = default_fixed_target_goal(7, 1)
+g = default_fixed_target_goal(5, 1)
 print('hard_goal (flat)=', g.tolist())
 print('hard_goal (cubes)=')
 print(np.asarray(g).reshape(-1, 3))
@@ -147,11 +150,10 @@ python -u ppo_contrastive.py \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
   --ppo_checkpoint_interval=150 \
   --builderbench_use_pd=true \
-  --builderbench_pd_duration="${PD_DURATION}" \
+  --builderbench_pd_duration=5 \
   --builderbench_permute_start_boxes=false \
   --builderbench_fixed_start_x="${FIXED_START_X}" \
-  --builderbench_mj_episode_length="${MJ_EP_LEN}" \
-  --ppo_rollout_length="${EP_LEN}" \
+  --ppo_rollout_length=50 \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
   --ppo_eval_interval=200 \
@@ -160,11 +162,18 @@ python -u ppo_contrastive.py \
   --ppo_video_fps=10 \
   --ppo_skip_first_video=true \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
-  --ppo_repr_mode=crl \
-  --ppo_crl_repr_tau="${REWARD_TAU}" \
-  --ppo_norm_obs \
-  --ppo_use_external_reward \
-  --ppo_external_reward_scale="${EXT_REW_SCALE}" \
+  --ppo_repr_mode=nf \
+  --nf_state_only \
+  --ppo_nf_reward_tau="${NF_REWARD_TAU}" \
+  --nf_rep_size="${NF_REP_SIZE}" \
+  --nf_num_blocks="${NF_NUM_BLOCKS}" \
+  --nf_coupling_width="${NF_COUPLING_WIDTH}" \
+  --nf_sa_hidden="${NF_SA_HIDDEN}" \
+  --nf_sa_num_layers="${NF_SA_NUM_LAYERS}" \
+  --nf_grad_clip="${NF_GRAD_CLIP}" \
+  --nf_noise_std="${NF_NOISE_STD}" \
+  --nf_goal_std_min="${NF_GOAL_STD_MIN}" \
+  --nf_goal_enc_size=0 \
   --ppo_categorical_select \
   --hidden_layer_sizes="256,256,256,256,256,256"
 PY_EXIT=$?

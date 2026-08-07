@@ -111,6 +111,7 @@ def _build_nets(mode: str, args: dict):
         goal_enc_size=int(args.get('nf_goal_enc_size', 0)),
         sa_hidden=int(args.get('nf_sa_hidden', 1024)),
         sa_num_layers=int(args.get('nf_sa_num_layers', 4)),
+        state_only=bool(args.get('nf_state_only', False)),
     )
   elif mode == 'fm':
     from contrastive import fm_density as _fm
