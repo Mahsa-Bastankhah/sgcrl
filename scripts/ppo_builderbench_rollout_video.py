@@ -393,7 +393,7 @@ def _make_bb_env(env_id: str, ctx: _TrainCtx):
     cfg.nconmax, cfg.njmax = _MJX_PARAMS[env_id]
 
   base = CreativeCube(config=cfg)
-  mocap_targets = base._task_mocap_targets
+  mocap_targets = getattr(base, '_task_mocap_targets', getattr(base, '_mocap_targets', getattr(base, 'mocap_targets', None)))
 
   if ctx.use_pd:
     assert cfg.episode_length % ctx.pd_duration == 0, (

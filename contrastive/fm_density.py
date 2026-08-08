@@ -427,6 +427,8 @@ def make_fm_density_update_fn(
     metrics = dict(metrics)
     metrics['grad_norm'] = _tree_l2_norm(grads)
     metrics['update_skipped_nonfinite'] = 1.0 - do_update.astype(jnp.float32)
+    return new_params, new_opt_state, metrics
+
   return jax.jit(update)
 
 

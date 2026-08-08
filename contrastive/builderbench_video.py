@@ -61,7 +61,7 @@ def make_bb_video_env(
 
   base = CreativeCube(config=cfg)
   # Masked-in goal mocaps only (equals all mocaps when mask is all-True).
-  mocap_targets = base._task_mocap_targets
+  mocap_targets = getattr(base, '_task_mocap_targets', getattr(base, '_mocap_targets', getattr(base, 'mocap_targets', None)))
 
   if use_pd:
     assert cfg.episode_length % pd_duration == 0, (
