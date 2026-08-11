@@ -439,6 +439,290 @@ def make_nf_density_update_fn(
     return jax.jit(update)
 
 
+def make_scan_nf_update_fn(
+    nf_networks: NFDensityNetworks,
+    optimizer: optax.GradientTransformation,
+    obs_dim: int,
+    noise_std: float = 0.0,
+    repr_tau: float = 0.0,
+):
+  """Scan-based NF updater: N density steps in one JIT call.
+
+  Caller pre-samples all N batches in NumPy, stacks them into
+  ``(N, B, dim)`` arrays, and transfers to GPU once.  Matches the CRL
+  ``make_scan_crl_update_fn`` pattern.  Reward-param EMA
+  (``0 < repr_tau < 1``) is applied inside the scan.
+
+  Returns:
+    ``multi_update(params, opt_state, params_ema, batches, key,
+                   goal_mean, goal_std)``
+    → ``(new_params, new_opt_state, new_params_ema, new_key,
+         mean_metrics)``
+  """
+  raw_update = make_nf_density_update_fn(
+      nf_networks, optimizer, obs_dim=obs_dim, noise_std=noise_std)
+  use_ema = 0.0 < float(repr_tau) < 1.0
+  _tau = float(repr_tau)
+
+  @jax.jit
+  def multi_update(
+      params, opt_state, params_ema, batches, key, goal_mean, goal_std):
+    def scan_step(carry, batch):
+      p, opt, ema, k = carry
+      k, k_u = jax.random.split(k)
+      p, opt, m = raw_update(p, opt, batch, k_u, goal_mean, goal_std)
+      if use_ema:
+        ema = jax.tree_util.tree_map(
+            lambda t, o: _tau * t + (1.0 - _tau) * o, ema, p)
+      else:
+        ema = p
+      return (p, opt, ema, k), m
+
+    (params, opt_state, params_ema, key), metrics = jax.lax.scan(
+        scan_step, (params, opt_state, params_ema, key), batches)
+    metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+    return params, opt_state, params_ema, key, metrics
+
+  return multi_update
+
+
+# ---------------------------------------------------------------------------
+# 3b.  TD-NF loss  (one-step + importance-weighted bootstrap)
+# ---------------------------------------------------------------------------
+
+def make_nf_td_density_update_fn(
+    nf_networks: NFDensityNetworks,
+    optimizer: optax.GradientTransformation,
+    obs_dim: int,
+    discount: float,
+    policy_network_apply,
+    sample_fn,
+    policy_goal: np.ndarray,
+    target_tau: float = 0.995,
+    noise_std: float = 0.0,
+    mask_prob: float = 0.2,
+    start_index: int = 0,
+    end_index: int = -1,
+    goal_state_indices=None,
+    ratio_clip: float = 20.0,
+):
+  """TD normalizing-flow density update.
+
+  Maximises::
+
+      (1-γ) log p_θ(g'|s,a)
+        + γ · stopgrad( p_{θ⁻}(g_j|s',a') / p_{θ⁻}(g_j) )
+              · log p_θ(g_j|s,a)
+
+  where ``g' = obs_to_goal(s')``, ``g_j`` is a rolled other-row next-state
+  goal (empirical next-state marginal), ``a' ∼ π(·|s', g_task)`` is sampled
+  fresh from the current PPO policy (no grad into π), and the target
+  marginal ``p_{θ⁻}(g_j)`` is the same NF with ``(s,a)`` replaced by zeros.
+
+  With probability ``mask_prob``, the *online* conditioning ``(s,a)`` is
+  also zero-masked so the flow learns the marginal pathway used in the
+  denominator.  Target params follow EMA
+  ``θ⁻ ← target_tau·θ⁻ + (1-target_tau)·θ``.
+  """
+  gamma = float(discount)
+  _target_tau = float(target_tau)
+  _mask_prob = float(mask_prob)
+  _noise_std = float(noise_std)
+  _ratio_clip = float(ratio_clip)
+  si = int(start_index)
+  ei = int(end_index)
+  _gidx = None if goal_state_indices is None else jnp.asarray(
+      goal_state_indices, dtype=jnp.int32)
+  _policy_goal = jnp.asarray(policy_goal, dtype=jnp.float32).reshape(-1)
+
+  def _state_as_goal(state: jnp.ndarray) -> jnp.ndarray:
+    if _gidx is not None:
+      return state[:, _gidx]
+    if ei == -1:
+      return state[:, si:]
+    return state[:, si:ei]
+
+  def _norm_goal(goal, goal_mean, goal_std):
+    return (goal - goal_mean) / (goal_std + 1e-8)
+
+  def _loss(params, target_params, policy_params, batch, key,
+            goal_mean, goal_std):
+    obs = batch['obs']
+    action = batch['action']
+    next_obs = batch['next_obs']
+    batch_size = obs.shape[0]
+
+    s = obs[:, :obs_dim]
+    next_s = next_obs[:, :obs_dim]
+
+    g_prime = _norm_goal(_state_as_goal(next_s), goal_mean, goal_std)
+    key, k_noise, k_mask, k_act = jax.random.split(key, 4)
+    if _noise_std > 0.0:
+      g_prime = g_prime + _noise_std * jax.random.normal(
+          k_noise, g_prime.shape)
+    # sj = next-state goals of other batch rows (marginal sample).
+    g_j = jnp.roll(g_prime, shift=1, axis=0)
+
+    # a' ~ π(· | s', g_task) — fresh policy sample (mirrors TD-InfoNCE).
+    env_goal = jnp.broadcast_to(
+        _policy_goal[None, :], (batch_size, _policy_goal.shape[0]))
+    next_policy_obs = jnp.concatenate([next_s, env_goal], axis=1)
+    next_dist = policy_network_apply(policy_params, next_policy_obs)
+    next_action = sample_fn(next_dist, k_act)
+
+    # Online conditioning: with mask_prob, replace (s,a) by zeros so the
+    # flow also learns p(g | MASK) ≈ marginal.
+    mask = jax.random.bernoulli(
+        k_mask, _mask_prob, shape=(batch_size, 1)).astype(s.dtype)
+    s_online = s * (1.0 - mask)
+    a_online = action * (1.0 - mask)
+
+    log_p_next = nf_log_prob(
+        nf_networks, params, s_online, a_online, g_prime)
+    log_p_sj = nf_log_prob(
+        nf_networks, params, s_online, a_online, g_j)
+
+    # Target weights (stop-grad): p(g_j|s',a') / p(g_j|MASK).
+    log_p_tgt_cond = nf_log_prob(
+        nf_networks, target_params, next_s, next_action, g_j)
+    zeros_s = jnp.zeros_like(next_s)
+    zeros_a = jnp.zeros_like(next_action)
+    log_p_tgt_marg = nf_log_prob(
+        nf_networks, target_params, zeros_s, zeros_a, g_j)
+    log_ratio = jnp.clip(
+        log_p_tgt_cond - log_p_tgt_marg, -_ratio_clip, _ratio_clip)
+    w = jax.lax.stop_gradient(jnp.exp(log_ratio))
+
+    term1 = (1.0 - gamma) * log_p_next
+    term2 = gamma * w * log_p_sj
+    objective = term1 + term2
+    loss = -jnp.mean(objective)
+
+    metrics = {
+        'density_loss': loss,
+        'td_term1': jnp.mean(term1),
+        'td_term2': jnp.mean(term2),
+        'log_p_next_mean': jnp.mean(log_p_next),
+        'log_p_sj_mean': jnp.mean(log_p_sj),
+        'log_p_tgt_cond_mean': jnp.mean(log_p_tgt_cond),
+        'log_p_tgt_marg_mean': jnp.mean(log_p_tgt_marg),
+        'td_w_mean': jnp.mean(w),
+        'td_w_std': jnp.std(w),
+        'td_mask_frac': jnp.mean(mask),
+        'a_prime_mean': jnp.mean(next_action),
+        'a_prime_std': jnp.std(next_action),
+        'log_p_mean': jnp.mean(log_p_next),
+        'log_p_min': jnp.min(log_p_next),
+        'log_p_max': jnp.max(log_p_next),
+    }
+    return loss, metrics
+
+  grad_fn = jax.value_and_grad(_loss, has_aux=True)
+
+  def update(params, opt_state, target_params, policy_params, batch, key,
+             goal_mean, goal_std):
+    (_, metrics), grads = grad_fn(
+        params, target_params, policy_params, batch, key,
+        goal_mean, goal_std)
+    metrics = dict(metrics)
+    metrics['encoder_grad_norm'] = _tree_l2_norm(grads['sa_encoder'])
+    metrics['flow_grad_norm'] = _tree_l2_norm(grads['nf_flow'])
+    if 'goal_encoder' in grads:
+      metrics['goal_enc_grad_norm'] = _tree_l2_norm(grads['goal_encoder'])
+
+    grads_finite = jnp.all(jnp.asarray(jax.tree_util.tree_leaves(
+        jax.tree_util.tree_map(lambda g: jnp.all(jnp.isfinite(g)), grads))))
+    loss_finite = jnp.isfinite(metrics['density_loss'])
+    do_update = jnp.logical_and(grads_finite, loss_finite)
+
+    def _apply(_):
+      updates, new_opt_state = optimizer.update(grads, opt_state, params)
+      return optax.apply_updates(params, updates), new_opt_state
+
+    def _skip(_):
+      return params, opt_state
+
+    new_params, new_opt_state = jax.lax.cond(
+        do_update, _apply, _skip, operand=None)
+    new_target = jax.tree_util.tree_map(
+        lambda t, o: _target_tau * t + (1.0 - _target_tau) * o,
+        target_params, new_params)
+    metrics = dict(metrics)
+    metrics['update_skipped_nonfinite'] = 1.0 - do_update.astype(jnp.float32)
+    return new_params, new_opt_state, new_target, metrics
+
+  return jax.jit(update)
+
+
+def make_scan_nf_td_update_fn(
+    nf_networks: NFDensityNetworks,
+    optimizer: optax.GradientTransformation,
+    obs_dim: int,
+    discount: float,
+    policy_network_apply,
+    sample_fn,
+    policy_goal: np.ndarray,
+    target_tau: float = 0.995,
+    noise_std: float = 0.0,
+    mask_prob: float = 0.2,
+    start_index: int = 0,
+    end_index: int = -1,
+    goal_state_indices=None,
+    repr_tau: float = 0.0,
+    ratio_clip: float = 20.0,
+):
+  """Scan-based TD-NF updater: N density steps in one JIT call.
+
+  Returns:
+    ``multi_update(params, opt_state, target_params, params_ema, batches,
+                   key, goal_mean, goal_std, policy_params)``
+    → ``(new_params, new_opt, new_target, new_ema, new_key, mean_metrics)``
+  """
+  raw_update = make_nf_td_density_update_fn(
+      nf_networks, optimizer,
+      obs_dim=obs_dim,
+      discount=discount,
+      policy_network_apply=policy_network_apply,
+      sample_fn=sample_fn,
+      policy_goal=policy_goal,
+      target_tau=target_tau,
+      noise_std=noise_std,
+      mask_prob=mask_prob,
+      start_index=start_index,
+      end_index=end_index,
+      goal_state_indices=goal_state_indices,
+      ratio_clip=ratio_clip,
+  )
+  use_ema = 0.0 < float(repr_tau) < 1.0
+  _tau = float(repr_tau)
+
+  @jax.jit
+  def multi_update(
+      params, opt_state, target_params, params_ema, batches, key,
+      goal_mean, goal_std, policy_params):
+    def scan_step(carry, batch):
+      p, opt, tgt, ema, k = carry
+      k, k_u = jax.random.split(k)
+      p, opt, tgt, m = raw_update(
+          p, opt, tgt, policy_params, batch, k_u, goal_mean, goal_std)
+      if use_ema:
+        ema = jax.tree_util.tree_map(
+            lambda t, o: _tau * t + (1.0 - _tau) * o, ema, p)
+      else:
+        ema = p
+      return (p, opt, tgt, ema, k), m
+
+    (params, opt_state, target_params, params_ema, key), metrics = (
+        jax.lax.scan(
+            scan_step,
+            (params, opt_state, target_params, params_ema, key),
+            batches))
+    metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+    return params, opt_state, target_params, params_ema, key, metrics
+
+  return multi_update
+
+
 # ---------------------------------------------------------------------------
 # 4.  Reward
 # ---------------------------------------------------------------------------

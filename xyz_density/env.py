@@ -7,6 +7,10 @@ Dynamics (per env, per step)::
 
 State and observation are both ``(x, y, z)``.  Episodes truncate at a
 fixed horizon (default 50); there is no terminal success signal.
+
+Optional ``single_axis_xy``: each episode locks motion to **either** the
+x-axis **or** the y-axis (never both in one episode).  Useful as an OOD
+protocol when eval uses unrestricted joint ``(a_x, a_y)`` actions.
 """
 from __future__ import annotations
 
@@ -34,6 +38,7 @@ class JaxXYZVecEnv:
       seed: int = 0,
       zero_az: bool = False,
       force_az_positive: bool = False,
+      single_axis_xy: bool = False,
       reset_center: Optional[np.ndarray] = None,
   ):
     self.num_envs = int(num_envs)
@@ -46,6 +51,8 @@ class JaxXYZVecEnv:
     self.zero_az = bool(zero_az)
     # If True: sample a_z ~ Uniform(0, action_high] (OOD vs zero_az training).
     self.force_az_positive = bool(force_az_positive)
+    # If True: each episode picks x-only OR y-only actions (never both).
+    self.single_axis_xy = bool(single_axis_xy)
     if self.zero_az and self.force_az_positive:
       raise ValueError('zero_az and force_az_positive are mutually exclusive')
     if reset_center is None:
@@ -57,6 +64,11 @@ class JaxXYZVecEnv:
     self._state = np.broadcast_to(
         self.reset_center, (self.num_envs, self.STATE_DIM)).copy()
     self._t = np.zeros(self.num_envs, dtype=np.int32)
+    # Per-env locked axis for the current episode: 0=x-only, 1=y-only.
+    self._axis = np.zeros(self.num_envs, dtype=np.int32)
+    self._np_rng = np.random.default_rng(int(seed) + 17)
+    if self.single_axis_xy:
+      self._resample_axes(np.ones(self.num_envs, dtype=bool))
     self._step_jit = jax.jit(self._step_fn)
     self._reset_jit = jax.jit(self._reset_fn)
 
@@ -71,6 +83,14 @@ class JaxXYZVecEnv:
   def _split_key(self):
     self._key, sub = jax.random.split(self._key)
     return sub
+
+  def _resample_axes(self, mask: np.ndarray) -> None:
+    """Assign a fresh x-or-y lock for envs where ``mask`` is True."""
+    mask = np.asarray(mask, dtype=bool)
+    n = int(mask.sum())
+    if n == 0:
+      return
+    self._axis[mask] = self._np_rng.integers(0, 2, size=n, dtype=np.int32)
 
   def _reset_fn(self, key, mask, state, t, reset_scale, reset_center):
     """Reset envs where ``mask`` is True; leave others unchanged."""
@@ -119,6 +139,8 @@ class JaxXYZVecEnv:
     )
     self._state = np.asarray(state_j, dtype=np.float32)
     self._t = np.asarray(t_j, dtype=np.int32)
+    if self.single_axis_xy:
+      self._resample_axes(mask)
     return self._state.copy()
 
   def step(
@@ -153,6 +175,9 @@ class JaxXYZVecEnv:
     self._state = np.asarray(out_state, dtype=np.float32)
     self._t = np.asarray(out_t, dtype=np.int32)
     done_np = np.asarray(done, dtype=bool)
+    if self.single_axis_xy and done_np.any():
+      # New episode after auto-reset → new axis lock.
+      self._resample_axes(done_np)
     info_rew = np.full(self.num_envs, np.nan, dtype=np.float32)
     return (
         self._state.copy(),
@@ -167,6 +192,8 @@ class JaxXYZVecEnv:
 
     When ``zero_az`` is set, the z-component is forced to 0.
     When ``force_az_positive`` is set, a_z ~ Uniform(0, action_high].
+    When ``single_axis_xy`` is set, each env zeros the inactive axis
+    (x-only or y-only for the current episode).
     """
     actions = rng.uniform(
         self.action_low, self.action_high,
@@ -177,4 +204,9 @@ class JaxXYZVecEnv:
       # Open at 0 so a_z > 0 almost surely.
       actions[:, 2] = rng.uniform(
           1e-6, self.action_high, size=(self.num_envs,)).astype(np.float32)
+    if self.single_axis_xy:
+      # axis==0 → keep x, zero y; axis==1 → keep y, zero x.
+      x_only = self._axis == 0
+      actions[x_only, 1] = 0.0
+      actions[~x_only, 0] = 0.0
     return actions

@@ -44,17 +44,21 @@ from xyz_density.train import (
     _softmax_normalize,
 )
 
-MODES = ('crl', 'nf', 'nf_compact', 'nf_tiny', 'td3', 'fm', 'tdinfonce')
+MODES = ('crl', 'nf', 'nf_compact', 'nf_tiny', 'nf_td', 'td3', 'fb', 'fm',
+         'tdinfonce')
 MODE_FILE_PREFIX = {
     'nf_compact': 'nf',
     'nf_tiny': 'nf',
+    'nf_td': 'nf',
 }
 MODE_COLORS = {
     'crl': '#1f77b4',
     'nf': '#ff7f0e',
     'nf_compact': '#8c564b',
     'nf_tiny': '#e377c2',
+    'nf_td': '#17becf',
     'td3': '#2ca02c',
+    'fb': '#bcbd22',
     'fm': '#d62728',
     'tdinfonce': '#9467bd',
 }
@@ -63,7 +67,9 @@ MODE_LABELS = {
     'nf': 'NF',
     'nf_compact': 'NF compact',
     'nf_tiny': 'NF tiny',
+    'nf_td': 'TD-NF',
     'td3': 'TD3',
+    'fb': 'FB',
     'fm': 'FM',
     'tdinfonce': 'TDInfoNCE',
 }
@@ -141,8 +147,12 @@ def _file_prefix(mode: str) -> str:
 
 
 def _score_mode(mode: str) -> str:
-  """Network / scoring mode name (nf_compact/nf_tiny share the NF scorer)."""
-  return 'nf' if mode in ('nf_compact', 'nf_tiny') else mode
+  """Network / scoring mode name (nf_* / fb share NF / TD3 scorers)."""
+  if mode in ('nf_compact', 'nf_tiny', 'nf_td'):
+    return 'nf'
+  if mode == 'fb':
+    return 'td3'
+  return mode
 
 
 def _list_ckpts(mode_dir: str, mode: str) -> List[Tuple[int, str]]:

@@ -150,7 +150,7 @@ python -u ppo_contrastive.py \
   --hidden_layer_sizes="256,256,256,256,256,256" \
   --ppo_eval_interval=10 \
   --ppo_eval_episodes=5 \
-  --ppo_checkpoint_interval=200 \
+  --ppo_checkpoint_interval=400 \
   --ppo_checkpoint_keep_last=5
 PY_EXIT=$?
 pkill -P $$ 2>/dev/null || true

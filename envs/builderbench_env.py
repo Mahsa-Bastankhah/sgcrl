@@ -89,6 +89,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
       fixed_target_goal: Optional[np.ndarray] = None,
       permute_start_boxes: bool = True,
       fixed_start_x: Optional[float] = None,
+      success_terminate_steps: int = 0,
   ):
     super().__init__()
     _require_builderbench(env_id)
@@ -105,6 +106,8 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     self._fixed_start_x = (
         None if fixed_start_x is None or float(fixed_start_x) < 0
         else float(fixed_start_x))
+    self._success_terminate_steps = int(success_terminate_steps)
+    self._consecutive_success = 0
 
     num_cubes, task_id = parse_creative_env_id(env_id)
     self._num_cubes = num_cubes
@@ -205,6 +208,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     state = self._env.reset(subkey)
     state = self._maybe_fix_target(state)
     self._state = state
+    self._consecutive_success = 0
     return self._pack_obs(state)
 
   def step(self, action):
@@ -216,17 +220,27 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     obs = self._pack_obs(self._state)
     reward = float(np.asarray(self._state.reward))
     done = bool(np.asarray(self._state.done))
+    success = float(np.asarray(self._state.metrics.get('success', 0.0)))
+    if self._success_terminate_steps > 0:
+      if success >= 0.5:
+        self._consecutive_success += 1
+      else:
+        self._consecutive_success = 0
+      if self._consecutive_success >= self._success_terminate_steps:
+        done = True
     info = {
-        'success': float(np.asarray(self._state.metrics.get('success', 0.0))),
+        'success': success,
         'easy_success': float(
             np.asarray(self._state.metrics.get('easy_success', 0.0))),
         'target_goal': np.asarray(
             self._state.info['target_goal'], dtype=np.float32),
         'achieved_goal': np.asarray(
             self._state.info['achieved_goal'], dtype=np.float32),
+        'consecutive_success': int(self._consecutive_success),
     }
     if done:
       self._state = None
+      self._consecutive_success = 0
     return obs, reward, done, info
 
 
@@ -239,6 +253,7 @@ def make_builderbench_creative_env(
     fixed_target_goal: Optional[np.ndarray] = None,
     permute_start_boxes: bool = True,
     fixed_start_x: Optional[float] = None,
+    success_terminate_steps: int = 0,
 ) -> BuilderBenchCreativeGymEnv:
   return BuilderBenchCreativeGymEnv(
       env_id=env_id,
@@ -249,4 +264,5 @@ def make_builderbench_creative_env(
       fixed_target_goal=fixed_target_goal,
       permute_start_boxes=permute_start_boxes,
       fixed_start_x=fixed_start_x,
+      success_terminate_steps=success_terminate_steps,
   )

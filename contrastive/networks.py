@@ -16,6 +16,7 @@ from itertools import product
 
 # modified Tanh mean to be mapped to tanh(mean) to keep within [-1, 1]
 from distributional import NormalTanhCategoricalSelect
+from distributional import NormalTanhCategoricalSelectWaypoint
 from distributional import NormalTanhDistribution
 
 
@@ -171,6 +172,7 @@ def make_networks(
     twin_q = False,
     use_image_obs = False,
     categorical_select_classes: Optional[int] = None,
+    categorical_select_waypoint: bool = False,
     state_only: bool = False):
   """Creates networks used by the agent.
 
@@ -180,6 +182,9 @@ def make_networks(
       ``action_dim - 1`` dims, and a categorical logits head with this many
       classes for the select dim (cube ids ``0 .. n-1``).  Sampled select is
       mapped to the PD center in ``[-1, 1]`` so the env API stays continuous.
+    categorical_select_waypoint: If True (requires categorical_select_classes),
+      use per-cube 3D waypoint heads (``n × 3``) plus a shared yaw head and
+      categorical select, instead of a single shared continuous head.
     state_only: If True, φ encodes state only (not concat[s,a]), so CRL
       learns / rewards with φ(s)·ψ(g) instead of φ(s,a)·ψ(g).  Action is
       still accepted by the critic apply API but ignored by the SA encoder.
@@ -188,6 +193,7 @@ def make_networks(
   num_dimensions = np.prod(spec.actions.shape, dtype=int)
   _cat_select = (None if categorical_select_classes is None
                  else int(categorical_select_classes))
+  _cat_wp = bool(categorical_select_waypoint)
   _state_only = bool(state_only)
   if _cat_select is not None and _cat_select < 2:
     raise ValueError(
@@ -196,6 +202,13 @@ def make_networks(
     raise ValueError(
         'categorical select actor requires action_dim >= 2 '
         f'(got {num_dimensions})')
+  if _cat_wp and _cat_select is None:
+    raise ValueError(
+        'categorical_select_waypoint requires categorical_select_classes')
+  if _cat_wp and num_dimensions < 5:
+    raise ValueError(
+        'categorical_select_waypoint expects PD action_dim >= 5 '
+        f'(xyz+yaw+select), got {num_dimensions}')
   TORSO = networks_lib.AtariTorso  # pylint: disable=invalid-name
 
   def _unflatten_obs(obs):
@@ -280,6 +293,13 @@ def make_networks(
         activate_final=True,
         w_init=hk.initializers.VarianceScaling(1.0, 'fan_in', 'uniform'),
     )
+    if _cat_select is not None and _cat_wp:
+      # Per-cube xyz waypoint heads + shared yaw + categorical select.
+      return NormalTanhCategoricalSelectWaypoint(
+          num_select_classes=_cat_select,
+          waypoint_dim=3,
+          min_scale=actor_min_std,
+      )(h)
     if _cat_select is not None:
       # Shared trunk; Gaussian on continuous dims; categorical over n cubes.
       return NormalTanhCategoricalSelect(

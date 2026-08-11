@@ -93,7 +93,7 @@ python -u ppo_contrastive.py \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
-  --ppo_checkpoint_interval=150 \
+  --ppo_checkpoint_interval=300 \
   --ppo_skip_first_eval=true \
   --ppo_eval_interval=0 \
   --hidden_layer_sizes="256,256,256,256,256,256"

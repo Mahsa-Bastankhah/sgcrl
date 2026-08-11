@@ -364,6 +364,43 @@ def make_fm_density_update_fn(
   return jax.jit(update)
 
 
+def make_scan_fm_update_fn(
+    fm_networks: FMDensityNetworks,
+    optimizer: optax.GradientTransformation,
+    obs_dim: int,
+    repr_tau: float = 0.0,
+):
+  """Scan-based FM updater: N density steps in one JIT call.
+
+  Caller pre-samples all N batches into ``(N, B, …)`` arrays.  Reward-param
+  EMA (``0 < repr_tau < 1``) is applied inside the scan.
+  """
+  raw_update = make_fm_density_update_fn(
+      fm_networks, optimizer, obs_dim=obs_dim)
+  use_ema = 0.0 < float(repr_tau) < 1.0
+  _tau = float(repr_tau)
+
+  @jax.jit
+  def multi_update(params, opt_state, params_ema, batches, key):
+    def scan_step(carry, batch):
+      p, opt, ema, k = carry
+      k, k_u = jax.random.split(k)
+      p, opt, m = raw_update(p, opt, batch, k_u)
+      if use_ema:
+        ema = jax.tree_util.tree_map(
+            lambda t, o: _tau * t + (1.0 - _tau) * o, ema, p)
+      else:
+        ema = p
+      return (p, opt, ema, k), m
+
+    (params, opt_state, params_ema, key), metrics = jax.lax.scan(
+        scan_step, (params, opt_state, params_ema, key), batches)
+    metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+    return params, opt_state, params_ema, key, metrics
+
+  return multi_update
+
+
 # ---------------------------------------------------------------------------
 # 6.  Reward  r_t = log p_θ(g | s_t, a_t)
 # ---------------------------------------------------------------------------

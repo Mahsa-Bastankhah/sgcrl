@@ -117,7 +117,7 @@ python -u xyz_density/train.py \
   --val_num_envs=128 \
   --val_batch_size="${VAL_BATCH_SIZE}" \
   --log_dir="${LOG_DIR}" \
-  --checkpoint_interval=100
+  --checkpoint_interval=200
 
 python -u xyz_density/plot_results.py \
   --log_root="${LOG_ROOT}" \

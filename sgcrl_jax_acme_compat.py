@@ -77,23 +77,31 @@ if not hasattr(jax, 'tree_multimap'):
 # launchpad stub — dm-launchpad is not pip-installable on Python 3.11, but acme
 # imports it in acme/utils/signals.py.  PPO does not use launchpad workers;
 # register_stop_handler / unregister_stop_handler are no-ops.
+#
+# Prefer the real package when present (e.g. sgcrl_flow + lp_contrastive).
+# Only stub if import fails — otherwise we shadow dm-launchpad and break
+# --lp_launch_type / Launchpad program startup.
 # ---------------------------------------------------------------------------
 if 'launchpad' not in sys.modules:
-    _lp = types.ModuleType('launchpad')
-    _lp._stop_handlers = []
+    try:
+        import launchpad as _real_launchpad  # noqa: F401
+    except ImportError:
+        _lp = types.ModuleType('launchpad')
+        _lp._stop_handlers = []
 
-    def register_stop_handler(handler):
-        _lp._stop_handlers.append(handler)
+        def register_stop_handler(handler):
+            _lp._stop_handlers.append(handler)
 
-    def unregister_stop_handler(handler):
-        try:
-            _lp._stop_handlers.remove(handler)
-        except ValueError:
-            pass
+        def unregister_stop_handler(handler):
+            try:
+                _lp._stop_handlers.remove(handler)
+            except ValueError:
+                pass
 
-    _lp.register_stop_handler = register_stop_handler
-    _lp.unregister_stop_handler = unregister_stop_handler
-    sys.modules['launchpad'] = _lp
+        _lp.register_stop_handler = register_stop_handler
+        _lp.unregister_stop_handler = unregister_stop_handler
+        sys.modules['launchpad'] = _lp
+        del register_stop_handler, unregister_stop_handler, _lp
 
 # ---------------------------------------------------------------------------
 # cv2 stub — only installed when the real cv2 cannot be loaded.

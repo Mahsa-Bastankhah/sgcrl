@@ -33,13 +33,27 @@ TD3 critic objective
   L     = MSE(Q1(s,a,g), y) + MSE(Q2(s,a,g), y)
   targets ← (1 − τ) · targets + τ · online          (Polyak; config.tau)
 
+FB critic objective (``fb_loss`` / ``ppo_td3_fb_loss``)
+-------------------------------------------------------
+Same twin Q(s,a,s_f) nets and s_f sampling, but no indicator reward::
+
+  a'  ~ π(· | s', s_f)
+  y   = γ · stopgrad( min(Q1̄, Q2̄)(s', a', s_f) )
+  L_i = mean( (Qi(s,a,s_f) − y)^2 ) − mean( Qi(s, a, s') )
+  L   = L_1 + L_2
+
+i.e. Bellman residual on the future goal s_f, plus maximize Q on the
+immediate next state s' (packed as ``obs_to_goal(s')``).
+
 Cross-batch goals (``cross_batch_goals`` / ``ppo_td3_cross_batch_goals``):
   For a batch of size B, each transition ``(s_i, a_i, s'_i)`` is trained against
   **every** future goal ``g_j = obs_to_goal(s_f_j)`` in the batch (B² pairs)::
 
       Q(s_i, a_i, g_j) ← 1[s'_i ≈ g_j] + γ min Q̄(s'_i, a'_{ij}, g_j)
 
-  With the flag off, only the diagonal pairs ``(i, i)`` are used.
+  With FB loss the indicator is dropped (``y = γ min Q̄``); the
+  ``−Q(s,a,s')`` term stays per-transition (diagonal).  With the flag off,
+  only the diagonal pairs ``(i, i)`` are used.
 
 Optional target policy (``use_target_policy`` / ``ppo_td3_use_target_policy``):
   a' ~ π̄(· | s', g) and π̄ ← (1−τ)·π̄ + τ·π after each critic step
@@ -224,6 +238,7 @@ def make_td3_density_update_fn(
     normalize_obs: bool = False,
     obs_norm_clip: float = 10.0,
     goal_state_indices=None,
+    fb_loss: bool = False,
 ):
   """Jitted TD3 twin-Q update over one EpisodeReplay batch.
 
@@ -244,6 +259,10 @@ def make_td3_density_update_fn(
   When ``cross_batch_goals`` is True (default), each ``(s_i, a_i, s'_i)`` is
   paired with every batch goal ``g_j`` (B² TD backups).  When False, only the
   paired goal ``g_i`` is used.
+
+  When ``fb_loss`` is True, use the FB objective
+  ``(Q(s,a,s_f) − γ sg Q(s',a',s_f))^2 − Q(s,a,s')`` instead of the
+  indicator TD3 backup (``s_f`` still sampled as usual).
   """
   gamma = float(discount)
   polyak = float(tau)
@@ -252,6 +271,7 @@ def make_td3_density_update_fn(
   ei = int(end_index)
   use_pi_bar = bool(use_target_policy)
   use_cross = bool(cross_batch_goals)
+  use_fb = bool(fb_loss)
   use_obs_norm = bool(normalize_obs)
   norm_clip = float(obs_norm_clip)
   norm_ei = int(obs_dim if ei == -1 else ei)
@@ -337,26 +357,54 @@ def make_td3_density_update_fn(
     q2_next = density_nets.qf2_net.apply(
         target_params['qf2_target'], next_obs_network, next_action)
     min_next = jnp.minimum(q1_next, q2_next)
-    # Non-absorbing backup: y = 1[s'≈g] + γ min Q̄(s', a', g)
-    target_q = jax.lax.stop_gradient(rewards_flat + gamma * min_next)
+    if use_fb:
+      # FB: y = γ · stopgrad(min Q̄(s', a', s_f))  (no indicator)
+      target_q = jax.lax.stop_gradient(gamma * min_next)
+    else:
+      # Non-absorbing backup: y = 1[s'≈g] + γ min Q̄(s', a', g)
+      target_q = jax.lax.stop_gradient(rewards_flat + gamma * min_next)
 
     q1 = density_nets.qf1_net.apply(
         online_params['qf1'], obs_network, action_flat)
     q2 = density_nets.qf2_net.apply(
         online_params['qf2'], obs_network, action_flat)
-    qf1_loss = jnp.mean((q1 - target_q) ** 2)
-    qf2_loss = jnp.mean((q2 - target_q) ** 2)
+    qf1_mse = jnp.mean((q1 - target_q) ** 2)
+    qf2_mse = jnp.mean((q2 - target_q) ** 2)
+
+    if use_fb:
+      # −Q(s, a, s'): maximize Q on the immediate next state as goal.
+      # Always diagonal over transitions (not cross-batch goals).
+      obs_sprime = jnp.concatenate([state, s_next_as_g], axis=-1)
+      obs_sprime_network = _normalize(obs_sprime, obs_mean, obs_var)
+      q1_sprime = density_nets.qf1_net.apply(
+          online_params['qf1'], obs_sprime_network, action)
+      q2_sprime = density_nets.qf2_net.apply(
+          online_params['qf2'], obs_sprime_network, action)
+      q1_sprime_mean = jnp.mean(q1_sprime)
+      q2_sprime_mean = jnp.mean(q2_sprime)
+      qf1_loss = qf1_mse - q1_sprime_mean
+      qf2_loss = qf2_mse - q2_sprime_mean
+    else:
+      q1_sprime_mean = jnp.array(0.0, dtype=obs.dtype)
+      q2_sprime_mean = jnp.array(0.0, dtype=obs.dtype)
+      qf1_loss = qf1_mse
+      qf2_loss = qf2_mse
     loss = qf1_loss + qf2_loss
 
     metrics = {
         'td3_qf_loss': loss,
         'td3_qf1_loss': qf1_loss,
         'td3_qf2_loss': qf2_loss,
+        'td3_qf1_mse': qf1_mse,
+        'td3_qf2_mse': qf2_mse,
         'td3_q1_mean': jnp.mean(q1),
         'td3_q2_mean': jnp.mean(q2),
         'td3_target_mean': jnp.mean(target_q),
         'td3_reward_mean': jnp.mean(rewards_flat),
         'td3_goal_hit_frac': jnp.mean(rewards_flat),
+        'td3_fb_loss': jnp.asarray(float(use_fb), dtype=obs.dtype),
+        'td3_q1_sprime_mean': q1_sprime_mean,
+        'td3_q2_sprime_mean': q2_sprime_mean,
     }
     if use_cross:
       # Diagonal = original paired (s_i, g_i) hits; useful sanity check.
@@ -418,6 +466,84 @@ def make_td3_density_update_fn(
     return new_q_params, new_opt_state, metrics, new_pi_target
 
   return update
+
+
+def make_scan_td3_update_fn(
+    density_nets: Td3DensityNetworks,
+    policy_network: networks_lib.FeedForwardNetwork,
+    sample_fn,
+    optimizer: optax.GradientTransformation,
+    obs_dim: int,
+    start_index: int = 0,
+    end_index: int = -1,
+    discount: float = 0.99,
+    tau: float = 0.005,
+    goal_tol: float = 1e-2,
+    use_target_policy: bool = False,
+    cross_batch_goals: bool = True,
+    normalize_obs: bool = False,
+    obs_norm_clip: float = 10.0,
+    goal_state_indices=None,
+    fb_loss: bool = False,
+    repr_tau: float = 0.0,
+):
+  """Scan-based TD3 updater: N critic steps in one JIT call.
+
+  Caller pre-samples all N batches into ``(N, B, …)`` arrays.  Reward-param
+  EMA (``0 < repr_tau < 1``) is applied inside the scan.
+
+  Returns:
+    ``multi_update(q_params, opt_state, params_ema, batches, key,
+                   policy_params, policy_target_params, obs_mean, obs_var)``
+    → ``(new_q, new_opt, new_ema, new_key, new_policy_target, mean_metrics)``
+  """
+  raw_update = make_td3_density_update_fn(
+      density_nets,
+      policy_network=policy_network,
+      sample_fn=sample_fn,
+      optimizer=optimizer,
+      obs_dim=obs_dim,
+      start_index=start_index,
+      end_index=end_index,
+      discount=discount,
+      tau=tau,
+      goal_tol=goal_tol,
+      use_target_policy=use_target_policy,
+      cross_batch_goals=cross_batch_goals,
+      normalize_obs=normalize_obs,
+      obs_norm_clip=obs_norm_clip,
+      goal_state_indices=goal_state_indices,
+      fb_loss=fb_loss,
+  )
+  use_ema = 0.0 < float(repr_tau) < 1.0
+  _tau = float(repr_tau)
+
+  @jax.jit
+  def multi_update(
+      q_params, opt_state, params_ema, batches, key,
+      policy_params, policy_target_params, obs_mean, obs_var):
+    def scan_step(carry, batch):
+      q_p, opt, ema, k, pi_t = carry
+      k, k_u = jax.random.split(k)
+      q_p, opt, m, pi_t = raw_update(
+          q_p, opt, batch, k_u, policy_params, pi_t, obs_mean, obs_var)
+      if use_ema:
+        ema = jax.tree_util.tree_map(
+            lambda t, o: _tau * t + (1.0 - _tau) * o, ema, q_p)
+      else:
+        ema = q_p
+      return (q_p, opt, ema, k, pi_t), m
+
+    (q_params, opt_state, params_ema, key, policy_target_params), metrics = (
+        jax.lax.scan(
+            scan_step,
+            (q_params, opt_state, params_ema, key, policy_target_params),
+            batches))
+    metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+    return (q_params, opt_state, params_ema, key, policy_target_params,
+            metrics)
+
+  return multi_update
 
 
 # ---------------------------------------------------------------------------

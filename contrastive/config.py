@@ -198,11 +198,31 @@ class ContrastiveConfig:
   # num_cubes classes for the select dim (cube ids 0..n-1).  BuilderBench
   # creative only; ignored on other envs.  Pass --noppo_categorical_select.
   ppo_categorical_select: bool = True
+  # If True, extend categorical select with per-cube 3D waypoint heads
+  # (n×3) + shared yaw; selected cube's waypoint head is used.  Implies
+  # ppo_categorical_select.  BuilderBench creative / PD only.
+  ppo_categorical_select_waypoint: bool = False
   # CRL updates per PPO iteration (InfoNCE on φ, ψ over replay).
   ppo_crl_steps_per_iter: int = 64
   # InfoNCE direction for PPO-CRL. 'forward': fix anchor sᵢ, vary goal gⱼ
   # (standard). 'backward': fix goal gᵢ, vary anchor sⱼ (logits transposed).
   ppo_crl_loss_direction: str = 'forward'  # 'forward' | 'backward'
+  # Optional hit-indicator CRL parameterization (training logits + PPO reward):
+  #   ''     — φ(s,a)·ψ(g) only (default)
+  #   'sf'   — φ·ψ + scale·1{‖obs_to_goal(s)−g‖ < tol}  for every batch goal
+  #   'goal' — φ·ψ + scale·1{‖obs_to_goal(s)−task_goal‖ < tol}  (independent
+  #            of g / s_f). Requires ppo_crl_hit_bonus_goal at runtime.
+  ppo_crl_hit_bonus: str = ''
+  ppo_crl_hit_bonus_tol: float = 1e-2
+  ppo_crl_hit_bonus_scale: float = 1.0
+  # Flat task-goal vector for 'goal' mode (set by the learner from the env
+  # fixed goal).  None disables the s≈task-goal indicator (treated as never).
+  ppo_crl_hit_bonus_goal: Optional[Any] = None
+  # CRL training-time future-goal (s_f) augmentation: with probability
+  # ``ppo_crl_sf_perturb_prob``, add noise with ‖δ‖₂ ≤ ``ppo_crl_sf_perturb_eps``
+  # to the packed goal slice before InfoNCE.  0 disables (default).
+  ppo_crl_sf_perturb_prob: float = 0.0
+  ppo_crl_sf_perturb_eps: float = 1e-2
   # EMA decay τ for φ, ψ used in the PPO reward r = φ·ψ (CRL mode only).
   # Reward uses EMA params: ema ← τ·ema + (1−τ)·online after each CRL step.
   # τ=0 uses online params directly (no EMA).  Higher τ = slower / smoother reward.
@@ -212,6 +232,19 @@ class ContrastiveConfig:
   # density step.  τ=0 uses online NF params (default).  Independent of
   # ppo_crl_repr_tau.
   ppo_nf_reward_tau: float = 0.0
+  # TD-NF density loss (only when ppo_repr_mode='nf' and ppo_nf_td=True).
+  # Objective:
+  #   (1-γ) log p_θ(g'|s,a)
+  #     + γ stopgrad(p_{θ⁻}(g_j|s',a') / p_{θ⁻}(g_j)) log p_θ(g_j|s,a)
+  # with g'=obs_to_goal(s'), g_j=rolled other-row next goals, and marginal
+  # p(g_j) from the same NF with (s,a) zero-masked.  Independent of
+  # ppo_nf_reward_tau (reward EMA).
+  ppo_nf_td: bool = False
+  ppo_nf_td_target_tau: float = 0.995  # EMA keep-rate for NF target params
+  # γ for TD-NF.  <0 → use ContrastiveConfig.discount.
+  ppo_nf_td_discount: float = -1.0
+  # Prob. of zero-masking online (s,a) so the flow also learns the marginal.
+  ppo_nf_td_mask_prob: float = 0.2
   # EMA decay τ for Gaussian density params used in PPO reward
   # r = log p_θ(g|s,a) (gaussian mode only).  Same update as NF:
   # ema ← τ·ema + (1−τ)·online after each density step.  τ=0 uses online
@@ -239,10 +272,10 @@ class ContrastiveConfig:
   ppo_external_reward_scale: float = 1.0
   ppo_external_reward_before_norm: bool = False
   # Checkpointing: save policy/value/CRL params every N PPO iterations.
-  # At default settings (8 envs × 128 steps = 1024 env-steps/iter), 100
-  # iterations ≈ 100k env steps — light enough not to bottleneck training.
+  # At default settings (8 envs × 128 steps = 1024 env-steps/iter), 400
+  # iterations ≈ 400k env steps (half the previous ckpt rate).
   # Set to 0 or a negative number to disable.
-  ppo_checkpoint_interval: int = 200
+  ppo_checkpoint_interval: int = 400
   # How many milestone ckpt_iter_*.pkl files to keep (FIFO prune of oldest).
   # 0 = keep all milestones (no pruning).  `latest.pkl` is always overwritten.
   ppo_checkpoint_keep_last: int = 0
@@ -319,6 +352,10 @@ class ContrastiveConfig:
   # If True, PPO reward is log((1−γ)·max(Q1, ε)) instead of raw Q1
   # (log-occupancy scale, comparable to Gaussian/NF log p).
   ppo_td3_log_reward: bool = False
+  # If True with ppo_repr_mode='td3' (or hybrid TD3): use FB critic loss
+  #   L = (Q(s,a,s_f) − γ sg minQ̄(s',a',s_f))^2 − Q(s,a,s')
+  # instead of the indicator TD3 backup.  s_f sampling unchanged.
+  ppo_td3_fb_loss: bool = False
   # Flow-matching options (only used when ppo_repr_mode == 'fm').
   fm_flow_steps: int = 10          # Euler steps for sample / reverse-ODE logp
   fm_logp_mode: str = 'exact'      # 'exact' | 'hutch-rade' | 'hutch-gaus'

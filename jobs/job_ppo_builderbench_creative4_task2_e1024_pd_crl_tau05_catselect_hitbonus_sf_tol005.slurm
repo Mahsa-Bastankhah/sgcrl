@@ -1,19 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_bb_c5t2_nf_np
-#SBATCH --output=slurm/ppo_builderbench_creative5_task2_e1024_pd_nf_tau05_actorreset_nopermute_%A_%a.log
-#SBATCH --error=slurm/ppo_builderbench_creative5_task2_e1024_pd_nf_tau05_actorreset_nopermute_%A_%a.log
+#SBATCH --job-name=c4t2_crl_hit_sf_t05
+#SBATCH --output=slurm/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_catselect_hitbonus_sf_tol005_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_catselect_hitbonus_sf_tol005_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
+#SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=48:00:00
+#SBATCH --time=14:00:00
 #SBATCH --account=seas
-#SBATCH --array=0
+#SBATCH --array=0-1
 
-# 5-cube creative-4-task2, PD + NF tau=0.5, seed 0.
-# Actor-reset guard active in ppo_learner (reinit policy if ep_length_mean
-# < 80% of nominal episode length). Same knobs as non-actorreset c5t2 NF.
+# 4-cube creative-4-task2, PD + CRL tau=0.5 + catselect.
+# Hit-indicator CRL param: φ·ψ + 1{‖obs_to_goal(s)−g‖ < tol} (mode=sf).
+# Hit-bonus tol=0.05. No external reward. Seeds 0-1.
 unset LD_PRELOAD
 
 module purge
@@ -88,7 +88,7 @@ export PIP_CACHE_DIR=/n/fs/mislresearch/mb6458-tmp/pip-cache
 export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-ENV=${ENV:-builderbench_creative_5_task2}
+ENV=${ENV:-builderbench_creative_4_task2}
 SEED=${SEED:-${SLURM_ARRAY_TASK_ID:-0}}
 NUM_STEPS=${NUM_STEPS:-200000000}
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
@@ -97,34 +97,27 @@ ENT_COEF=0.05
 MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
-NF_REWARD_TAU=${NF_REWARD_TAU:-0.5}
+CRL_REPR_TAU=${CRL_REPR_TAU:-0.5}
+HIT_BONUS_TOL=${HIT_BONUS_TOL:-0.05}
+HIT_BONUS_SCALE=${HIT_BONUS_SCALE:-1.0}
 
-# NF architecture (same as other BuilderBench / Sawyer NF jobs)
-NF_REP_SIZE=${NF_REP_SIZE:-256}
-NF_NUM_BLOCKS=${NF_NUM_BLOCKS:-12}
-NF_COUPLING_WIDTH=${NF_COUPLING_WIDTH:-512}
-NF_GRAD_CLIP=${NF_GRAD_CLIP:-1.0}
-NF_NOISE_STD=${NF_NOISE_STD:-0.05}
-NF_GOAL_STD_MIN=${NF_GOAL_STD_MIN:-0.02}
-
-LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative5_task2_e1024_pd_nf_tau05_actorreset_nopermute/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_catselect_hitbonus_sf_tol005/}"
 
 mkdir -p slurm "${LOG_DIR}"
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=nf nf_reward_tau=${NF_REWARD_TAU}"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=crl crl_repr_tau=${CRL_REPR_TAU}"
 echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
 echo "max_replay_size=${MAX_REPLAY_SIZE}"
-echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=false goals=MID+offsets(default)"
-echo "actor_reset=true (ep_length_mean < 0.8 * nominal)"
-echo "nf_rep_size=${NF_REP_SIZE} nf_num_blocks=${NF_NUM_BLOCKS} nf_coupling_width=${NF_COUPLING_WIDTH}"
-echo "nf_grad_clip=${NF_GRAD_CLIP} nf_noise_std=${NF_NOISE_STD} nf_goal_std_min=${NF_GOAL_STD_MIN}"
+echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=true goals=MID+offsets(default)"
+echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
+echo "ppo_crl_hit_bonus=sf tol=${HIT_BONUS_TOL} scale=${HIT_BONUS_SCALE} (no external reward)"
 echo "steps_per_iter=$((PPO_NUM_ENVS * 50))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * 50)))"
 python -u -c "
 from envs.builderbench_utils import default_fixed_target_goal
 import numpy as np
-g = default_fixed_target_goal(5, 1)
+g = default_fixed_target_goal(4, 1)
 print('hard_goal (flat)=', g.tolist())
 print('hard_goal (cubes)=')
 print(np.asarray(g).reshape(-1, 3))
@@ -142,24 +135,21 @@ python -u ppo_contrastive.py \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
-  --ppo_checkpoint_interval=150 \
+  --ppo_checkpoint_interval=300 \
   --builderbench_use_pd=true \
   --builderbench_pd_duration=5 \
-  --builderbench_permute_start_boxes=false \
+  --builderbench_permute_start_boxes=true \
   --ppo_rollout_length=50 \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
   --ppo_eval_interval=0 \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
-  --ppo_repr_mode=nf \
-  --ppo_nf_reward_tau="${NF_REWARD_TAU}" \
-  --nf_rep_size="${NF_REP_SIZE}" \
-  --nf_num_blocks="${NF_NUM_BLOCKS}" \
-  --nf_coupling_width="${NF_COUPLING_WIDTH}" \
-  --nf_grad_clip="${NF_GRAD_CLIP}" \
-  --nf_noise_std="${NF_NOISE_STD}" \
-  --nf_goal_std_min="${NF_GOAL_STD_MIN}" \
-  --nf_goal_enc_size=0 \
+  --ppo_repr_mode=crl \
+  --ppo_crl_repr_tau="${CRL_REPR_TAU}" \
+  --ppo_categorical_select \
+  --ppo_crl_hit_bonus=sf \
+  --ppo_crl_hit_bonus_tol="${HIT_BONUS_TOL}" \
+  --ppo_crl_hit_bonus_scale="${HIT_BONUS_SCALE}" \
   --hidden_layer_sizes="256,256,256,256,256,256"
 PY_EXIT=$?
 pkill -P $$ 2>/dev/null || true
