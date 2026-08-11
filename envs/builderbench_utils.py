@@ -416,7 +416,7 @@ def ppo_env_defaults(
     out = dict(
         start_index=0,
         end_index=pos_end if goal_state_indices is not None else goal_dim,
-        checkpoint_interval=150,
+        checkpoint_interval=300,
     )
   else:
     rollout_length = min(512, max(256, episode_length))
@@ -427,7 +427,7 @@ def ppo_env_defaults(
         end_index=pos_end if goal_state_indices is not None else goal_dim,
         num_envs=64,
         eval_interval=0,
-        checkpoint_interval=150,
+        checkpoint_interval=300,
     )
   if goal_state_indices is not None:
     out['goal_state_indices'] = goal_state_indices

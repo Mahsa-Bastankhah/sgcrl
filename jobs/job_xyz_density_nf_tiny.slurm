@@ -129,7 +129,7 @@ python -u xyz_density/train.py \
   --nf_sa_hidden="${NF_SA_HIDDEN}" \
   --nf_sa_num_layers="${NF_SA_NUM_LAYERS}" \
   --log_dir="${LOG_DIR}" \
-  --checkpoint_interval=100
+  --checkpoint_interval=200
 
 # Refresh comparison plots (includes nf_tiny once metrics exist).
 python -u xyz_density/plot_results.py \

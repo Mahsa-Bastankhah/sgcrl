@@ -370,6 +370,179 @@ class NormalTanhCategoricalSelect(hk.Module):
         continuous_dist, categorical_dist, self._num_select_classes)
 
 
+class HybridSelectWaypointDistribution:
+  """Categorical select + per-cube 3D waypoint + shared yaw.
+
+  Env action packing stays ``[xyz(3), yaw(1), select(1)]``.  Select is a
+  categorical over ``n`` cubes; each cube has its own tanh-Gaussian waypoint
+  head (``n × 3``).  Sampling / mode / log_prob use the waypoint head of the
+  chosen cube.  Yaw uses one shared 1D tanh-Gaussian head.
+
+  Entropy is ``H(cat) + E_{k~cat}[H(wp_k)] + H(yaw)``.
+  """
+
+  hybrid_select: bool = True
+  hybrid_select_waypoint: bool = True
+
+  def __init__(
+      self,
+      waypoint_loc: jnp.ndarray,
+      waypoint_scale: jnp.ndarray,
+      yaw_dist: tfd.Distribution,
+      categorical_dist: tfd.Distribution,
+      num_select_classes: int,
+  ):
+    # waypoint_loc / scale: [B, n, 3] pre-tanh Normal params.
+    self.waypoint_loc = waypoint_loc
+    self.waypoint_scale = waypoint_scale
+    self.yaw_dist = yaw_dist
+    self.categorical_dist = categorical_dist
+    self.num_select_classes = int(num_select_classes)
+    self._centers = select_cube_centers(self.num_select_classes)
+    # Diagnostics / det-select helpers: continuous Gaussian for the mode cube.
+    self.continuous_dist = self._packed_continuous_dist(
+        self.categorical_dist.mode())
+
+  def _select_from_class(self, cube_id: jnp.ndarray) -> jnp.ndarray:
+    return self._centers[cube_id][..., None]
+
+  def _gather_wp_params(self, cube_id: jnp.ndarray):
+    idx = cube_id.astype(jnp.int32)[..., None, None]  # [B, 1, 1]
+    loc = jnp.take_along_axis(self.waypoint_loc, idx, axis=1).squeeze(1)
+    scale = jnp.take_along_axis(self.waypoint_scale, idx, axis=1).squeeze(1)
+    return loc, scale
+
+  def _wp_dist(self, cube_id: jnp.ndarray) -> tfd.Distribution:
+    loc, scale = self._gather_wp_params(cube_id)
+    return tfd.Independent(
+        TanhTransformedDistribution(tfd.Normal(loc=loc, scale=scale)),
+        reinterpreted_batch_ndims=1)
+
+  def _packed_continuous_dist(self, cube_id: jnp.ndarray) -> tfd.Distribution:
+    """Tanh-Gaussian over ``[xyz, yaw]`` for diagnostics / continuous_dist."""
+    wp_loc, wp_scale = self._gather_wp_params(cube_id)
+    yaw_td = self.yaw_dist.distribution
+    yaw_normal = yaw_td.distribution
+    loc = jnp.concatenate([wp_loc, yaw_normal.loc], axis=-1)
+    scale = jnp.concatenate([wp_scale, yaw_normal.scale], axis=-1)
+    threshold = float(getattr(yaw_td, '_threshold', 0.999))
+    return tfd.Independent(
+        TanhTransformedDistribution(
+            tfd.Normal(loc=loc, scale=scale), threshold=threshold),
+        reinterpreted_batch_ndims=1)
+
+  def sample(self, seed=None, sample_shape=()):
+    key_wp, key_yaw, key_cat = jax.random.split(seed, 3)
+    cube_id = self.categorical_dist.sample(
+        seed=key_cat, sample_shape=sample_shape)
+    wp = self._wp_dist(cube_id).sample(
+        seed=key_wp, sample_shape=sample_shape)
+    yaw = self.yaw_dist.sample(seed=key_yaw, sample_shape=sample_shape)
+    return jnp.concatenate(
+        [wp, yaw, self._select_from_class(cube_id)], axis=-1)
+
+  def mode(self):
+    cube_id = self.categorical_dist.mode()
+    wp = self._wp_dist(cube_id).mode()
+    yaw = self.yaw_dist.mode()
+    return jnp.concatenate(
+        [wp, yaw, self._select_from_class(cube_id)], axis=-1)
+
+  def log_prob(self, actions: jnp.ndarray) -> jnp.ndarray:
+    cube_id = select_action_to_cube_id(
+        actions[..., -1], self.num_select_classes)
+    wp_lp = self._wp_dist(cube_id).log_prob(actions[..., :3])
+    yaw_lp = self.yaw_dist.log_prob(actions[..., 3:4])
+    cat_lp = self.categorical_dist.log_prob(cube_id)
+    return wp_lp + yaw_lp + cat_lp
+
+  def entropy(self, seed=None):
+    # H(cat) + Σ_k π(k) H(wp_k) + H(yaw)
+    probs = self.categorical_dist.probs_parameter()  # [B, n]
+    bsz, n_cls, wp_dim = self.waypoint_loc.shape
+    flat_loc = self.waypoint_loc.reshape((bsz * n_cls, wp_dim))
+    flat_scale = self.waypoint_scale.reshape((bsz * n_cls, wp_dim))
+    flat_wp = tfd.Independent(
+        TanhTransformedDistribution(
+            tfd.Normal(loc=flat_loc, scale=flat_scale)),
+        reinterpreted_batch_ndims=1)
+    if seed is not None:
+      key_wp, key_yaw = jax.random.split(seed)
+      try:
+        wp_h_flat = flat_wp.entropy(seed=key_wp)
+      except TypeError:
+        wp_h_flat = flat_wp.entropy()
+      try:
+        yaw_h = self.yaw_dist.entropy(seed=key_yaw)
+      except TypeError:
+        yaw_h = self.yaw_dist.entropy()
+    else:
+      try:
+        wp_h_flat = flat_wp.entropy()
+      except TypeError:
+        # TanhTransformedDistribution.entropy requires a seed; invent one.
+        wp_h_flat = flat_wp.entropy(seed=jax.random.PRNGKey(0))
+      try:
+        yaw_h = self.yaw_dist.entropy()
+      except TypeError:
+        yaw_h = self.yaw_dist.entropy(seed=jax.random.PRNGKey(0))
+    wp_h = wp_h_flat.reshape((bsz, n_cls))  # [B, n]
+    wp_h_exp = jnp.sum(probs * wp_h, axis=-1)
+    return self.categorical_dist.entropy() + wp_h_exp + yaw_h
+
+
+class NormalTanhCategoricalSelectWaypoint(hk.Module):
+  """Hybrid actor: n-way categorical select + n×3 waypoint heads + shared yaw.
+
+  Shared trunk features feed:
+    * ``select_logits`` → Categorical over ``num_select_classes`` cubes
+    * ``waypoint_{loc,scale}`` → ``[n, 3]`` tanh-Gaussian params per cube
+    * shared 1D yaw tanh-Gaussian (PD action dim 3)
+  """
+
+  def __init__(
+      self,
+      num_select_classes: int,
+      waypoint_dim: int = 3,
+      min_scale: float = 1e-3,
+      w_init: hk_init.Initializer = hk_init.VarianceScaling(
+          1.0, 'fan_in', 'uniform'),
+      b_init: hk_init.Initializer = hk_init.Constant(0.),
+      name: Optional[str] = None,
+  ):
+    super().__init__(name=name or 'NormalTanhCategoricalSelectWaypoint')
+    self._num_select_classes = int(num_select_classes)
+    self._waypoint_dim = int(waypoint_dim)
+    self._min_scale = min_scale
+    n3 = self._num_select_classes * self._waypoint_dim
+    self._wp_loc = hk.Linear(n3, w_init=w_init, b_init=b_init,
+                             name='waypoint_loc')
+    self._wp_scale = hk.Linear(n3, w_init=w_init, b_init=b_init,
+                               name='waypoint_scale')
+    self._yaw_head = NormalTanhDistribution(
+        1, min_scale=min_scale, w_init=w_init, b_init=b_init)
+    self._select_logits = hk.Linear(
+        self._num_select_classes, w_init=w_init, b_init=b_init,
+        name='select_logits')
+    self._bijector = tfp.bijectors.Tanh()
+
+  def __call__(self, inputs: jnp.ndarray) -> HybridSelectWaypointDistribution:
+    bsz = inputs.shape[0]
+    n = self._num_select_classes
+    d = self._waypoint_dim
+    loc = self._wp_loc(inputs)
+    # Match NormalTanhDistribution pre-squash of means.
+    loc = 10.0 * self._bijector.forward(loc / 10.0)
+    scale = jax.nn.softplus(self._wp_scale(inputs)) + self._min_scale
+    loc = loc.reshape((bsz, n, d))
+    scale = scale.reshape((bsz, n, d))
+    yaw_dist = self._yaw_head(inputs)
+    logits = self._select_logits(inputs)
+    categorical_dist = tfd.Categorical(logits=logits)
+    return HybridSelectWaypointDistribution(
+        loc, scale, yaw_dist, categorical_dist, self._num_select_classes)
+
+
 class MultivariateNormalDiagHead(hk.Module):
   """Module that produces a tfd.MultivariateNormalDiag distribution."""
 

@@ -79,8 +79,13 @@ def _make_env_spec(obs_dim: int, act_dim: int, goal_dim: int) -> specs.Environme
   )
 
 
-def _make_uniform_bootstrap_policy(act_dim: int, zero_az: bool = False):
-  """TD3 bootstrap a' ~ Uniform[-1, 1] (matches the data-collection policy)."""
+def _make_uniform_bootstrap_policy(
+    act_dim: int, zero_az: bool = False, single_axis_xy: bool = False):
+  """TD bootstrap a' ~ Uniform matching the data-collection policy.
+
+  With ``single_axis_xy``, each sample independently zeros either a_x or a_y
+  (matches the per-episode train lock in distribution).
+  """
 
   def init(_key):
     return {}
@@ -90,10 +95,16 @@ def _make_uniform_bootstrap_policy(act_dim: int, zero_az: bool = False):
 
     class _UniformDist:
       def sample(self, seed):
+        key_a, key_ax = jax.random.split(seed)
         a = jax.random.uniform(
-            seed, shape=(b, act_dim), minval=-1.0, maxval=1.0)
+            key_a, shape=(b, act_dim), minval=-1.0, maxval=1.0)
         if zero_az and act_dim >= 3:
           a = a.at[..., 2].set(0.0)
+        if single_axis_xy and act_dim >= 2:
+          # 0 → x-only, 1 → y-only.
+          axis = jax.random.randint(key_ax, (b,), 0, 2)
+          a = a.at[..., 0].set(jnp.where(axis == 0, a[..., 0], 0.0))
+          a = a.at[..., 1].set(jnp.where(axis == 1, a[..., 1], 0.0))
         return a
 
     return _UniformDist()
@@ -347,12 +358,16 @@ def _make_fixed_ood_probes(
     high_xy: float = 15.0,
     axy_low: float = 2.0,
     axy_high: float = 4.0,
+    *,
+    include_xy_joint: bool = False,
 ):
   """Fixed one-step probes shared across all model jobs.
 
   1. ``az_ood``: s=0, a_z=0.5 (action OOD) — histogram along z'
   2. ``state_ood``: s=(high,high,0), a_z=0 (state OOD) — histogram along x'
   3. ``axy_ood``: s=0, a_x,a_y ~ U[axy_low,axy_high], a_z=0 — hist along x'
+  4. ``xy_joint_ood`` (optional): s=0, both a_x,a_y nonzero in [-1,1]
+     — OOD vs single-axis-xy training; hist along x'
   """
   rng = np.random.default_rng(_PROBE_ACTION_SEED)
   ax, ay = rng.uniform(-1.0, 1.0, size=2)
@@ -381,11 +396,25 @@ def _make_fixed_ood_probes(
       axis=0,
       name='axy_ood',
   )
-  return {
+  out = {
       'az_ood': az_probe,
       'state_ood': state_probe,
       'axy_ood': axy_probe,
   }
+  if include_xy_joint:
+    ax4, ay4 = rng.uniform(-1.0, 1.0, size=2)
+    for _ in range(32):
+      if abs(float(ax4)) > 0.2 and abs(float(ay4)) > 0.2:
+        break
+      ax4, ay4 = rng.uniform(-1.0, 1.0, size=2)
+    out['xy_joint_ood'] = _make_1d_density_probe(
+        state=np.zeros(3, dtype=np.float32),
+        action=np.array([ax4, ay4, 0.0], dtype=np.float32),
+        noise_std=noise_std,
+        axis=0,
+        name='xy_joint_ood',
+    )
+  return out
 
 
 def _categorical_accuracy_from_batch(
@@ -473,8 +502,9 @@ def evaluate_categorical(
     q_params,
     nf_goal_mean: np.ndarray,
     nf_goal_std: np.ndarray,
+    val_env_xy_joint_ood: JaxXYZVecEnv | None = None,
 ) -> Dict[str, float]:
-  """Train / in-dist / az-OOD / state-OOD / axy-OOD categorical accuracies."""
+  """Train / in-dist / OOD categorical accuracies."""
   out: Dict[str, float] = {}
   if train_replay.size >= batch_size:
     train_batch = train_replay.sample(batch_size, rng)
@@ -503,6 +533,9 @@ def evaluate_categorical(
       mode, val_env=val_env_state_ood, **kwargs)
   out['val/cat_acc_axy_ood'] = _categorical_accuracy_on_env(
       mode, val_env=val_env_axy_ood, **kwargs)
+  if val_env_xy_joint_ood is not None:
+    out['val/cat_acc_xy_joint_ood'] = _categorical_accuracy_on_env(
+        mode, val_env=val_env_xy_joint_ood, **kwargs)
   return out
 
 
@@ -566,18 +599,20 @@ def train(args: argparse.Namespace) -> None:
   E = int(args.num_envs)
   T = int(args.episode_length)
   mode = str(args.repr_mode).strip().lower()
-  if mode not in ('crl', 'nf', 'td3', 'fm', 'tdinfonce'):
+  if mode not in ('crl', 'nf', 'td3', 'fb', 'fm', 'tdinfonce'):
     raise ValueError(
-        f'repr_mode must be crl|nf|td3|fm|tdinfonce, got {mode!r}')
+        f'repr_mode must be crl|nf|td3|fb|fm|tdinfonce, got {mode!r}')
 
   zero_az = bool(args.zero_az)
+  single_axis_xy = bool(getattr(args, 'single_axis_xy', False))
   print(f'[xyz] JAX backend={jax.default_backend()} devices={jax.devices()}',
         flush=True)
   print(f'[xyz] mode={mode}  num_envs={E}  episode_length={T}  '
         f'density_steps_per_iter={args.density_steps_per_iter}  '
         f'max_replay_size={args.max_replay_size}  batch_size={args.batch_size}  '
         f'discount={args.discount}  noise_std={args.noise_std}  '
-        f'zero_az={zero_az}  val_every={args.val_every}', flush=True)
+        f'zero_az={zero_az}  single_axis_xy={single_axis_xy}  '
+        f'val_every={args.val_every}', flush=True)
 
   rng = np.random.default_rng(seed)
   env = JaxXYZVecEnv(
@@ -586,21 +621,24 @@ def train(args: argparse.Namespace) -> None:
       noise_std=float(args.noise_std),
       seed=seed,
       zero_az=zero_az,
+      single_axis_xy=single_axis_xy,
   )
   high_xy = float(args.ood_high_xy)
   axy_low = float(args.axy_ood_low)
   axy_high = float(args.axy_ood_high)
   # Held-out validation envs:
-  #   az0: in-dist (a_z=0, start ~0, a_x,a_y ~ U[-1,1])
+  #   az0: in-dist (matches train action protocol)
   #   az_ood: action OOD (a_z ~ Uniform[-1,1], vs train a_z=0)
   #   state_ood: state OOD (a_z=0, start at (high,high,0))
   #   axy_ood: action OOD (a_x,a_y ~ U[axy_low,axy_high], a_z=0)
+  #   xy_joint_ood (if single_axis_xy): joint (a_x,a_y) vs train x-XOR-y
   val_env_az0 = JaxXYZVecEnv(
       num_envs=int(args.val_num_envs),
       episode_length=T,
       noise_std=float(args.noise_std),
       seed=seed + 10_000,
       zero_az=True,
+      single_axis_xy=single_axis_xy,
   )
   val_env_az_ood = JaxXYZVecEnv(
       num_envs=int(args.val_num_envs),
@@ -617,6 +655,7 @@ def train(args: argparse.Namespace) -> None:
       seed=seed + 30_000,
       zero_az=True,
       reset_center=np.array([high_xy, high_xy, 0.0], dtype=np.float32),
+      single_axis_xy=single_axis_xy,
   )
   val_env_axy_ood = JaxXYZVecEnv(
       num_envs=int(args.val_num_envs),
@@ -627,6 +666,17 @@ def train(args: argparse.Namespace) -> None:
       action_low=axy_low,
       action_high=axy_high,
   )
+  val_env_xy_joint_ood = None
+  if single_axis_xy:
+    # Joint XY motion in [-1,1]^2 (train never sees both axes in one episode).
+    val_env_xy_joint_ood = JaxXYZVecEnv(
+        num_envs=int(args.val_num_envs),
+        episode_length=T,
+        noise_std=float(args.noise_std),
+        seed=seed + 50_000,
+        zero_az=True,
+        single_axis_xy=False,
+    )
   obs_dim = env.obs_dim
   act_dim = env.act_dim
   goal_dim = obs_dim  # full state is the goal
@@ -653,6 +703,8 @@ def train(args: argparse.Namespace) -> None:
   policy_params = None
   td3_policy_target = None
   td_infonce_target_q = None
+  nf_td_target = None
+  use_nf_td = False
   policy_network = None
   sample_fn = None
 
@@ -662,6 +714,7 @@ def train(args: argparse.Namespace) -> None:
       high_xy=high_xy,
       axy_low=axy_low,
       axy_high=axy_high,
+      include_xy_joint=single_axis_xy,
   )
   probe_dir = os.path.join(args.log_dir, 'ood_density_probe')
   os.makedirs(probe_dir, exist_ok=True)
@@ -675,6 +728,7 @@ def train(args: argparse.Namespace) -> None:
     f.write(f"probe_action_seed={_PROBE_ACTION_SEED}\n")
     f.write(f"ood_high_xy={high_xy}\n")
     f.write(f"axy_ood_action=U[{axy_low},{axy_high}]\n")
+    f.write(f"single_axis_xy={single_axis_xy}\n")
   for name, pr in ood_probes.items():
     print(f"[xyz] density probe[{name}] s={pr['state'].tolist()} "
           f"a={pr['action'].tolist()} axis={pr['axis']}", flush=True)
@@ -699,6 +753,7 @@ def train(args: argparse.Namespace) -> None:
 
   elif mode == 'nf':
     nf_state_only = bool(getattr(args, 'nf_state_only', False))
+    use_nf_td = bool(getattr(args, 'nf_td', False))
     nf_nets = _nf.make_nf_density_networks(
         obs_dim=obs_dim,
         act_dim=act_dim,
@@ -721,15 +776,45 @@ def train(args: argparse.Namespace) -> None:
         has_goal_encoder=(nf_nets.goal_encoder_net is not None),
     )
     q_opt_state = q_optimizer.init(q_params)
-    density_update = _nf.make_nf_density_update_fn(
-        nf_nets, q_optimizer, obs_dim=obs_dim,
-        noise_std=float(args.nf_noise_std))
     _cond = 'p(g|s)' if nf_state_only else 'p(g|s,a)'
-    print(f'[xyz] NF RealNVP  rep_size={args.nf_rep_size}  '
-          f'blocks={args.nf_num_blocks}  width={args.nf_coupling_width}  '
-          f'sa={args.nf_sa_num_layers}x{args.nf_sa_hidden}  '
-          f'state_only={nf_state_only} ({_cond})  '
-          f'flow_dim={nf_nets.flow_dim}', flush=True)
+    if use_nf_td:
+      # a' ~ Uniform (matches random data collection), same as TD3/TDInfoNCE.
+      policy_network, sample_fn = _make_uniform_bootstrap_policy(
+          act_dim, zero_az=zero_az, single_axis_xy=single_axis_xy)
+      policy_params = policy_network.init(jax.random.PRNGKey(0))
+      nf_td_target = jax.tree_util.tree_map(lambda x: jnp.array(x), q_params)
+      _nf_td_tau = float(getattr(args, 'nf_td_target_tau', 0.995))
+      _nf_td_mask = float(getattr(args, 'nf_td_mask_prob', 0.2))
+      density_update = _nf.make_nf_td_density_update_fn(
+          nf_nets, q_optimizer,
+          obs_dim=obs_dim,
+          discount=float(args.discount),
+          policy_network_apply=policy_network.apply,
+          sample_fn=sample_fn,
+          policy_goal=np.zeros(goal_dim, dtype=np.float32),
+          target_tau=_nf_td_tau,
+          noise_std=float(args.nf_noise_std),
+          mask_prob=_nf_td_mask,
+          start_index=0,
+          end_index=goal_dim,
+      )
+      print(f'[xyz] TD-NF RealNVP  rep_size={args.nf_rep_size}  '
+            f'blocks={args.nf_num_blocks}  width={args.nf_coupling_width}  '
+            f'sa={args.nf_sa_num_layers}x{args.nf_sa_hidden}  '
+            f'state_only={nf_state_only} ({_cond})  '
+            f'flow_dim={nf_nets.flow_dim}  '
+            f'mix_gamma={args.discount}  target_tau={_nf_td_tau}  '
+            f'mask_prob={_nf_td_mask}  a\'~Uniform (zero_az={zero_az})',
+            flush=True)
+    else:
+      density_update = _nf.make_nf_density_update_fn(
+          nf_nets, q_optimizer, obs_dim=obs_dim,
+          noise_std=float(args.nf_noise_std))
+      print(f'[xyz] NF RealNVP  rep_size={args.nf_rep_size}  '
+            f'blocks={args.nf_num_blocks}  width={args.nf_coupling_width}  '
+            f'sa={args.nf_sa_num_layers}x{args.nf_sa_hidden}  '
+            f'state_only={nf_state_only} ({_cond})  '
+            f'flow_dim={nf_nets.flow_dim}', flush=True)
 
   elif mode == 'fm':
     fm_nets = _fm.make_fm_density_networks(
@@ -790,7 +875,8 @@ def train(args: argparse.Namespace) -> None:
         f"a'~Uniform (zero_az={zero_az})",
         flush=True)
 
-  else:  # td3
+  else:  # td3 or fb (same twin Q; FB swaps the critic objective)
+    use_fb = (mode == 'fb') or bool(getattr(args, 'td3_fb_loss', False))
     td3_nets = _td3.make_td3_density_networks(
         obs_dim=obs_dim,
         act_dim=act_dim,
@@ -805,7 +891,7 @@ def train(args: argparse.Namespace) -> None:
     q_optimizer = optax.adam(float(args.learning_rate))
     q_opt_state = q_optimizer.init(_td3.online_td3_params(q_params))
     policy_network, sample_fn = _make_uniform_bootstrap_policy(
-        act_dim, zero_az=zero_az)
+        act_dim, zero_az=zero_az, single_axis_xy=single_axis_xy)
     policy_params = policy_network.init(jax.random.PRNGKey(0))
     td3_policy_target = policy_params
     density_update = _td3.make_td3_density_update_fn(
@@ -821,8 +907,13 @@ def train(args: argparse.Namespace) -> None:
         goal_tol=float(args.td3_goal_tol),
         use_target_policy=False,
         cross_batch_goals=bool(args.td3_cross_batch_goals),
+        fb_loss=use_fb,
     )
-    print(f'[xyz] TD3 twin-Q  hidden={hidden}  goal_tol={args.td3_goal_tol}  '
+    _loss_name = (
+        'FB [(Q−γ sg Q\')^2 − Q(s,a,s\')]' if use_fb
+        else 'TD3 [1[s\'≈sf]+γ Q\']')
+    print(f'[xyz] twin-Q ({_loss_name})  hidden={hidden}  '
+          f'goal_tol={args.td3_goal_tol}  '
           f'cross_batch_goals={args.td3_cross_batch_goals}  '
           f"a'~Uniform[-1,1]", flush=True)
 
@@ -841,7 +932,7 @@ def train(args: argparse.Namespace) -> None:
       # Shared categorical accuracies (train / in-dist val / OOD val).
       'train/cat_acc', 'val/cat_acc_az0',
       'val/cat_acc_az_ood', 'val/cat_acc_state_ood',
-      'val/cat_acc_axy_ood',
+      'val/cat_acc_axy_ood', 'val/cat_acc_xy_joint_ood',
   ]
   csv_file = open(csv_path, 'w', newline='')  # pylint: disable=consider-using-with
   csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction='ignore')
@@ -920,9 +1011,15 @@ def train(args: argparse.Namespace) -> None:
           q_params, q_opt_state, m = density_update(
               q_params, q_opt_state, batch, k_upd)
         elif mode == 'nf':
-          q_params, q_opt_state, m = density_update(
-              q_params, q_opt_state, batch, k_upd,
-              jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std))
+          if use_nf_td:
+            q_params, q_opt_state, nf_td_target, m = density_update(
+                q_params, q_opt_state, nf_td_target, policy_params,
+                batch, k_upd,
+                jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std))
+          else:
+            q_params, q_opt_state, m = density_update(
+                q_params, q_opt_state, batch, k_upd,
+                jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std))
         elif mode == 'fm':
           q_params, q_opt_state, m = density_update(
               q_params, q_opt_state, batch, k_upd)
@@ -987,7 +1084,7 @@ def train(args: argparse.Namespace) -> None:
         probe_log['probe/crl_cat_acc'] = float(
             np.mean(np.argmax(np.asarray(logits), axis=1)
                     == np.arange(logits.shape[0])))
-      elif mode == 'td3':
+      elif mode in ('td3', 'fb'):
         q1 = np.asarray(td3_nets.qf1_net.apply(
             q_params['qf1'], jnp.asarray(probe['obs']), jnp.asarray(a)))
         probe_log['probe/td3_q1_mean'] = float(q1.mean())
@@ -1008,6 +1105,7 @@ def train(args: argparse.Namespace) -> None:
           val_env_az_ood=val_env_az_ood,
           val_env_state_ood=val_env_state_ood,
           val_env_axy_ood=val_env_axy_ood,
+          val_env_xy_joint_ood=val_env_xy_joint_ood,
           rng=rng,
           discount=float(args.discount),
           batch_size=int(args.val_batch_size),
@@ -1090,6 +1188,8 @@ def train(args: argparse.Namespace) -> None:
       }
       if mode == 'tdinfonce' and td_infonce_target_q is not None:
         ckpt['td_infonce_target_q'] = td_infonce_target_q
+      if use_nf_td and nf_td_target is not None:
+        ckpt['nf_td_target'] = nf_td_target
       ckpt_path = os.path.join(
           args.log_dir, f'ckpt_{mode}_seed{seed}_iter{iteration}.pkl')
       with open(ckpt_path, 'wb') as f:
@@ -1104,7 +1204,7 @@ def build_parser() -> argparse.ArgumentParser:
   p = argparse.ArgumentParser(
       description='xyz density probe (CRL / NF / TD3 / FM / TDInfoNCE)')
   p.add_argument('--repr_mode', type=str, default='crl',
-                 choices=['crl', 'nf', 'td3', 'fm', 'tdinfonce'])
+                 choices=['crl', 'nf', 'td3', 'fb', 'fm', 'tdinfonce'])
   p.add_argument('--seed', type=int, default=0)
   p.add_argument('--num_envs', type=int, default=1024)
   p.add_argument('--episode_length', type=int, default=50)
@@ -1120,6 +1220,10 @@ def build_parser() -> argparse.ArgumentParser:
   p.add_argument('--zero_az', action='store_true', default=True,
                  help='Force a_z=0 and freeze z (xy motion only).')
   p.add_argument('--no_zero_az', dest='zero_az', action='store_false')
+  p.add_argument(
+      '--single_axis_xy', action='store_true', default=False,
+      help='Train: each episode moves only along x OR only along y '
+           '(never both). Eval adds xy_joint_ood (joint a_x,a_y).')
   p.add_argument('--axy_ood_low', type=float, default=2.0,
                  help='axy_ood val: lower bound for a_x,a_y (train uses -1).')
   p.add_argument('--axy_ood_high', type=float, default=4.0,
@@ -1159,6 +1263,12 @@ def build_parser() -> argparse.ArgumentParser:
   p.add_argument('--nf_grad_clip', type=float, default=1.0)
   p.add_argument('--nf_noise_std', type=float, default=0.05)
   p.add_argument('--nf_goal_std_min', type=float, default=0.1)
+  p.add_argument('--nf_td', action='store_true',
+                 help='NF: use TD-NF density loss instead of plain NLL.')
+  p.add_argument('--nf_td_target_tau', type=float, default=0.995,
+                 help='TD-NF: EMA keep-rate for target NF params.')
+  p.add_argument('--nf_td_mask_prob', type=float, default=0.2,
+                 help='TD-NF: prob of zero-masking (s,a) to learn marginal.')
   # TD3
   p.add_argument('--td3_tau', type=float, default=0.005)
   p.add_argument('--td3_goal_tol', type=float, default=0.05)
@@ -1166,6 +1276,10 @@ def build_parser() -> argparse.ArgumentParser:
   p.add_argument('--no_td3_cross_batch_goals',
                  dest='td3_cross_batch_goals', action='store_false')
   p.add_argument('--td3_bilinear', action='store_true')
+  p.add_argument(
+      '--td3_fb_loss', action='store_true', default=False,
+      help='With --repr_mode=td3, use FB critic loss instead of indicator TD3. '
+           'Implied automatically when --repr_mode=fb.')
   # Logging
   p.add_argument('--log_dir', type=str, default='logs/xyz_density/')
   p.add_argument('--log_interval', type=int, default=1)

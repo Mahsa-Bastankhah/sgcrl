@@ -116,7 +116,7 @@ python -u xyz_density/train.py \
   --val_num_envs=128 \
   --val_batch_size=256 \
   --log_dir="${LOG_DIR}" \
-  --checkpoint_interval=100
+  --checkpoint_interval=200
 
 # Refresh comparison plots from whatever modes have finished so far.
 python -u xyz_density/plot_results.py \

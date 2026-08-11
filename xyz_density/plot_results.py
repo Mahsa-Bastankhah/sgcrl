@@ -2,14 +2,15 @@
 """Plot xyz density-probe results across CRL / NF / TD3 / FM / TDInfoNCE.
 
 Produces:
-  1. Five categorical-accuracy curves
-     (train / in-dist / az-OOD / state-OOD / axy-OOD),
+  1. Categorical-accuracy curves
+     (train / in-dist / az-OOD / state-OOD / axy-OOD [/ xy-joint-OOD]),
      each with all models + chance baseline.
-  2. Three OOD density histogram families:
+  2. OOD density histogram families:
        - az_ood:   s=0, a_z=0.5  → p̂(z'|s,a)
        - state_ood: s=(ood_high_xy,ood_high_xy,0), a_z=0 → p̂(x'|s,a)
          (current default / reeval target: ood_high_xy=15)
        - axy_ood:  s=0, a_x,a_y ~ U[2,4], a_z=0 → p̂(x'|s,a)
+       - xy_joint_ood (optional): s=0, joint (a_x,a_y) vs single-axis train
 
 Example::
 
@@ -30,13 +31,16 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-MODES = ('crl', 'nf', 'nf_compact', 'nf_tiny', 'td3', 'fm', 'tdinfonce')
+MODES = ('crl', 'nf', 'nf_compact', 'nf_tiny', 'nf_td', 'td3', 'fb', 'fm',
+         'tdinfonce')
 MODE_COLORS = {
     'crl': '#1f77b4',
     'nf': '#ff7f0e',
     'nf_compact': '#8c564b',
     'nf_tiny': '#e377c2',
+    'nf_td': '#17becf',
     'td3': '#2ca02c',
+    'fb': '#bcbd22',
     'fm': '#d62728',
     'tdinfonce': '#9467bd',
 }
@@ -45,7 +49,9 @@ MODE_LABELS = {
     'nf': 'NF',
     'nf_compact': 'NF compact',
     'nf_tiny': 'NF tiny',
+    'nf_td': 'TD-NF',
     'td3': 'TD3',
+    'fb': 'FB',
     'fm': 'FM',
     'tdinfonce': 'TDInfoNCE',
 }
@@ -53,6 +59,7 @@ MODE_LABELS = {
 MODE_FILE_PREFIX = {
     'nf_compact': 'nf',
     'nf_tiny': 'nf',
+    'nf_td': 'nf',
 }
 # (metric_col, title, filename, log_y)
 ACC_SPECS = (
@@ -69,11 +76,15 @@ ACC_SPECS = (
     ('val/cat_acc_axy_ood',
      r'OOD val categorical accuracy ($a_x,a_y\sim U[2,4]$, $a_z=0$)',
      'cat_acc_val_axy_ood.png', True),
+    ('val/cat_acc_xy_joint_ood',
+     r'OOD val cat-acc (joint $a_x,a_y$ vs single-axis train)',
+     'cat_acc_val_xy_joint_ood.png', True),
 )
 PROBE_SPECS = (
     ('az_ood', "z'", 'ood_az_density'),
     ('state_ood', "x'", 'ood_state_density'),
     ('axy_ood', "x'", 'ood_axy_density'),
+    ('xy_joint_ood', "x'", 'ood_xy_joint_density'),
 )
 
 

@@ -3,12 +3,16 @@
 
 By default discovers config dirs that have a matching ``slurm/*.log`` (recently
 run jobs), maps each to its ``logs/...`` dir, groups by ``creativeN_taskK``,
-and overlays variants. Multiple seeds of the same config are averaged with a
-±1 standard-error shade. CPU-only (CSV / slurm text reads; no rollouts).
+and overlays variants. Crowded tasks are also split by method family
+(CRL / NF / TD3 / …) under ``{task}_by_method/``. Legends use human-readable
+labels and mark currently RUNNING squeue jobs. Multiple seeds of the same
+config are averaged with a ±1 standard-error shade. CPU-only (CSV / slurm
+text reads; no rollouts).
 
 Writes:
   figs/builderbench/active_train_eval/{task}_train_success1000.png
   figs/builderbench/active_train_eval/{task}_eval_success.png
+  figs/builderbench/active_train_eval/{task}_by_method/{task}_*_crl|nf|td3….png
 
 Usage:
   python scripts/plot_builderbench_train_success1000.py
@@ -634,21 +638,124 @@ def _short_label(label: str) -> str:
   for old, new in (
       ('pd_nf_tiny_sa2x128_r32_b4_w128_tau05_', 'nf_tiny_'),
       ('pd_nf_compact_sa3x256_r64_b6_w256_tau05_', 'nf_compact_'),
+      ('pd_nf_td_tau05_', 'nf+td_'),
       ('pd_nf_tau05_', 'nf_'),
       ('pd_crl_tau05_', 'crl_'),
+      ('pd_td3_fb_logq_tau05_', 'td3_fb_'),
       ('pd_td3_logq_tau05_', 'td3_'),
       ('pd_tdinfonce_tau05_', 'tdinfonce_'),
       ('actorreset_', ''),
       ('evalvid_', ''),
       ('catselect_', 'cat_'),
-      ('minstd1e4_', ''),
+      ('catwp_', 'catwp_'),
+      ('minstd1e5_', 'minstd1e-5_'),
+      ('minstd1e4_', 'minstd1e-4_'),
+      ('entanneal_', 'ent_'),
       ('nopermute_', 'noperm_'),
+      ('permute_rand_', 'permute_'),
       ('fixedx01_', 'fixx_'),
       ('norand_normobs_', 'norand+norm_'),
+      ('normobs_', 'norm_'),
+      ('extrew10', 'ext10'),
       ('extrew1', 'ext1'),
   ):
     s = s.replace(old, new)
   return s
+
+
+def _method_family(log_dir_name: str) -> str:
+  """Coarse method bucket for splitting crowded task overlays."""
+  low = log_dir_name.lower()
+  if '_tdinfonce_' in low:
+    return 'tdinfonce'
+  if '_td3_' in low or '_td3fb_' in low:
+    return 'td3'
+  if '_nf_td_' in low:
+    return 'nf_td'
+  if re.search(r'(^|_)nf(_|$)', low) or '_nf_compact_' in low or '_nf_tiny_' in low:
+    return 'nf'
+  if re.search(r'(^|_)crl(_|$)', low):
+    return 'crl'
+  return 'other'
+
+
+FAMILY_TITLE = {
+    'crl': 'CRL',
+    'nf': 'NF',
+    'nf_td': 'NF+TD',
+    'td3': 'TD3',
+    'tdinfonce': 'TDInfoNCE',
+    'other': 'Other',
+}
+
+
+def _friendly_label(log_dir_name: str, raw_suffix: str | None = None) -> str:
+  """Human-readable legend for common BuilderBench ablations."""
+  s = raw_suffix if raw_suffix is not None else _variant_label(log_dir_name)
+  low = log_dir_name.lower()
+  fam = FAMILY_TITLE.get(_method_family(log_dir_name), 'Run')
+
+  if 'hitbonus_goal' in low:
+    return 'CRL · hit-bonus on goal'
+  if 'hitbonus_sf_tol003' in low:
+    return 'CRL · hit-bonus SF (tol=0.03)'
+  if 'hitbonus_sf_tol005' in low:
+    return 'CRL · hit-bonus SF (tol=0.05)'
+  if 'hitbonus_sf_tol008' in low:
+    return 'CRL · hit-bonus SF (tol=0.08)'
+  if 'sfpert' in low:
+    return 'CRL · SF perturbation'
+  if low.endswith('_succ3') or '_catselect_succ3' in low:
+    return f'{fam} · success×3 reward'
+  if '_tdinfonce_' in low:
+    return 'TDInfoNCE · catselect'
+  if '_td3_fb_' in low:
+    return 'TD3-FB · noperm + norand + norm'
+  if '_td3_logq_' in low and 'tol0013' in low:
+    return 'TD3 · catwp tol=0.013'
+  if '_td3_logq_' in low:
+    return 'TD3 · logQ'
+  if '_nf_td_' in low:
+    return 'NF+TD · catselect + extrew1'
+  if '_nf_compact_' in low:
+    bits = ['NF compact']
+    if 'permute_rand' in low:
+      bits.append('permute')
+    elif 'nopermute' in low and 'fixedx01' in low:
+      bits.append('nopermute + fixedx')
+    elif 'nopermute' in low:
+      bits.append('nopermute')
+    if 'catwp' in low:
+      bits.append('catwp')
+    elif 'catselect' in low:
+      bits.append('catselect')
+    if 'extrew10' in low:
+      bits.append('extrew10')
+    elif 'extrew1' in low:
+      bits.append('extrew1')
+    if 'minstd1e5' in low:
+      bits.append('minstd1e-5')
+    elif 'minstd1e4' in low:
+      bits.append('minstd1e-4')
+    m = re.search(r'(?:^|_)crl(\d+)(?:_|$)', low)
+    if m:
+      bits.append(f'CRL steps/iter={m.group(1)}')
+    if 'entanneal' in low:
+      bits.append('ent-anneal')
+    if 'ep60' in low:
+      bits.append('ep60 / 300M')
+    elif 'ep70' in low:
+      bits.append('ep70 / 300M')
+    elif 'ep50' in low:
+      bits.append('ep50 / 300M')
+    return ' · '.join(bits)
+  m = re.search(r'(?:^|_)crl(\d+)(?:_|$)', low)
+  if '_crl_' in low and m and 'nf_' not in low:
+    return f'CRL · steps/iter={m.group(1)}'
+  if '_crl_' in low and 'nopermute' in low and 'extrew1' in low:
+    return 'CRL · nopermute + fixedx + extrew1'
+
+  return _short_label(s)
 
 
 def _plot_group(log_root: str, figs_dir: str, group_key: str,
@@ -657,9 +764,13 @@ def _plot_group(log_root: str, figs_dir: str, group_key: str,
                 out_suffix: str, title_metric: str,
                 xlabel: str, ylabel: str,
                 fmt_x_steps: bool, marker: str | None = None,
-                slurm_dir: str = SLURM_DIR) -> str | None:
+                slurm_dir: str = SLURM_DIR,
+                active_dirs: set[str] | None = None,
+                family_title: str | None = None,
+                out_name: str | None = None) -> str | None:
   fig, ax = plt.subplots(figsize=(11.5, 4.8))
   plotted = 0
+  active_dirs = active_dirs or set()
 
   for i, (log_dir_name, label) in enumerate(runs):
     if split == 'eval':
@@ -677,9 +788,12 @@ def _plot_group(log_root: str, figs_dir: str, group_key: str,
       continue
     xs, mean, se = _subsample_curve(xs, mean, se)
     color = ACCENT_COLORS[i % len(ACCENT_COLORS)]
-    legend_label = f'{_short_label(label)} (n={n_seeds})'
+    nice = _friendly_label(log_dir_name, label)
+    status = ' · RUNNING' if log_dir_name in active_dirs else ''
+    legend_label = f'{nice} (n={n_seeds}){status}'
     kwargs = dict(
-        color=color, linewidth=2.0, label=legend_label, alpha=0.95,
+        color=color, linewidth=2.4 if log_dir_name in active_dirs else 2.0,
+        label=legend_label, alpha=0.95,
         zorder=3 + i,
     )
     if split == 'eval' or marker:
@@ -697,8 +811,9 @@ def _plot_group(log_root: str, figs_dir: str, group_key: str,
       hi = [m + s for m, s in zip(mean, se)]
       ax.fill_between(xs, lo, hi, color=color, alpha=0.22, linewidth=0,
                       zorder=2 + i)
-    print(f'  {group_key}/{label}: n_seeds={n_seeds}, {len(xs)} {split} pts '
-          f'x=[{xs[0]}..{xs[-1]}] y=[{min(mean):.3f}..{max(mean):.3f}]')
+    print(f'  {group_key}/{nice}: n_seeds={n_seeds}, {len(xs)} {split} pts '
+          f'x=[{xs[0]}..{xs[-1]}] y=[{min(mean):.3f}..{max(mean):.3f}]'
+          f'{status}')
     plotted += 1
 
   if plotted == 0:
@@ -707,8 +822,9 @@ def _plot_group(log_root: str, figs_dir: str, group_key: str,
 
   creative, task = group_key.split('_task')
   creative_num = creative.replace('creative', '')
+  fam_tag = f' [{family_title}]' if family_title else ''
   ax.set_title(
-      f'BuilderBench Creative {creative_num} Task {task} — '
+      f'BuilderBench Creative {creative_num} Task {task}{fam_tag} — '
       f'{title_metric} (mean ± stderr)',
       fontsize=12,
       fontweight='bold',
@@ -723,7 +839,7 @@ def _plot_group(log_root: str, figs_dir: str, group_key: str,
   ax.grid(axis='y', linestyle='--', alpha=0.4)
   leg = ax.legend(
       loc='upper left', bbox_to_anchor=(1.01, 1.0),
-      fontsize=10, framealpha=1.0, ncol=1,
+      fontsize=9.5, framealpha=1.0, ncol=1,
       edgecolor='#333333', fancybox=False, borderpad=0.6,
       handlelength=2.4, labelspacing=0.45, borderaxespad=0.0,
   )
@@ -732,14 +848,26 @@ def _plot_group(log_root: str, figs_dir: str, group_key: str,
   for text in leg.get_texts():
     text.set_fontweight('bold')
 
-  out_path = os.path.join(figs_dir, f'{group_key}_{out_suffix}.png')
-  fig.subplots_adjust(right=0.62)
+  fname = out_name or f'{group_key}_{out_suffix}.png'
+  out_path = os.path.join(figs_dir, fname)
+  fig.subplots_adjust(right=0.58)
   fig.savefig(
       out_path, dpi=150, bbox_inches='tight',
       bbox_extra_artists=(leg,),
   )
   plt.close(fig)
   return out_path
+
+
+def _split_runs_by_family(
+    runs: list[tuple[str, str]],
+) -> dict[str, list[tuple[str, str]]]:
+  by_fam: dict[str, list[tuple[str, str]]] = defaultdict(list)
+  for name, label in runs:
+    by_fam[_method_family(name)].append((name, label))
+  for fam in by_fam:
+    by_fam[fam].sort(key=lambda x: (_friendly_label(x[0], x[1]), x[0]))
+  return by_fam
 
 
 def run_once(log_root: str, figs_dir: str, mode: str = 'slurm',
@@ -750,14 +878,37 @@ def run_once(log_root: str, figs_dir: str, mode: str = 'slurm',
     print('No BuilderBench runs with learner CSV/slurm data found.')
     return []
 
+  active_dirs = _active_log_dirs(slurm_dir)
+  if active_dirs:
+    print(f'Currently RUNNING/PENDING ({len(active_dirs)}):')
+    for d in sorted(active_dirs):
+      print(f'  * {d}')
+
   print(f'Found {len(groups)} task group(s)')
   outs: list[str] = []
 
-  for group_key, runs in sorted(groups.items()):
-    labels = ', '.join(l for _, l in runs)
-    print(f'  {group_key} train: {len(runs)} variants ({labels})')
+  def _plot_both(group_key: str, runs: list[tuple[str, str]], *,
+                 family_title: str | None = None,
+                 subdir: str | None = None) -> None:
+    nonlocal outs
+    dest = os.path.join(figs_dir, subdir) if subdir else figs_dir
+    os.makedirs(dest, exist_ok=True)
+    fam_slug = (
+        family_title.lower().replace('+', 'p').replace(' ', '_')
+        if family_title else None)
+    train_name = (
+        f'{group_key}_train_success1000_{fam_slug}.png'
+        if fam_slug else f'{group_key}_train_success1000.png')
+    eval_name = (
+        f'{group_key}_eval_success_{fam_slug}.png'
+        if fam_slug else f'{group_key}_eval_success.png')
+
+    labels = ', '.join(_friendly_label(n, l) for n, l in runs)
+    print(f'  {group_key} train'
+          f'{f" [{family_title}]" if family_title else ""}: '
+          f'{len(runs)} variants ({labels})')
     out = _plot_group(
-        log_root, figs_dir, group_key, runs,
+        log_root, dest, group_key, runs,
         split='learner', x_col=TRAIN_X_COL, y_col=TRAIN_METRIC,
         out_suffix='train_success1000',
         title_metric=f'train {TRAIN_METRIC}',
@@ -765,6 +916,9 @@ def run_once(log_root: str, figs_dir: str, mode: str = 'slurm',
         ylabel='Train Success (last 1000)',
         fmt_x_steps=True,
         slurm_dir=slurm_dir,
+        active_dirs=active_dirs,
+        family_title=family_title,
+        out_name=train_name,
     )
     if out:
       print(f'    → {out}')
@@ -777,12 +931,16 @@ def run_once(log_root: str, figs_dir: str, mode: str = 'slurm',
       if has_csv or has_slurm:
         eval_runs.append((name, label))
     if not eval_runs:
-      print(f'  {group_key} eval: no runs with eval CSV/slurm lines')
-      continue
-    elabels = ', '.join(l for _, l in eval_runs)
-    print(f'  {group_key} eval: {len(eval_runs)} variants ({elabels})')
+      print(f'  {group_key} eval'
+            f'{f" [{family_title}]" if family_title else ""}: '
+            f'no runs with eval CSV/slurm lines')
+      return
+    elabels = ', '.join(_friendly_label(n, l) for n, l in eval_runs)
+    print(f'  {group_key} eval'
+          f'{f" [{family_title}]" if family_title else ""}: '
+          f'{len(eval_runs)} variants ({elabels})')
     eout = _plot_group(
-        log_root, figs_dir, group_key, eval_runs,
+        log_root, dest, group_key, eval_runs,
         split='eval', x_col=EVAL_X_COL, y_col=EVAL_METRIC,
         out_suffix='eval_success',
         title_metric=f'eval {EVAL_METRIC}',
@@ -791,10 +949,32 @@ def run_once(log_root: str, figs_dir: str, mode: str = 'slurm',
         fmt_x_steps=True,
         marker='o',
         slurm_dir=slurm_dir,
+        active_dirs=active_dirs,
+        family_title=family_title,
+        out_name=eval_name,
     )
     if eout:
       print(f'    → {eout}')
       outs.append(eout)
+
+  for group_key, runs in sorted(groups.items()):
+    # Always write the combined task overlay.
+    _plot_both(group_key, runs)
+
+    # When a task mixes methods (or is crowded), also write per-family plots
+    # so legends stay readable.
+    by_fam = _split_runs_by_family(runs)
+    if len(by_fam) > 1 or len(runs) > 4:
+      fam_dir = os.path.join(group_key + '_by_method')
+      print(f'  {group_key}: splitting into {len(by_fam)} method families → '
+            f'{fam_dir}/')
+      for fam, fam_runs in sorted(
+          by_fam.items(), key=lambda kv: FAMILY_TITLE.get(kv[0], kv[0])):
+        _plot_both(
+            group_key, fam_runs,
+            family_title=FAMILY_TITLE.get(fam, fam),
+            subdir=fam_dir,
+        )
   return outs
 
 

@@ -135,7 +135,7 @@ python -u ppo_contrastive.py \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
-  --ppo_checkpoint_interval=150 \
+  --ppo_checkpoint_interval=300 \
   --builderbench_use_pd=true \
   --builderbench_pd_duration=5 \
   --builderbench_permute_start_boxes=false \

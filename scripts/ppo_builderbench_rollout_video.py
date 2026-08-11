@@ -41,6 +41,7 @@ from contrastive import ppo_learner
 from contrastive import utils as contrastive_utils
 from ppo_contrastive import fixed_goal_for_env, ppo_env_defaults_for_env
 from envs.builderbench_utils import (
+    apply_fixed_start_x,
     creative_cube_mj_episode_length,
     creative_cube_full_state_obs_dim,
     filter_pd_policy_state_obs,
@@ -62,6 +63,10 @@ from utils.wrapper import (
     PDWrapper,
     VmapWrapper,
 )
+
+
+# Default video init: match the usual nopermute+norand training setup.
+VIDEO_FIXED_START_X = 0.1
 
 
 @dataclass
@@ -86,7 +91,18 @@ class _TrainCtx:
   ppo_norm_obs: bool = False
   ppo_obs_norm_clip: float = 10.0
   categorical_select_classes: Optional[int] = None
+  categorical_select_waypoint: bool = False
   crl_state_only: bool = False
+  fixed_start_x: Optional[float] = None
+
+
+def force_video_nopermute_norand(ctx: _TrainCtx,
+                                 fixed_start_x: float = VIDEO_FIXED_START_X
+                                 ) -> _TrainCtx:
+  """Force nopermute + fixed start x for video rollouts (in-place)."""
+  ctx.permute_start_boxes = False
+  ctx.fixed_start_x = float(fixed_start_x)
+  return ctx
 
 
 def _episode_success_from_states(states) -> float:
@@ -256,6 +272,10 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     rsnorm_clip = float(resolved.get(
         'rsnorm_clip', flags.get('rsnorm_clip', 10.0)))
     ppo_cleanrl_actor = bool(flags.get('ppo_cleanrl_actor', True))
+    fx = flags.get(
+        'builderbench_fixed_start_x',
+        resolved.get('builderbench_fixed_start_x', -1.0))
+    fixed_start_x = (None if fx is None or float(fx) < 0 else float(fx))
     ppo_norm_obs = bool(flags.get(
         'ppo_norm_obs', resolved.get('ppo_norm_obs', False)))
     ppo_obs_norm_clip = float(flags.get(
@@ -265,6 +285,11 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
         'ppo_categorical_select',
         resolved.get('ppo_categorical_select', False)))
     categorical_select_classes = int(num_cubes) if cat_select else None
+    categorical_select_waypoint = bool(flags.get(
+        'ppo_categorical_select_waypoint',
+        resolved.get('ppo_categorical_select_waypoint', False)))
+    if categorical_select_waypoint and categorical_select_classes is None:
+      categorical_select_classes = int(num_cubes)
     crl_state_only = bool(flags.get(
         'crl_state_only',
         resolved.get('crl_state_only', False)))
@@ -287,9 +312,11 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     z_scale_multiplier = 3.0
     rsnorm_clip = 10.0
     ppo_cleanrl_actor = True
+    fixed_start_x = None
     ppo_norm_obs = False
     ppo_obs_norm_clip = 10.0
     categorical_select_classes = None
+    categorical_select_waypoint = False
     crl_state_only = False
 
   if use_pd:
@@ -332,7 +359,9 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
       ppo_norm_obs=ppo_norm_obs,
       ppo_obs_norm_clip=ppo_obs_norm_clip,
       categorical_select_classes=categorical_select_classes,
+      categorical_select_waypoint=categorical_select_waypoint,
       crl_state_only=crl_state_only,
+      fixed_start_x=fixed_start_x,
   )
 
 
@@ -345,6 +374,8 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
     env_kwargs['builderbench_pd_filter_policy_obs'] = ctx.filter_policy_obs
     env_kwargs['obs_space_list'] = ctx.obs_space_list
   env_kwargs['builderbench_permute_start_boxes'] = ctx.permute_start_boxes
+  if ctx.fixed_start_x is not None:
+    env_kwargs['builderbench_fixed_start_x'] = float(ctx.fixed_start_x)
 
   probe_env, obs_dim = contrastive_utils.make_environment(
       env_name,
@@ -374,6 +405,7 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
       actor_min_std=ctx.actor_min_std,
       ppo_cleanrl_actor=ctx.ppo_cleanrl_actor,
       categorical_select_classes=ctx.categorical_select_classes,
+      categorical_select_waypoint=bool(ctx.categorical_select_waypoint),
       state_only=bool(ctx.crl_state_only),
   )
   return networks
@@ -415,6 +447,7 @@ def _make_bb_env(env_id: str, ctx: _TrainCtx):
     cfg.nconmax, cfg.njmax = _MJX_PARAMS[env_id]
 
   base = CreativeCube(config=cfg)
+  apply_fixed_start_x(base, ctx.fixed_start_x)
   mocap_targets = getattr(base, '_task_mocap_targets', getattr(base, '_mocap_targets', getattr(base, 'mocap_targets', None)))
 
   if ctx.use_pd:
@@ -533,6 +566,13 @@ def main():
   parser.add_argument(
       '--skip_existing', action='store_true',
       help='Skip checkpoints whose output mp4 already exists.')
+  parser.add_argument(
+      '--match_run_init', action='store_true',
+      help='Use permute/fixed_start_x from run_config. Default is to force '
+           'nopermute + fixed_start_x=0.1 (norand) for all videos.')
+  parser.add_argument(
+      '--fixed_start_x', type=float, default=VIDEO_FIXED_START_X,
+      help='Start-box x when forcing norand (ignored with --match_run_init).')
   args = parser.parse_args()
   if args.max_seed_attempts < 1:
     parser.error('--max_seed_attempts must be >= 1')
@@ -553,6 +593,10 @@ def main():
   print(f'[bb_video] found {len(ckpt_entries)} checkpoint(s)')
 
   ctx = _load_train_ctx(args.env, args.checkpoint)
+  if not args.match_run_init:
+    force_video_nopermute_norand(ctx, fixed_start_x=float(args.fixed_start_x))
+    print(f'[bb_video] forcing nopermute + fixed_start_x={ctx.fixed_start_x} '
+          f'(pass --match_run_init to use run_config)', flush=True)
   cfg_path = _run_config_path_for_checkpoint(args.checkpoint)
   if cfg_path is not None:
     skip = video_render_skip_reason(cfg_path)
@@ -560,7 +604,9 @@ def main():
       print(f'[bb_video] skip: {skip}')
       return
   cfg_note = (f'use_pd={ctx.use_pd} pd_duration={ctx.pd_duration} '
-              f'filter_policy_obs={ctx.filter_policy_obs}')
+              f'filter_policy_obs={ctx.filter_policy_obs} '
+              f'permute={ctx.permute_start_boxes} '
+              f'fixed_start_x={ctx.fixed_start_x}')
   print(f'[bb_video] training context: {cfg_note} '
         f'obs_dim={ctx.obs_dim} ep_len={ctx.episode_length}')
 

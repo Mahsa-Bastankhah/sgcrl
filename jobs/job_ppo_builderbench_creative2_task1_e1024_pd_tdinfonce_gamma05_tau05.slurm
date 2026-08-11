@@ -132,7 +132,7 @@ python -u ppo_contrastive.py \
   --discount="${CRITIC_DISCOUNT}" \
   --ppo_discount="${PPO_DISCOUNT}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
-  --ppo_checkpoint_interval=150 \
+  --ppo_checkpoint_interval=300 \
   --builderbench_use_pd=true \
   --builderbench_pd_duration=5 \
   --ppo_rollout_length=50 \

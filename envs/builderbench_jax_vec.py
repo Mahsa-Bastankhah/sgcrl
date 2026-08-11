@@ -104,9 +104,51 @@ class TerminalObsWrapper(Wrapper):
     return state.replace(info=info)
 
 
-def _wrap_batched_env(env, episode_length: int):
+class SuccessTerminateWrapper(Wrapper):
+  """End the episode after ``n`` consecutive successful macro-steps.
+
+  BuilderBench ``metrics['success']`` is treated as success when ``>= 0.5``
+  (with PD wrapping this is a sum over micro-steps, so any success in the
+  PD window registers).  ``n <= 0`` disables early termination (wrapper
+  should not be inserted in that case).
+  """
+
+  def __init__(self, env, n_consecutive: int = 3):
+    super().__init__(env)
+    self._n = int(n_consecutive)
+    if self._n <= 0:
+      raise ValueError(
+          f'success_terminate_steps must be > 0 when wrapping, got {self._n}')
+
+  def reset(self, rng: jax.Array) -> State:
+    state = self.env.reset(rng)
+    info = dict(state.info)
+    info['consecutive_success'] = jnp.zeros(rng.shape[:-1], dtype=jnp.int32)
+    return state.replace(info=info)
+
+  def step(self, state: State, action: jax.Array) -> State:
+    state = self.env.step(state, action)
+    succ = (state.metrics['success'] >= 0.5).astype(jnp.int32)
+    prev = state.info.get(
+        'consecutive_success',
+        jnp.zeros_like(succ, dtype=jnp.int32))
+    consec = jnp.where(succ > 0, prev + 1, jnp.zeros_like(prev))
+    done_succ = (consec >= self._n).astype(state.done.dtype)
+    done = jnp.maximum(state.done, done_succ)
+    # Zero the counter on termination so AutoReset carries a clean start.
+    consec = jnp.where(done > 0, jnp.zeros_like(consec), consec)
+    info = dict(state.info)
+    info['consecutive_success'] = consec
+    return state.replace(done=done, info=info)
+
+
+def _wrap_batched_env(
+    env, episode_length: int, success_terminate_steps: int = 0):
   env = VmapWrapper(env)
   env = EpisodeWrapper(env, episode_length=episode_length, action_repeat=1)
+  if int(success_terminate_steps) > 0:
+    env = SuccessTerminateWrapper(
+        env, n_consecutive=int(success_terminate_steps))
   env = TerminalObsWrapper(env)
   env = AutoResetWrapper(env)
   return env
@@ -164,6 +206,7 @@ class JaxBuilderBenchVecEnv:
       permute_start_boxes: bool = True,
       mj_episode_length: Optional[int] = None,
       fixed_start_x: Optional[float] = None,
+      success_terminate_steps: int = 0,
   ):
     _require_builderbench(env_name)
     self._env_name = str(env_name)
@@ -181,6 +224,7 @@ class JaxBuilderBenchVecEnv:
     self._fixed_start_x = (
         None if fixed_start_x is None or float(fixed_start_x) < 0
         else float(fixed_start_x))
+    self._success_terminate_steps = int(success_terminate_steps)
 
     num_cubes, task_id = self._num_cubes, self._task_id
     cfg = default_config()
@@ -211,7 +255,9 @@ class JaxBuilderBenchVecEnv:
       inner = base
       episode_length = cfg.episode_length
 
-    self._env = _wrap_batched_env(inner, episode_length=int(episode_length))
+    self._env = _wrap_batched_env(
+        inner, episode_length=int(episode_length),
+        success_terminate_steps=self._success_terminate_steps)
     self._episode_length = int(episode_length)
     self._obs_space_list = obs_space_list or ["xy", "select"]
 
@@ -239,13 +285,16 @@ class JaxBuilderBenchVecEnv:
     _fx = (
         f' fixed_start_x={self._fixed_start_x}'
         if self._fixed_start_x is not None else '')
+    _st = (
+        f' success_terminate={self._success_terminate_steps}'
+        if self._success_terminate_steps > 0 else '')
     print(f'[jax_vec] BuilderBench {self._bb_env_id}: '
           f'E={self._num_envs} obs={self._obs_dim_total} '
           f'act={self._action_dim} ep_len={self._episode_length} '
           f'use_pd={self._use_pd} '
           f'pd_duration={self._pd_duration} '
           f'permute_start_boxes={self._permute_start_boxes}'
-          f'{_fx}'
+          f'{_fx}{_st}'
           f'{_pd_obs_msg}')
 
   def _reset_impl(self, rng: jax.Array) -> State:

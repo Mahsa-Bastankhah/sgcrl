@@ -42,11 +42,13 @@ from xyz_density.train import (
     dump_ood_density_probe,
 )
 
-MODES = ('crl', 'nf', 'nf_compact', 'nf_tiny', 'td3', 'fm', 'tdinfonce')
+MODES = ('crl', 'nf', 'nf_compact', 'nf_tiny', 'nf_td', 'td3', 'fb', 'fm',
+         'tdinfonce')
 # Directory tag → checkpoint / metrics / probe file prefix.
 MODE_FILE_PREFIX = {
     'nf_compact': 'nf',
     'nf_tiny': 'nf',
+    'nf_td': 'nf',
 }
 
 
@@ -192,7 +194,12 @@ def reeval_mode(
 
   # Shared val env + NF whitening (recomputed once; train-dist, not OOD).
   file_mode = _file_prefix(mode)
-  score_mode = 'nf' if mode in ('nf_compact', 'nf_tiny') else mode
+  if mode in ('nf_compact', 'nf_tiny', 'nf_td'):
+    score_mode = 'nf'
+  elif mode == 'fb':
+    score_mode = 'td3'
+  else:
+    score_mode = mode
   nf_goal_mean = np.zeros(3, dtype=np.float32)
   nf_goal_std = np.ones(3, dtype=np.float32)
   if score_mode == 'nf':
@@ -281,7 +288,7 @@ def reeval_mode(
     if dump_probes and target in ('state_ood', 'axy_ood'):
       # Rewrite the matching fixed-(s,a) density probe for this target.
       dump_ood_density_probe(
-          'nf' if mode in ('nf_compact', 'nf_tiny') else score_mode,
+          'nf' if mode in ('nf_compact', 'nf_tiny', 'nf_td') else score_mode,
           probe=probes[target],
           out_path=os.path.join(
               probe_dir,

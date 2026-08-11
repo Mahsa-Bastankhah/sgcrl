@@ -71,18 +71,18 @@ for it in 1800 3900; do
     PY_EXIT=1
     continue
   fi
-  tag="c3t1_crl_stateonly_ckpt${it}_phi_psi_traj"
-  echo "[rewvid] iter=${it}"
+  tag="c3t1_crl_stateonly_ckpt${it}_phi_psi_dual"
+  echo "[rewvid] iter=${it} (EMA + online dual strips)"
   python -u scripts/render_frozen_crl_traj_reward_video.py \
     --checkpoint="${ckpt}" \
     --tag="${tag}" \
-    --title="CRL state-only reward  r=φ(s)·ψ(g)  ·  c3t1 ckpt ${it}" \
+    --title="CRL state-only  r=φ(s)·ψ(g)  ·  c3t1 ckpt ${it}" \
     --allow_no_success \
     --max_tries=40 \
     --seed=0 \
     --fps=8 || PY_EXIT=$?
 done
 
-ls -lh "${OUT_DIR}"/c3t1_crl_stateonly_ckpt*_phi_psi_traj* 2>&1 | tail -40 || true
+ls -lh "${OUT_DIR}"/c3t1_crl_stateonly_ckpt*_phi_psi_dual* 2>&1 | tail -40 || true
 pkill -P $$ 2>/dev/null || true
 exit $PY_EXIT
