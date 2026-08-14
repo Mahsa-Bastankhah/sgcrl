@@ -114,7 +114,7 @@ echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=false fixed_sta
 echo "ppo_categorical_select=true  ppo_actor_min_std=${MIN_STD}"
 echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} (AFTER return-norm)"
 echo "actor_reset=true (ep_length_mean < 0.8 * nominal; BB default)"
-echo "ppo_eval_interval=200  (no in-train video; no obs-norm; no ent-anneal)"
+echo "ppo_eval_interval=30  (no in-train video; no obs-norm; no ent-anneal)"
 echo "steps_per_iter=$((PPO_NUM_ENVS * 50))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * 50)))"
 
@@ -147,7 +147,7 @@ python -u ppo_contrastive.py \
   --ppo_rollout_length=50 \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=200 \
+  --ppo_eval_interval=30 \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
   --ppo_repr_mode=crl \
   --ppo_crl_repr_tau="${REWARD_TAU}" \

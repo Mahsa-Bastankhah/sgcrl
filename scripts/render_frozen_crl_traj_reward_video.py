@@ -214,6 +214,36 @@ def _compile_rollout_and_states(policy, env, ep_len, fixed_goal, mocap_targets,
   return _run
 
 
+def make_phi_psi_grad_norm_fn(networks, cfg):
+  """‖∇_s (φ(s,a)·ψ(g))‖ and ‖∇_a (φ(s,a)·ψ(g))‖, g held fixed.
+
+  Matches ``make_reward_fn`` for the raw CRL dot product (no hit bonus).
+  ``ψ(g)`` does not depend on ``s`` or ``a``, so these are the encoder
+  Jacobian norms of φ against the frozen goal embedding.
+  """
+  obs_dim = int(cfg.obs_dim)
+
+  def _dot(q_params, s, a, g):
+    packed = jnp.concatenate([s, g], axis=-1)[None]
+    _, phi, psi = networks.q_network.apply(q_params, packed, a[None])
+    return jnp.sum(phi * psi)
+
+  @jax.jit
+  def grad_norm_fn(q_params, packed, action):
+    s = packed[:, :obs_dim]
+    g = packed[:, obs_dim:]
+
+    def one(s_i, a_i, g_i):
+      gs = jax.grad(_dot, argnums=1)(q_params, s_i, a_i, g_i)
+      ga = jax.grad(_dot, argnums=2)(q_params, s_i, a_i, g_i)
+      return jnp.linalg.norm(gs), jnp.linalg.norm(ga)
+
+    gs_n, ga_n = jax.vmap(one)(s, action, g)
+    return gs_n, ga_n
+
+  return grad_norm_fn
+
+
 def _render_reward_strip(
     rewards: np.ndarray,
     success: np.ndarray,
@@ -282,6 +312,88 @@ def _render_reward_strip(
               fontsize=11, fontweight='bold', va='center')
   fig.suptitle(title or r'online CRL reward  $r=\varphi\!\cdot\!\psi$',
                color='#e8eef4', fontsize=10, y=0.96)
+  canvas = FigureCanvasAgg(fig)
+  canvas.draw()
+  buf = np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
+  plt.close(fig)
+  if buf.shape[1] != width or buf.shape[0] != height:
+    buf = np.asarray(
+        Image.fromarray(buf).resize((width, height), Image.Resampling.LANCZOS))
+  return buf
+
+
+def _render_grad_norm_strip(
+    grad_s: np.ndarray,
+    grad_a: np.ndarray,
+    success: np.ndarray,
+    t: int,
+    width: int,
+    height: int = 220,
+    *,
+    title: str = '',
+    ylabel_s: str = r'$\Vert\nabla_s(\varphi\cdot\psi)\Vert$',
+    ylabel_a: str = r'$\Vert\nabla_a(\varphi\cdot\psi)\Vert$',
+) -> np.ndarray:
+  """Episode timeline of ‖∇_s r‖ and ‖∇_a r‖ (twin axes)."""
+  T = len(grad_s)
+  gs_now = float(grad_s[t])
+  ga_now = float(grad_a[t])
+  first_succ = int(np.argmax(success >= 0.5)) if np.any(success >= 0.5) else -1
+  dpi = 120
+  fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi,
+                   facecolor='#0f1419')
+  ax = fig.add_axes([0.07, 0.22, 0.72, 0.62])
+  ax.set_facecolor('#0f1419')
+  xs = np.arange(T)
+  ax.plot(xs, grad_s, color='#3a6a7a', lw=1.6, alpha=0.45, zorder=1)
+  ax.plot(xs[: t + 1], grad_s[: t + 1], color='#5ec8ff', lw=2.4, zorder=2)
+  ax.scatter([t], [gs_now], s=55, color='#ffe566', edgecolors='#1a1a1a',
+             linewidths=0.8, zorder=4)
+  ax.axvline(t, color='#ffe566', ls=':', lw=1.0, alpha=0.7, zorder=3)
+  if first_succ >= 0:
+    ax.axvline(first_succ, color='#ff8a4c', ls='--', lw=1.2, alpha=0.85,
+               zorder=2)
+  gs_min = float(np.min(grad_s))
+  gs_max = float(np.max(grad_s))
+  gs_pad = 0.08 * max(gs_max - gs_min, 1e-6)
+  ax.set_xlim(-0.5, T - 0.5)
+  ax.set_ylim(gs_min - gs_pad, gs_max + gs_pad)
+  ax.set_xlabel('macro step t', color='#c8d0d8', fontsize=9)
+  ax.set_ylabel(ylabel_s, color='#5ec8ff', fontsize=9)
+  ax.tick_params(colors='#9aa7b5', labelsize=8)
+  ax.tick_params(axis='y', colors='#5ec8ff')
+  for spine in ax.spines.values():
+    spine.set_color('#3a4654')
+  ax.grid(True, color='#2a3540', alpha=0.7, lw=0.6)
+
+  ax2 = ax.twinx()
+  ax2.plot(xs, grad_a, color='#6a4a7a', lw=1.4, alpha=0.45, zorder=1)
+  ax2.plot(xs[: t + 1], grad_a[: t + 1], color='#e0c3ff', lw=2.2, zorder=2)
+  ax2.scatter([t], [ga_now], s=40, color='#e0c3ff', edgecolors='#1a1a1a',
+              linewidths=0.6, zorder=4)
+  ga_min = float(np.min(grad_a))
+  ga_max = float(np.max(grad_a))
+  ga_pad = 0.08 * max(ga_max - ga_min, 1e-6)
+  ax2.set_ylim(ga_min - ga_pad, ga_max + ga_pad)
+  ax2.set_ylabel(ylabel_a, color='#e0c3ff', fontsize=9)
+  ax2.tick_params(colors='#e0c3ff', labelsize=8)
+
+  ax_txt = fig.add_axes([0.80, 0.22, 0.18, 0.62])
+  ax_txt.set_facecolor('#0f1419')
+  ax_txt.axis('off')
+  ax_txt.text(0.05, 0.88, r'$\Vert\nabla_s\Vert$', transform=ax_txt.transAxes,
+              color='#9aa7b5', fontsize=9, va='center')
+  ax_txt.text(0.05, 0.70, f'{gs_now:.3f}', transform=ax_txt.transAxes,
+              color='#5ec8ff', fontsize=14, fontweight='bold', va='center')
+  ax_txt.text(0.05, 0.48, r'$\Vert\nabla_a\Vert$', transform=ax_txt.transAxes,
+              color='#9aa7b5', fontsize=9, va='center')
+  ax_txt.text(0.05, 0.30, f'{ga_now:.3f}', transform=ax_txt.transAxes,
+              color='#e0c3ff', fontsize=14, fontweight='bold', va='center')
+  ax_txt.text(0.05, 0.10, f't = {t}/{T - 1}', transform=ax_txt.transAxes,
+              color='#c8d0d8', fontsize=10, va='center')
+  fig.suptitle(
+      title or r'$\Vert\nabla_{s,a}(\varphi(s,a)\cdot\psi(g))\Vert$',
+      color='#e8eef4', fontsize=10, y=0.96)
   canvas = FigureCanvasAgg(fig)
   canvas.draw()
   buf = np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
@@ -644,11 +756,15 @@ def _write_mp4(frames, path: str, fps: int) -> None:
     raise RuntimeError(f'video write failed: {path}')
 
 
-def _enumerate_ckpts(checkpoint: str, checkpoint_dir: str):
+def _enumerate_ckpts(checkpoint: str, checkpoint_dir: str,
+                     ckpt_stride: int = 1):
   if checkpoint_dir:
     files = sorted(
         glob.glob(os.path.join(checkpoint_dir, 'ckpt_iter_*.pkl')),
         key=lambda p: int(re.search(r'ckpt_iter_(\d+)\.pkl$', p).group(1)))
+    stride = max(1, int(ckpt_stride))
+    if stride > 1:
+      files = files[::stride]
     out = []
     for p in files:
       m = re.search(r'ckpt_iter_(\d+)\.pkl$', p)
@@ -664,6 +780,9 @@ def _parse_args():
   p.add_argument('--checkpoint', default=DEFAULT_CKPT)
   p.add_argument('--checkpoint_dir', default='',
                  help='If set, render every ckpt_iter_*.pkl in this dir.')
+  p.add_argument('--ckpt_stride', type=int, default=1,
+                 help='Keep every Nth milestone when using --checkpoint_dir '
+                      '(e.g. 2 = every other checkpoint).')
   p.add_argument('--env', default=DEFAULT_ENV)
   p.add_argument('--out_dir', default=OUT_DIR)
   p.add_argument('--reward_ckpt', default='',
@@ -682,6 +801,11 @@ def _parse_args():
                  help='Add a timeline strip for state select_action / cube id')
   p.add_argument('--show_pos_delta', action='store_true',
                  help='Add per-cube ||Δxyz|| strip from the reward state s')
+  p.add_argument('--normalize_reward', action='store_true',
+                 help='Also show a 2nd reward strip normalised by episode std.')
+  p.add_argument('--show_phi_psi_grad', action='store_true',
+                 help='Add ||∇_s (φ·ψ)|| and ||∇_a (φ·ψ)|| strips over the '
+                      'episode (g held fixed)')
   p.add_argument('--show_hit', action='store_true',
                  help='Add 1{||s_g−g||<tol} (+ distance) strip; also on by '
                       'default whenever run_config has a hit-bonus mode')
@@ -699,7 +823,8 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, env, mocap_targets,
                 ep_len, num_cubes, reward_fn, mean0, var1, out_dir,
                 hit_mode: str = '',
                 hit_tol: float = 1e-2,
-                task_goal: np.ndarray | None = None):
+                task_goal: np.ndarray | None = None,
+                grad_norm_fn=None):
   tag = args.tag if (args.tag and not args.checkpoint_dir) else (
       f'{args.tag_prefix}_{label}')
   out_mp4 = os.path.join(out_dir, f'{tag}.mp4')
@@ -752,7 +877,7 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, env, mocap_targets,
     if sel.ndim > 1:
       sel = sel.reshape(sel.shape[0], -1)[:, 0]
     cur = dict(rewards=rewards, success=succ, states=states, select=sel,
-               packed=packed, attempt=attempt)
+               packed=packed, actions=actions, attempt=attempt)
     if reached:
       best = cur
       break
@@ -771,6 +896,7 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, env, mocap_targets,
   select = np.asarray(best['select'], dtype=np.float32)
   cube = select_action_to_cube(select, num_cubes)
   packed = np.asarray(best['packed'], dtype=np.float32)
+  actions = np.asarray(best['actions'], dtype=np.float32)
   cube_pos = packed[:, :3 * num_cubes].reshape(len(packed), num_cubes, 3)
   step_delta = cube_step_deltas_from_pos(cube_pos)
   show_hit = (not args.no_show_hit) and (
@@ -788,6 +914,17 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, env, mocap_targets,
         hit_tol=float(hit_tol),
         task_goal=task_goal,
     )
+  show_grad = bool(args.show_phi_psi_grad) and grad_norm_fn is not None
+  grad_s = np.zeros(len(packed), dtype=np.float32)
+  grad_a = np.zeros(len(packed), dtype=np.float32)
+  if show_grad:
+    gs, ga = grad_norm_fn(
+        q_params, jnp.asarray(packed), jnp.asarray(actions))
+    grad_s = np.asarray(gs, dtype=np.float32)
+    grad_a = np.asarray(ga, dtype=np.float32)
+    print(f'[vid] ||∇_s φ·ψ|| range=[{grad_s.min():.4g},{grad_s.max():.4g}] '
+          f'||∇_a φ·ψ|| range=[{grad_a.min():.4g},{grad_a.max():.4g}]',
+          flush=True)
   T = len(rewards)
   first_succ = (int(np.argmax(success >= 0.5))
                 if np.any(success >= 0.5) else -1)
@@ -813,9 +950,11 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, env, mocap_targets,
       select, cube.astype(np.float32),
       step_delta.sum(axis=1).astype(np.float32),
       hit.astype(np.float32),
+      grad_s.astype(np.float32),
+      grad_a.astype(np.float32),
   ]
   header = ('t,reward_online,success,dist,select_action,select_cube,'
-            'pos_delta_sum,hit')
+            'pos_delta_sum,hit,grad_s_norm,grad_a_norm')
   for c in range(num_cubes):
     csv_cols.append(step_delta[:, c].astype(np.float32))
     header += f',pos_delta_c{c}'
@@ -840,6 +979,7 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, env, mocap_targets,
       hit_mode, bool(getattr(ctx, 'crl_state_only', False)), tag,
       title_override=args.title)
 
+  rewards_norm = rewards / (float(np.std(rewards)) + 1e-8)
   print('[vid] composing reward overlay...', flush=True)
   frames = []
   for t in range(T):
@@ -848,6 +988,18 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, env, mocap_targets,
         title=title, ylabel=ylabel, ylim=None)
     extra = []
     select_badge = None
+    if args.normalize_reward:
+      extra.append(_render_reward_strip(
+          rewards_norm, success, t, width=width, height=180,
+          title=rf'normalised reward  $r/\sigma_r$  ·  {tag}',
+          ylabel=r'$r/\sigma_r$',
+          line_color='#ffb347'))
+    if show_grad:
+      extra.append(_render_grad_norm_strip(
+          grad_s, grad_a, success, t, width=width, height=220,
+          title=(r'$\Vert\nabla_s(\varphi(s,a)\cdot\psi(g))\Vert$  /  '
+                 r'$\Vert\nabla_a(\varphi(s,a)\cdot\psi(g))\Vert$'
+                 rf'  ·  {tag}')))
     if show_hit and hit_mode:
       if hit_mode == 'goal':
         hit_title = (
@@ -891,11 +1043,13 @@ def main():
   args = _parse_args()
   out_dir = args.out_dir
   os.makedirs(out_dir, exist_ok=True)
-  entries = _enumerate_ckpts(args.checkpoint, args.checkpoint_dir)
+  entries = _enumerate_ckpts(
+      args.checkpoint, args.checkpoint_dir, ckpt_stride=int(args.ckpt_stride))
   if not entries:
     raise FileNotFoundError('no checkpoints found')
   print(f'[vid] jax={jax.default_backend()} devices={jax.devices()}')
-  print(f'[vid] {len(entries)} checkpoint(s) → {out_dir}')
+  print(f'[vid] {len(entries)} checkpoint(s) '
+        f'(stride={max(1, int(args.ckpt_stride))}) → {out_dir}')
 
   first_path = entries[0][1]
   env_name = args.env
@@ -920,6 +1074,7 @@ def main():
   if task_goal is not None:
     task_goal = np.asarray(task_goal, dtype=np.float32).reshape(-1)
   reward_fn = ppo_learner.make_reward_fn(networks, cfg)
+  grad_norm_fn = make_phi_psi_grad_norm_fn(networks, cfg)
   mean0 = jnp.zeros((ctx.obs_dim,), dtype=jnp.float32)
   var1 = jnp.ones((ctx.obs_dim,), dtype=jnp.float32)
 
@@ -929,7 +1084,7 @@ def main():
         env=env, mocap_targets=mocap_targets, ep_len=ep_len,
         num_cubes=num_cubes, reward_fn=reward_fn, mean0=mean0, var1=var1,
         out_dir=out_dir, hit_mode=hit_mode, hit_tol=hit_tol,
-        task_goal=task_goal)
+        task_goal=task_goal, grad_norm_fn=grad_norm_fn)
 
 
 if __name__ == '__main__':

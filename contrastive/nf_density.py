@@ -363,6 +363,23 @@ def nf_log_prob(nf_networks: NFDensityNetworks, params, state, action, goal):
     return nf_networks.flow_net.apply(params['nf_flow'], g, y)
 
 
+def _l2_ball_perturb(x, key, prob, eps):
+  """Independent per-row L2-ball jitter: with prob p, add δ with ‖δ‖₂ ≤ eps."""
+  key, k_dir, k_rad, k_mask = jax.random.split(key, 4)
+  direction = jax.random.normal(k_dir, x.shape, dtype=x.dtype)
+  direction = direction / jnp.maximum(
+      jnp.linalg.norm(direction, axis=-1, keepdims=True), 1e-8)
+  radius = jax.random.uniform(
+      k_rad, (x.shape[0], 1), dtype=x.dtype) * eps
+  noise = direction * radius
+  do_pert = jax.random.bernoulli(
+      k_mask, prob, shape=(x.shape[0],)).astype(x.dtype)
+  noise = noise * do_pert[:, None]
+  frac = jnp.mean(do_pert)
+  mean_norm = jnp.mean(jnp.linalg.norm(noise, axis=-1))
+  return x + noise, frac, mean_norm
+
+
 # ---------------------------------------------------------------------------
 # 3.  Loss
 # ---------------------------------------------------------------------------
@@ -372,46 +389,115 @@ def make_nf_density_update_fn(
     optimizer: optax.GradientTransformation,
     obs_dim: int,
     noise_std: float = 0.0,
+    s_pert_prob: float = 0.0,
+    s_pert_eps: float = 1e-2,
+    grad_reg_c: float = 100.0,
+    grad_reg_coef: float = 0.0,
 ):
     """Jitted update with separate grads for SA encoder, goal encoder, and NF flow.
 
     noise_std > 0 adds Gaussian noise to goals during training (regularisation).
     Noise is applied after normalization but before goal encoding.
 
+    s_pert_prob / s_pert_eps: with probability p, add L2-ball noise
+    ‖δ‖₂ ≤ eps to raw state s before the SA encoder (same as CRL s perturb).
+
+    grad_reg_coef > 0 adds the CRL-style hinge
+    L_reg = λ E[max(0, ‖∇_s log p_NF(g|s,a)‖ − c)] to the NLL.
+    λ is passed in at update time (adaptive between PPO iters).
+
     goal_mean / goal_std are per-dim running stats passed at call time to
     normalise goals to approximately zero mean / unit variance before the flow.
     Both are 1-D arrays of length goal_dim.  Pass zeros/ones to disable.
     """
+    _s_pert_prob = float(s_pert_prob)
+    _s_pert_eps = float(s_pert_eps)
+    _do_s_pert = _s_pert_prob > 0.0 and _s_pert_eps > 0.0
+    _grad_reg_c = float(grad_reg_c)
+    _grad_reg_coef = float(grad_reg_coef)
+    _do_grad_reg = _grad_reg_coef > 0.0
+    _init_lam = jnp.array(
+        max(_grad_reg_coef, 5e-4) if _do_grad_reg else 0.0,
+        dtype=jnp.float32)
 
-    def _loss(params, batch, key, goal_mean, goal_std):
+    def _loss(params, batch, key, goal_mean, goal_std, lam_val):
         obs    = batch['obs']
         action = batch['action']
         state  = obs[:, :obs_dim]
         goal   = obs[:, obs_dim:]
+        s_pert_frac = jnp.array(0.0, dtype=state.dtype)
+        s_pert_norm = jnp.array(0.0, dtype=state.dtype)
+        key, k_s, k_g = jax.random.split(key, 3)
+
+        if _do_s_pert:
+            state, s_pert_frac, s_pert_norm = _l2_ball_perturb(
+                state, k_s, _s_pert_prob, _s_pert_eps)
 
         # Normalise goals to ~N(0,1) using caller-supplied running stats.
         goal = (goal - goal_mean) / (goal_std + 1e-8)
 
         if noise_std > 0.0:
-            goal = goal + noise_std * jax.random.normal(key, goal.shape)
+            goal = goal + noise_std * jax.random.normal(k_g, goal.shape)
 
         y = nf_networks.sa_encoder_net.apply(params['sa_encoder'], state, action)
         g = _encode_goal(nf_networks, params, goal)
         log_p = nf_networks.flow_net.apply(params['nf_flow'], g, y)
-        loss  = -jnp.mean(log_p)
+        nll = -jnp.mean(log_p)
+
+        zero = jnp.array(0.0, dtype=nll.dtype)
+        gnorm_mean = zero
+        gnorm_max = zero
+        gnorm_frac_above = zero
+        grad_reg_raw = zero
+        grad_reg_lam = zero
+        grad_reg = zero
+        if _do_grad_reg:
+            def _one_logp(s, a, g_one):
+                y_one = nf_networks.sa_encoder_net.apply(
+                    params['sa_encoder'], s, a)
+                g_enc = _encode_goal(nf_networks, params, g_one)
+                return nf_networks.flow_net.apply(
+                    params['nf_flow'], g_enc, y_one)
+
+            def _gnorm(s, a, g_one):
+                gs = jax.grad(_one_logp, argnums=0)(s, a, g_one)
+                return jnp.linalg.norm(gs)
+
+            gnorms = jax.vmap(_gnorm)(state, action, goal)
+            gnorm_mean = jnp.mean(gnorms)
+            gnorm_max = jnp.max(gnorms)
+            gnorm_frac_above = jnp.mean(
+                (gnorms > _grad_reg_c).astype(nll.dtype))
+            grad_reg_raw = jnp.mean(jnp.maximum(gnorms - _grad_reg_c, 0.0))
+            grad_reg_lam = lam_val.astype(nll.dtype)
+            grad_reg = grad_reg_lam * grad_reg_raw
+
+        loss = nll + grad_reg
         metrics = {
-            'density_loss': loss,
+            'density_loss': nll,
+            'nf_total_loss': loss,
             'log_p_mean':   jnp.mean(log_p),
             'log_p_min':    jnp.min(log_p),
             'log_p_max':    jnp.max(log_p),
             'repr_norm':    jnp.mean(jnp.linalg.norm(y, axis=-1)),
+            'nf_s_perturb_frac': s_pert_frac,
+            'nf_s_perturb_norm': s_pert_norm,
+            'nf_grad_reg': grad_reg,
+            'nf_grad_reg_raw': grad_reg_raw,
+            'nf_grad_reg_lam': grad_reg_lam,
+            'nf_logp_grad_s_norm_mean': gnorm_mean,
+            'nf_logp_grad_s_norm_max': gnorm_max,
+            'nf_logp_grad_s_frac_above_c': gnorm_frac_above,
         }
         return loss, metrics
 
     grad_fn = jax.value_and_grad(_loss, has_aux=True)
 
-    def update(params, opt_state, batch, key, goal_mean, goal_std):
-        (_, metrics), grads = grad_fn(params, batch, key, goal_mean, goal_std)
+    def update(params, opt_state, batch, key, goal_mean, goal_std,
+               lam_val=None):
+        _lam = _init_lam if lam_val is None else lam_val
+        (_, metrics), grads = grad_fn(
+            params, batch, key, goal_mean, goal_std, _lam)
         metrics = dict(metrics)
         metrics['encoder_grad_norm'] = _tree_l2_norm(grads['sa_encoder'])
         metrics['flow_grad_norm']    = _tree_l2_norm(grads['nf_flow'])
@@ -445,6 +531,10 @@ def make_scan_nf_update_fn(
     obs_dim: int,
     noise_std: float = 0.0,
     repr_tau: float = 0.0,
+    s_pert_prob: float = 0.0,
+    s_pert_eps: float = 1e-2,
+    grad_reg_c: float = 100.0,
+    grad_reg_coef: float = 0.0,
 ):
   """Scan-based NF updater: N density steps in one JIT call.
 
@@ -455,22 +545,26 @@ def make_scan_nf_update_fn(
 
   Returns:
     ``multi_update(params, opt_state, params_ema, batches, key,
-                   goal_mean, goal_std)``
+                   goal_mean, goal_std, lam_val=None)``
     → ``(new_params, new_opt_state, new_params_ema, new_key,
          mean_metrics)``
   """
   raw_update = make_nf_density_update_fn(
-      nf_networks, optimizer, obs_dim=obs_dim, noise_std=noise_std)
+      nf_networks, optimizer, obs_dim=obs_dim, noise_std=noise_std,
+      s_pert_prob=s_pert_prob, s_pert_eps=s_pert_eps,
+      grad_reg_c=grad_reg_c, grad_reg_coef=grad_reg_coef)
   use_ema = 0.0 < float(repr_tau) < 1.0
   _tau = float(repr_tau)
 
   @jax.jit
   def multi_update(
-      params, opt_state, params_ema, batches, key, goal_mean, goal_std):
+      params, opt_state, params_ema, batches, key, goal_mean, goal_std,
+      lam_val=None):
     def scan_step(carry, batch):
       p, opt, ema, k = carry
       k, k_u = jax.random.split(k)
-      p, opt, m = raw_update(p, opt, batch, k_u, goal_mean, goal_std)
+      p, opt, m = raw_update(
+          p, opt, batch, k_u, goal_mean, goal_std, lam_val)
       if use_ema:
         ema = jax.tree_util.tree_map(
             lambda t, o: _tau * t + (1.0 - _tau) * o, ema, p)
@@ -505,6 +599,8 @@ def make_nf_td_density_update_fn(
     end_index: int = -1,
     goal_state_indices=None,
     ratio_clip: float = 20.0,
+    s_pert_prob: float = 0.0,
+    s_pert_eps: float = 1e-2,
 ):
   """TD normalizing-flow density update.
 
@@ -529,6 +625,9 @@ def make_nf_td_density_update_fn(
   _mask_prob = float(mask_prob)
   _noise_std = float(noise_std)
   _ratio_clip = float(ratio_clip)
+  _s_pert_prob = float(s_pert_prob)
+  _s_pert_eps = float(s_pert_eps)
+  _do_s_pert = _s_pert_prob > 0.0 and _s_pert_eps > 0.0
   si = int(start_index)
   ei = int(end_index)
   _gidx = None if goal_state_indices is None else jnp.asarray(
@@ -554,9 +653,14 @@ def make_nf_td_density_update_fn(
 
     s = obs[:, :obs_dim]
     next_s = next_obs[:, :obs_dim]
+    s_pert_frac = jnp.array(0.0, dtype=s.dtype)
+    s_pert_norm = jnp.array(0.0, dtype=s.dtype)
 
     g_prime = _norm_goal(_state_as_goal(next_s), goal_mean, goal_std)
-    key, k_noise, k_mask, k_act = jax.random.split(key, 4)
+    key, k_noise, k_mask, k_act, k_s = jax.random.split(key, 5)
+    if _do_s_pert:
+      s, s_pert_frac, s_pert_norm = _l2_ball_perturb(
+          s, k_s, _s_pert_prob, _s_pert_eps)
     if _noise_std > 0.0:
       g_prime = g_prime + _noise_std * jax.random.normal(
           k_noise, g_prime.shape)
@@ -614,6 +718,8 @@ def make_nf_td_density_update_fn(
         'log_p_mean': jnp.mean(log_p_next),
         'log_p_min': jnp.min(log_p_next),
         'log_p_max': jnp.max(log_p_next),
+        'nf_s_perturb_frac': s_pert_frac,
+        'nf_s_perturb_norm': s_pert_norm,
     }
     return loss, metrics
 
@@ -670,6 +776,8 @@ def make_scan_nf_td_update_fn(
     goal_state_indices=None,
     repr_tau: float = 0.0,
     ratio_clip: float = 20.0,
+    s_pert_prob: float = 0.0,
+    s_pert_eps: float = 1e-2,
 ):
   """Scan-based TD-NF updater: N density steps in one JIT call.
 
@@ -692,6 +800,8 @@ def make_scan_nf_td_update_fn(
       end_index=end_index,
       goal_state_indices=goal_state_indices,
       ratio_clip=ratio_clip,
+      s_pert_prob=s_pert_prob,
+      s_pert_eps=s_pert_eps,
   )
   use_ema = 0.0 < float(repr_tau) < 1.0
   _tau = float(repr_tau)

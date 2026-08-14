@@ -74,7 +74,7 @@ case "${SLURM_ARRAY_TASK_ID}" in
   2)
     # best≈0.881 (collapsed); probes mostly present
     KIND=nf
-    CKPT_DIR=logs/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew1_ep70_300m_NOnormobs/ppo_builderbench_creative_7_task2_0/checkpoints
+    CKPT_DIR=logs/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew1_ep70_300m/ppo_builderbench_creative_7_task2_0/checkpoints
     OUT_DIR=figs/builderbench/nf_logp_reward_probe/c7t2_nf_base_s0_online_all
     TAG_PREFIX=c7t2_nf_base_s0_online
     ;;

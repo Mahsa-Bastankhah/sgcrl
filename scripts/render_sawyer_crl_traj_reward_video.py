@@ -255,6 +255,23 @@ def _rollout_collect(policy_params, gym_env, networks, render, reward_fn,
   )
 
 
+def _make_psi_psi_reward_fn(networks, obs_dim: int):
+  """r = ψ(s)·ψ(g): encode current state and goal both through the g-encoder."""
+  obs_dim = int(obs_dim)
+
+  @jax.jit
+  def reward_fn(q_params, obs, action, obs_mean, obs_var):
+    del obs_mean, obs_var  # no obs-norm in this probe; action unused by ψ
+    s = obs[:, :obs_dim]
+    # Goal slot ← state so g_encoder yields ψ(s).
+    obs_ss = jnp.concatenate([s, s], axis=-1)
+    _, _, psi_g = networks.q_network.apply(q_params, obs, action)
+    _, _, psi_s = networks.q_network.apply(q_params, obs_ss, action)
+    return jnp.sum(psi_s * psi_g, axis=-1)
+
+  return reward_fn
+
+
 def _parse_args():
   p = argparse.ArgumentParser()
   p.add_argument('--checkpoint', default='')
@@ -266,6 +283,9 @@ def _parse_args():
   p.add_argument('--tag', default='')
   p.add_argument('--tag_prefix', default='sawyer_bin_online')
   p.add_argument('--title', default='')
+  p.add_argument('--score_mode', default='phi_psi',
+                 choices=('phi_psi', 'psi_psi'),
+                 help='Top-strip score: φ(s,a)·ψ(g) (default) or ψ(s)·ψ(g).')
   p.add_argument('--allow_no_success', action='store_true')
   p.add_argument('--max_tries', type=int, default=MAX_TRIES)
   p.add_argument('--seed', type=int, default=SEED)
@@ -299,8 +319,11 @@ def _render_one(args, *, label, ckpt_path, networks, gym_env, render,
   ckpt = ppo_learner.load_checkpoint(ckpt_path)
   q_params = ckpt['q_params']
   policy_params = ckpt['policy_params']
+  score_mode = str(getattr(args, 'score_mode', 'phi_psi') or 'phi_psi')
+  score_name = (r'ψ(s)·ψ(g)' if score_mode == 'psi_psi'
+                else r'φ(s,a)·ψ(g)')
   print(f'[vid] policy_iter={ckpt.get("iteration")} max_steps={max_steps} '
-        f'reward_src=q_params(online) φ·ψ only', flush=True)
+        f'reward_src=q_params(online) {score_name}', flush=True)
 
   best = None
   for attempt in range(int(args.max_tries)):
@@ -345,11 +368,16 @@ def _render_one(args, *, label, ckpt_path, networks, gym_env, render,
   width = int(frames_rgb[0].shape[1])
   if width % 2:
     width -= 1
+  score_mode = str(getattr(args, 'score_mode', 'phi_psi') or 'phi_psi')
   if args.title:
     title = f'{args.title}  ·  {tag}'
+    ylabel = r'$r$'
+  elif score_mode == 'psi_psi':
+    title = rf'online CRL  $r=\psi(s)\cdot\psi(g)$  ·  {tag}'
+    ylabel = r'$r=\psi(s)\cdot\psi(g)$'
   else:
     title = rf'online CRL  $r=\varphi(s,a)\cdot\psi(g)$  ·  {tag}'
-  ylabel = r'$r=\varphi(s,a)\cdot\psi(g)$'
+    ylabel = r'$r=\varphi(s,a)\cdot\psi(g)$'
 
   print('[vid] composing reward overlay...', flush=True)
   frames = []
@@ -414,8 +442,14 @@ def main():
   cfg.start_index = 0
   cfg.end_index = -1
   cfg.ppo_norm_obs = False
-  cfg.ppo_crl_hit_bonus = ''  # φ·ψ only
-  reward_fn = ppo_learner.make_reward_fn(networks, cfg)
+  cfg.ppo_crl_hit_bonus = ''  # score only (no hit indicator)
+  score_mode = str(args.score_mode or 'phi_psi')
+  if score_mode == 'psi_psi':
+    reward_fn = _make_psi_psi_reward_fn(networks, obs_dim)
+    print('[vid] score_mode=psi_psi → r=ψ(s)·ψ(g)', flush=True)
+  else:
+    reward_fn = ppo_learner.make_reward_fn(networks, cfg)
+    print('[vid] score_mode=phi_psi → r=φ(s,a)·ψ(g)', flush=True)
   mean0 = jnp.zeros((obs_dim,), dtype=jnp.float32)
   var1 = jnp.ones((obs_dim,), dtype=jnp.float32)
 

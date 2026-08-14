@@ -60,6 +60,8 @@ from envs.builderbench_utils import is_builderbench_creative_env
 CSV_FIELDS = [
     'label', 'path', 'iteration', 'global_step',
     'success_mean', 'success_std', 'episode_successes',
+    'very_hard_success_mean', 'very_hard_success_std',
+    'episode_very_hard_successes',
 ]
 
 
@@ -87,6 +89,9 @@ class CheckpointEvalResult:
   success_mean: float
   success_std: float
   episode_successes: Tuple[float, ...]
+  very_hard_success_mean: float = float('nan')
+  very_hard_success_std: float = float('nan')
+  episode_very_hard_successes: Tuple[float, ...] = ()
 
 
 def resolve_paths(
@@ -170,6 +175,10 @@ def read_csv_results(csv_path: str) -> List[CheckpointEvalResult]:
     for row in csv.DictReader(fh):
       ep_raw = str(row.get('episode_successes', '') or '')
       ep = tuple(float(x) for x in ep_raw.split(';') if x.strip())
+      vh_raw = str(row.get('episode_very_hard_successes', '') or '')
+      vh_ep = tuple(float(x) for x in vh_raw.split(';') if x.strip())
+      vh_mean = row.get('very_hard_success_mean', '')
+      vh_std = row.get('very_hard_success_std', '')
       rows.append(CheckpointEvalResult(
           label=str(row['label']),
           path=str(row['path']),
@@ -178,6 +187,11 @@ def read_csv_results(csv_path: str) -> List[CheckpointEvalResult]:
           success_mean=float(row['success_mean']),
           success_std=float(row['success_std']),
           episode_successes=ep,
+          very_hard_success_mean=(
+              float(vh_mean) if str(vh_mean).strip() else float('nan')),
+          very_hard_success_std=(
+              float(vh_std) if str(vh_std).strip() else float('nan')),
+          episode_very_hard_successes=vh_ep,
       ))
   rows.sort(key=lambda r: r.iteration)
   return rows
@@ -200,6 +214,10 @@ def write_csv_results(path: str, results: Sequence[CheckpointEvalResult]) -> Non
           'success_mean': r.success_mean,
           'success_std': r.success_std,
           'episode_successes': ';'.join(f'{x:.0f}' for x in r.episode_successes),
+          'very_hard_success_mean': r.very_hard_success_mean,
+          'very_hard_success_std': r.very_hard_success_std,
+          'episode_very_hard_successes': ';'.join(
+              f'{x:.0f}' for x in r.episode_very_hard_successes),
       })
 
 
@@ -215,8 +233,11 @@ def merge_results(
   return sorted(by_key.values(), key=lambda r: r.iteration)
 
 
-def episode_successes_from_steps(steps) -> np.ndarray:
-  success = np.asarray(steps['success'], dtype=np.float32)
+def episode_successes_from_steps(steps, key: str = 'success') -> np.ndarray:
+  if key not in steps:
+    success = np.asarray(steps['success'], dtype=np.float32)
+    return np.zeros(success.shape[1], dtype=np.float32)
+  success = np.asarray(steps[key], dtype=np.float32)
   return (np.max(success, axis=0) >= 0.5).astype(np.float32)
 
 
@@ -305,7 +326,7 @@ class CheckpointEvalSession:
       policy_params: Any,
       obs_mean: Optional[np.ndarray] = None,
       obs_var: Optional[np.ndarray] = None,
-  ) -> Tuple[float, float, Tuple[float, ...]]:
+  ) -> Tuple[float, float, Tuple[float, ...], float, float, Tuple[float, ...]]:
     eval_state = self.vec_env.reset_state()
     if self._norm_obs:
       if obs_mean is None or obs_var is None:
@@ -318,10 +339,16 @@ class CheckpointEvalSession:
     else:
       steps = self._eval_unroll(eval_state, policy_params)
     ep_success = episode_successes_from_steps(steps)
+    ep_very_hard = episode_successes_from_steps(steps, key='very_hard_success')
     mean = float(ep_success.mean())
+    vh_mean = float(ep_very_hard.mean())
     n = int(ep_success.size)
     std = float(math.sqrt(mean * (1.0 - mean) / max(n, 1)))
-    return mean, std, tuple(float(x) for x in ep_success)
+    vh_std = float(math.sqrt(vh_mean * (1.0 - vh_mean) / max(n, 1)))
+    return (
+        mean, std, tuple(float(x) for x in ep_success),
+        vh_mean, vh_std, tuple(float(x) for x in ep_very_hard),
+    )
 
   def eval_checkpoint_file(self, label: str, path: str) -> CheckpointEvalResult:
     ckpt = ppo_learner.load_checkpoint(path)
@@ -340,7 +367,7 @@ class CheckpointEvalSession:
       if int(obs_state.get('count', 0)) <= 0:
         # Identity / raw inputs when stats have not started yet.
         obs_mean = np.full_like(obs_mean, np.nan)
-    mean, std, ep_succ = self.eval_policy_params(
+    mean, std, ep_succ, vh_mean, vh_std, vh_ep = self.eval_policy_params(
         ckpt['policy_params'], obs_mean=obs_mean, obs_var=obs_var)
     return CheckpointEvalResult(
         label=label,
@@ -350,6 +377,9 @@ class CheckpointEvalSession:
         success_mean=mean,
         success_std=std,
         episode_successes=ep_succ,
+        very_hard_success_mean=vh_mean,
+        very_hard_success_std=vh_std,
+        episode_very_hard_successes=vh_ep,
     )
 
 

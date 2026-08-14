@@ -124,7 +124,7 @@ echo "builderbench_use_pd=true pd_duration=5"
 echo "episode_length=${EP_LEN} (default c5t2 PD macro; mj=350)"
 echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
 echo "ppo_use_external_reward=false"
-echo "ppo_eval_interval=200"
+echo "ppo_eval_interval=30"
 echo "ppo_nf_td=true nf_td_target_tau=${NF_TD_TARGET_TAU} nf_td_mask_prob=${NF_TD_MASK_PROB}"
 echo "nf_rep_size=${NF_REP_SIZE} nf_num_blocks=${NF_NUM_BLOCKS} nf_coupling_width=${NF_COUPLING_WIDTH}"
 echo "nf_grad_clip=${NF_GRAD_CLIP} nf_noise_std=${NF_NOISE_STD} nf_goal_std_min=${NF_GOAL_STD_MIN}"
@@ -157,7 +157,7 @@ python -u ppo_contrastive.py \
   --ppo_rollout_length="${EP_LEN}" \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=200 \
+  --ppo_eval_interval=30 \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
   --ppo_repr_mode=nf \
   --ppo_nf_td \

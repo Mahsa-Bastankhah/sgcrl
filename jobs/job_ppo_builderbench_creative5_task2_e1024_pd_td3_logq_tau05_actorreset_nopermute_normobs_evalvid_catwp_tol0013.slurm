@@ -118,7 +118,7 @@ echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=false goals=MID
 echo "actor_reset=true (ep_length_mean < 0.8 * nominal)"
 echo "ppo_norm_obs=true"
 echo "ppo_categorical_select=true ppo_categorical_select_waypoint=true (catwp)"
-echo "ppo_eval_interval=200 ppo_video_interval=400 (deterministic + live obs_rms)"
+echo "ppo_eval_interval=30 ppo_video_interval=400 (deterministic + live obs_rms)"
 echo "td3 defaults otherwise: cross_batch_goals=false, mlp Q, no bilinear; polyak_tau=0.005"
 echo "steps_per_iter=$((PPO_NUM_ENVS * 50))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * 50)))"
@@ -150,7 +150,7 @@ python -u ppo_contrastive.py \
   --ppo_rollout_length=50 \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=200 \
+  --ppo_eval_interval=30 \
   --ppo_eval_episodes=5 \
   --ppo_video_interval=400 \
   --ppo_video_fps=10 \

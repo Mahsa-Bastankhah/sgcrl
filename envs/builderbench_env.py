@@ -232,6 +232,8 @@ class BuilderBenchCreativeGymEnv(gym.Env):
         'success': success,
         'easy_success': float(
             np.asarray(self._state.metrics.get('easy_success', 0.0))),
+        'very_hard_success': float(
+            np.asarray(self._state.metrics.get('very_hard_success', 0.0))),
         'target_goal': np.asarray(
             self._state.info['target_goal'], dtype=np.float32),
         'achieved_goal': np.asarray(

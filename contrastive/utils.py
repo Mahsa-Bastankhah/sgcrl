@@ -144,27 +144,42 @@ class BuilderBenchSuccessObserver(observers_base.EnvLoopObserver):
   def __init__(self):
     self._step_success = []
     self._success = []
+    self._step_very_hard = []
+    self._very_hard = []
 
   def observe_first(self, env, timestep):
     if self._step_success:
       self._success.append(bool(np.max(self._step_success) >= 0.5))
+    if self._step_very_hard:
+      self._very_hard.append(bool(np.max(self._step_very_hard) >= 0.5))
     self._step_success = []
+    self._step_very_hard = []
 
   def observe(self, env, timestep, action):
     get_info = getattr(env, 'get_info', None)
     val = 0.0
+    vh = 0.0
     if get_info is not None:
       info = get_info() or {}
       val = float(info.get('success', info.get('easy_success', 0.0)))
+      vh = float(info.get('very_hard_success', 0.0))
     self._step_success.append(val)
+    self._step_very_hard.append(vh)
 
   def get_metrics(self):
     hit = bool(np.max(self._step_success) >= 0.5) if self._step_success else False
-    return {
+    vh_hit = (
+        bool(np.max(self._step_very_hard) >= 0.5)
+        if self._step_very_hard else False)
+    out = {
         'success': float(hit),
         'success_1000': float(np.mean(self._success[-1000:]))
         if self._success else float('nan'),
+        'very_hard_success': float(vh_hit),
     }
+    if self._very_hard:
+      out['very_hard_success_1000'] = float(np.mean(self._very_hard[-1000:]))
+    return out
 
 
 class RiverSwimGoalVisitSuccessObserver(observers_base.EnvLoopObserver):

@@ -108,7 +108,7 @@ class MPOCRLConfig:
   # target <- (1-rate) * target + rate * online.
   repr_target_update_rate: float = 0.005
 
-  eval_interval: int = 10
+  eval_interval: int = 30
   eval_episodes: int = 5
   checkpoint_interval: int = 200
   checkpoint_keep_last: int = 0
@@ -1025,7 +1025,9 @@ def run_mpo_crl_training(
   # BuilderBench: track episode success from env metrics (dense reward ≠ success).
   track_train_success = bool(use_jax_bb and hasattr(vec_env, 'last_success'))
   recent_success: list[float] = []
+  recent_very_hard_success: list[float] = []
   ep_success_max = np.zeros(num_envs, dtype=np.float32)
+  ep_very_hard_success_max = np.zeros(num_envs, dtype=np.float32)
 
   learner_logger = logger_fn(label='learner')
   eval_logger = logger_fn(label='eval')
@@ -1062,6 +1064,11 @@ def run_mpo_crl_training(
       rollout_actions = np.asarray(steps['actions'], dtype=np.float32)
       env_rewards = np.asarray(steps['env_rew'], dtype=np.float32)
       rollout_success = np.asarray(steps['success'], dtype=np.float32)
+      if 'very_hard_success' in steps:
+        rollout_very_hard = np.asarray(
+            steps['very_hard_success'], dtype=np.float32)
+      else:
+        rollout_very_hard = np.zeros_like(rollout_success)
       rollout_dones = np.asarray(steps['step_dones'], dtype=bool)
       terminal_obs_rollout = np.asarray(
           steps['terminal_obs'], dtype=np.float32)
@@ -1086,6 +1093,7 @@ def run_mpo_crl_training(
       if aligned_episodes:
         rollout_returns = np.sum(env_rewards, axis=0)
         rollout_successes = np.max(rollout_success, axis=0) >= 0.5
+        rollout_very_hard_successes = np.max(rollout_very_hard, axis=0) >= 0.5
         for index in range(num_envs):
           episode_replay.add_episode(
               np.concatenate(
@@ -1098,9 +1106,12 @@ def run_mpo_crl_training(
             [int(mpo_config.rollout_length)] * num_envs)
         recent_success.extend(
             rollout_successes.astype(float).tolist())
+        recent_very_hard_success.extend(
+            rollout_very_hard_successes.astype(float).tolist())
         recent_returns[:] = recent_returns[-100:]
         recent_lengths[:] = recent_lengths[-100:]
         recent_success[:] = recent_success[-1000:]
+        recent_very_hard_success[:] = recent_very_hard_success[-1000:]
         obs = next_obs_rollout[-1]
         episode_obs = [[obs[index].copy()] for index in range(num_envs)]
       else:
@@ -1114,6 +1125,9 @@ def run_mpo_crl_training(
             ep_success_max[index] = max(
                 ep_success_max[index],
                 float(rollout_success[timestep, index]))
+            ep_very_hard_success_max[index] = max(
+                ep_very_hard_success_max[index],
+                float(rollout_very_hard[timestep, index]))
             if rollout_dones[timestep, index]:
               episode_obs[index].append(
                   terminal_obs_rollout[timestep, index].copy())
@@ -1124,15 +1138,19 @@ def run_mpo_crl_training(
               recent_lengths.append(int(episode_lengths[index]))
               recent_success.append(
                   float(ep_success_max[index] >= 0.5))
+              recent_very_hard_success.append(
+                  float(ep_very_hard_success_max[index] >= 0.5))
               recent_returns[:] = recent_returns[-100:]
               recent_lengths[:] = recent_lengths[-100:]
               recent_success[:] = recent_success[-1000:]
+              recent_very_hard_success[:] = recent_very_hard_success[-1000:]
               episode_obs[index] = [
                   next_obs_rollout[timestep, index].copy()]
               episode_actions[index] = []
               episode_returns[index] = 0.0
               episode_lengths[index] = 0
               ep_success_max[index] = 0.0
+              ep_very_hard_success_max[index] = 0.0
             else:
               episode_obs[index].append(
                   next_obs_rollout[timestep, index].copy())
@@ -1247,6 +1265,12 @@ def run_mpo_crl_training(
       log['train_success_1000'] = (
           float(np.mean(recent_success[-1000:]))
           if recent_success else float('nan'))
+      log['train_very_hard_success_mean'] = (
+          float(np.mean(recent_very_hard_success[-100:]))
+          if recent_very_hard_success else float('nan'))
+      log['train_very_hard_success_1000'] = (
+          float(np.mean(recent_very_hard_success[-1000:]))
+          if recent_very_hard_success else float('nan'))
     # Acme's CSV logger fixes its columns on the first write. Seed update
     # columns even while replay is warming up so later MPO/CRL metrics persist.
     for key_ in (

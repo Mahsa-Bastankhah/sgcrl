@@ -112,7 +112,7 @@ echo "max_replay_size=${MAX_REPLAY_SIZE}"
 echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=true (random init) goals=MID+offsets(default)"
 echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE}"
 echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
-echo "ppo_eval_interval=200"
+echo "ppo_eval_interval=30"
 echo "steps_per_iter=$((PPO_NUM_ENVS * 50))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * 50)))"
 python -u -c "
@@ -143,7 +143,7 @@ python -u ppo_contrastive.py \
   --ppo_rollout_length=50 \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=200 \
+  --ppo_eval_interval=30 \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
   --ppo_repr_mode=crl \
   --crl_state_only \

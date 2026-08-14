@@ -117,7 +117,7 @@ echo "episode_length=${EP_LEN} (mj_episode_length=${MJ_EP_LEN}, rollout_length=$
 echo "ppo_norm_obs=false"
 echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} (AFTER return-norm)"
 echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
-echo "ppo_eval_interval=200 ppo_video_interval=400 (deterministic)"
+echo "ppo_eval_interval=30 ppo_video_interval=400 (deterministic)"
 echo "steps_per_iter=$((PPO_NUM_ENVS * EP_LEN))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * EP_LEN)))"
 python -u -c "
@@ -152,7 +152,7 @@ python -u ppo_contrastive.py \
   --ppo_rollout_length="${EP_LEN}" \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=200 \
+  --ppo_eval_interval=30 \
   --ppo_eval_episodes=5 \
   --ppo_video_interval=400 \
   --ppo_video_fps=10 \

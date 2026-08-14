@@ -12,7 +12,7 @@
 
 # Render creative7 task2 NF runs that reached eval success=1:
 #   - NF extrew1 minstd+entanneal (success from eval iter 1400)
-#   - NF extrew1 (NOnormobs dir; success from eval iter 2200)
+#   - NF extrew1 catselect ep70 (success from eval iter 2200)
 unset LD_PRELOAD
 module purge
 
@@ -89,8 +89,8 @@ for it in 1350 1500 1650 1800 1950; do
   render_det "${NF_MS}" "c7t2_nf_ext1_ms_ea_det" "${it}"
 done
 
-# NF extrew1 (default no-normobs naming) — eval success from 2200
-NF_BASE=logs/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew1_ep70_300m_NOnormobs/ppo_builderbench_creative_7_task2_0
+# NF extrew1 catselect ep70 — eval success from 2200
+NF_BASE=logs/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew1_ep70_300m/ppo_builderbench_creative_7_task2_0
 for it in 2100 2250; do
   render_det "${NF_BASE}" "c7t2_nf_ext1_det" "${it}"
 done

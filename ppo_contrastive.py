@@ -286,7 +286,7 @@ flags.DEFINE_string(
     '(in addition to the short-episode guard). Empty disables the schedule.')
 flags.DEFINE_integer(
     'ppo_eval_interval', -1,
-    'Run eval every N PPO iterations. <0 keeps config/env default (10). 0 disables eval.')
+    'Run eval every N PPO iterations. <0 keeps config/env default (30). 0 disables eval.')
 flags.DEFINE_integer(
     'ppo_eval_episodes', -1,
     'Number of eval episodes per eval round. <0 keeps config default (5).')
@@ -359,6 +359,38 @@ flags.DEFINE_boolean(
     'ppo_external_reward_before_norm', False,
     'If True with ppo_use_external_reward, add the extrinsic bonus to the raw '
     'shaped reward BEFORE return-norm. Default False (add after norm).')
+flags.DEFINE_string(
+    'ppo_external_reward_success', 'hard',
+    'BuilderBench success used for the external PPO bonus: '
+    '"hard" (2cm, default) or "very_hard" (1cm). '
+    'Both are always logged; this only changes the reward.')
+flags.DEFINE_boolean(
+    'ppo_sparse_after_success', False,
+    'If True with ppo_use_external_reward: after '
+    'ppo_sparse_after_success_iters consecutive PPO iters with train success '
+    '>= ppo_sparse_after_success_threshold, stop using denser/repr rewards '
+    'and use only the sparse hard-success 0/1 reward (scaled by '
+    'ppo_external_reward_scale). Latches for the rest of training.')
+flags.DEFINE_float(
+    'ppo_sparse_after_success_threshold', 0.5,
+    'Train-success level treated as "high" for ppo_sparse_after_success.')
+flags.DEFINE_integer(
+    'ppo_sparse_after_success_iters', 10,
+    'Consecutive high-success PPO iters required before switching to '
+    'sparse-only reward (ppo_sparse_after_success).')
+flags.DEFINE_boolean(
+    'ppo_freeze_repr_after_success', False,
+    'If True: after ppo_freeze_repr_after_success_iters consecutive PPO iters '
+    'with train success >= ppo_freeze_repr_after_success_threshold, freeze '
+    'the representation (ppo_crl_steps_per_iter=0) and keep training PPO '
+    'with the same shaped/extrew reward and return-normalizer. Latches.')
+flags.DEFINE_float(
+    'ppo_freeze_repr_after_success_threshold', 0.5,
+    'Train-success level treated as "high" for ppo_freeze_repr_after_success.')
+flags.DEFINE_integer(
+    'ppo_freeze_repr_after_success_iters', 10,
+    'Consecutive high-success PPO iters required before freezing '
+    'representations (ppo_freeze_repr_after_success).')
 flags.DEFINE_integer(
     'ppo_checkpoint_interval', -1,
     'Save checkpoints every N PPO iterations. <0 keeps config default (400).')
@@ -366,6 +398,11 @@ flags.DEFINE_integer(
     'ppo_checkpoint_keep_last', -1,
     'Max milestone ckpt_iter_*.pkl files to retain (FIFO). '
     '0 = keep all. <0 keeps config default (0 = keep all).')
+flags.DEFINE_integer(
+    'ppo_checkpoint_replay_max', -1,
+    'Serialize up to this many recent replay transitions into latest.pkl so '
+    'a requeued run resumes with a warm buffer. ~195 bytes/transition. '
+    '0 disables. <0 keeps config default (0 = disabled).')
 flags.DEFINE_string(
     'ppo_crl_loss_direction', 'forward',
     "InfoNCE loss direction for PPO-CRL: 'forward' (fix anchor, vary goal) "
@@ -391,6 +428,32 @@ flags.DEFINE_float(
     'ppo_crl_sf_perturb_eps', -1.0,
     'CRL training: max L2 radius of s_f noise when perturbing '
     '(‖δ‖₂ ≤ eps). <0 keeps config default (1e-2).')
+flags.DEFINE_float(
+    'ppo_crl_s_perturb_prob', -1.0,
+    'CRL training: probability of perturbing each packed state s '
+    'before InfoNCE (φ input). Independent of s_f perturb. 0 disables. '
+    '<0 keeps config default (0).')
+flags.DEFINE_float(
+    'ppo_crl_s_perturb_eps', -1.0,
+    'CRL training: max L2 radius of s noise when perturbing '
+    '(‖δ‖₂ ≤ eps). <0 keeps config default (1e-2).')
+flags.DEFINE_float(
+    'ppo_crl_grad_reg_c', -1.0,
+    'CRL: threshold c on ‖∇_s (φ(s,a)·ψ(s_f))‖. '
+    'L_reg = λ E[max(0, ‖J_f(s)‖ − c)]. <0 keeps config default (100).')
+flags.DEFINE_float(
+    'ppo_crl_grad_reg_coef', -1.0,
+    'CRL: initial λ for the ∇_s hinge (adapted each iteration via EMA '
+    'so L_reg ≈ ppo_crl_grad_reg_rel × L_InfoNCE). 0 = not in the loss '
+    '(∇_s stats are still logged). <0 keeps config default (0).')
+flags.DEFINE_float(
+    'ppo_crl_grad_reg_rel', -1.0,
+    'CRL: target ratio L_reg / L_InfoNCE for adaptive λ (default 0.1). '
+    '<0 keeps config default.')
+flags.DEFINE_boolean(
+    'ppo_nf_grad_reg', False,
+    'NF: add the CRL-style hinge on ‖∇_s log p_NF(g|s,a)‖ to the NLL '
+    '(uses ppo_crl_grad_reg_{c,coef,rel}; ∇_s stats are always logged).')
 flags.DEFINE_float(
     'ppo_crl_repr_tau', -1.0,
     'CRL mode: EMA decay τ for φ, ψ used in PPO reward r=φ·ψ. '
@@ -859,10 +922,25 @@ def main(_):
   config.ppo_external_reward_scale = float(FLAGS.ppo_external_reward_scale)
   config.ppo_external_reward_before_norm = bool(
       FLAGS.ppo_external_reward_before_norm)
+  config.ppo_external_reward_success = str(
+      FLAGS.ppo_external_reward_success).strip().lower()
+  config.ppo_sparse_after_success = bool(FLAGS.ppo_sparse_after_success)
+  config.ppo_sparse_after_success_threshold = float(
+      FLAGS.ppo_sparse_after_success_threshold)
+  config.ppo_sparse_after_success_iters = int(
+      FLAGS.ppo_sparse_after_success_iters)
+  config.ppo_freeze_repr_after_success = bool(
+      FLAGS.ppo_freeze_repr_after_success)
+  config.ppo_freeze_repr_after_success_threshold = float(
+      FLAGS.ppo_freeze_repr_after_success_threshold)
+  config.ppo_freeze_repr_after_success_iters = int(
+      FLAGS.ppo_freeze_repr_after_success_iters)
   if FLAGS.ppo_checkpoint_interval >= 0:
     config.ppo_checkpoint_interval = int(FLAGS.ppo_checkpoint_interval)
   if FLAGS.ppo_checkpoint_keep_last >= 0:
     config.ppo_checkpoint_keep_last = int(FLAGS.ppo_checkpoint_keep_last)
+  if FLAGS.ppo_checkpoint_replay_max >= 0:
+    config.ppo_checkpoint_replay_max = int(FLAGS.ppo_checkpoint_replay_max)
   if FLAGS.ppo_crl_loss_direction.strip():
     config.ppo_crl_loss_direction = FLAGS.ppo_crl_loss_direction.strip().lower()
   if FLAGS.ppo_crl_hit_bonus.strip():
@@ -875,6 +953,17 @@ def main(_):
     config.ppo_crl_sf_perturb_prob = float(FLAGS.ppo_crl_sf_perturb_prob)
   if FLAGS.ppo_crl_sf_perturb_eps >= 0.0:
     config.ppo_crl_sf_perturb_eps = float(FLAGS.ppo_crl_sf_perturb_eps)
+  if FLAGS.ppo_crl_s_perturb_prob >= 0.0:
+    config.ppo_crl_s_perturb_prob = float(FLAGS.ppo_crl_s_perturb_prob)
+  if FLAGS.ppo_crl_s_perturb_eps >= 0.0:
+    config.ppo_crl_s_perturb_eps = float(FLAGS.ppo_crl_s_perturb_eps)
+  if FLAGS.ppo_crl_grad_reg_c >= 0.0:
+    config.ppo_crl_grad_reg_c = float(FLAGS.ppo_crl_grad_reg_c)
+  if FLAGS.ppo_crl_grad_reg_coef >= 0.0:
+    config.ppo_crl_grad_reg_coef = float(FLAGS.ppo_crl_grad_reg_coef)
+  if FLAGS.ppo_crl_grad_reg_rel >= 0.0:
+    config.ppo_crl_grad_reg_rel = float(FLAGS.ppo_crl_grad_reg_rel)
+  config.ppo_nf_grad_reg = bool(FLAGS.ppo_nf_grad_reg)
   if FLAGS.ppo_crl_repr_tau >= 0.0:
     config.ppo_crl_repr_tau = float(FLAGS.ppo_crl_repr_tau)
   if FLAGS.ppo_nf_reward_tau >= 0.0:
@@ -927,6 +1016,12 @@ def main(_):
         f'ppo_crl_hit_bonus_scale={config.ppo_crl_hit_bonus_scale}  '
         f'ppo_crl_sf_perturb_prob={config.ppo_crl_sf_perturb_prob}  '
         f'ppo_crl_sf_perturb_eps={config.ppo_crl_sf_perturb_eps}  '
+        f'ppo_crl_s_perturb_prob={config.ppo_crl_s_perturb_prob}  '
+        f'ppo_crl_s_perturb_eps={config.ppo_crl_s_perturb_eps}  '
+        f'ppo_crl_grad_reg_c={config.ppo_crl_grad_reg_c}  '
+        f'ppo_crl_grad_reg_coef={config.ppo_crl_grad_reg_coef}  '
+        f'ppo_crl_grad_reg_rel={config.ppo_crl_grad_reg_rel}  '
+        f'ppo_nf_grad_reg={config.ppo_nf_grad_reg}  '
         f'ppo_nf_reward_tau={config.ppo_nf_reward_tau}  '
         f'ppo_nf_td={config.ppo_nf_td}  '
         f'ppo_nf_td_target_tau={config.ppo_nf_td_target_tau}  '
@@ -954,12 +1049,26 @@ def main(_):
         f'ppo_external_reward_scale={config.ppo_external_reward_scale}  '
         f'ppo_external_reward_before_norm='
         f'{config.ppo_external_reward_before_norm}  '
+        f'ppo_external_reward_success='
+        f'{config.ppo_external_reward_success}  '
+        f'ppo_sparse_after_success={config.ppo_sparse_after_success}  '
+        f'ppo_sparse_after_success_threshold='
+        f'{config.ppo_sparse_after_success_threshold}  '
+        f'ppo_sparse_after_success_iters='
+        f'{config.ppo_sparse_after_success_iters}  '
+        f'ppo_freeze_repr_after_success='
+        f'{config.ppo_freeze_repr_after_success}  '
+        f'ppo_freeze_repr_after_success_threshold='
+        f'{config.ppo_freeze_repr_after_success_threshold}  '
+        f'ppo_freeze_repr_after_success_iters='
+        f'{config.ppo_freeze_repr_after_success_iters}  '
         f'kde_max_points={config.kde_max_points}  '
         f'kde_refit_interval={config.kde_refit_interval}  '
         f'kde_bandwidth={config.kde_bandwidth}  '
         f'ckpt_interval={config.ppo_checkpoint_interval}  '
         f'ckpt_keep_last={config.ppo_checkpoint_keep_last} '
         f'({"all milestones" if config.ppo_checkpoint_keep_last <= 0 else "FIFO prune"})  '
+        f'ckpt_replay_max={config.ppo_checkpoint_replay_max}  '
         f'hidden_layers={config.hidden_layer_sizes}')
 
   # ---- Build env factories ----------------------------------------------

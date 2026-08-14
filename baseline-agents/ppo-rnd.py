@@ -10,6 +10,7 @@ import tyro
 import numpy as np
 import functools
 import pprint
+import re
 import mediapy
 import wandb
 import wandb_osh
@@ -87,6 +88,11 @@ class Args:
     num_timesteps: int = 50000000
     policy_hidden_sizes: list = field(default_factory=lambda: [256, 256, 256, 256])
     value_hidden_sizes: list = field(default_factory=lambda: [256, 256, 256, 256])
+    # Opt-in architecture matching contrastive/networks.py::ResidualMLP:
+    # 6x256 hidden layers, LayerNorm + Swish, with skips every two layers.
+    use_residual_mlp: bool = False
+    # PD-only hybrid actor: shared xyz/yaw Gaussian plus categorical cube select.
+    categorical_select: bool = False
     rollout_length: int = 160
     num_minibatches_per_rollout: int = 32
     num_epochs_per_rollout: int = 8    
@@ -126,20 +132,200 @@ class PPONetworks:
     int_value_network: Any
     rnd_network: Any
 
+
+_RESIDUAL_HIDDEN_SIZES = (256,) * 6
+_RESIDUAL_SKIP_EVERY = 2
+
+
+class ResidualMLP(nn.Module):
+    """Flax equivalent of contrastive.networks.ResidualMLP."""
+
+    layer_sizes: Sequence[int]
+    activation: Any = nn.swish
+    skip_every: int = _RESIDUAL_SKIP_EVERY
+    use_layer_norm: bool = True
+    activate_final: bool = False
+
+    @nn.compact
+    def get_penultimate(self, data):
+        hidden = data
+        skip = None
+        for i, hidden_size in enumerate(self.layer_sizes[:-1]):
+            hidden = nn.Dense(hidden_size, name=f"linear_{i}")(hidden)
+            if self.use_layer_norm:
+                hidden = nn.LayerNorm(name=f"ln_{i}")(hidden)
+            hidden = self.activation(hidden)
+            if self.skip_every and (i + 1) % self.skip_every == 0:
+                if skip is not None and skip.shape[-1] == hidden.shape[-1]:
+                    hidden = skip + hidden
+                skip = hidden
+        return hidden
+
+    @nn.compact
+    def __call__(self, data):
+        hidden = self.get_penultimate(data)
+        final_index = len(self.layer_sizes) - 1
+        hidden = nn.Dense(
+            self.layer_sizes[-1], name=f"linear_{final_index}")(hidden)
+        if self.activate_final:
+            hidden = self.activation(hidden)
+        return hidden
+
+
+def _select_cube_centers(num_cubes):
+    ids = jnp.arange(num_cubes, dtype=jnp.float32)
+    return (((2.0 * ids + 1.0) * jnp.pi / num_cubes) - jnp.pi) / jnp.pi
+
+
+def _select_action_to_cube_id(select, num_cubes):
+    bins = jnp.arange(1, num_cubes + 1) * (2.0 * jnp.pi / num_cubes)
+    cube_id = jnp.digitize(jnp.pi * select + jnp.pi, bins)
+    return jnp.clip(cube_id, 0, num_cubes - 1)
+
+
+class HybridSelectDistribution:
+    """Tanh-Gaussian continuous controls plus categorical PD cube select."""
+
+    hybrid_select = True
+
+    def __init__(self, continuous_dist, categorical_dist, num_select_classes):
+        self.continuous_dist = continuous_dist
+        self.categorical_dist = categorical_dist
+        self.num_select_classes = int(num_select_classes)
+        self._bijector = distrax.Tanh()
+        self._centers = _select_cube_centers(self.num_select_classes)
+
+    def _pack(self, raw_continuous, cube_id):
+        continuous = self._bijector.forward(raw_continuous)
+        select = self._centers[cube_id][..., None]
+        return jnp.concatenate([continuous, select], axis=-1)
+
+    def sample(self, seed):
+        continuous_key, select_key = jax.random.split(seed)
+        raw_continuous = self.continuous_dist.sample(seed=continuous_key)
+        cube_id = self.categorical_dist.sample(seed=select_key)
+        return self._pack(raw_continuous, cube_id)
+
+    def mode(self):
+        return self._pack(
+            self.continuous_dist.mode(), self.categorical_dist.mode())
+
+    def log_prob(self, action):
+        continuous = jnp.clip(
+            action[..., :-1], -1.0 + 1e-6, 1.0 - 1e-6)
+        raw_continuous = self._bijector.inverse(continuous)
+        continuous_log_prob = self.continuous_dist.log_prob(raw_continuous)
+        continuous_log_prob -= self._bijector.forward_log_det_jacobian(
+            raw_continuous)
+        continuous_log_prob = jnp.sum(continuous_log_prob, axis=-1)
+        cube_id = _select_action_to_cube_id(
+            action[..., -1], self.num_select_classes)
+        return continuous_log_prob + self.categorical_dist.log_prob(cube_id)
+
+    def entropy(self, seed):
+        # One-sample estimate of entropy for the transformed joint policy.
+        return -self.log_prob(self.sample(seed))
+
+
+def _network_class(use_residual_mlp):
+    return ResidualMLP if use_residual_mlp else MLP
+
+
+def _hidden_sizes(configured_sizes, use_residual_mlp):
+    if use_residual_mlp:
+        return list(_RESIDUAL_HIDDEN_SIZES)
+    return list(configured_sizes)
+
+
+def categorical_select_classes(args):
+    """Return cube count for a valid CatSelect run, or None when disabled."""
+    if not args.categorical_select:
+        return None
+    if not args.use_pd:
+        raise ValueError("--categorical-select requires --use-pd")
+    match = re.fullmatch(r"creative-(\d+)-task\d+", args.env_id)
+    if match is None:
+        raise ValueError(
+            "--categorical-select requires a creative-N-taskK BuilderBench env")
+    return int(match.group(1))
+
+
+def make_ppo_networks(args, action_size, include_auxiliary=True):
+    """Build PPO+RND modules with architecture inferred from Args."""
+    num_select_classes = categorical_select_classes(args)
+    if num_select_classes is not None and action_size != 5:
+        raise ValueError(
+            "CatSelect expects the 5D PD action [xyz, yaw, select], "
+            f"but the environment has action_size={action_size}")
+    policy_hidden_sizes = _hidden_sizes(
+        args.policy_hidden_sizes, args.use_residual_mlp)
+    value_hidden_sizes = _hidden_sizes(
+        args.value_hidden_sizes, args.use_residual_mlp)
+    policy_output_size = (
+        2 * (action_size - 1) + num_select_classes
+        if num_select_classes is not None else action_size * 2
+    )
+    policy = Actor(
+        layer_sizes=policy_hidden_sizes + [policy_output_size],
+        use_residual_mlp=args.use_residual_mlp,
+        num_select_classes=num_select_classes or 0,
+    )
+    if not include_auxiliary:
+        return PPONetworks(policy, None, None, None)
+    return PPONetworks(
+        policy_network=policy,
+        value_network=Value(
+            layer_sizes=value_hidden_sizes + [1],
+            use_residual_mlp=args.use_residual_mlp,
+        ),
+        int_value_network=Value(
+            layer_sizes=value_hidden_sizes + [1],
+            use_residual_mlp=args.use_residual_mlp,
+        ),
+        rnd_network=RND(
+            layer_sizes=value_hidden_sizes + (
+                [256] if args.use_residual_mlp else []),
+            use_residual_mlp=args.use_residual_mlp,
+        ),
+    )
+
+
 class Actor(nn.Module):
     layer_sizes: Sequence[int]
     activation: Any = nn.swish
     layer_norm: bool = False
     _min_std: float = 0.001
     _var_scale: float = 1
+    use_residual_mlp: bool = False
+    num_select_classes: int = 0
     
     def setup(self):
-        self.actor_net = MLP(self.layer_sizes, activation=self.activation, layer_norm=self.layer_norm)
+        network_cls = _network_class(self.use_residual_mlp)
+        if self.use_residual_mlp:
+            self.actor_net = network_cls(
+                self.layer_sizes, activation=self.activation)
+        else:
+            self.actor_net = network_cls(
+                self.layer_sizes, activation=self.activation,
+                layer_norm=self.layer_norm)
 
     def __call__(self, x, normalizer_params=None):
         if normalizer_params is not None:
             x = (x - normalizer_params.mean ) / (normalizer_params.std)
         stats = self.actor_net(x)
+        if self.num_select_classes:
+            num_continuous = (
+                stats.shape[-1] - self.num_select_classes) // 2
+            loc = stats[..., :num_continuous]
+            raw_scale = stats[..., num_continuous:2 * num_continuous]
+            logits = stats[..., 2 * num_continuous:]
+            scale = (
+                jax.nn.softplus(raw_scale) + self._min_std) * self._var_scale
+            return HybridSelectDistribution(
+                distrax.Normal(loc=loc, scale=scale),
+                distrax.Categorical(logits=logits),
+                self.num_select_classes,
+            )
         loc, scale = jnp.split(stats, 2, axis=-1)
         scale = (jax.nn.softplus(scale) + self._min_std) * self._var_scale
 
@@ -156,9 +342,17 @@ class Value(nn.Module):
     layer_sizes: Sequence[int]
     activation: Any = nn.swish
     layer_norm: bool = False
+    use_residual_mlp: bool = False
     
     def setup(self):
-        self.value_net = MLP(self.layer_sizes, activation=self.activation, layer_norm=self.layer_norm)
+        network_cls = _network_class(self.use_residual_mlp)
+        if self.use_residual_mlp:
+            self.value_net = network_cls(
+                self.layer_sizes, activation=self.activation)
+        else:
+            self.value_net = network_cls(
+                self.layer_sizes, activation=self.activation,
+                layer_norm=self.layer_norm)
 
     def __call__(self, x, normalizer_params=None):
         if normalizer_params is not None:
@@ -177,10 +371,22 @@ class RND(nn.Module):
     layer_sizes: Sequence[int]
     activation: Any = nn.swish
     layer_norm: bool = False
+    use_residual_mlp: bool = False
 
     def setup(self):
-        self.prediction_net = MLP(self.layer_sizes, activation=self.activation, layer_norm=self.layer_norm)
-        self.target_net = MLP(self.layer_sizes, activation=self.activation, layer_norm=self.layer_norm)
+        network_cls = _network_class(self.use_residual_mlp)
+        if self.use_residual_mlp:
+            self.prediction_net = network_cls(
+                self.layer_sizes, activation=self.activation)
+            self.target_net = network_cls(
+                self.layer_sizes, activation=self.activation)
+        else:
+            self.prediction_net = network_cls(
+                self.layer_sizes, activation=self.activation,
+                layer_norm=self.layer_norm)
+            self.target_net = network_cls(
+                self.layer_sizes, activation=self.activation,
+                layer_norm=self.layer_norm)
 
     def __call__(self, x, normalizer_params=None):
         if normalizer_params is not None:
@@ -199,7 +405,18 @@ def make_inference_fn(ppo_networks):
         def policy(observations, goals, key_sample):
             inputs = jnp.concatenate([observations, goals], axis=-1)
             policy_dist = policy_network.apply(params['policy'], inputs, params['normalizer'])
-                
+
+            if getattr(policy_dist, "hybrid_select", False):
+                actions = (
+                    policy_dist.mode() if deterministic
+                    else policy_dist.sample(seed=key_sample)
+                )
+                return actions, {
+                    'log_prob': policy_dist.log_prob(actions),
+                    # PPO stores this field for both policy types.
+                    'raw_action': actions,
+                }
+
             if deterministic:
                 return bijector.forward( policy_dist.mode() ), {}
                 
@@ -219,7 +436,8 @@ def make_inference_fn(ppo_networks):
     return make_policy
 
 def main(args: Args):
-    
+    categorical_select_classes(args)
+
     args.num_training_step = args.num_timesteps // ( args.num_envs * args.rollout_length )
     args.num_training_steps_per_eval = args.num_training_step // args.num_eval_steps
     args.num_training_steps_per_real_reset = args.num_training_step // max(1, args.num_reset_steps)
@@ -295,12 +513,7 @@ def main(args: Args):
     log_data_metric_keys = tuple(log_data_metric_keys)
 
     # Initialize PPO networks
-    ppo_network = PPONetworks( 
-        policy_network = Actor(layer_sizes=args.policy_hidden_sizes + [action_size * 2]),
-        value_network = Value(layer_sizes=args.value_hidden_sizes + [1]),
-        int_value_network = Value(layer_sizes=args.value_hidden_sizes  + [1]),
-        rnd_network = RND(layer_sizes=args.value_hidden_sizes),
-    )
+    ppo_network = make_ppo_networks(args, action_size)
     training_state = PPOTrainingState.create(
         apply_fn=None,
         params={
@@ -465,8 +678,16 @@ def main(args: Args):
 
         # Policy function loss
         policy_dist = policy_apply(params['policy'], data.observation, normalizer_params)
-        target_action_log_probs = policy_dist.log_prob( data.extras['policy_extras']['raw_action'] ) - bijector.forward_log_det_jacobian( data.extras['policy_extras']['raw_action'] )
-        target_action_log_probs = jnp.sum(target_action_log_probs, axis=-1)  
+        if getattr(policy_dist, "hybrid_select", False):
+            target_action_log_probs = policy_dist.log_prob(
+                data.extras['policy_extras']['raw_action'])
+        else:
+            target_action_log_probs = policy_dist.log_prob(
+                data.extras['policy_extras']['raw_action'])
+            target_action_log_probs -= bijector.forward_log_det_jacobian(
+                data.extras['policy_extras']['raw_action'])
+            target_action_log_probs = jnp.sum(
+                target_action_log_probs, axis=-1)
         behaviour_action_log_probs = data.extras['policy_extras']['log_prob']
         rho_s = jnp.exp(target_action_log_probs - behaviour_action_log_probs)
         surrogate_loss1 = rho_s * advantages
@@ -488,8 +709,12 @@ def main(args: Args):
         int_v_loss = jnp.mean(int_v_error * int_v_error) * 0.5 * 0.5
 
         # Entropy loss
-        entropy = policy_dist.entropy() + bijector.forward_log_det_jacobian( policy_dist.sample(seed=rng) )
-        entropy = jnp.mean( jnp.sum(entropy, axis=-1) )
+        if getattr(policy_dist, "hybrid_select", False):
+            entropy = jnp.mean(policy_dist.entropy(seed=rng))
+        else:
+            entropy = policy_dist.entropy() + bijector.forward_log_det_jacobian(
+                policy_dist.sample(seed=rng))
+            entropy = jnp.mean(jnp.sum(entropy, axis=-1))
         entropy_loss = args.entropy_cost * -entropy
 
         total_loss = policy_loss + v_loss + int_v_loss + entropy_loss + forward_loss

@@ -119,7 +119,7 @@ echo "ppo_actor_min_std=${MIN_STD}"
 echo "ppo_anneal_lr=true ppo_anneal_ent_coef=true"
 echo "ppo_categorical_select=true ppo_categorical_select_waypoint=true (n-way select + n×3 waypoint heads)"
 echo "ppo_crl_steps_per_iter=${CRL_STEPS}"
-echo "ppo_eval_interval=200 ppo_video_interval=400"
+echo "ppo_eval_interval=30 ppo_video_interval=400"
 echo "steps_per_iter=$((PPO_NUM_ENVS * EP_LEN))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * EP_LEN)))"
 echo "nf_compact: sa3x256 r64 b6 w256"
@@ -157,7 +157,7 @@ python -u ppo_contrastive.py \
   --ppo_rollout_length="${EP_LEN}" \
   --ppo_crl_steps_per_iter="${CRL_STEPS}" \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=200 \
+  --ppo_eval_interval=30 \
   --ppo_eval_episodes=5 \
   --ppo_video_interval=400 \
   --ppo_video_fps=10 \
