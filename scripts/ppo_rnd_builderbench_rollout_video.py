@@ -12,6 +12,7 @@ Run with the builderbench venv and PYTHONPATH including builderbench root, e.g.:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import sys
 from pathlib import Path
@@ -40,6 +41,12 @@ def _parse_args(argv=None):
                  help='Match training: wrap env with PD waypoint control')
   p.add_argument('--pd_duration', type=int, default=5,
                  help='PD duration (must match training; default 5)')
+  p.add_argument('--use_residual_mlp', '--use-residual-mlp',
+                 action='store_true',
+                 help='Load a checkpoint trained with the 6x256 residual MLP')
+  p.add_argument('--categorical_select', '--categorical-select',
+                 action='store_true',
+                 help='Load a PD checkpoint trained with CatSelect')
   return p.parse_args(argv)
 
 
@@ -70,9 +77,28 @@ def main(args):
   from utils.wrapper import wrap_env, PDWrapper
   from utils.networks import load_params
   from utils.evaluation import get_video
-  from ppo_rnd import Args as RndArgs, PPONetworks, Actor, Value, make_inference_fn
 
-  rnd_args = RndArgs(env_id=args.env_id, seed=args.seed, num_envs=1)
+  # The training entrypoint contains a hyphen, so load it by path. Importing
+  # ``ppo_rnd`` would silently select BuilderBench's older copy instead.
+  sgcrl_root = Path(
+      os.environ.get('SGCRL_ROOT', Path(__file__).resolve().parents[1]))
+  module_path = sgcrl_root / 'baseline-agents' / 'ppo-rnd.py'
+  spec = importlib.util.spec_from_file_location('sgcrl_ppo_rnd', module_path)
+  if spec is None or spec.loader is None:
+    raise ImportError(f'Could not load PPO+RND module from {module_path}')
+  ppo_rnd = importlib.util.module_from_spec(spec)
+  sys.modules[spec.name] = ppo_rnd
+  spec.loader.exec_module(ppo_rnd)
+
+  rnd_args = ppo_rnd.Args(
+      env_id=args.env_id,
+      seed=args.seed,
+      num_envs=1,
+      use_pd=args.use_pd,
+      pd_duration=args.pd_duration,
+      use_residual_mlp=args.use_residual_mlp,
+      categorical_select=args.categorical_select,
+  )
   env_class, default_config = make_env(rnd_args)
   # BuilderBench defaults to MJX warp; match training (BUILDERBENCH_MJX_IMPL=jax).
   default_config.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
@@ -94,15 +120,9 @@ def main(args):
   action_size = env.action_size
 
   # make_inference_fn only uses policy_network; other fields unused for video.
-  ppo_network = PPONetworks(
-      policy_network=Actor(
-          layer_sizes=rnd_args.policy_hidden_sizes + [action_size * 2]),
-      value_network=Value(
-          layer_sizes=rnd_args.value_hidden_sizes + [1]),
-      int_value_network=None,
-      rnd_network=None,
-  )
-  make_policy = make_inference_fn(ppo_network)
+  ppo_network = ppo_rnd.make_ppo_networks(
+      rnd_args, action_size, include_auxiliary=False)
+  make_policy = ppo_rnd.make_inference_fn(ppo_network)
 
   ckpts = sorted(
       ckpt_dir.glob(args.ckpt_glob),

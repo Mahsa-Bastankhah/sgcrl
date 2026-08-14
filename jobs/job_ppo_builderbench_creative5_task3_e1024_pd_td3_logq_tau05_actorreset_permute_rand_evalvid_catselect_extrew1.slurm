@@ -115,7 +115,7 @@ echo "ppo_actor_min_std=${MIN_STD}"
 echo "ppo_anneal_ent_coef=false"
 echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
 echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} (AFTER return-norm)"
-echo "ppo_eval_interval=200 ppo_video_interval=400 (deterministic + live obs_rms)"
+echo "ppo_eval_interval=30 ppo_video_interval=400 (deterministic + live obs_rms)"
 echo "steps_per_iter=$((PPO_NUM_ENVS * 50))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * 50)))"
 python -u -c "
@@ -153,7 +153,7 @@ python -u ppo_contrastive.py \
   --ppo_rollout_length=50 \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=200 \
+  --ppo_eval_interval=30 \
   --ppo_eval_episodes=5 \
   --ppo_video_interval=400 \
   --ppo_video_fps=10 \

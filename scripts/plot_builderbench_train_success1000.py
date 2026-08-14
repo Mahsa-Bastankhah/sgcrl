@@ -41,9 +41,15 @@ LOG_ROOT = '/n/fs/mislresearch/sgcrl/logs'
 SLURM_DIR = '/n/fs/mislresearch/sgcrl/slurm'
 FIGS_DIR = '/n/fs/mislresearch/sgcrl/figs/builderbench/active_train_eval'
 TRAIN_METRIC = 'train_success_1000'
+TRAIN_VERY_HARD_METRIC = 'train_very_hard_success_1000'
 TRAIN_X_COL = 'global_step'  # env steps
 EVAL_METRIC = 'success'  # per-eval episode mean
+EVAL_VERY_HARD_METRIC = 'very_hard_success'
 EVAL_X_COL = 'iteration'  # converted to env steps for plotting
+# Centered rolling mean over this many eval checkpoints (~7.5M env steps
+# at eval_interval=30, E=1024, rollout=50). Raw eval stays in the figure
+# as a faint line; the bold line is the smooth. Train is not smoothed.
+EVAL_SMOOTH_WINDOW = 5
 DEFAULT_STEPS_PER_ITER = 1024 * 50  # num_envs * rollout_length
 
 ACCENT_COLORS = [
@@ -51,6 +57,8 @@ ACCENT_COLORS = [
     '#A84CE8', '#E8D44C', '#4CE8D4', '#E84CA8',
     '#6B8E9F', '#C45C26', '#2A9D8F', '#9B2226',
 ]
+# Kept for older plot scripts; eval panels now use the same unmarked lines
+# as train (squares/diamonds read as cubes and hide the stderr shade).
 EVAL_MARKERS = ['o', 's', '^', 'D', 'v', 'P', 'X', '*', 'h', '<', '>', 'p']
 EVAL_LINESTYLES = ['-', '--', '-.', ':', '-', '--', '-.', ':', '-', '--', '-.', ':']
 
@@ -323,25 +331,61 @@ def _discover_runs(log_root: str, mode: str = 'slurm',
   return groups
 
 
+def _interp_seed_at(pts: list[tuple[int, float]], x: int) -> float | None:
+  """Linear interp of ``pts`` at ``x``; None outside this seed's range."""
+  if not pts:
+    return None
+  if x < pts[0][0] or x > pts[-1][0]:
+    return None
+  lo, hi = 0, len(pts) - 1
+  if pts[lo][0] == x:
+    return float(pts[lo][1])
+  if pts[hi][0] == x:
+    return float(pts[hi][1])
+  while hi - lo > 1:
+    mid = (lo + hi) // 2
+    if pts[mid][0] <= x:
+      lo = mid
+    else:
+      hi = mid
+  x0, y0 = pts[lo]
+  x1, y1 = pts[hi]
+  if x1 == x0:
+    return float(y0)
+  t = (x - x0) / (x1 - x0)
+  return float(y0 + t * (y1 - y0))
+
+
 def _aggregate_mean_stderr(seed_series: list[list[tuple[int, float]]]):
-  """Per-x mean and standard error across seeds. Returns (xs, mean, se, n)."""
-  by_x: dict[int, list[float]] = defaultdict(list)
-  n_seeds = 0
-  for pts in seed_series:
-    if not pts:
-      continue
-    n_seeds += 1
-    for x, y in pts:
-      by_x[int(x)].append(float(y))
-  if not by_x:
+  """Per-x mean and standard error across seeds. Returns (xs, mean, se, n).
+
+  Seeds are linearly interpolated onto the union of x values (no
+  extrapolation). Exact-x binning used to zero-out eval stderr whenever
+  seeds logged eval at slightly different env steps.
+  """
+  nonempty = [sorted((int(x), float(y)) for x, y in pts)
+              for pts in seed_series if pts]
+  n_seeds = len(nonempty)
+  if n_seeds == 0:
     return [], [], [], 0
+  if n_seeds == 1:
+    xs = [p[0] for p in nonempty[0]]
+    mean = [p[1] for p in nonempty[0]]
+    return xs, mean, [0.0] * len(xs), 1
+  grid = sorted({p[0] for pts in nonempty for p in pts})
   xs, mean, se = [], [], []
-  for x in sorted(by_x):
-    ys = by_x[x]
+  for x in grid:
+    ys = []
+    for pts in nonempty:
+      v = _interp_seed_at(pts, x)
+      if v is not None:
+        ys.append(v)
+    if not ys:
+      continue
     m = sum(ys) / len(ys)
     if len(ys) > 1:
       var = sum((y - m) ** 2 for y in ys) / (len(ys) - 1)
-      s = math.sqrt(var / len(ys))  # stderr
+      s = math.sqrt(var / len(ys))
     else:
       s = 0.0
     xs.append(x)
@@ -632,11 +676,44 @@ def _subsample_curve(xs, mean, se, max_pts=500):
   return xs_s, mean_s, se_s
 
 
+def _rolling_mean(ys, window: int = EVAL_SMOOTH_WINDOW) -> list[float]:
+  """Centered rolling mean; window shrinks at the edges (no NaN padding)."""
+  n = len(ys)
+  if window <= 1 or n == 0:
+    return list(ys)
+  w = window if window % 2 == 1 else window + 1
+  half = w // 2
+  out = []
+  for i in range(n):
+    lo = max(0, i - half)
+    hi = min(n, i + half + 1)
+    out.append(sum(ys[lo:hi]) / float(hi - lo))
+  return out
+
+
+def _plot_eval_smoothed(ax, xs, ys, *, color, label, linestyle='-',
+                        zorder=3, linewidth=2.0, window: int = EVAL_SMOOTH_WINDOW):
+  """Faint raw eval + bold rolling-mean overlay. Returns the smoothed ys."""
+  if not xs:
+    return []
+  sm = _rolling_mean(ys, window)
+  ax.plot(
+      xs, ys, color=color, linewidth=1.0, alpha=0.28, linestyle=linestyle,
+      marker='o', markersize=3.2, markeredgewidth=0.0, zorder=zorder,
+  )
+  ax.plot(
+      xs, sm, color=color, linewidth=linewidth, linestyle=linestyle,
+      label=label, alpha=0.95, zorder=zorder + 1,
+  )
+  return sm
+
+
 def _short_label(label: str) -> str:
   """Compress long BuilderBench variant suffixes for legends."""
   s = label
   for old, new in (
       ('pd_nf_tiny_sa2x128_r32_b4_w128_tau05_', 'nf_tiny_'),
+      ('pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_', 'nf_compact_small_'),
       ('pd_nf_compact_sa3x256_r64_b6_w256_tau05_', 'nf_compact_'),
       ('pd_nf_td_tau05_', 'nf+td_'),
       ('pd_nf_tau05_', 'nf_'),
@@ -717,8 +794,9 @@ def _friendly_label(log_dir_name: str, raw_suffix: str | None = None) -> str:
     return 'TD3 · logQ'
   if '_nf_td_' in low:
     return 'NF+TD · catselect + extrew1'
-  if '_nf_compact_' in low:
-    bits = ['NF compact']
+  if '_nf_compact_small_' in low or '_nf_compact_' in low:
+    bits = (['NF compact small'] if '_nf_compact_small_' in low
+            else ['NF compact'])
     if 'permute_rand' in low:
       bits.append('permute')
     elif 'nopermute' in low and 'fixedx01' in low:
@@ -791,28 +869,36 @@ def _plot_group(log_root: str, figs_dir: str, group_key: str,
     nice = _friendly_label(log_dir_name, label)
     status = ' · RUNNING' if log_dir_name in active_dirs else ''
     legend_label = f'{nice} (n={n_seeds}){status}'
-    kwargs = dict(
-        color=color, linewidth=2.4 if log_dir_name in active_dirs else 2.0,
-        label=legend_label, alpha=0.95,
-        zorder=3 + i,
-    )
-    if split == 'eval' or marker:
-      kwargs.update(
-          marker=EVAL_MARKERS[i % len(EVAL_MARKERS)],
-          markersize=7,
-          linestyle=EVAL_LINESTYLES[i % len(EVAL_LINESTYLES)],
-          markerfacecolor=color,
-          markeredgecolor='white',
-          markeredgewidth=0.6,
+    lw = 2.4 if log_dir_name in active_dirs else 2.0
+    if split == 'eval':
+      sm = _plot_eval_smoothed(
+          ax, xs, mean, color=color, label=legend_label,
+          zorder=3 + i, linewidth=lw)
+      if n_seeds > 1 and any(s > 0 for s in se):
+        lo = _rolling_mean([m - s for m, s in zip(mean, se)])
+        hi = _rolling_mean([m + s for m, s in zip(mean, se)])
+        ax.fill_between(xs, lo, hi, color=color, alpha=0.18, linewidth=0,
+                        zorder=2 + i)
+      plot_ys = sm
+    else:
+      kwargs = dict(
+          color=color, linewidth=lw,
+          label=legend_label, alpha=0.95,
+          zorder=3 + i,
       )
-    ax.plot(xs, mean, **kwargs)
-    if n_seeds > 1 and any(s > 0 for s in se):
-      lo = [m - s for m, s in zip(mean, se)]
-      hi = [m + s for m, s in zip(mean, se)]
-      ax.fill_between(xs, lo, hi, color=color, alpha=0.22, linewidth=0,
-                      zorder=2 + i)
+      if marker:
+        kwargs['marker'] = marker
+        kwargs['markersize'] = 4
+        kwargs['markevery'] = max(1, len(xs) // 24)
+      ax.plot(xs, mean, **kwargs)
+      if n_seeds > 1 and any(s > 0 for s in se):
+        lo = [m - s for m, s in zip(mean, se)]
+        hi = [m + s for m, s in zip(mean, se)]
+        ax.fill_between(xs, lo, hi, color=color, alpha=0.22, linewidth=0,
+                        zorder=2 + i)
+      plot_ys = mean
     print(f'  {group_key}/{nice}: n_seeds={n_seeds}, {len(xs)} {split} pts '
-          f'x=[{xs[0]}..{xs[-1]}] y=[{min(mean):.3f}..{max(mean):.3f}]'
+          f'x=[{xs[0]}..{xs[-1]}] y=[{min(plot_ys):.3f}..{max(plot_ys):.3f}]'
           f'{status}')
     plotted += 1
 
@@ -832,7 +918,11 @@ def _plot_group(log_root: str, figs_dir: str, group_key: str,
   ax.set_xlabel(xlabel, fontsize=11)
   if fmt_x_steps:
     ax.xaxis.set_major_formatter(mticker.FuncFormatter(_fmt_steps))
-  ax.set_ylabel(ylabel, fontsize=11)
+  if split == 'eval':
+    ax.set_ylabel(
+        f'{ylabel} (roll mean w={EVAL_SMOOTH_WINDOW})', fontsize=11)
+  else:
+    ax.set_ylabel(ylabel, fontsize=11)
   # Keep room so y=0 and y=1 markers are not clipped by the frame.
   ax.set_ylim(-0.05, 1.05)
   ax.spines[['top', 'right']].set_visible(False)
@@ -947,7 +1037,6 @@ def run_once(log_root: str, figs_dir: str, mode: str = 'slurm',
         xlabel='Env Steps',
         ylabel='Eval Success',
         fmt_x_steps=True,
-        marker='o',
         slurm_dir=slurm_dir,
         active_dirs=active_dirs,
         family_title=family_title,
@@ -956,6 +1045,45 @@ def run_once(log_root: str, figs_dir: str, mode: str = 'slurm',
     if eout:
       print(f'    → {eout}')
       outs.append(eout)
+
+    vh_train_name = (
+        f'{group_key}_train_very_hard_success1000_{fam_slug}.png'
+        if fam_slug else f'{group_key}_train_very_hard_success1000.png')
+    vh_eval_name = (
+        f'{group_key}_eval_very_hard_success_{fam_slug}.png'
+        if fam_slug else f'{group_key}_eval_very_hard_success.png')
+    vh_train = _plot_group(
+        log_root, dest, group_key, runs,
+        split='learner', x_col=TRAIN_X_COL, y_col=TRAIN_VERY_HARD_METRIC,
+        out_suffix='train_very_hard_success1000',
+        title_metric='train very-hard success (1cm)',
+        xlabel='Env Steps',
+        ylabel='Train Very-Hard Success (last 1000)',
+        fmt_x_steps=True,
+        slurm_dir=slurm_dir,
+        active_dirs=active_dirs,
+        family_title=family_title,
+        out_name=vh_train_name,
+    )
+    if vh_train:
+      print(f'    → {vh_train}')
+      outs.append(vh_train)
+    vh_eval = _plot_group(
+        log_root, dest, group_key, eval_runs,
+        split='eval', x_col=EVAL_X_COL, y_col=EVAL_VERY_HARD_METRIC,
+        out_suffix='eval_very_hard_success',
+        title_metric='eval very-hard success (1cm)',
+        xlabel='Env Steps',
+        ylabel='Eval Very-Hard Success',
+        fmt_x_steps=True,
+        slurm_dir=slurm_dir,
+        active_dirs=active_dirs,
+        family_title=family_title,
+        out_name=vh_eval_name,
+    )
+    if vh_eval:
+      print(f'    → {vh_eval}')
+      outs.append(vh_eval)
 
   for group_key, runs in sorted(groups.items()):
     # Always write the combined task overlay.

@@ -108,7 +108,7 @@ echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
 echo "max_replay_size=${MAX_REPLAY_SIZE}"
 echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=true goals=MID+offsets(default)"
 echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
-echo "ppo_eval_interval=200 ppo_video_interval=400 (deterministic)"
+echo "ppo_eval_interval=30 ppo_video_interval=400 (deterministic)"
 echo "steps_per_iter=$((PPO_NUM_ENVS * 50))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * 50)))"
 python -u -c "
@@ -139,7 +139,7 @@ python -u ppo_contrastive.py \
   --ppo_rollout_length=50 \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=200 \
+  --ppo_eval_interval=30 \
   --ppo_eval_episodes=5 \
   --ppo_video_interval=400 \
   --ppo_video_fps=10 \

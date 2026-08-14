@@ -2,11 +2,14 @@
 
 Overview
 --------
-Instead of contrastive φ(s,a)·ψ(g), we learn a goal-conditioned Q:
+Instead of contrastive φ(s,a)·ψ(g), we learn a goal-conditioned Q that
+approximates discounted occupancy of future goals under the current policy:
 
     Q_θ(s, a, g)   ≈   E[ Σ_t γ^t  1{s_t ≈ g}  |  s_0=s, a_0=a ]
 
-with twin critics + Polyak target networks (TD3-style clipped double Q).
+Twin critics + Polyak target nets give TD3-style clipped double-Q backups
+(min of the two targets), which stabilizes the density / occupancy estimate
+used later as a PPO reward.
 
 Parameterizations
 -----------------
@@ -23,7 +26,9 @@ Reuses the same EpisodeReplay batches as CRL / Gaussian / NF:
     batch['action']   = a
     batch['next_obs'] = [ s' ; obs_to_goal(s_f) ]
 
-where s_f is a geometrically-sampled future state (d ≥ 1).
+where s_f is a geometrically-sampled future state (d ≥ 1).  The goal channel
+is therefore packed into the second half of ``obs`` / ``next_obs``; this
+module never re-samples futures itself.
 
 TD3 critic objective
 --------------------
@@ -32,6 +37,9 @@ TD3 critic objective
   y     = r + γ · min(Q1̄, Q2̄)(s', a', g)           (always bootstrap)
   L     = MSE(Q1(s,a,g), y) + MSE(Q2(s,a,g), y)
   targets ← (1 − τ) · targets + τ · online          (Polyak; config.tau)
+
+This is a non-absorbing discounted occupancy backup: hitting g at s' pays 1
+and we still bootstrap, so Q can accumulate multiple future hits.
 
 FB critic objective (``fb_loss`` / ``ppo_td3_fb_loss``)
 -------------------------------------------------------
@@ -59,12 +67,10 @@ Optional target policy (``use_target_policy`` / ``ppo_td3_use_target_policy``):
   a' ~ π̄(· | s', g) and π̄ ← (1−τ)·π̄ + τ·π after each critic step
   (same τ as the Q targets).
 
-This is the non-absorbing discounted occupancy backup:
-  Q(s,a,s_f) ← 1[s'=s_f] + γ min_i Q̄_i(s', a', s_f)
-
 ``τ`` here is the TD3 target-network coefficient (``config.tau`` /
 ``ppo_td3_tau``).  It is **independent** of ``ppo_crl_repr_tau`` (EMA of
-φ/ψ used only for CRL-mode PPO rewards).
+φ/ψ used only for CRL-mode PPO rewards) and of ``ppo_td3_reward_tau``
+(EMA of Q params used only when shaping PPO rewards).
 
 PPO reward
 ----------
@@ -79,7 +85,9 @@ PPO reward
 
 Usage
 -----
-Set ``config.ppo_repr_mode = 'td3'``.
+Set ``config.ppo_repr_mode = 'td3'``.  Wire via
+``make_td3_density_networks`` / ``make_td3_density_update_fn`` (or the
+scan wrapper) / ``make_td3_reward_fn`` from ``ppo_learner.py``.
 """
 from __future__ import annotations
 
@@ -104,7 +112,10 @@ class Td3DensityNetworks(NamedTuple):
 
   Each ``qf*_net`` is a FeedForwardNetwork:
       init(key) / apply(params, obs, action) → (B,)
-  where ``obs = [state; goal]``.
+  where ``obs = [state; goal]`` (goal already packed by EpisodeReplay).
+
+  Twin critics are required for clipped double-Q: bootstrap targets use
+  ``min(Q1̄, Q2̄)`` to reduce overestimation of occupancy.
   """
   qf1_net: networks_lib.FeedForwardNetwork
   qf2_net: networks_lib.FeedForwardNetwork
@@ -126,6 +137,10 @@ def make_td3_density_networks(
   """Build twin Q(s, a, g) critics.
 
   Args:
+    obs_dim / act_dim / goal_dim: Shapes for dummy init; ``obs`` fed to
+      apply is always ``obs_dim + goal_dim`` (state concatenated with goal).
+    hidden_layer_sizes: Trunk widths. Deep stacks use ResidualMLP via
+      ``_mlp_or_residual`` (same helper as CRL / FM).
     bilinear: If False (default), each critic is an MLP on ``[s;g;a]``.
       If True, ``Q = x(s,a)·y(g)`` with x/y matching CRL φ/ψ
       (``sa_encoder`` / ``g_encoder``, widths ``hidden + [repr_dim]``).
@@ -134,6 +149,7 @@ def make_td3_density_networks(
   """
 
   def _make_mlp_q_fn(net_name: str):
+    """Q = MLP([obs; action]) → scalar; obs already includes the goal."""
     def _q_fn(obs: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
       x = jnp.concatenate([obs, action], axis=-1)
       w_init = hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform')
@@ -151,7 +167,8 @@ def make_td3_density_networks(
     return _q_fn
 
   def _make_bilinear_q_fn(net_name: str):
-    # Same arch as CRL φ(s,a) / ψ(g) in contrastive.networks._repr_fn.
+    # Same arch as CRL φ(s,a) / ψ(g) in contrastive.networks._repr_fn so
+    # bilinear TD3 Q lives in the same representation family as CRL logits.
     def _q_fn(obs: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
       state = obs[:, :obs_dim]
       goal = obs[:, obs_dim:]
@@ -181,6 +198,7 @@ def make_td3_density_networks(
     return _q_fn
 
   _factory = _make_bilinear_q_fn if bilinear else _make_mlp_q_fn
+  # Separate Haiku transforms so qf1 / qf2 have independent parameter trees.
   qf1_t = hk.without_apply_rng(hk.transform(_factory('qf1')))
   qf2_t = hk.without_apply_rng(hk.transform(_factory('qf2')))
 
@@ -201,7 +219,11 @@ def init_td3_params(
     nets: Td3DensityNetworks,
     key: networks_lib.PRNGKey,
 ) -> Dict[str, networks_lib.Params]:
-  """Init online twin Qs and copy them into Polyak targets."""
+  """Init online twin Qs and deep-copy them into Polyak targets.
+
+  Returned dict keys: ``qf1``, ``qf2``, ``qf1_target``, ``qf2_target``.
+  Targets start identical to online; only soft updates move them later.
+  """
   k1, k2 = jax.random.split(key)
   qf1 = nets.qf1_net.init(k1)
   qf2 = nets.qf2_net.init(k2)
@@ -214,7 +236,7 @@ def init_td3_params(
 
 
 def online_td3_params(q_params: Dict[str, networks_lib.Params]):
-  """Optimizer / grad-bearing subset of ``q_params``."""
+  """Optimizer / grad-bearing subset of ``q_params`` (targets excluded)."""
   return {'qf1': q_params['qf1'], 'qf2': q_params['qf2']}
 
 
@@ -244,25 +266,31 @@ def make_td3_density_update_fn(
 
   Signature::
 
-      update(q_params, opt_state, batch, key, policy_params, policy_target_params)
+      update(q_params, opt_state, batch, key, policy_params, policy_target_params,
+             obs_mean=None, obs_var=None)
       → (new_q_params, new_opt_state, metrics, new_policy_target_params)
 
-  ``tau`` is the Polyak coefficient for target Q nets (and for π̄ when
-  ``use_target_policy``).  Unrelated to ``ppo_crl_repr_tau``.
+  Args (behavior flags):
+    tau: Polyak coefficient for target Q nets (and for π̄ when
+      ``use_target_policy``).  Unrelated to ``ppo_crl_repr_tau`` /
+      ``ppo_td3_reward_tau``.
+    goal_tol: L2 threshold for the TD3 indicator ``1[s' ≈ g]`` in goal space.
+    use_target_policy: If True, bootstrap a' from ``policy_target_params``
+      and Polyak-update that target toward the online PPO policy.  If False,
+      a' comes from the online policy (stop-grad) and π̄ is returned unchanged.
+    cross_batch_goals: If True (default), each ``(s_i, a_i, s'_i)`` is paired
+      with every batch goal ``g_j`` (B² TD backups).  If False, only ``(i, i)``.
+    fb_loss: If True, use the FB objective
+      ``(Q(s,a,s_f) − γ sg Q(s',a',s_f))^2 − Q(s,a,s')`` instead of the
+      indicator TD3 backup (``s_f`` still sampled as usual).
+    start_index / end_index / goal_state_indices: How to map a raw next state
+      into goal coordinates for the hit indicator and FB's ``−Q(s,a,s')`` term
+      (mirrors ``obs_to_goal`` used when packing the batch).
+    normalize_obs: Optional running-mean/var whitening of state and goal
+      channels before the Q nets (same stats as PPO obs norm when enabled).
 
-  When ``use_target_policy`` is True, bootstrap actions a' are sampled from
-  ``policy_target_params`` and that target is Polyak-updated toward the
-  online PPO policy after each successful critic step.  When False, a' comes
-  from the online policy (stop-grad) and ``policy_target_params`` is returned
-  unchanged.
-
-  When ``cross_batch_goals`` is True (default), each ``(s_i, a_i, s'_i)`` is
-  paired with every batch goal ``g_j`` (B² TD backups).  When False, only the
-  paired goal ``g_i`` is used.
-
-  When ``fb_loss`` is True, use the FB objective
-  ``(Q(s,a,s_f) − γ sg Q(s',a',s_f))^2 − Q(s,a,s')`` instead of the
-  indicator TD3 backup (``s_f`` still sampled as usual).
+  Non-finite grads or loss skip the parameter update (and Polyak / π̄ steps)
+  for that batch; ``metrics['update_skipped_nonfinite']`` records the skip.
   """
   gamma = float(discount)
   polyak = float(tau)
@@ -274,11 +302,14 @@ def make_td3_density_update_fn(
   use_fb = bool(fb_loss)
   use_obs_norm = bool(normalize_obs)
   norm_clip = float(obs_norm_clip)
+  # end_index==-1 means "through end of state"; for goal-mean slicing we need
+  # an explicit upper bound equal to obs_dim.
   norm_ei = int(obs_dim if ei == -1 else ei)
   _gidx = None if goal_state_indices is None else jnp.asarray(
       goal_state_indices, dtype=jnp.int32)
 
   def _state_as_goal(state: jnp.ndarray) -> jnp.ndarray:
+    """Project raw state → goal coords (same convention as batch packing)."""
     if _gidx is not None:
       return state[:, _gidx]
     if ei == -1:
@@ -286,6 +317,12 @@ def make_td3_density_update_fn(
     return state[:, si:ei]
 
   def _normalize(obs, obs_mean, obs_var):
+    """Whiten state and goal halves separately, then clip.
+
+    Goal channels reuse the matching state indices' mean/var so packed
+    ``[s; g]`` stays consistent with how goals were derived from states.
+    If ``obs_mean`` is non-finite, return ``obs`` unchanged (norm not ready).
+    """
     if not use_obs_norm:
       return obs
     active = jnp.all(jnp.isfinite(obs_mean))
@@ -305,9 +342,10 @@ def make_td3_density_update_fn(
   def _critic_loss(
       online_params, batch, key, policy_for_bootstrap, target_params,
       obs_mean, obs_var):
+    """TD3 or FB twin-Q loss on one replay batch (possibly B² after cross)."""
     obs = batch['obs']            # [s ; g],  g = obs_to_goal(s_f)
     action = batch['action']
-    next_obs = batch['next_obs']  # [s' ; g]
+    next_obs = batch['next_obs']  # [s' ; g]  (same g as obs)
 
     goal = obs[:, obs_dim:]
     state = obs[:, :obs_dim]
@@ -315,7 +353,8 @@ def make_td3_density_update_fn(
     s_next_as_g = _state_as_goal(s_next)
 
     if use_cross:
-      # (i, j) = transition i × goal j  →  flatten to B² rows.
+      # Cross-batch: (i, j) = transition i × goal j → flatten to B² rows.
+      # state/action/s' stay on axis 0; goals broadcast on axis 1.
       B = obs.shape[0]
       state_ij = jnp.broadcast_to(
           state[:, None, :], (B, B, state.shape[-1]))
@@ -330,12 +369,13 @@ def make_td3_density_update_fn(
       next_obs_flat = jnp.concatenate(
           [s_next_ij, goal_ij], axis=-1).reshape(B * B, -1)
       action_flat = action_ij.reshape(B * B, -1)
-      # r_ij = 1[s'_i ≈ g_j]
+      # r_ij = 1[s'_i ≈ g_j] in goal space (tol from config).
       rewards = (jnp.linalg.norm(
           s_next_as_g[:, None, :] - goal[None, :, :], axis=-1) < tol).astype(
               obs.dtype)  # (B, B)
       rewards_flat = rewards.reshape(B * B)
     else:
+      # Diagonal only: each transition keeps its paired future goal g_i.
       obs_flat = obs
       next_obs_flat = next_obs
       action_flat = action
@@ -346,22 +386,24 @@ def make_td3_density_update_fn(
     obs_network = _normalize(obs_flat, obs_mean, obs_var)
     next_obs_network = _normalize(next_obs_flat, obs_mean, obs_var)
 
-    # a' ~ π or π̄ (· | s', g) with frozen weights.
+    # a' ~ π or π̄ (· | s', g); policy weights are stop-grad so the critic
+    # update never backprops into the PPO actor through the bootstrap.
     key, k_act = jax.random.split(key)
     next_dist = policy_network.apply(
         jax.lax.stop_gradient(policy_for_bootstrap), next_obs_network)
     next_action = sample_fn(next_dist, k_act)
 
+    # Clipped double Q: bootstrap with min of the two Polyak targets.
     q1_next = density_nets.qf1_net.apply(
         target_params['qf1_target'], next_obs_network, next_action)
     q2_next = density_nets.qf2_net.apply(
         target_params['qf2_target'], next_obs_network, next_action)
     min_next = jnp.minimum(q1_next, q2_next)
     if use_fb:
-      # FB: y = γ · stopgrad(min Q̄(s', a', s_f))  (no indicator)
+      # FB: y = γ · stopgrad(min Q̄(s', a', s_f))  — no indicator reward.
       target_q = jax.lax.stop_gradient(gamma * min_next)
     else:
-      # Non-absorbing backup: y = 1[s'≈g] + γ min Q̄(s', a', g)
+      # Non-absorbing TD3 occupancy: y = 1[s'≈g] + γ min Q̄(s', a', g).
       target_q = jax.lax.stop_gradient(rewards_flat + gamma * min_next)
 
     q1 = density_nets.qf1_net.apply(
@@ -372,8 +414,8 @@ def make_td3_density_update_fn(
     qf2_mse = jnp.mean((q2 - target_q) ** 2)
 
     if use_fb:
-      # −Q(s, a, s'): maximize Q on the immediate next state as goal.
-      # Always diagonal over transitions (not cross-batch goals).
+      # −Q(s, a, s'): maximize Q when the goal is the immediate next state.
+      # Always diagonal over transitions (not expanded to cross-batch goals).
       obs_sprime = jnp.concatenate([state, s_next_as_g], axis=-1)
       obs_sprime_network = _normalize(obs_sprime, obs_mean, obs_var)
       q1_sprime = density_nets.qf1_net.apply(
@@ -407,7 +449,8 @@ def make_td3_density_update_fn(
         'td3_q2_sprime_mean': q2_sprime_mean,
     }
     if use_cross:
-      # Diagonal = original paired (s_i, g_i) hits; useful sanity check.
+      # Diagonal = original paired (s_i, g_i) hits; useful sanity check vs
+      # the full B² hit rate which includes many intentional negatives.
       metrics['td3_goal_hit_frac_diag'] = jnp.mean(jnp.diag(rewards))
     return loss, metrics
 
@@ -422,11 +465,13 @@ def make_td3_density_update_fn(
         'qf1_target': q_params['qf1_target'],
         'qf2_target': q_params['qf2_target'],
     }
+    # Choose which policy supplies bootstrap actions a'.
     policy_for_bootstrap = (
         policy_target_params if use_pi_bar else policy_params)
     (_, metrics), grads = grad_fn(
         online, batch, key, policy_for_bootstrap, target, obs_mean, obs_var)
 
+    # Guard: skip opt + Polyak if anything is non-finite (keeps targets sane).
     grads_finite = jnp.all(jnp.asarray(jax.tree_util.tree_leaves(
         jax.tree_util.tree_map(lambda x: jnp.all(jnp.isfinite(x)), grads))))
     loss_finite = jnp.isfinite(metrics['td3_qf_loss'])
@@ -435,7 +480,7 @@ def make_td3_density_update_fn(
     def _apply(_):
       updates, new_opt = optimizer.update(grads, opt_state, online)
       new_online = optax.apply_updates(online, updates)
-      # Polyak: target ← (1−τ)·target + τ·online
+      # Polyak: target ← (1−τ)·target + τ·online  (slow tracking of online Q).
       new_qf1_t = jax.tree_util.tree_map(
           lambda t, o: (1.0 - polyak) * t + polyak * o,
           q_params['qf1_target'], new_online['qf1'])
@@ -449,6 +494,7 @@ def make_td3_density_update_fn(
           'qf2_target': new_qf2_t,
       }
       if use_pi_bar:
+        # Same τ soft-updates the target policy used for a' sampling.
         new_pi_t = jax.tree_util.tree_map(
             lambda t, o: (1.0 - polyak) * t + polyak * o,
             policy_target_params, policy_params)
@@ -489,8 +535,16 @@ def make_scan_td3_update_fn(
 ):
   """Scan-based TD3 updater: N critic steps in one JIT call.
 
-  Caller pre-samples all N batches into ``(N, B, …)`` arrays.  Reward-param
-  EMA (``0 < repr_tau < 1``) is applied inside the scan.
+  Caller pre-samples all N batches into leading-axis ``(N, B, …)`` arrays.
+  Each scan step runs one ``make_td3_density_update_fn`` update.
+
+  Reward-param EMA (``0 < repr_tau < 1``, i.e. ``ppo_td3_reward_tau``) is
+  applied inside the scan after each successful critic step::
+
+      ema ← repr_tau · ema + (1 − repr_tau) · online_q_params
+
+  That EMA is separate from Polyak ``tau`` on the TD3 target nets.  If
+  ``repr_tau`` is outside (0, 1), ``params_ema`` simply tracks online params.
 
   Returns:
     ``multi_update(q_params, opt_state, params_ema, batches, key,
@@ -528,6 +582,7 @@ def make_scan_td3_update_fn(
       q_p, opt, m, pi_t = raw_update(
           q_p, opt, batch, k_u, policy_params, pi_t, obs_mean, obs_var)
       if use_ema:
+        # Reward EMA only — does not replace Polyak Q targets inside q_p.
         ema = jax.tree_util.tree_map(
             lambda t, o: _tau * t + (1.0 - _tau) * o, ema, q_p)
       else:
@@ -539,6 +594,7 @@ def make_scan_td3_update_fn(
             scan_step,
             (q_params, opt_state, params_ema, key, policy_target_params),
             batches))
+    # Average metrics across the N scanned critic steps.
     metrics = jax.tree_util.tree_map(jnp.mean, metrics)
     return (q_params, opt_state, params_ema, key, policy_target_params,
             metrics)
@@ -564,8 +620,13 @@ def make_td3_reward_fn(
 ):
   """Jitted PPO reward from the online (or EMA) twin critic.
 
-  Default: ``r = Q1(s, a, g)``.
-  If ``log_reward``: ``r = log((1 − γ) · max(Q1, q_eps))``.
+  Default: ``r = Q1(s, a, g)`` — raw occupancy / density scale.
+  If ``log_reward``: ``r = log((1 − γ) · max(Q1, q_eps))`` so the reward
+  lives on a log-occupancy scale comparable to Gaussian / NF ``log p``.
+
+  Caller chooses whether ``q_params`` is online or the reward EMA tree;
+  this function always reads ``q_params['qf1']`` (twin 2 is unused for
+  reward).  Obs whitening mirrors the critic update when enabled.
   """
   one_m_gamma = float(1.0 - float(discount))
   use_log = bool(log_reward)
@@ -583,6 +644,7 @@ def make_td3_reward_fn(
       obs_mean: jnp.ndarray = None,
       obs_var: jnp.ndarray = None) -> jnp.ndarray:
     if use_obs_norm:
+      # Same state/goal whitening as the critic so reward matches training.
       active = jnp.all(jnp.isfinite(obs_mean))
       obs_mean = jnp.nan_to_num(obs_mean)
       raw_obs = obs
@@ -599,6 +661,7 @@ def make_td3_reward_fn(
       obs = jnp.where(active, obs, raw_obs)
     q1 = density_nets.qf1_net.apply(q_params['qf1'], obs, action)
     if use_log:
+      # (1−γ) Q ≈ discounted occupancy mass; log for density-like PPO reward.
       return jnp.log(one_m_gamma * jnp.maximum(q1, eps))
     return q1
 

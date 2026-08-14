@@ -123,7 +123,7 @@ echo "actor_reset=true (ep_length_mean < 0.8 * nominal)"
 echo "ppo_norm_obs=false"
 echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
 echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} (AFTER return-norm)"
-echo "ppo_eval_interval=200 ppo_video_interval=400"
+echo "ppo_eval_interval=30 ppo_video_interval=400"
 echo "nf_rep_size=${NF_REP_SIZE} nf_num_blocks=${NF_NUM_BLOCKS} nf_coupling_width=${NF_COUPLING_WIDTH}"
 echo "nf_sa_hidden=${NF_SA_HIDDEN} nf_sa_num_layers=${NF_SA_NUM_LAYERS}"
 echo "nf_grad_clip=${NF_GRAD_CLIP} nf_noise_std=${NF_NOISE_STD} nf_goal_std_min=${NF_GOAL_STD_MIN}"
@@ -158,7 +158,7 @@ python -u ppo_contrastive.py \
   --ppo_rollout_length=50 \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=200 \
+  --ppo_eval_interval=30 \
   --ppo_eval_episodes=5 \
   --ppo_video_interval=400 \
   --ppo_video_fps=10 \

@@ -416,6 +416,7 @@ def ppo_env_defaults(
     out = dict(
         start_index=0,
         end_index=pos_end if goal_state_indices is not None else goal_dim,
+        eval_interval=30,
         checkpoint_interval=300,
     )
   else:

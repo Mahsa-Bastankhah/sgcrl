@@ -1,17 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=c7t2_nfc_e1_no_nn
-#SBATCH --output=slurm/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew1_ep70_300m_NOnormobs_%A_%a.log
-#SBATCH --error=slurm/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew1_ep70_300m_NOnormobs_%A_%a.log
+#SBATCH --job-name=c7t2_crl_freeze
+#SBATCH --output=slurm/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_entanneal_ep70_300m_freezeafter_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_entanneal_ep70_300m_freezeafter_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
+#SBATCH --time=14:59:00
 #SBATCH --account=seas
 #SBATCH --array=0-0
 
-# c7t2 NF compact (sa3x256/r64/b6/w256) nopermute fixedx01 catselect extrew1 ep70 300M seed0. NOTE: requested normobs but NF rejects it; running WITHOUT ppo_norm_obs.
+# c7t2 CRL catwp ep70 (best CRL) + ppo_freeze_repr_after_success:
+# after 10 consecutive iters with train_success_mean >= 0.5, freeze φ/ψ
+# (crl_steps=0) and keep the same shaped+extrew reward / return-normalizer.
 unset LD_PRELOAD
 
 module purge
@@ -93,7 +95,7 @@ PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
 MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
 ENT_COEF=0.05
 ENT_COEF_FINAL=0.0
-MIN_STD=0.01
+MIN_STD=1e-5
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
 REWARD_TAU=${REWARD_TAU:-0.5}
@@ -103,25 +105,25 @@ EP_LEN=${EP_LEN:-70}
 PD_DURATION=${PD_DURATION:-5}
 MJ_EP_LEN=$((EP_LEN * PD_DURATION))
 
-LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew1_ep70_300m_NOnormobs/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_entanneal_ep70_300m_freezeafter/}"
 
 mkdir -p slurm "${LOG_DIR}"
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=nf reward_tau=${REWARD_TAU}"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=crl reward_tau=${REWARD_TAU}"
 echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
 echo "max_replay_size=${MAX_REPLAY_SIZE}"
 echo "builderbench_use_pd=true pd_duration=${PD_DURATION} permute_start_boxes=false fixed_start_x=${FIXED_START_X} goals=MID+offsets(task2)"
 echo "episode_length=${EP_LEN} (mj_episode_length=${MJ_EP_LEN}, rollout_length=${EP_LEN})"
 echo "ppo_norm_obs=false"
 echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} (AFTER return-norm)"
+echo "ppo_freeze_repr_after_success=true thresh=0.5 iters=10 (freeze φ/ψ; keep reward; prints LATCHED)"
 echo "ppo_actor_min_std=${MIN_STD}"
-echo "ppo_anneal_lr=true ppo_anneal_ent_coef=false"
-echo "ppo_categorical_select=true"
-echo "ppo_eval_interval=200 ppo_video_interval=400"
+echo "ppo_anneal_lr=true ppo_anneal_ent_coef=true"
+echo "ppo_categorical_select=true ppo_categorical_select_waypoint=true (n-way select + n×3 waypoint heads)"
+echo "ppo_eval_interval=30 ppo_video_interval=400"
 echo "steps_per_iter=$((PPO_NUM_ENVS * EP_LEN))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * EP_LEN)))"
-echo "nf_compact: sa3x256 r64 b6 w256"
 
 python -u -c "
 from envs.builderbench_utils import default_fixed_target_goal, num_creative_tasks, load_task_goal_offsets
@@ -143,6 +145,8 @@ python -u ppo_contrastive.py \
   --log_dir_path="${LOG_DIR}" \
   --ppo_num_envs="${PPO_NUM_ENVS}" \
   --ppo_ent_coef="${ENT_COEF}" \
+  --ppo_anneal_ent_coef=true \
+  --ppo_ent_coef_final="${ENT_COEF_FINAL}" \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
@@ -155,26 +159,21 @@ python -u ppo_contrastive.py \
   --ppo_rollout_length="${EP_LEN}" \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=200 \
+  --ppo_eval_interval=30 \
   --ppo_eval_episodes=5 \
   --ppo_video_interval=400 \
   --ppo_video_fps=10 \
   --ppo_skip_first_video=true \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
-  --ppo_repr_mode=nf \
-  --ppo_nf_reward_tau="${REWARD_TAU}" \
-  --nf_rep_size=64 \
-  --nf_num_blocks=6 \
-  --nf_coupling_width=256 \
-  --nf_sa_hidden=256 \
-  --nf_sa_num_layers=3 \
-  --nf_grad_clip=1.0 \
-  --nf_noise_std=0.05 \
-  --nf_goal_std_min=0.02 \
-  --nf_goal_enc_size=0 \
+  --ppo_repr_mode=crl \
+  --ppo_crl_repr_tau="${REWARD_TAU}" \
   --ppo_use_external_reward \
   --ppo_external_reward_scale="${EXT_REW_SCALE}" \
   --ppo_categorical_select \
+  --ppo_categorical_select_waypoint \
+  --ppo_freeze_repr_after_success=true \
+  --ppo_freeze_repr_after_success_threshold=0.5 \
+  --ppo_freeze_repr_after_success_iters=10 \
   --hidden_layer_sizes="256,256,256,256,256,256"
 PY_EXIT=$?
 pkill -P $$ 2>/dev/null || true

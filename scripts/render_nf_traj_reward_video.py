@@ -69,6 +69,7 @@ _crl = _ilu.module_from_spec(_crl_spec)
 assert _crl_spec.loader is not None
 _crl_spec.loader.exec_module(_crl)
 _render_reward_strip = _crl._render_reward_strip
+_render_grad_norm_strip = _crl._render_grad_norm_strip
 _render_select_strip = _crl._render_select_strip
 _render_pos_delta_strip = _crl._render_pos_delta_strip
 _compose_frame = _crl._compose_frame
@@ -195,6 +196,35 @@ def _build_networks(env_name: str, seed: int, ctx, arch: dict):
   return networks, nf_nets, goal_dim
 
 
+def make_nf_logp_grad_norm_fn(nf_nets, obs_dim: int):
+  """‖∇_s log p_NF(g|s,a)‖ and ‖∇_a log p_NF(g|s,a)‖, g held fixed.
+
+  Goal is normalized the same way as ``make_nf_reward_fn``. Action is ignored
+  by the encoder when the nets were built with ``state_only=True``.
+  """
+
+  def _logp(nf_params, s, a, g_norm):
+    lp = _nf.nf_log_prob(
+        nf_nets, nf_params, s[None], a[None], g_norm[None])
+    return jnp.sum(lp)
+
+  @jax.jit
+  def grad_norm_fn(nf_params, packed, action, goal_mean, goal_std):
+    s = packed[:, :obs_dim]
+    g = packed[:, obs_dim:]
+    g_norm = (g - goal_mean) / (goal_std + 1e-8)
+
+    def one(s_i, a_i, g_i):
+      gs = jax.grad(_logp, argnums=1)(nf_params, s_i, a_i, g_i)
+      ga = jax.grad(_logp, argnums=2)(nf_params, s_i, a_i, g_i)
+      return jnp.linalg.norm(gs), jnp.linalg.norm(ga)
+
+    gs_n, ga_n = jax.vmap(one)(s, action, g_norm)
+    return gs_n, ga_n
+
+  return grad_norm_fn
+
+
 def _enumerate_ckpts(checkpoint: str, checkpoint_dir: str):
   if checkpoint_dir:
     files = sorted(
@@ -228,6 +258,11 @@ def _parse_args():
                  help='Add a timeline strip for state select_action / cube id')
   p.add_argument('--show_pos_delta', action='store_true',
                  help='Add per-cube ||Δxyz|| strip from the reward state s')
+  p.add_argument('--normalize_reward', action='store_true',
+                 help='Also show a 2nd reward strip normalised by episode std.')
+  p.add_argument('--show_logp_grad', action='store_true',
+                 help='Add ||∇_s log p_NF|| and ||∇_a log p_NF|| strips '
+                      '(g held fixed)')
   p.add_argument('--match_run_init', action='store_true',
                  help='Use permute/fixed_start_x from run_config (default: '
                       'force nopermute + fixed_start_x=0.1)')
@@ -298,7 +333,7 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
       sel = sel.reshape(sel.shape[0], -1)[:, 0]
     # packed state matches the reward input (policy obs before step).
     cur = dict(rewards=rewards, success=succ, states=states, select=sel,
-               packed=packed, attempt=attempt)
+               packed=packed, actions=actions, attempt=attempt)
     if reached:
       best = cur
       break
@@ -317,9 +352,22 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
   select = np.asarray(best['select'], dtype=np.float32)
   cube = select_action_to_cube(select, num_cubes)
   packed = np.asarray(best['packed'], dtype=np.float32)
+  actions = np.asarray(best['actions'], dtype=np.float32)
   # Same xyz layout as PD policy obs / NF state_only input.
   cube_pos = packed[:, :3 * num_cubes].reshape(len(packed), num_cubes, 3)
   step_delta = cube_step_deltas_from_pos(cube_pos)
+  show_grad = bool(args.show_logp_grad)
+  grad_s = np.zeros(len(packed), dtype=np.float32)
+  grad_a = np.zeros(len(packed), dtype=np.float32)
+  if show_grad:
+    grad_fn = make_nf_logp_grad_norm_fn(nf_nets, obs_dim=int(ctx.obs_dim))
+    gs, ga = grad_fn(
+        nf_params, jnp.asarray(packed), jnp.asarray(actions), gmean, gstd)
+    grad_s = np.asarray(gs, dtype=np.float32)
+    grad_a = np.asarray(ga, dtype=np.float32)
+    print(f'[vid] ||∇_s logp|| range=[{grad_s.min():.4g},{grad_s.max():.4g}] '
+          f'||∇_a logp|| range=[{grad_a.min():.4g},{grad_a.max():.4g}]',
+          flush=True)
   T = len(rewards)
   first_succ = (int(np.argmax(success >= 0.5))
                 if np.any(success >= 0.5) else -1)
@@ -335,9 +383,11 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
       np.full(T, np.nan, dtype=np.float32),
       select, cube.astype(np.float32),
       step_delta.sum(axis=1).astype(np.float32),
+      grad_s.astype(np.float32),
+      grad_a.astype(np.float32),
   ]
   header = ('t,reward_logp_online,success,dist,select_action,select_cube,'
-            'pos_delta_sum')
+            'pos_delta_sum,grad_s_norm,grad_a_norm')
   for c in range(num_cubes):
     csv_cols.append(step_delta[:, c].astype(np.float32))
     header += f',pos_delta_c{c}'
@@ -366,6 +416,7 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
     title = rf'online NF  $r=\log p(g\mid s,a)$  ·  {tag}'
   ylabel = r'$\log p_{\mathrm{NF}}$'
 
+  rewards_norm = rewards / (float(np.std(rewards)) + 1e-8)
   print('[vid] composing reward overlay...', flush=True)
   frames = []
   for t in range(T):
@@ -374,6 +425,28 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
         title=title, ylabel=ylabel, line_color='#5ec8ff', ylim=None)
     extra = []
     select_badge = None
+    if args.normalize_reward:
+      extra.append(_render_reward_strip(
+          rewards_norm, success, t, width=width, height=180,
+          title=rf'normalised reward  $r/\sigma_r$  ·  {tag}',
+          ylabel=r'$r/\sigma_r$',
+          line_color='#ffb347'))
+    if show_grad:
+      if arch['nf_state_only']:
+        grad_title = (
+            r'$\Vert\nabla_s\log p_{\mathrm{NF}}(g\mid s)\Vert$  /  '
+            r'$\Vert\nabla_a\log p_{\mathrm{NF}}\Vert$ (unused)'
+            rf'  ·  {tag}')
+      else:
+        grad_title = (
+            r'$\Vert\nabla_s\log p_{\mathrm{NF}}(g\mid s,a)\Vert$  /  '
+            r'$\Vert\nabla_a\log p_{\mathrm{NF}}(g\mid s,a)\Vert$'
+            rf'  ·  {tag}')
+      extra.append(_render_grad_norm_strip(
+          grad_s, grad_a, success, t, width=width, height=220,
+          title=grad_title,
+          ylabel_s=r'$\Vert\nabla_s\log p_{\mathrm{NF}}\Vert$',
+          ylabel_a=r'$\Vert\nabla_a\log p_{\mathrm{NF}}\Vert$'))
     if args.show_select:
       extra.append(_render_select_strip(
           select, cube, t, width=width, num_cubes=num_cubes, height=180,

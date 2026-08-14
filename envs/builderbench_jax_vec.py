@@ -104,6 +104,13 @@ class TerminalObsWrapper(Wrapper):
     return state.replace(info=info)
 
 
+def _metric_or_zero(metrics, name: str, like):
+  """Read ``metrics[name]`` if present (traced once at JIT compile)."""
+  if name in metrics:
+    return metrics[name]
+  return jnp.zeros_like(like)
+
+
 class SuccessTerminateWrapper(Wrapper):
   """End the episode after ``n`` consecutive successful macro-steps.
 
@@ -386,6 +393,9 @@ class JaxBuilderBenchVecEnv:
             'values': values,
             'env_rew': next_state.reward,
             'success': next_state.metrics['success'],
+            'very_hard_success': _metric_or_zero(
+                next_state.metrics, 'very_hard_success',
+                next_state.metrics['success']),
             'step_dones': dones.astype(jnp.float32),
             'terminal_obs': term_obs,
             'next_obs': next_packed,
@@ -466,6 +476,9 @@ class JaxBuilderBenchVecEnv:
             'actions': actions,
             'env_rew': next_state.reward,
             'success': next_state.metrics['success'],
+            'very_hard_success': _metric_or_zero(
+                next_state.metrics, 'very_hard_success',
+                next_state.metrics['success']),
             'step_dones': dones,
             'terminal_obs': jnp.where(
                 dones[:, None], terminal_obs, next_packed),
@@ -515,6 +528,9 @@ class JaxBuilderBenchVecEnv:
         step_out = {
             'reward': next_state.reward,
             'success': next_state.metrics['success'],
+            'very_hard_success': _metric_or_zero(
+                next_state.metrics, 'very_hard_success',
+                next_state.metrics['success']),
             'state_obs': next_state.obs,
             'goal': next_state.info['target_goal'],
         }
@@ -593,6 +609,16 @@ class JaxBuilderBenchVecEnv:
     if self._state is None:
       return np.zeros(self._num_envs, dtype=np.float32)
     return np.asarray(self._state.metrics['success'], dtype=np.float32)
+
+  @property
+  def last_very_hard_success(self) -> np.ndarray:
+    """Per-env 1cm success flags from the most recent ``step``."""
+    if self._state is None:
+      return np.zeros(self._num_envs, dtype=np.float32)
+    metrics = self._state.metrics
+    if 'very_hard_success' not in metrics:
+      return np.zeros(self._num_envs, dtype=np.float32)
+    return np.asarray(metrics['very_hard_success'], dtype=np.float32)
 
   @property
   def num_envs(self) -> int:

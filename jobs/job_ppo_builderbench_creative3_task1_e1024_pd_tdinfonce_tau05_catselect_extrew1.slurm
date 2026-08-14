@@ -141,7 +141,7 @@ python -u ppo_contrastive.py \
   --ppo_rollout_length=50 \
   --ppo_crl_steps_per_iter=25 \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=200 \
+  --ppo_eval_interval=30 \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
   --ppo_repr_mode=tdinfonce \
   --ppo_crl_repr_tau="${CRL_REPR_TAU}" \

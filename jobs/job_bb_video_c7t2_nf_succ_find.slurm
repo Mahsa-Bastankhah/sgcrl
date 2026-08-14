@@ -92,7 +92,7 @@ for it in 1650 1500 1800; do
 done
 
 # NF extrew1 — peak train ~2201, eval success 2200
-NF_BASE=logs/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew1_ep70_300m_NOnormobs/ppo_builderbench_creative_7_task2_0
+NF_BASE=logs/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catselect_extrew1_ep70_300m/ppo_builderbench_creative_7_task2_0
 for it in 2250 2100; do
   render_until_succ "${NF_BASE}" "c7t2_nf_ext1" "${it}" 64
 done

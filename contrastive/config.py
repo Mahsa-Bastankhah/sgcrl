@@ -230,6 +230,24 @@ class ContrastiveConfig:
   # to the packed goal slice before InfoNCE.  0 disables (default).
   ppo_crl_sf_perturb_prob: float = 0.0
   ppo_crl_sf_perturb_eps: float = 1e-2
+  # Same L2-ball jitter on the packed state slice s (φ input) before InfoNCE.
+  # Independent of s_f perturb.  0 disables (default).
+  ppo_crl_s_perturb_prob: float = 0.0
+  ppo_crl_s_perturb_eps: float = 1e-2
+  # Penalty on ‖∇_s (φ(s,a)·ψ(s_f))‖ during InfoNCE:
+  #   L_reg = λ E[ max(0, ‖∇_s f‖ − c) ]
+  # Diagnostics (mean/max/frac/raw) are always logged.  The hinge is added
+  # to the loss only when ppo_crl_grad_reg_coef > 0.
+  # λ is adapted between PPO iterations via EMA so that the running average
+  # of L_reg stays ≈ ppo_crl_grad_reg_rel × L_InfoNCE (target ratio 0.1).
+  # Within each scan λ is constant, so larger excess still gives larger L_reg.
+  # ppo_crl_grad_reg_coef: initial λ (overridden quickly by EMA); 0 = not in loss.
+  ppo_crl_grad_reg_c: float = 100.0
+  ppo_crl_grad_reg_coef: float = 0.0
+  ppo_crl_grad_reg_rel: float = 0.1   # target ratio: L_reg ≈ rel × L_InfoNCE
+  # NF analog of the CRL hinge, off by default.  ∇_s log p stats are always
+  # logged; the hinge enters the NLL only when this flag is True (and coef>0).
+  ppo_nf_grad_reg: bool = False
   # EMA decay τ for φ, ψ used in the PPO reward r = φ·ψ (CRL mode only).
   # Reward uses EMA params: ema ← τ·ema + (1−τ)·online after each CRL step.
   # τ=0 uses online params directly (no EMA).  Higher τ = slower / smoother reward.
@@ -278,6 +296,27 @@ class ContrastiveConfig:
   ppo_use_external_reward: bool = False
   ppo_external_reward_scale: float = 1.0
   ppo_external_reward_before_norm: bool = False
+  # Which BuilderBench success metric the external bonus uses.
+  # 'hard' = all cubes within 2cm (metrics['success'], default).
+  # 'very_hard' = all cubes within 1cm (metrics['very_hard_success']).
+  # Both metrics are always logged; this only selects the PPO bonus.
+  ppo_external_reward_success: str = 'hard'
+  # After this many consecutive PPO iters with high train success, latch onto
+  # sparse hard-success reward only (drop CRL/NF/… shaped reward). Requires
+  # ppo_use_external_reward. Success metric = mean of the last ≤100 finished
+  # training episodes (BuilderBench) or fraction of envs that saw a success
+  # step in the current rollout (Sawyer fallback).
+  ppo_sparse_after_success: bool = False
+  ppo_sparse_after_success_threshold: float = 0.5
+  ppo_sparse_after_success_iters: int = 10
+  # Same consecutive-success trigger as sparse-after, but keep the current
+  # shaped+extrew PPO reward (and its return-normalizer) and freeze φ/ψ by
+  # setting ppo_crl_steps_per_iter=0. Does not require external reward.
+  # If ppo_external_reward_success='very_hard', the latch uses 1cm
+  # train_very_hard_success_mean; otherwise 2cm train_success_mean.
+  ppo_freeze_repr_after_success: bool = False
+  ppo_freeze_repr_after_success_threshold: float = 0.5
+  ppo_freeze_repr_after_success_iters: int = 10
   # Checkpointing: save policy/value/CRL params every N PPO iterations.
   # At default settings (8 envs × 128 steps = 1024 env-steps/iter), 400
   # iterations ≈ 400k env steps (half the previous ckpt rate).
@@ -286,6 +325,12 @@ class ContrastiveConfig:
   # How many milestone ckpt_iter_*.pkl files to keep (FIFO prune of oldest).
   # 0 = keep all milestones (no pruning).  `latest.pkl` is always overwritten.
   ppo_checkpoint_keep_last: int = 0
+  # Serialize up to this many of the most recent replay transitions into
+  # `latest.pkl` so a requeued run resumes with a warm buffer instead of
+  # refilling from empty.  0 disables.  Milestones never carry the replay:
+  # at ~200 bytes/transition a full buffer dwarfs the params, and only the
+  # resume path needs it.
+  ppo_checkpoint_replay_max: int = 0
   # If True, mix 50% uniformly sampled goals into each CRL replay batch so
   # that half the in-batch negatives come from the uniform goal distribution
   # rather than the replay future-state distribution.
@@ -423,7 +468,7 @@ class ContrastiveConfig:
   # Comma-separated PPO iterations at which to force an actor reinit
   # (in addition to the short-episode guard). Empty = schedule disabled.
   ppo_actor_reset_iters: str = ''
-  ppo_eval_interval: int = 10  # run eval every N PPO iterations (0 = disabled)
+  ppo_eval_interval: int = 30  # run eval every N PPO iterations (0 = disabled)
   ppo_eval_episodes: int = 5  # number of eval episodes per eval round
   # In-train BuilderBench video (deterministic policy + live obs_rms).
   # 0 = disabled. Videos written under <run_dir>/videos/.
