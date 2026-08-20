@@ -137,7 +137,7 @@ python -u ppo_contrastive.py \
   --nobuilderbench_permute_start_boxes \
   --ppo_deterministic_select_dim \
   --ppo_rollout_length=50 \
-  --ppo_crl_steps_per_iter=25 \
+  --ppo_crl_steps_per_iter=10 \
   --ppo_skip_first_eval=true \
   --ppo_eval_interval=0 \
   --max_replay_size="${MAX_REPLAY_SIZE}" \

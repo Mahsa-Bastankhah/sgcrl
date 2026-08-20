@@ -101,7 +101,7 @@ EXT_REW_SCALE=${EXT_REW_SCALE:-1}
 EP_LEN=${EP_LEN:-60}
 PD_DURATION=${PD_DURATION:-5}
 MJ_EP_LEN=$((EP_LEN * PD_DURATION))
-CRL_STEPS=${CRL_STEPS:-25}
+CRL_STEPS=${CRL_STEPS:-10}
 FIXED_START_X=${FIXED_START_X:-0.1}
 
 LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_normobs_catwp_extrew1_minstd1e5_entanneal_ep60_300m/}"

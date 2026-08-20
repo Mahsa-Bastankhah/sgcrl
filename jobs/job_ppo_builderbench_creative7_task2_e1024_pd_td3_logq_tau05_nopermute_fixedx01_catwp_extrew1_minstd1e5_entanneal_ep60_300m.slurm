@@ -12,7 +12,7 @@
 #SBATCH --array=0-0
 
 # c7t2 TD3 logQ: nopermute fixedx01 catwp extrew1 minstd1e-5 entanneal ep60
-# ppo_crl_steps_per_iter=25 (no ppo_norm_obs). Seed 0.
+# ppo_crl_steps_per_iter=10 (no ppo_norm_obs). Seed 0.
 unset LD_PRELOAD
 
 module purge
@@ -103,7 +103,7 @@ FIXED_START_X=${FIXED_START_X:-0.1}
 EP_LEN=${EP_LEN:-60}
 PD_DURATION=${PD_DURATION:-5}
 MJ_EP_LEN=$((EP_LEN * PD_DURATION))
-CRL_STEPS=${CRL_STEPS:-25}
+CRL_STEPS=${CRL_STEPS:-10}
 
 LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative7_task2_e1024_pd_td3_logq_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_entanneal_ep60_300m/}"
 

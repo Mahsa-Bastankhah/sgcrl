@@ -13,7 +13,7 @@
 
 # 3-cube creative-3-task2, PD + NF reward with EMA tau=0.5.
 # Same PPO knobs as creative3_task1/task2 td3_logq_tau05 baseline:
-#   rollout_length=50, crl_steps_per_iter=25, ent_coef=0.05, etc.
+#   rollout_length=50, crl_steps_per_iter=10, ent_coef=0.05, etc.
 # Fixed goals = sampling midpoint + task offsets (default).
 # Init start-box permutation ENABLED (unlike the older noperm NF job).
 unset LD_PRELOAD
@@ -140,7 +140,7 @@ python -u ppo_contrastive.py \
   --builderbench_pd_duration=5 \
   --builderbench_permute_start_boxes=true \
   --ppo_rollout_length=50 \
-  --ppo_crl_steps_per_iter=25 \
+  --ppo_crl_steps_per_iter=10 \
   --ppo_skip_first_eval=true \
   --ppo_eval_interval=0 \
   --max_replay_size="${MAX_REPLAY_SIZE}" \

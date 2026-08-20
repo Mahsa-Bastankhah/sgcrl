@@ -102,7 +102,7 @@ REWARD_TAU=${REWARD_TAU:-0.5}
 EP_LEN=${EP_LEN:-50}
 PD_DURATION=${PD_DURATION:-5}
 MJ_EP_LEN=$((EP_LEN * PD_DURATION))
-CRL_STEPS=${CRL_STEPS:-25}
+CRL_STEPS=${CRL_STEPS:-10}
 FIXED_START_X=${FIXED_START_X:-0.1}
 
 # Gradient regulariser: L_reg = λ E[max(0, ‖∇_s(φ·ψ)‖ − c)]

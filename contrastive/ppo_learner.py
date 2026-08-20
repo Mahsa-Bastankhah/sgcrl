@@ -88,6 +88,71 @@ def _policy_normal_loc_scale(dist):
   return normal.loc, normal.scale
 
 
+def _gaussian_kl_nd(mu0, s0, mu1, s1):
+  """KL(N(mu0, s0²) ‖ N(mu1, s1²)) summed over the last axis.
+
+  Result has one fewer dimension than the inputs, e.g. (B, n, d) → (B, n).
+  All inputs are pre-tanh Normal parameters (loc / scale).
+  """
+  return 0.5 * jnp.sum(
+      jnp.log(s1 ** 2 / s0 ** 2)
+      + (s0 ** 2 + (mu0 - mu1) ** 2) / s1 ** 2
+      - 1.0,
+      axis=-1,
+  )
+
+
+def _analytic_policy_kl(dist_old, dist_new):
+  """Analytic KL(π_old ‖ π_new) using pre-tanh Gaussian and categorical terms.
+
+  Returns (kl_total, kl_gauss, kl_cat) — all scalars (batch means).
+
+  Handles three actor types:
+    * Pure tanh-Gaussian (NormalTanhDistribution)
+    * Shared-trunk hybrid: tanh-Gaussian continuous dims + Categorical select
+      (HybridSelectDistribution; hybrid_select=True)
+    * Per-cube waypoint hybrid: n×3 tanh-Gaussian waypoint heads + shared 1D
+      yaw + Categorical select (HybridSelectWaypointDistribution;
+      hybrid_select_waypoint=True).  Waypoint KL is the expected KL under
+      the old categorical: Σ_c p_old(c)·KL(wp_old_c ‖ wp_new_c).
+  """
+  _zero = jnp.zeros(())
+  if getattr(dist_old, 'hybrid_select_waypoint', False):
+    # --- cat-waypoint actor --------------------------------------------------
+    logp_old_c = jax.nn.log_softmax(dist_old.categorical_dist.logits, axis=-1)
+    logp_new_c = jax.nn.log_softmax(dist_new.categorical_dist.logits, axis=-1)
+    p_old_c = jnp.exp(logp_old_c)                                   # [B, n]
+    kl_c = jnp.mean(jnp.sum(p_old_c * (logp_old_c - logp_new_c), axis=-1))
+    # Waypoint: dist.waypoint_{loc,scale} are [B, n, 3] pre-tanh Normal params.
+    kl_wp_per_cube = _gaussian_kl_nd(
+        dist_old.waypoint_loc, dist_old.waypoint_scale,
+        dist_new.waypoint_loc, dist_new.waypoint_scale,
+    )                                                                # [B, n]
+    kl_wp = jnp.mean(jnp.sum(p_old_c * kl_wp_per_cube, axis=-1))
+    # Yaw: Independent(TanhTransformed(Normal), 1) → Normal.
+    yaw_n_old = dist_old.yaw_dist.distribution.distribution
+    yaw_n_new = dist_new.yaw_dist.distribution.distribution
+    kl_yaw = jnp.mean(_gaussian_kl_nd(
+        yaw_n_old.loc, yaw_n_old.scale, yaw_n_new.loc, yaw_n_new.scale))
+    kl_g = kl_wp + kl_yaw
+  elif getattr(dist_old, 'hybrid_select', False):
+    # --- shared-head cat-select actor ----------------------------------------
+    logp_old_c = jax.nn.log_softmax(dist_old.categorical_dist.logits, axis=-1)
+    logp_new_c = jax.nn.log_softmax(dist_new.categorical_dist.logits, axis=-1)
+    p_old_c = jnp.exp(logp_old_c)
+    kl_c = jnp.mean(jnp.sum(p_old_c * (logp_old_c - logp_new_c), axis=-1))
+    n_old = dist_old.continuous_dist.distribution.distribution
+    n_new = dist_new.continuous_dist.distribution.distribution
+    kl_g = jnp.mean(_gaussian_kl_nd(n_old.loc, n_old.scale, n_new.loc, n_new.scale))
+  else:
+    # --- pure tanh-Gaussian actor --------------------------------------------
+    n_old = dist_old.distribution.distribution
+    n_new = dist_new.distribution.distribution
+    kl_g = jnp.mean(_gaussian_kl_nd(n_old.loc, n_old.scale, n_new.loc, n_new.scale))
+    kl_c = _zero
+  return kl_g + kl_c, kl_g, kl_c
+
+
 # ---------------------------------------------------------------------------
 # Training state
 # ---------------------------------------------------------------------------
@@ -1076,6 +1141,8 @@ def make_reward_fn(
       products are replaced by Gaussian KDE log-densities fitted on replay
       buffer states.  Requires a ``GaussianKDE`` object to be maintained
       externally and passed as the first argument of the returned function.
+    * ``'env_dense'``: not handled here — rollout copies BuilderBench
+      ``env_rew`` (tanh cube–goal distance). Default remains φ·ψ.
 
   Optional ``config.ppo_crl_hit_bonus`` adds an indicator on top of φ·ψ:
   ``'sf'`` → scale·1{‖obs_to_goal(s)−g‖<tol}; ``'goal'`` →
@@ -1086,10 +1153,14 @@ def make_reward_fn(
     return make_dirac_target_reward_fn(networks, config)
   if mode == 'kde_dirac':
     return make_kde_dirac_reward_fn(config)
+  if mode == 'env_dense':
+    raise ValueError(
+        "ppo_reward_mode='env_dense' does not use a φ·ψ reward_fn; "
+        'the learner copies env_rew instead')
   if mode not in ('', 'phi_psi'):
     raise ValueError(
         f'Unknown ppo_reward_mode={config.ppo_reward_mode!r}; '
-        f"supported: '', 'phi_psi', 'dirac_target', 'kde_dirac'")
+        f"supported: '', 'phi_psi', 'dirac_target', 'kde_dirac', 'env_dense'")
   norm_obs = bool(getattr(config, 'ppo_norm_obs', False))
   obs_dim = int(config.obs_dim)
   si = int(config.start_index)
@@ -1289,10 +1360,10 @@ def make_ppo_update_fn(
   norm_clip = float(getattr(config, 'ppo_obs_norm_clip', 10.0))
   gidx = getattr(config, 'goal_state_indices', None)
   det_select = bool(getattr(config, 'ppo_deterministic_select_dim', False))
+  _kl_pen = float(getattr(config, 'ppo_kl_penalty_coef', 0.0)) > 0
 
-  def ppo_loss(params, batch, key, obs_mean, obs_var, step=None):
-    ent_coef = (ent_coef_schedule(step) if ent_coef_schedule is not None
-                else ent_coef_const)
+  def _ppo_loss_core(params, batch, key, obs_mean, obs_var, ent_coef):
+    """Shared PPO loss computation. Returns (total, dist, network_obs, metrics)."""
     network_obs = _normalize_packed_obs(
         batch['obs'], obs_mean, obs_var, obs_dim=obs_dim, start_index=si,
         end_index=ei, clip=norm_clip, enabled=norm_obs,
@@ -1333,7 +1404,6 @@ def make_ppo_update_fn(
 
     # ---- entropy bonus ----
     entropy_mean = jnp.mean(entropy_est)
-    # Term as it enters the minimized objective: L includes -coef * H.
     entropy_loss_term = -ent_coef * entropy_mean
 
     # ---- Self-Imitation Learning (SIL) loss (Approach 1) ----
@@ -1349,12 +1419,10 @@ def make_ppo_update_fn(
     sil_coef = float(getattr(config, 'ppo_good_buffer_coef', 0.1)) if 'good_obs' in batch else 0.0
     total = pg_loss - ent_coef * entropy_mean + vf_coef * v_loss + sil_coef * sil_loss
 
-    # ---- diagnostics (stop_gradient is implicit for metrics) ----
-    approx_kl = jnp.mean((ratio - 1.0) - logratio)    # http://joschu.net/blog/kl-approx.html
+    # ---- diagnostics ----
+    approx_kl = jnp.mean((ratio - 1.0) - logratio)  # http://joschu.net/blog/kl-approx.html
     old_approx_kl = jnp.mean(-logratio)
     clipfrac = jnp.mean((jnp.abs(ratio - 1.0) > clip_coef).astype(jnp.float32))
-
-    # Pre-tanh Gaussian loc (μ) and scale (σ) from the continuous policy head.
     policy_loc, policy_scale = _policy_normal_loc_scale(dist)
 
     metrics = {
@@ -1368,44 +1436,100 @@ def make_ppo_update_fn(
         'old_approx_kl': old_approx_kl,
         'clipfrac': clipfrac,
         'ratio_mean': jnp.mean(ratio),
+        'ratio_max': jnp.max(ratio),
+        'logratio_abs_max': jnp.max(jnp.abs(logratio)),
         'policy_loc_mean': jnp.mean(policy_loc),
         'policy_loc_abs_mean': jnp.mean(jnp.abs(policy_loc)),
         'policy_scale_mean': jnp.mean(policy_scale),
         'policy_scale_min': jnp.min(policy_scale),
         'ent_coef': jnp.asarray(ent_coef, dtype=jnp.float32),
     }
-    return total, metrics
+    return total, dist, network_obs, metrics
 
-  grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
+  if _kl_pen:
+    # PPO-penalty path: loss includes β·KL(π_rollout ‖ π_now).
+    # old_policy_params_j: rollout-time policy params (stop-gradiented inside).
+    # kl_beta_j: current β scalar; adapted per minibatch by the host loop.
+    def ppo_loss_kl(params, batch, key, obs_mean, obs_var,
+                    old_policy_params_j, kl_beta_j, step=None):
+      ent_coef = (ent_coef_schedule(step) if ent_coef_schedule is not None
+                  else ent_coef_const)
+      total, dist, network_obs, metrics = _ppo_loss_core(
+          params, batch, key, obs_mean, obs_var, ent_coef)
+      dist_old = _policy_dist_maybe_det_select(
+          networks.policy_network.apply(
+              jax.lax.stop_gradient(old_policy_params_j), network_obs),
+          det_select)
+      kl_total, kl_g, kl_c = _analytic_policy_kl(dist_old, dist)
+      total = total + kl_beta_j * kl_total
+      metrics['analytic_kl'] = kl_total
+      metrics['analytic_kl_gauss'] = kl_g
+      metrics['analytic_kl_cat'] = kl_c
+      metrics['kl_penalty_loss'] = kl_beta_j * kl_total
+      return total, metrics
 
-  if ent_coef_schedule is not None:
-    @jax.jit
-    def update(params, opt_state, batch, key, obs_mean, obs_var, step):
-      (_, metrics), grads = grad_fn(
-          params, batch, key, obs_mean, obs_var, step)
-      actor_metrics = compute_analysis_dict(
-          prefix="actor",
-          params=params['policy'],
-          grads=grads['policy']
-      )
-      metrics.update(actor_metrics)
-      updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
-      new_params = optax.apply_updates(params, updates)
-      return new_params, new_opt_state, metrics
+    grad_fn = jax.value_and_grad(ppo_loss_kl, has_aux=True)
+
+    if ent_coef_schedule is not None:
+      @jax.jit
+      def update(params, opt_state, batch, key, obs_mean, obs_var, step,
+                 old_policy_params_j, kl_beta_j):
+        (_, metrics), grads = grad_fn(
+            params, batch, key, obs_mean, obs_var,
+            old_policy_params_j, kl_beta_j, step)
+        updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, metrics
+    else:
+      @jax.jit
+      def update(params, opt_state, batch, key, obs_mean, obs_var,
+                 old_policy_params_j, kl_beta_j):
+        (_, metrics), grads = grad_fn(
+            params, batch, key, obs_mean, obs_var,
+            old_policy_params_j, kl_beta_j)
+        updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, metrics
+
   else:
-    @jax.jit
-    def update(params, opt_state, batch, key, obs_mean, obs_var):
-      (_, metrics), grads = grad_fn(
-          params, batch, key, obs_mean, obs_var)
-      actor_metrics = compute_analysis_dict(
-          prefix="actor",
-          params=params['policy'],
-          grads=grads['policy']
-      )
-      metrics.update(actor_metrics)
-      updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
-      new_params = optax.apply_updates(params, updates)
-      return new_params, new_opt_state, metrics
+    # Default path (no KL penalty): zero overhead, unchanged behaviour.
+    def ppo_loss(params, batch, key, obs_mean, obs_var, step=None):
+      ent_coef = (ent_coef_schedule(step) if ent_coef_schedule is not None
+                  else ent_coef_const)
+      total, _, _, metrics = _ppo_loss_core(
+          params, batch, key, obs_mean, obs_var, ent_coef)
+      return total, metrics
+
+    grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
+
+    if ent_coef_schedule is not None:
+      @jax.jit
+      def update(params, opt_state, batch, key, obs_mean, obs_var, step):
+        (_, metrics), grads = grad_fn(
+            params, batch, key, obs_mean, obs_var, step)
+        actor_metrics = compute_analysis_dict(
+            prefix="actor",
+            params=params['policy'],
+            grads=grads['policy']
+        )
+        metrics.update(actor_metrics)
+        updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, metrics
+    else:
+      @jax.jit
+      def update(params, opt_state, batch, key, obs_mean, obs_var):
+        (_, metrics), grads = grad_fn(
+            params, batch, key, obs_mean, obs_var)
+        actor_metrics = compute_analysis_dict(
+            prefix="actor",
+            params=params['policy'],
+            grads=grads['policy']
+        )
+        metrics.update(actor_metrics)
+        updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, metrics
 
   return update
 
@@ -1425,6 +1549,23 @@ def _crl_l2_ball_perturb(x, key, prob, eps):
   frac = jnp.mean(do_pert)
   mean_norm = jnp.mean(jnp.linalg.norm(noise, axis=-1))
   return x + noise, frac, mean_norm, key
+
+
+def _crl_l2_ball_perturb_slice(x, key, prob, eps, lo, hi):
+  """L2-ball jitter on ``x[:, lo:hi]`` when that is a proper prefix; else all of x.
+
+  BuilderBench PD state is ``[xyz | select]``: pass ``lo=0, hi=n_cubes*3`` so
+  select is left alone.  Other envs pass ``lo=0, hi=obs_dim`` (full s).
+  """
+  d = int(x.shape[-1])
+  lo_i = int(lo)
+  hi_i = int(hi) if int(hi) >= 0 else d
+  if 0 <= lo_i < hi_i < d:
+    sl, frac, mean_norm, key = _crl_l2_ball_perturb(
+        x[:, lo_i:hi_i], key, prob, eps)
+    x = x.at[:, lo_i:hi_i].set(sl)
+    return x, frac, mean_norm, key
+  return _crl_l2_ball_perturb(x, key, prob, eps)
 
 
 def make_crl_update_fn(
@@ -1500,6 +1641,11 @@ def make_crl_update_fn(
   s_pert_eps = float(
       getattr(config, 'ppo_crl_s_perturb_eps', 1e-2)
       if config is not None else 1e-2)
+  # BuilderBench PD s = [xyz | select]: L2 ball on xyz only.  Other envs: all of s.
+  _is_bb = str(
+      getattr(config, 'env_name', '') or '').startswith('builderbench_')
+  s_pert_lo = si if _is_bb else 0
+  s_pert_hi = ei if _is_bb else obs_dim
   if not (0.0 <= sf_pert_prob <= 1.0):
     raise ValueError(
         f'ppo_crl_sf_perturb_prob must be in [0, 1], got {sf_pert_prob}')
@@ -1524,7 +1670,8 @@ def make_crl_update_fn(
   if grad_reg_coef < 0.0:
     raise ValueError(
         f'ppo_crl_grad_reg_coef must be >= 0, got {grad_reg_coef}')
-  do_grad_reg = obs_dim > 0 and grad_reg_coef > 0.0
+  log_grad_reg = obs_dim > 0
+  do_grad_reg = log_grad_reg and grad_reg_coef > 0.0
 
   def critic_loss(q_params, lam_val, batch, key, obs_mean, obs_var):
     obs_raw = batch['obs']
@@ -1540,8 +1687,8 @@ def make_crl_update_fn(
       state = obs_raw[:, :obs_dim]
       goal = obs_raw[:, obs_dim:]
       if do_s:
-        state, s_pert_frac, s_pert_norm, key = _crl_l2_ball_perturb(
-            state, key, s_pert_prob, s_pert_eps)
+        state, s_pert_frac, s_pert_norm, key = _crl_l2_ball_perturb_slice(
+            state, key, s_pert_prob, s_pert_eps, s_pert_lo, s_pert_hi)
       if do_sf:
         goal, sf_pert_frac, sf_pert_norm, key = _crl_l2_ball_perturb(
             goal, key, sf_pert_prob, sf_pert_eps)
@@ -1598,7 +1745,7 @@ def make_crl_update_fn(
     grad_reg_raw = zero
     grad_reg_lam = zero
     grad_reg = zero
-    if do_grad_reg:
+    if log_grad_reg:
       s_reg = obs[:, :obs_dim]
       g_reg = obs[:, obs_dim:]
 
@@ -1617,8 +1764,9 @@ def make_crl_update_fn(
       gnorm_frac_above = jnp.mean(
           (gnorms > grad_reg_c).astype(nce_loss.dtype))
       grad_reg_raw = jnp.mean(jnp.maximum(gnorms - grad_reg_c, 0.0))
-      grad_reg_lam = lam_val.astype(nce_loss.dtype)
-      grad_reg = grad_reg_lam * grad_reg_raw
+      if do_grad_reg:
+        grad_reg_lam = lam_val.astype(nce_loss.dtype)
+        grad_reg = grad_reg_lam * grad_reg_raw
 
     total_loss = nce_loss + grad_reg
 
@@ -2718,6 +2866,8 @@ def run_ppo_training(
     nf_sa_hidden     = int(getattr(config, 'nf_sa_hidden', 1024))
     nf_sa_num_layers = int(getattr(config, 'nf_sa_num_layers', 4))
     nf_state_only    = bool(getattr(config, 'nf_state_only', False))
+    nf_scale_tanh    = bool(getattr(config, 'nf_scale_tanh', False))
+    nf_scale_tanh_c  = float(getattr(config, 'nf_scale_tanh_c', 2.0))
     nf_density_nets = _nf.make_nf_density_networks(
         obs_dim=obs_dim_cfg,
         act_dim=act_dim_cfg,
@@ -2730,6 +2880,8 @@ def run_ppo_training(
         sa_hidden=nf_sa_hidden,
         sa_num_layers=nf_sa_num_layers,
         state_only=nf_state_only,
+        scale_tanh=nf_scale_tanh,
+        scale_tanh_c=nf_scale_tanh_c,
     )
     _goal_enc_desc = (f'goal_encoder=2x256+swish→{nf_goal_enc_size}'
                       if nf_goal_enc_size > 0 else 'goal_encoder=none (raw goal)')
@@ -2739,7 +2891,10 @@ def run_ppo_training(
           f'rep_size={nf_rep_size}  num_blocks={nf_num_blocks}  '
           f'coupling_width={nf_coupling_w}  flow_dim={nf_density_nets.flow_dim}  '
           f'sa_encoder={nf_sa_num_layers}x{nf_sa_hidden}+swish  '
-          f'state_only={nf_state_only} ({_cond_desc})  {_goal_enc_desc}')
+          f'state_only={nf_state_only} ({_cond_desc})  {_goal_enc_desc}  '
+          f'normalize_goals={bool(getattr(config, "nf_normalize_goals", True))}  '
+          f'scale_tanh={nf_scale_tanh}'
+          f'{f"(c={nf_scale_tanh_c:g})" if nf_scale_tanh else ""}')
   elif use_td3 or use_crl_td3_switch:
     _td3_bilinear = bool(getattr(config, 'ppo_td3_bilinear', False))
     td3_density_nets = _td3.make_td3_density_networks(
@@ -3089,8 +3244,19 @@ def run_ppo_training(
   reward_mode = (getattr(config, 'ppo_reward_mode', '') or '').strip().lower()
   use_dirac_target = reward_mode == 'dirac_target'
   use_kde_dirac    = reward_mode == 'kde_dirac'
-  reward_fn = make_reward_fn(networks, config)
-  print('[ppo] init: reward_fn ready', flush=True)
+  use_env_dense    = reward_mode == 'env_dense'
+  if use_env_dense:
+    if not _use_jax_bb_vec:
+      raise ValueError(
+          "ppo_reward_mode='env_dense' is a BuilderBench baseline "
+          '(CreativeCube tanh cube–goal distance); other envs unsupported')
+    reward_fn = None
+    print('[ppo] reward mode: env_dense (BuilderBench tanh cube-goal '
+          'distance env_rew; φ·ψ unused; opt-in baseline only)',
+          flush=True)
+  else:
+    reward_fn = make_reward_fn(networks, config)
+    print('[ppo] init: reward_fn ready', flush=True)
   if use_dirac_target:
     print(f'[ppo] reward mode: dirac_target (eps={config.ppo_dirac_eps})')
   if use_kde_dirac:
@@ -3168,29 +3334,66 @@ def run_ppo_training(
   elif use_nf:
     _nf_s_p = float(getattr(config, 'ppo_crl_s_perturb_prob', 0.0))
     _nf_s_eps = float(getattr(config, 'ppo_crl_s_perturb_eps', 1e-2))
+    _nf_is_bb = str(getattr(config, 'env_name', '') or '').startswith(
+        'builderbench_')
+    _nf_s_lo = int(config.start_index) if _nf_is_bb else 0
+    _nf_s_hi = (
+        int(config.end_index if int(config.end_index) != -1
+            else int(config.obs_dim))
+        if _nf_is_bb else -1)
     _nf_gr = bool(getattr(config, 'ppo_nf_grad_reg', False))
     _nf_gr_c = float(getattr(config, 'ppo_crl_grad_reg_c', 100.0))
     _nf_gr_coef = (
-        float(getattr(config, 'ppo_crl_grad_reg_coef', 5e-4))
+        float(getattr(config, 'ppo_crl_grad_reg_coef', 0.0))
         if _nf_gr else 0.0)
+    _nf_mask_prob = float(getattr(config, 'nf_mask_prob', 0.0))
+    if not (0.0 <= _nf_mask_prob <= 1.0):
+      raise ValueError(
+          f'nf_mask_prob must be in [0, 1], got {_nf_mask_prob}')
     crl_update = _nf.make_nf_density_update_fn(
         nf_density_nets, q_optimizer, obs_dim=int(config.obs_dim),
         noise_std=float(getattr(config, 'nf_noise_std', 0.0)),
+        mask_prob=_nf_mask_prob,
         s_pert_prob=_nf_s_p, s_pert_eps=_nf_s_eps,
+        s_pert_lo=_nf_s_lo, s_pert_hi=_nf_s_hi,
         grad_reg_c=_nf_gr_c, grad_reg_coef=_nf_gr_coef)
     # Pre-sample N batches → one H→D transfer → one scanned JIT (like CRL).
+    # lam_lr > 0 enables dual (primal-dual) λ updates inside the scan.
+    # <0 config → auto 100× flow lr; 0 → fixed λ (no dual).
+    _nf_lam_lr_cfg = float(getattr(config, 'ppo_nf_grad_reg_lam_lr', -1.0))
+    if _nf_gr and _nf_gr_coef > 0.0:
+      if _nf_lam_lr_cfg < 0.0:
+        _nf_lam_lr = 100.0 * float(getattr(config, 'nf_critic_lr', 1e-4))
+      else:
+        _nf_lam_lr = _nf_lam_lr_cfg
+    else:
+      _nf_lam_lr = 0.0
     nf_scan_update = _nf.make_scan_nf_update_fn(
         nf_density_nets, q_optimizer, obs_dim=int(config.obs_dim),
         noise_std=float(getattr(config, 'nf_noise_std', 0.0)),
         repr_tau=_repr_tau,
+        mask_prob=_nf_mask_prob,
         s_pert_prob=_nf_s_p, s_pert_eps=_nf_s_eps,
-        grad_reg_c=_nf_gr_c, grad_reg_coef=_nf_gr_coef)
+        s_pert_lo=_nf_s_lo, s_pert_hi=_nf_s_hi,
+        grad_reg_c=_nf_gr_c, grad_reg_coef=_nf_gr_coef,
+        lam_lr=_nf_lam_lr)
     if _nf_s_p > 0.0 and _nf_s_eps > 0.0:
-      print(f'[ppo] NF s perturb: prob={_nf_s_p}  eps={_nf_s_eps}  '
-            f'(‖δ‖₂≤eps on packed state before SA encoder)')
-    if _nf_gr and _nf_gr_coef > 0.0:
-      print(f'[ppo] NF ∇_s log p reg: c={_nf_gr_c}  λ={_nf_gr_coef}  '
-            f'(L_reg=λ·E[max(0,‖∇_s log p‖−c)])')
+      if _nf_is_bb:
+        print(f'[ppo] NF s perturb: prob={_nf_s_p}  eps={_nf_s_eps}  '
+              f'(‖δ‖₂≤eps on packed xyz [{_nf_s_lo}:{_nf_s_hi}], '
+              f'select left alone)')
+      else:
+        print(f'[ppo] NF s perturb: prob={_nf_s_p}  eps={_nf_s_eps}  '
+              f'(‖δ‖₂≤eps on packed state before SA encoder)')
+    if _nf_mask_prob > 0.0:
+      print(f'[ppo] NF NLL (s,a) mask: p={_nf_mask_prob}  '
+            f'(zeros conditioning; reward still uses unmasked (s,a))',
+            flush=True)
+    print(f'[ppo] NF ∇_s log p: log always (c={_nf_gr_c}); '
+          f'in-loss={"on" if (_nf_gr and _nf_gr_coef > 0.0) else "off"}  '
+          f'λ_init={_nf_gr_coef}  '
+          f'lam_lr={_nf_lam_lr}'
+          f'{" (dual)" if _nf_lam_lr > 0.0 else " (fixed λ)"}')
     if use_nf_td:
       _nf_td_tau = float(getattr(config, 'ppo_nf_td_target_tau', 0.995))
       _nf_td_mix = float(getattr(config, 'ppo_nf_td_discount', -1.0))
@@ -3238,6 +3441,7 @@ def run_ppo_training(
           end_index=int(config.end_index),
           goal_state_indices=_goal_state_indices,
           s_pert_prob=_nf_s_p, s_pert_eps=_nf_s_eps,
+          s_pert_lo=_nf_s_lo, s_pert_hi=_nf_s_hi,
       )
       nf_scan_update = None
       nf_scan_td_update = _nf.make_scan_nf_td_update_fn(
@@ -3255,20 +3459,45 @@ def run_ppo_training(
           goal_state_indices=_goal_state_indices,
           repr_tau=_repr_tau,
           s_pert_prob=_nf_s_p, s_pert_eps=_nf_s_eps,
+          s_pert_lo=_nf_s_lo, s_pert_hi=_nf_s_hi,
       )
       print(f'[ppo] TD-NF density: mix_gamma={_nf_td_mix} '
             f'(HER/discount={config.discount}), '
             f'target_keep_tau={_nf_td_tau}, mask_prob={_nf_td_mask}, '
             f'a\'∼π(·|s\',g_task)  '
             f'policy_goal_dim={_nf_policy_goal.shape[0]}', flush=True)
+    _nf_tanh = bool(getattr(config, 'nf_reward_tanh', False))
+    _nf_tanh_scale = float(getattr(config, 'nf_reward_tanh_scale', 50.0))
+    _nf_rew_mode = _nf.normalize_nf_reward_mode(
+        getattr(config, 'nf_reward_mode', 'forward'))
     nf_reward_fn = _nf.make_nf_reward_fn(
-        nf_density_nets, obs_dim=int(config.obs_dim))
+        nf_density_nets, obs_dim=int(config.obs_dim),
+        tanh_scale=(_nf_tanh_scale if _nf_tanh else 0.0),
+        reward_mode=_nf_rew_mode)
     gaussian_reward_fn = None
     fm_reward_fn = None
     td3_reward_fn = None
     if _use_repr_ema:
       print(f'[ppo] NF reward param EMA: tau={_repr_tau} '
             f'(density training still uses online NF params)')
+    _clip = _nf.NF_REWARD_LOGP_CLIP
+    if _nf_rew_mode == 'reverse':
+      print(f'[ppo] NF reward mode: reverse  '
+            f'r=exp(clip(log_p,±{_clip:g}))  '
+            f'(density NLL still uses raw log p; ext bonus added after)',
+            flush=True)
+    elif _nf_rew_mode == 'chi_squared':
+      print(f'[ppo] NF reward mode: chi_squared  '
+            f'r=-exp(-clip(log_p,±{_clip:g}))  '
+            f'(density NLL still uses raw log p; ext bonus added after)',
+            flush=True)
+    elif _nf_tanh:
+      print(f'[ppo] NF reward tanh: ON  r={_nf_tanh_scale:g}'
+            f'*tanh(log_p/{_nf_tanh_scale:g})  '
+            f'(density NLL still uses raw log p; ext bonus added after)',
+            flush=True)
+    else:
+      print('[ppo] NF reward mode: forward  r=log_p', flush=True)
     print('[ppo] NF density updates: jax.lax.scan multi-step', flush=True)
   elif use_td3:
     _td3_tau_cfg = float(getattr(config, 'ppo_td3_tau', -1.0))
@@ -3454,13 +3683,22 @@ def run_ppo_training(
         print(f'[ppo] CRL s_f perturb: prob={_sf_p}  eps={_sf_eps}  '
               f'(‖δ‖₂≤eps on packed goal before InfoNCE)')
       if _s_p > 0.0 and _s_eps > 0.0:
-        print(f'[ppo] CRL s perturb: prob={_s_p}  eps={_s_eps}  '
-              f'(‖δ‖₂≤eps on packed state before InfoNCE)')
+        _s_env = str(getattr(config, 'env_name', '') or '')
+        if _s_env.startswith('builderbench_'):
+          _si = int(config.start_index)
+          _ei = int(
+              config.end_index if int(config.end_index) != -1
+              else int(config.obs_dim))
+          print(f'[ppo] CRL s perturb: prob={_s_p}  eps={_s_eps}  '
+                f'(‖δ‖₂≤eps on packed xyz [{_si}:{_ei}], '
+                f'select left alone)')
+        else:
+          print(f'[ppo] CRL s perturb: prob={_s_p}  eps={_s_eps}  '
+                f'(‖δ‖₂≤eps on packed state before InfoNCE)')
       _gr_c = float(getattr(config, 'ppo_crl_grad_reg_c', 100.0))
       _gr_coef = float(getattr(config, 'ppo_crl_grad_reg_coef', 0.0))
-      if _gr_coef > 0.0:
-        print(f'[ppo] CRL ∇_s(φ·ψ) reg: c={_gr_c}  λ={_gr_coef}  '
-              f'(L_reg=λ·E[max(0,‖∇_s(φ·ψ)‖−c)])')
+      print(f'[ppo] CRL ∇_s(φ·ψ): log always (c={_gr_c}); '
+            f'in-loss={"on" if _gr_coef > 0.0 else "off"}  λ={_gr_coef}')
       _hit = (getattr(config, 'ppo_crl_hit_bonus', '') or '').strip().lower()
       if _hit:
         _hit_g = getattr(config, 'ppo_crl_hit_bonus_goal', None)
@@ -3870,6 +4108,28 @@ def run_ppo_training(
   nf_goal_std  = np.ones(goal_dim_cfg,  dtype=np.float32)
   fm_goal_mean = np.zeros(goal_dim_cfg, dtype=np.float32)
   fm_goal_std  = np.ones(goal_dim_cfg,  dtype=np.float32)
+  _nf_normalize_goals = bool(getattr(config, 'nf_normalize_goals', True))
+  _nf_zero_mean_j = jnp.zeros((goal_dim_cfg,), dtype=jnp.float32)
+  _nf_unit_std_j = jnp.ones((goal_dim_cfg,), dtype=jnp.float32)
+
+  def _nf_apply_goal_stats():
+    """Stats actually fed to the flow (identity if normalisation is off)."""
+    if _nf_normalize_goals:
+      return jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std)
+    return _nf_zero_mean_j, _nf_unit_std_j
+
+  if use_nf:
+    if _nf_normalize_goals:
+      print('[ppo] NF goal norm: ON  (g-replay_mean)/max(replay_std, floor) '
+            'in train + reward', flush=True)
+    else:
+      print('[ppo] NF goal norm: OFF  raw goals in train + reward '
+            '(logged nf/goal_mean_*, nf/goal_std_* still from replay)',
+            flush=True)
+    if bool(getattr(config, 'nf_mix_task_goal_stats', False)):
+      print('[ppo] NF goal stats: mix batch_size replay s_f + '
+            f'batch_size copies of env task goal '
+            f'(batch_size={int(config.batch_size)})', flush=True)
 
   obs = vec_env.reset()
   next_done = np.zeros(E, dtype=np.float32)
@@ -4058,20 +4318,80 @@ def run_ppo_training(
   # global_step, ppo_sgd_step, start_iteration set above (0 for fresh runs,
   # restored from checkpoint on resume).
 
-  # Adaptive λ for the ∇_s(φ·ψ) regularizer.  Maintained as a Python float;
-  # updated between PPO iterations via EMA toward the target ratio so that
-  # running_avg(L_reg) stays ≈ _gr_rel * running_avg(L_CRL).
-  # λ is constant within each JIT scan (so larger excess → larger penalty).
-  _gr_coef_cfg = float(getattr(config, 'ppo_crl_grad_reg_coef', 5e-4))
+  # λ for NF/CRL ∇_s regularizer.  NF dual updates λ inside the scan when
+  # lam_lr > 0; otherwise λ stays at this init for the whole run.
+  _gr_coef_cfg = float(getattr(config, 'ppo_crl_grad_reg_coef', 0.0))
   _nf_gr_do = bool(getattr(config, 'ppo_nf_grad_reg', False)) and use_nf
   _gr_do = (
       _gr_coef_cfg > 0.0 and obs_dim_cfg > 0
       and (repr_mode in ('crl', 'crl_td3_switch') or _nf_gr_do))
   _gr_rel = float(getattr(config, 'ppo_crl_grad_reg_rel', 0.1))
-  _gr_lam = float(max(_gr_coef_cfg, 1e-8))
-  _gr_lam_alpha = 0.05   # EMA speed: ~20 iters to converge
+  _nf_lam_cfg = float(getattr(config, 'ppo_nf_grad_reg_lam', -1.0))
+  if _nf_gr_do and _nf_lam_cfg >= 0.0:
+    _gr_lam = float(_nf_lam_cfg)
+  else:
+    _gr_lam = float(max(_gr_coef_cfg, 1e-8)) if _gr_do else 0.0
+  _gr_lam_alpha = 0.05   # EMA speed (CRL only): ~20 iters to converge
   _gr_lam_min   = 1e-8
-  _gr_lam_max   = 1.0    # hard cap so it can't swamp InfoNCE
+  _gr_lam_max   = 1.0    # hard cap so it can't swamp InfoNCE / NLL
+  if _nf_gr_do:
+    _nf_lam_lr_log = float(getattr(config, 'ppo_nf_grad_reg_lam_lr', -1.0))
+    _nf_lam_mode = 'fixed' if _nf_lam_lr_log == 0.0 else 'dual (inside scan)'
+    print(f'[ppo] NF grad-reg λ init={_gr_lam}  mode={_nf_lam_mode}')
+  # Skip logging keys for features that are off. λ / ∇_s diagnostics stay
+  # even when the regularizer is not in the loss.
+  _hit_on = bool((getattr(config, 'ppo_crl_hit_bonus', '') or '').strip())
+  _sf_pert_on = float(getattr(config, 'ppo_crl_sf_perturb_prob', 0.0)) > 0.0
+  _s_pert_on = float(getattr(config, 'ppo_crl_s_perturb_prob', 0.0)) > 0.0
+  _crl_log_skip = set()
+  if not _hit_on:
+    _crl_log_skip.add('crl_hit_bonus_frac')
+  if not _sf_pert_on:
+    _crl_log_skip.update(('crl_sf_perturb_frac', 'crl_sf_perturb_norm'))
+  if not _s_pert_on:
+    _crl_log_skip.update(('crl_s_perturb_frac', 'crl_s_perturb_norm'))
+  _nf_log_skip = set()
+  if not _s_pert_on:
+    _nf_log_skip.update(('nf_s_perturb_frac', 'nf_s_perturb_norm'))
+  if float(getattr(config, 'nf_mask_prob', 0.0)) <= 0.0:
+    _nf_log_skip.add('nf_mask_frac')
+  if nf_density_nets is None or nf_density_nets.goal_encoder_net is None:
+    _nf_log_skip.add('goal_enc_grad_norm')
+  if not bool(getattr(config, 'nf_scale_tanh', False)):
+    _nf_log_skip.update(('s_raw_mean', 's_mean'))
+
+  # PPO-penalty adaptive β (Schulman §4).  Initialized once and adapted across
+  # the full run (not reset per iteration).
+  _kl_penalty_on = float(getattr(config, 'ppo_kl_penalty_coef', 0.0)) > 0
+  _kl_target = float(getattr(config, 'ppo_kl_penalty_target', 0.01))
+  _kl_beta = float(getattr(config, 'ppo_kl_penalty_coef', 0.0))
+  _kl_beta_min = float(getattr(config, 'ppo_kl_penalty_beta_min', 0.0))
+  _kl_adapt_epoch = bool(getattr(config, 'ppo_kl_penalty_adapt_epoch', False))
+  _kl_rollback = bool(getattr(config, 'ppo_kl_early_stop_rollback', False))
+  _kl_es_cooldown_iters = int(getattr(config, 'ppo_target_kl_reset_cooldown', 0))
+  _kl_es_cooldown = 0
+  _last_kl_beta = _kl_beta
+  if _kl_beta_min > 0.0 and _kl_penalty_on:
+    _kl_beta = max(_kl_beta, _kl_beta_min)
+    _last_kl_beta = _kl_beta
+
+  def _adapt_kl_beta(d: float) -> None:
+    nonlocal _kl_beta, _last_kl_beta
+    if d < _kl_target / 1.5:
+      _kl_beta /= 2.0
+    elif d > 1.5 * _kl_target:
+      _kl_beta *= 2.0
+    if _kl_beta_min > 0.0:
+      _kl_beta = max(_kl_beta, _kl_beta_min)
+    _last_kl_beta = _kl_beta
+
+  if _kl_penalty_on:
+    print(f'[ppo] KL-penalty: β₀={_kl_beta}, target={_kl_target}, '
+          f'β_min={_kl_beta_min:g}, '
+          f'adapt={"epoch" if _kl_adapt_epoch else "minibatch"}, '
+          f'rollback={_kl_rollback}, '
+          f'reset_cooldown={_kl_es_cooldown_iters}',
+          flush=True)
 
   for iteration in range(start_iteration, num_iterations):
     # One immutable snapshot is shared by every network call in this
@@ -4307,6 +4627,9 @@ def run_ppo_training(
     if sparse_reward_only:
       # Latched: drop denser/repr reward; PPO uses sparse hard-success only.
       roll_rew_raw[:] = 0.0
+    elif use_env_dense:
+      # Opt-in BB baseline: PPO on CreativeCube tanh distance (env_rew).
+      roll_rew_raw[:] = np.asarray(roll_env_rew, dtype=np.float32)
     elif not use_kde_dirac:
       if rollout_j is not None:
         _flat_obs_j = jnp.reshape(rollout_j['obs'], (T * E, -1))
@@ -4315,9 +4638,10 @@ def run_ppo_training(
         _flat_obs_j = jnp.asarray(roll_obs.reshape(T * E, -1))
         _flat_acts_j = jnp.asarray(roll_acts.reshape(T * E, -1))
       if use_nf:
+        _gmean_j, _gstd_j = _nf_apply_goal_stats()
         _rew_flat_j = nf_reward_fn(
             _reward_q_params(), _flat_obs_j, _flat_acts_j,
-            jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std))
+            _gmean_j, _gstd_j)
       elif use_gaussian:
         _rew_flat_j = gaussian_reward_fn(
             _reward_q_params(), _flat_obs_j, _flat_acts_j)
@@ -4598,10 +4922,31 @@ def run_ppo_training(
     ppo_metrics_device: list = []
     early_stop = False
     _need_kl_sync = config.ppo_target_kl is not None
-    for epoch in range(int(config.ppo_num_epochs)):
+    _target_kl = (
+        float(config.ppo_target_kl) if _need_kl_sync else None)
+    _n_mb = int(config.ppo_num_minibatches)
+    _es_epoch = -1
+    _es_mb_approx: list = []
+    _es_mb_analytic: list = []
+    _es_mb_beta: list = []
+    _rolled_back = False
+    _cd_now = _kl_es_cooldown
+    _es_this_iter = bool(_need_kl_sync) and (_cd_now <= 0)
+    if _need_kl_sync and _kl_es_cooldown > 0:
+      print(f'[ppo] target_kl cooldown after actor-reset: '
+            f'{_kl_es_cooldown} iters left (early-stop/rollback off)',
+            flush=True)
+    # Snapshot rollout-time policy params once per iteration for KL penalty.
+    if _kl_penalty_on:
+      _old_ppo_policy_params_j = ppo_params['policy']
+    _n_epochs = int(config.ppo_num_epochs)
+    for epoch in range(_n_epochs):
       perm = np_rng.permutation(batch_per_iter)
-      last_kl = None
-      for start in range(0, batch_per_iter, mb_size):
+      epoch_kl_max = 0.0
+      epoch_mb_approx: list = []
+      epoch_mb_analytic: list = []
+      epoch_mb_beta: list = []
+      for mb_i, start in enumerate(range(0, batch_per_iter, mb_size)):
         mb = jnp.asarray(perm[start:start + mb_size])
         batch = {
             'obs':          flat_obs_j[mb],
@@ -4638,27 +4983,103 @@ def run_ppo_training(
             batch['good_returns'] = jnp.asarray(good_sample['returns'])
 
         key, k_mb = jax.random.split(key)
-        if ent_coef_schedule is not None:
+        params_before = ppo_params
+        opt_before = ppo_opt_state
+        if ent_coef_schedule is not None and _kl_penalty_on:
+          ppo_params, ppo_opt_state, m = ppo_update(
+              ppo_params, ppo_opt_state, batch, k_mb,
+              iter_obs_mean_j, iter_obs_var_j,
+              jnp.asarray(ppo_sgd_step, dtype=jnp.int32),
+              _old_ppo_policy_params_j,
+              jnp.asarray(_kl_beta, dtype=jnp.float32))
+        elif ent_coef_schedule is not None:
           ppo_params, ppo_opt_state, m = ppo_update(
               ppo_params, ppo_opt_state, batch, k_mb,
               iter_obs_mean_j, iter_obs_var_j,
               jnp.asarray(ppo_sgd_step, dtype=jnp.int32))
+        elif _kl_penalty_on:
+          ppo_params, ppo_opt_state, m = ppo_update(
+              ppo_params, ppo_opt_state, batch, k_mb,
+              iter_obs_mean_j, iter_obs_var_j,
+              _old_ppo_policy_params_j,
+              jnp.asarray(_kl_beta, dtype=jnp.float32))
         else:
           ppo_params, ppo_opt_state, m = ppo_update(
               ppo_params, ppo_opt_state, batch, k_mb,
               iter_obs_mean_j, iter_obs_var_j)
-        ppo_sgd_step += 1
+        _mb_approx = float(m['approx_kl'])
+        _mb_analytic = (
+            float(m['analytic_kl']) if _kl_penalty_on else float('nan'))
+        _trip = _need_kl_sync and _mb_approx > _target_kl
+        if _trip and (not _es_this_iter):
+          print(f'[ppo] target_kl SKIP (actor-reset cooldown) '
+                f'iter={iteration} epoch={epoch}/{_n_epochs - 1} '
+                f'mb={mb_i}/{_n_mb - 1} approx_kl={_mb_approx:.6g} '
+                f'threshold={_target_kl:g}',
+                flush=True)
+        elif _trip and _kl_rollback:
+          # Discard this minibatch's update and end the iteration.
+          ppo_params = params_before
+          ppo_opt_state = opt_before
+          early_stop = True
+          _rolled_back = True
+          _es_epoch = int(epoch)
+          epoch_mb_approx.append(_mb_approx)
+          if _kl_penalty_on:
+            epoch_mb_analytic.append(_mb_analytic)
+            epoch_mb_beta.append(_kl_beta)
+          _es_mb_approx = epoch_mb_approx
+          _es_mb_analytic = epoch_mb_analytic
+          _es_mb_beta = epoch_mb_beta
+          _an_s = (f'{_mb_analytic:.6g}' if _kl_penalty_on else 'n/a')
+          print(f'[ppo] target_kl ROLLBACK iter={iteration} '
+                f'epoch={epoch}/{_n_epochs - 1} mb={mb_i}/{_n_mb - 1} '
+                f'threshold={_target_kl:g} approx_kl={_mb_approx:.6g} '
+                f'analytic_kl={_an_s}',
+                flush=True)
+          print('[ppo]   discarded this minibatch update; '
+                'stopping remaining epochs',
+                flush=True)
+          if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic[:-1]:
+            _adapt_kl_beta(float(np.mean(epoch_mb_analytic[:-1])))
+          break
         ppo_metrics_device.append(m)
+        epoch_mb_approx.append(_mb_approx)
         if use_good_buffer and good_replay is not None:
           ppo_metrics_agg.setdefault('good_buffer_size', []).append(float(good_replay.size))
           ppo_metrics_agg.setdefault('good_buffer_episodes', []).append(float(good_replay.episodes_added))
-        # Only sync KL when early-stopping is enabled (default: off).
         if _need_kl_sync:
-          last_kl = float(m['approx_kl'])
-      if (_need_kl_sync and last_kl is not None
-          and last_kl > float(config.ppo_target_kl)):
-        early_stop = True
+          epoch_kl_max = max(epoch_kl_max, _mb_approx)
+        if _kl_penalty_on:
+          epoch_mb_analytic.append(_mb_analytic)
+          if not _kl_adapt_epoch:
+            _adapt_kl_beta(_mb_analytic)
+          epoch_mb_beta.append(_kl_beta)
+      if _rolled_back:
         break
+      if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic:
+        _adapt_kl_beta(float(np.mean(epoch_mb_analytic)))
+      if _es_this_iter and (not _kl_rollback) and epoch_kl_max > _target_kl:
+        early_stop = True
+        _es_epoch = int(epoch)
+        _es_mb_approx = epoch_mb_approx
+        _es_mb_analytic = epoch_mb_analytic
+        _es_mb_beta = epoch_mb_beta
+        _approx_s = ', '.join(f'{x:.6g}' for x in _es_mb_approx)
+        print(f'[ppo] target_kl early-stop iter={iteration} '
+              f'epoch={epoch}/{_n_epochs - 1} '
+              f'threshold={_target_kl:g} max={epoch_kl_max:.6g} '
+              f'mb_approx_kl=[{_approx_s}]',
+              flush=True)
+        if _kl_penalty_on:
+          _an_s = ', '.join(f'{x:.6g}' for x in _es_mb_analytic)
+          _b_s = ', '.join(f'{x:.6g}' for x in _es_mb_beta)
+          print(f'[ppo]   mb_analytic_kl=[{_an_s}]', flush=True)
+          print(f'[ppo]   mb_beta_after=[{_b_s}]', flush=True)
+        break
+
+    if _kl_es_cooldown > 0:
+      _kl_es_cooldown -= 1
 
     # One host sync for all PPO metrics after the epoch loop.
     ppo_metrics_agg: Dict[str, list] = {}
@@ -4701,7 +5122,10 @@ def run_ppo_training(
         _nf_normalizer_reset_done = True
       if use_nf:
         _std_floor = float(getattr(config, 'nf_goal_std_min', 0.02))
-        _stat_batch = replay.sample(min(2048, replay.size), np_rng)
+        _mix_task = bool(getattr(config, 'nf_mix_task_goal_stats', False))
+        _n_sf = int(config.batch_size) if _mix_task else min(2048, replay.size)
+        _n_sf = min(_n_sf, int(replay.size))
+        _stat_batch = replay.sample(_n_sf, np_rng)
         _goals = _stat_batch['obs'][:, int(config.obs_dim):]
         # Optionally mix in the actual env goals from the current rollout so
         # that the running stats cover both hindsight goals AND reward goals.
@@ -4715,6 +5139,21 @@ def run_ppo_training(
             _env_goals = roll_obs.reshape(
                 -1, roll_obs.shape[-1])[:, int(config.obs_dim):]
           _goals = np.concatenate([_goals, _env_goals], axis=0)
+        if _mix_task:
+          if rollout_j is not None:
+            _g_task = np.asarray(
+                rollout_j['obs'].reshape(-1, rollout_j['obs'].shape[-1])
+                [0, int(config.obs_dim):],
+                dtype=np.float32)
+          else:
+            _g_task = roll_obs.reshape(
+                -1, roll_obs.shape[-1])[0, int(config.obs_dim):].astype(
+                    np.float32)
+          _n_task = int(config.batch_size)
+          _goals = np.concatenate(
+              [_goals, np.repeat(_g_task[None], _n_task, axis=0)], axis=0)
+          _nf_stat_log['nf/goal_stat_n_sf'] = float(_n_sf)
+          _nf_stat_log['nf/goal_stat_n_task'] = float(_n_task)
         nf_goal_mean = _goals.mean(axis=0).astype(np.float32)
         nf_goal_std  = _goals.std(axis=0).astype(np.float32)
         nf_goal_std  = np.maximum(nf_goal_std, _std_floor).astype(np.float32)
@@ -4793,27 +5232,23 @@ def run_ppo_training(
         _stacked = {
             k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
             for k_ in _samples[0]}
+        _gmean_j, _gstd_j = _nf_apply_goal_stats()
         if use_nf_td:
           (q_params, q_opt_state, nf_td_target, q_params_reward,
            key, m) = nf_scan_td_update(
               q_params, q_opt_state, nf_td_target, q_params_reward,
               _stacked, key,
-              jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std),
+              _gmean_j, _gstd_j,
               ppo_params['policy'])
         else:
           (q_params, q_opt_state, q_params_reward,
-           key, m) = nf_scan_update(
+           key, _gr_lam_j, m) = nf_scan_update(
               q_params, q_opt_state, q_params_reward, _stacked, key,
-              jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std),
+              _gmean_j, _gstd_j,
               jnp.array(_gr_lam, dtype=jnp.float32))
+          # Dual mode: λ updated inside scan; keep Python float for next iter.
+          _gr_lam = float(_gr_lam_j)
         crl_metrics_agg = {k_: [float(v)] for k_, v in m.items()}
-        if _gr_do and 'nf_grad_reg_raw' in m:
-          _reg_raw = float(m['nf_grad_reg_raw'])
-          _nll_val = float(m['density_loss'])
-          _target = _gr_rel * _nll_val / (_reg_raw + 1e-8)
-          _gr_lam = float(np.clip(
-              (1 - _gr_lam_alpha) * _gr_lam + _gr_lam_alpha * _target,
-              _gr_lam_min, _gr_lam_max))
       elif use_td3:
         _samples = [
             (replay.sample_with_uniform_negatives(
@@ -4974,19 +5409,22 @@ def run_ppo_training(
         'repr_rT_minus_r0_mean_fail': float(_rT_r0_fail),
         'repr_rT_minus_r0_n_ep_succ': float(_rT_r0_n_succ),
         'repr_rT_minus_r0_n_ep_fail': float(_rT_r0_n_fail),
-        'reward_return_norm_std': (
-            float(reward_normalizer.std) if reward_normalizer is not None
-            else float('nan')),
         'reward_env_mean':       float(roll_env_rew.mean()),
         'value_mean':        float(roll_vals.mean()),
         'returns_mean':      float(ret.mean()),
         'advantage_mean':    float(adv.mean()),
         'advantage_std':     float(adv.std()),
+        'advantage_min':     float(adv.min()),
+        'advantage_max':     float(adv.max()),
+        'advantage_p01':     float(np.percentile(adv, 1)),
+        'advantage_p99':     float(np.percentile(adv, 99)),
         'early_stop_epochs': int(early_stop),
         'ep_return_mean':    float(np.mean(recent_returns)) if recent_returns else float('nan'),
         'ep_length_mean':    float(np.mean(recent_lengths)) if recent_lengths else float('nan'),
         'ppo/mean_pg_loss':  mean_pg,
     }
+    if reward_normalizer is not None:
+      log['reward_return_norm_std'] = float(reward_normalizer.std)
     if _track_train_success:
       log['train_success_mean'] = (
           float(np.mean(recent_success[-100:]))
@@ -4994,12 +5432,13 @@ def run_ppo_training(
       log['train_success_1000'] = (
           float(np.mean(recent_success[-1000:]))
           if recent_success else float('nan'))
-      log['train_very_hard_success_mean'] = (
-          float(np.mean(recent_very_hard_success[-100:]))
-          if recent_very_hard_success else float('nan'))
-      log['train_very_hard_success_1000'] = (
-          float(np.mean(recent_very_hard_success[-1000:]))
-          if recent_very_hard_success else float('nan'))
+      if _use_jax_bb_vec:
+        log['train_very_hard_success_mean'] = (
+            float(np.mean(recent_very_hard_success[-100:]))
+            if recent_very_hard_success else float('nan'))
+        log['train_very_hard_success_1000'] = (
+            float(np.mean(recent_very_hard_success[-1000:]))
+            if recent_very_hard_success else float('nan'))
     if use_crl_td3_switch:
       log['reward_source_td3'] = float(_reward_uses_td3_this_iter)
       log['reward_td3_weight'] = float(_reward_td3_weight)
@@ -5015,10 +5454,10 @@ def run_ppo_training(
       log['freeze_repr_streak'] = int(freeze_repr_streak)
       log['freeze_repr_switch_iteration'] = int(freeze_repr_switch_iteration)
       log['crl_steps_per_iter'] = int(config.ppo_crl_steps_per_iter)
-    log['obs_norm_enabled'] = float(norm_obs)
-    log['obs_norm_count'] = float(obs_rms.count)
-    log['obs_norm_mean_abs'] = float(np.mean(np.abs(obs_rms.mean)))
-    log['obs_norm_std_mean'] = float(np.mean(np.sqrt(iter_obs_var + 1e-8)))
+    if norm_obs:
+      log['obs_norm_count'] = float(obs_rms.count)
+      log['obs_norm_mean_abs'] = float(np.mean(np.abs(obs_rms.mean)))
+      log['obs_norm_std_mean'] = float(np.mean(np.sqrt(iter_obs_var + 1e-8)))
 
     # Acme CSVLogger fixes columns on the *first* write and drops any later
     # keys.  Seed density-mode columns from iter 0 so training metrics land in CSV.
@@ -5064,8 +5503,16 @@ def run_ppo_training(
           'sa/repr_norm': float('nan'),
           'sa/encoder_grad_norm': float('nan'),
       })
+      if _s_pert_on:
+        log['nf/nf_s_perturb_frac'] = float('nan')
+        log['nf/nf_s_perturb_norm'] = float('nan')
+      if float(getattr(config, 'nf_mask_prob', 0.0)) > 0.0:
+        log['nf/nf_mask_frac'] = float('nan')
       if nf_density_nets.goal_encoder_net is not None:
         log['nf/goal_enc_grad_norm'] = float('nan')
+      if bool(getattr(config, 'nf_scale_tanh', False)):
+        log['nf/s_raw_mean'] = float('nan')
+        log['nf/s_mean'] = float('nan')
       for _di in range(goal_dim_cfg):
         log[f'nf/goal_mean_{_di}'] = float('nan')
         log[f'nf/goal_std_{_di}']  = float('nan')
@@ -5080,6 +5527,14 @@ def run_ppo_training(
           'crl/crl_phi_psi_grad_s_norm_max': float('nan'),
           'crl/crl_phi_psi_grad_s_frac_above_c': float('nan'),
       })
+      if _hit_on:
+        log['crl/crl_hit_bonus_frac'] = float('nan')
+      if _sf_pert_on:
+        log['crl/crl_sf_perturb_frac'] = float('nan')
+        log['crl/crl_sf_perturb_norm'] = float('nan')
+      if _s_pert_on:
+        log['crl/crl_s_perturb_frac'] = float('nan')
+        log['crl/crl_s_perturb_norm'] = float('nan')
 
     # Flow-dense benchmark reward: only when the env provides it.
     if _has_flow_dense:
@@ -5091,60 +5546,89 @@ def run_ppo_training(
     # PPO update metrics (always present).
     for k_, vs in ppo_metrics_agg.items():
       log[f'ppo/{k_}'] = float(np.mean(vs))
+    if ppo_metrics_agg.get('approx_kl'):
+      log['ppo/approx_kl_max'] = float(np.max(ppo_metrics_agg['approx_kl']))
+    if _need_kl_sync:
+      log['ppo/early_stop_epoch'] = int(_es_epoch)
+      for _i in range(_n_mb):
+        log[f'ppo/es_mb_approx_kl_{_i}'] = (
+            float(_es_mb_approx[_i]) if _i < len(_es_mb_approx)
+            else float('nan'))
+        if _kl_penalty_on:
+          log[f'ppo/es_mb_analytic_kl_{_i}'] = (
+              float(_es_mb_analytic[_i]) if _i < len(_es_mb_analytic)
+              else float('nan'))
+          log[f'ppo/es_mb_beta_{_i}'] = (
+              float(_es_mb_beta[_i]) if _i < len(_es_mb_beta)
+              else float('nan'))
+    if _kl_penalty_on:
+      if ppo_metrics_agg.get('analytic_kl'):
+        log['ppo/analytic_kl_max'] = float(np.max(ppo_metrics_agg['analytic_kl']))
+      log['ppo/kl_beta'] = _last_kl_beta
+    log['ppo/kl_rollback'] = float(_rolled_back)
+    log['ppo/target_kl_cooldown'] = float(_cd_now)
+    _ent_vs = ppo_metrics_agg.get('entropy_loss', [])
+    _pg_vs = ppo_metrics_agg.get('pg_loss', [])
+    if _ent_vs and _pg_vs:
+      _ent_m = abs(float(np.mean(_ent_vs)))
+      _pg_m = abs(float(np.mean(_pg_vs)))
+      log['ppo/entropy_pg_abs_ratio'] = _ent_m / max(_pg_m, 1e-12)
+    if ppo_metrics_agg.get('ratio_max'):
+      log['ppo/ratio_max'] = float(np.max(ppo_metrics_agg['ratio_max']))
+    if ppo_metrics_agg.get('logratio_abs_max'):
+      log['ppo/logratio_abs_max'] = float(
+          np.max(ppo_metrics_agg['logratio_abs_max']))
+    log['ppo/n_sgd_steps'] = float(len(ppo_metrics_device))
 
     # Density-estimator metrics: only the active mode.
+    def _put_metrics(agg, prefix, skip=()):
+      for k_, vs in agg.items():
+        if k_ in skip:
+          continue
+        log[f'{prefix}/{k_}'] = float(np.mean(vs))
+
     if use_gaussian:
-      for k_, vs in crl_metrics_agg.items():
-        log[f'gaussian/{k_}'] = float(np.mean(vs))
+      _put_metrics(crl_metrics_agg, 'gaussian')
     elif use_fm:
-      for k_, vs in crl_metrics_agg.items():
-        log[f'fm/{k_}'] = float(np.mean(vs))
+      _put_metrics(crl_metrics_agg, 'fm')
       log['fm/update_steps'] = (
           int(config.ppo_crl_steps_per_iter) if crl_metrics_agg else 0)
     elif use_nf:
       _sa_keys = frozenset({'repr_norm', 'encoder_grad_norm'})
-      _ge_keys = frozenset({'goal_enc_grad_norm'})
       for k_, vs in crl_metrics_agg.items():
-        if k_ in _sa_keys:
-          prefix = 'sa'
-        elif k_ in _ge_keys:
-          prefix = 'nf'
-        else:
-          prefix = 'nf'
+        if k_ in _nf_log_skip:
+          continue
+        prefix = 'sa' if k_ in _sa_keys else 'nf'
         log[f'{prefix}/{k_}'] = float(np.mean(vs))
       # Scan path stores mean metrics (len=1); report configured step count.
       log['nf/update_steps'] = (
           int(config.ppo_crl_steps_per_iter) if crl_metrics_agg else 0)
     elif use_td3:
-      for k_, vs in crl_metrics_agg.items():
-        log[f'td3/{k_}'] = float(np.mean(vs))
+      _put_metrics(crl_metrics_agg, 'td3')
       log['td3/update_steps'] = (
           int(config.ppo_crl_steps_per_iter) if crl_metrics_agg else 0)
     elif use_td_infonce:
-      for k_, vs in crl_metrics_agg.items():
-        log[f'tdinfonce/{k_}'] = float(np.mean(vs))
+      _put_metrics(crl_metrics_agg, 'tdinfonce')
       log['tdinfonce/update_steps'] = (
           int(config.ppo_crl_steps_per_iter) if crl_metrics_agg else 0)
     elif use_crl_td3_switch:
-      for k_, vs in crl_metrics_agg.items():
-        log[f'crl/{k_}'] = float(np.mean(vs))
-      for k_, vs in hybrid_td3_metrics_agg.items():
-        log[f'td3/{k_}'] = float(np.mean(vs))
+      _put_metrics(crl_metrics_agg, 'crl', _crl_log_skip)
+      _put_metrics(hybrid_td3_metrics_agg, 'td3')
       log['crl/update_steps'] = (
           int(config.ppo_crl_steps_per_iter) if crl_metrics_agg else 0)
       log['td3/update_steps'] = (
           int(config.ppo_crl_steps_per_iter)
           if hybrid_td3_metrics_agg else 0)
     else:
-      for k_, vs in crl_metrics_agg.items():
-        log[f'crl/{k_}'] = float(np.mean(vs))
+      _put_metrics(crl_metrics_agg, 'crl', _crl_log_skip)
     if config.ppo_anneal_lr:
       lr_log = float(lr_schedule(max(0, ppo_sgd_step - 1)))
     else:
       lr_log = float(config.learning_rate)
     # Seven fractional digits so CSV / terminal show stable small LRs.
     log['ppo/learning_rate'] = round(lr_log, 7)
-    log.update(_nf_stat_log)
+    if use_nf:
+      log.update(_nf_stat_log)
 
     if _env.startswith('builderbench_'):
       diag_metrics = compute_per_axis_diagnostics(
@@ -5248,7 +5732,6 @@ def run_ppo_training(
           log.update(_fm_logp_stats)
       except Exception as _fm_diag_err:
         print(f'[ppo] FM logp diagnostic warning at iter={iteration}: {_fm_diag_err}', flush=True)
-
     learner_logger.write(log)
 
     if _switch_after_this_iteration:
@@ -5311,6 +5794,11 @@ def run_ppo_training(
         _why = (f'{_reset_kind}; ep_length_mean={_ep_mean:.2f} < '
                 f'{_thresh:.1f} (nominal={_nominal_ep_len})')
       print(f'[ppo] actor reset at iter={iteration}: {_why}')
+      if _kl_es_cooldown_iters > 0:
+        _kl_es_cooldown = int(_kl_es_cooldown_iters)
+        print(f'[ppo]   disabling target_kl early-stop/rollback for the '
+              f'next {_kl_es_cooldown} iters',
+              flush=True)
 
     # =================================================================
     # 6. Periodic evaluation

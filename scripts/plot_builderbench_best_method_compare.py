@@ -303,10 +303,14 @@ USER_OVERRIDES: dict[tuple[str, str], dict] = {
     },
     ('creative7_task2', 'nf'): {
         'name': (
-            'ppo_builderbench_creative7_task2_e1024_pd_nf_compact_sa3x256_r64_b6_w256_'
-            'tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_entanneal_ep70_300m'
+            'ppo_builderbench_creative7_task2_e1024_pd_nf_compact_small_sa3x192_'
+            'r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_'
+            'entanneal_ep70_300m'
         ),
-        'note': 'user: lock clear pick',
+        'note': (
+            'user: compact-small ep70 300m (peak≈0.96 then collapse by 65M); '
+            'replaces large compact sa3x256'
+        ),
     },
     ('creative7_task2', 'td3'): {
         'name': (

@@ -404,6 +404,176 @@ def _render_grad_norm_strip(
   return buf
 
 
+def _render_policy_loc_scale_strip(
+    scale_mean: np.ndarray,
+    scale_min: np.ndarray,
+    loc_abs_mean: np.ndarray,
+    success: np.ndarray,
+    t: int,
+    width: int,
+    height: int = 220,
+    *,
+    title: str = '',
+) -> np.ndarray:
+  """Pre-tanh policy σ (mean/min over xyz+yaw) and mean |μ| vs macro step."""
+  T = len(scale_mean)
+  sm = float(scale_mean[t])
+  smin = float(scale_min[t])
+  lm = float(loc_abs_mean[t])
+  first_succ = int(np.argmax(success >= 0.5)) if np.any(success >= 0.5) else -1
+  dpi = 120
+  fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi,
+                   facecolor='#0f1419')
+  ax = fig.add_axes([0.07, 0.22, 0.72, 0.62])
+  ax.set_facecolor('#0f1419')
+  xs = np.arange(T)
+  ax.plot(xs, scale_mean, color='#3a6a7a', lw=1.4, alpha=0.4, zorder=1)
+  ax.plot(xs[: t + 1], scale_mean[: t + 1], color='#5ec8ff', lw=2.2, zorder=2)
+  ax.plot(xs, scale_min, color='#6a3a2a', lw=1.2, alpha=0.4, zorder=1)
+  ax.plot(xs[: t + 1], scale_min[: t + 1], color='#E8834C', lw=2.0, zorder=2)
+  ax.scatter([t], [sm], s=50, color='#ffe566', edgecolors='#1a1a1a',
+             linewidths=0.8, zorder=4)
+  ax.axvline(t, color='#ffe566', ls=':', lw=1.0, alpha=0.7, zorder=3)
+  if first_succ >= 0:
+    ax.axvline(first_succ, color='#ff8a4c', ls='--', lw=1.2, alpha=0.85,
+               zorder=2)
+  y0 = float(min(np.min(scale_mean), np.min(scale_min)))
+  y1 = float(max(np.max(scale_mean), np.max(scale_min)))
+  pad = 0.08 * max(y1 - y0, 1e-6)
+  ax.set_xlim(-0.5, T - 0.5)
+  ax.set_ylim(y0 - pad, y1 + pad)
+  ax.set_xlabel('macro step t', color='#c8d0d8', fontsize=9)
+  ax.set_ylabel(r'policy $\sigma$ (pre-tanh xyz+yaw)', color='#5ec8ff',
+                fontsize=8)
+  ax.tick_params(colors='#9aa7b5', labelsize=8)
+  ax.tick_params(axis='y', colors='#5ec8ff')
+  for spine in ax.spines.values():
+    spine.set_color('#3a4654')
+  ax.grid(True, color='#2a3540', alpha=0.7, lw=0.6)
+
+  ax2 = ax.twinx()
+  ax2.plot(xs, loc_abs_mean, color='#6a4a7a', lw=1.2, alpha=0.4, zorder=1)
+  ax2.plot(xs[: t + 1], loc_abs_mean[: t + 1], color='#e0c3ff', lw=2.0,
+           zorder=2)
+  ax2.scatter([t], [lm], s=36, color='#e0c3ff', edgecolors='#1a1a1a',
+              linewidths=0.6, zorder=4)
+  l0 = float(np.min(loc_abs_mean))
+  l1 = float(np.max(loc_abs_mean))
+  lpad = 0.08 * max(l1 - l0, 1e-6)
+  ax2.set_ylim(l0 - lpad, l1 + lpad)
+  ax2.set_ylabel(r'mean $|\mu|$', color='#e0c3ff', fontsize=8)
+  ax2.tick_params(colors='#e0c3ff', labelsize=8)
+
+  ax_txt = fig.add_axes([0.80, 0.22, 0.18, 0.62])
+  ax_txt.set_facecolor('#0f1419')
+  ax_txt.axis('off')
+  ax_txt.text(0.05, 0.92, r'$\sigma$ mean', transform=ax_txt.transAxes,
+              color='#9aa7b5', fontsize=8, va='center')
+  ax_txt.text(0.05, 0.78, f'{sm:.3f}', transform=ax_txt.transAxes,
+              color='#5ec8ff', fontsize=13, fontweight='bold', va='center')
+  ax_txt.text(0.05, 0.60, r'$\sigma$ min', transform=ax_txt.transAxes,
+              color='#9aa7b5', fontsize=8, va='center')
+  ax_txt.text(0.05, 0.46, f'{smin:.3f}', transform=ax_txt.transAxes,
+              color='#E8834C', fontsize=13, fontweight='bold', va='center')
+  ax_txt.text(0.05, 0.28, r'mean $|\mu|$', transform=ax_txt.transAxes,
+              color='#9aa7b5', fontsize=8, va='center')
+  ax_txt.text(0.05, 0.14, f'{lm:.3f}', transform=ax_txt.transAxes,
+              color='#e0c3ff', fontsize=13, fontweight='bold', va='center')
+  fig.suptitle(
+      title or r'policy $\mu,\sigma$ (mode-cube xyz+yaw)',
+      color='#e8eef4', fontsize=10, y=0.96)
+  canvas = FigureCanvasAgg(fig)
+  canvas.draw()
+  buf = np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
+  plt.close(fig)
+  if buf.shape[1] != width or buf.shape[0] != height:
+    buf = np.asarray(
+        Image.fromarray(buf).resize((width, height), Image.Resampling.LANCZOS))
+  return buf
+
+
+def _render_gae_strip(
+    advantage: np.ndarray,
+    value: np.ndarray,
+    success: np.ndarray,
+    t: int,
+    width: int,
+    height: int = 220,
+    *,
+    title: str = '',
+) -> np.ndarray:
+  """Raw GAE A_t (return-std reward, no minibatch-norm) and V(s_t)."""
+  T = len(advantage)
+  a_now = float(advantage[t])
+  v_now = float(value[t])
+  first_succ = int(np.argmax(success >= 0.5)) if np.any(success >= 0.5) else -1
+  dpi = 120
+  fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi,
+                   facecolor='#0f1419')
+  ax = fig.add_axes([0.07, 0.22, 0.72, 0.62])
+  ax.set_facecolor('#0f1419')
+  xs = np.arange(T)
+  ax.axhline(0.0, color='#c8d0d8', ls='-', lw=0.8, alpha=0.55, zorder=1)
+  ax.plot(xs, advantage, color='#2a5a4a', lw=1.6, alpha=0.45, zorder=2)
+  ax.plot(xs[: t + 1], advantage[: t + 1], color='#5ee8a8', lw=2.4, zorder=3)
+  ax.scatter([t], [a_now], s=55, color='#ffe566', edgecolors='#1a1a1a',
+             linewidths=0.8, zorder=5)
+  ax.axvline(t, color='#ffe566', ls=':', lw=1.0, alpha=0.7, zorder=4)
+  if first_succ >= 0:
+    ax.axvline(first_succ, color='#ff8a4c', ls='--', lw=1.2, alpha=0.85,
+               zorder=3)
+  a0 = float(np.min(advantage))
+  a1 = float(np.max(advantage))
+  pad = 0.08 * max(a1 - a0, 1e-6)
+  ax.set_xlim(-0.5, T - 0.5)
+  ax.set_ylim(a0 - pad, a1 + pad)
+  ax.set_xlabel('macro step t', color='#c8d0d8', fontsize=9)
+  ax.set_ylabel(r'GAE $A_t$ (raw)', color='#5ee8a8', fontsize=8)
+  ax.tick_params(colors='#9aa7b5', labelsize=8)
+  ax.tick_params(axis='y', colors='#5ee8a8')
+  for spine in ax.spines.values():
+    spine.set_color('#3a4654')
+  ax.grid(True, color='#2a3540', alpha=0.7, lw=0.6)
+
+  ax2 = ax.twinx()
+  ax2.plot(xs, value, color='#3a5a7a', lw=1.2, alpha=0.4, zorder=1)
+  ax2.plot(xs[: t + 1], value[: t + 1], color='#4C9BE8', lw=2.0, zorder=2)
+  ax2.scatter([t], [v_now], s=36, color='#4C9BE8', edgecolors='#1a1a1a',
+              linewidths=0.6, zorder=4)
+  v0 = float(np.min(value))
+  v1 = float(np.max(value))
+  vpad = 0.08 * max(v1 - v0, 1e-6)
+  ax2.set_ylim(v0 - vpad, v1 + vpad)
+  ax2.set_ylabel(r'$V(s_t)$', color='#4C9BE8', fontsize=8)
+  ax2.tick_params(colors='#4C9BE8', labelsize=8)
+
+  ax_txt = fig.add_axes([0.80, 0.22, 0.18, 0.62])
+  ax_txt.set_facecolor('#0f1419')
+  ax_txt.axis('off')
+  a_col = '#5ee8a8' if a_now >= 0.0 else '#E8834C'
+  ax_txt.text(0.05, 0.88, r'$A_t$', transform=ax_txt.transAxes,
+              color='#9aa7b5', fontsize=9, va='center')
+  ax_txt.text(0.05, 0.70, f'{a_now:+.3f}', transform=ax_txt.transAxes,
+              color=a_col, fontsize=14, fontweight='bold', va='center')
+  ax_txt.text(0.05, 0.48, r'$V(s_t)$', transform=ax_txt.transAxes,
+              color='#9aa7b5', fontsize=9, va='center')
+  ax_txt.text(0.05, 0.30, f'{v_now:.3f}', transform=ax_txt.transAxes,
+              color='#4C9BE8', fontsize=14, fontweight='bold', va='center')
+  ax_txt.text(0.05, 0.10, f't = {t}/{T - 1}', transform=ax_txt.transAxes,
+              color='#c8d0d8', fontsize=10, va='center')
+  fig.suptitle(
+      title or r'GAE $A_t$  (return-std $r$, no minibatch-norm)',
+      color='#e8eef4', fontsize=10, y=0.96)
+  canvas = FigureCanvasAgg(fig)
+  canvas.draw()
+  buf = np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
+  plt.close(fig)
+  if buf.shape[1] != width or buf.shape[0] != height:
+    buf = np.asarray(
+        Image.fromarray(buf).resize((width, height), Image.Resampling.LANCZOS))
+  return buf
+
+
 def select_action_to_cube(select: np.ndarray, num_cubes: int,
                           select_scale: float = np.pi) -> np.ndarray:
   """Map continuous PD ``select_action`` ∈ [-1, 1] → cube index (BuilderBench)."""

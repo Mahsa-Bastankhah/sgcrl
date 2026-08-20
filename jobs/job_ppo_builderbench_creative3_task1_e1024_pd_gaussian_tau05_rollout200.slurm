@@ -125,7 +125,7 @@ python -u ppo_contrastive.py \
   --log_dir_path="${LOG_DIR}" \
   --ppo_num_envs="${PPO_NUM_ENVS}" \
   --ppo_rollout_length="${ROLLOUT_LENGTH}" \
-  --ppo_crl_steps_per_iter=25 \
+  --ppo_crl_steps_per_iter=10 \
   --ppo_ent_coef="${ENT_COEF}" \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \

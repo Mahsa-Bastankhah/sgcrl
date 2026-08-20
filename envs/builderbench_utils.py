@@ -393,14 +393,11 @@ def ppo_env_defaults(
 ) -> dict:
   """Non-rollout/CRL PPO defaults scaled to BuilderBench creative episode length.
 
-  NOTE: for PD mode (``use_pd=True``), this deliberately does NOT return
-  ``rollout_length``/``crl_steps_per_iter`` any more. Those used to be
-  silently auto-computed here (``rollout_length // 2``-style formula
-  copy-pasted from the point-maze defaults) and would override whatever a
-  job script implied, with no visible flag. Every BuilderBench PD job must
-  now pass ``--ppo_rollout_length`` and ``--ppo_crl_steps_per_iter``
-  explicitly; see ``contrastive.config.ContrastiveConfig`` for the raw
-  fallback defaults if neither is a passed.
+  PD mode (``use_pd=True``) still omits ``rollout_length``: episode length
+  varies per job (50/60/70) so scripts must pass ``--ppo_rollout_length``.
+  CRL/NF/TD3 updates per iter default to 10 (same as Sawyer). Override with
+  ``--ppo_crl_steps_per_iter``. Non-PD used to copy the maze formula
+  ``rollout_length // 2``; that is also 10 now.
   """
   episode_length = creative_cube_mj_episode_length(num_cubes, task_index)
   # Full cube-xyz region in state (used when mask is all-True).
@@ -414,6 +411,7 @@ def ppo_env_defaults(
         num_cubes, task_index, start_index=0).tolist()
   if use_pd:
     out = dict(
+        crl_steps_per_iter=10,
         start_index=0,
         end_index=pos_end if goal_state_indices is not None else goal_dim,
         eval_interval=30,
@@ -423,7 +421,7 @@ def ppo_env_defaults(
     rollout_length = min(512, max(256, episode_length))
     out = dict(
         rollout_length=rollout_length,
-        crl_steps_per_iter=rollout_length // 2,
+        crl_steps_per_iter=10,
         start_index=0,
         end_index=pos_end if goal_state_indices is not None else goal_dim,
         num_envs=64,

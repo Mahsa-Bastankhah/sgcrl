@@ -40,7 +40,11 @@ import contrastive
 from contrastive import ppo_learner
 from contrastive import utils as contrastive_utils
 import env_utils
-from ppo_contrastive import fixed_goal_dict
+# Do not import ppo_contrastive at module load. In-train Sawyer NF video
+# `_load_script`s this file from a process that already ran
+# `python ppo_contrastive.py` as `__main__`; a top-level import would
+# re-execute the entrypoint and redefine absl flags ("flag defined twice").
+# `_get_render_fn` must stay import-free of ppo_contrastive.
 
 # Metaworld/Sawyer cameras.  'corner' works for bin/box/peg; 'topview'
 # and 'behindGripper' exist too if you want a different angle.
@@ -59,6 +63,7 @@ def _build_networks(env_name, seed):
   loaded params won't plug in cleanly.  We read them off a fresh
   ContrastiveConfig so this file stays in sync with config.py defaults.
   """
+  from ppo_contrastive import fixed_goal_dict
   probe_env, obs_dim = contrastive_utils.make_environment(
       env_name, start_index=0, end_index=-1, seed=seed,
       fixed_start_end=fixed_goal_dict[env_name])
@@ -228,6 +233,7 @@ def _resolve_output_path(output_arg: str, env: str, label: str,
 
 
 def main():
+  from ppo_contrastive import fixed_goal_dict
   parser = argparse.ArgumentParser()
   parser.add_argument('--checkpoint', required=True,
                       help='Path to a single .pkl OR a directory containing '

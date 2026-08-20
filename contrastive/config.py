@@ -188,6 +188,28 @@ class ContrastiveConfig:
   ppo_good_buffer_min_cubes: int = 2  # Min cubes stacked (2, 3, 4) to store trajectory
   ppo_good_buffer_coef: float = 0.1  # SIL loss weight (or mix ratio for 'mixed' mode)
   ppo_good_buffer_max_size: int = 50_000  # Max transitions in Good Experience Buffer
+  # PPO-penalty trust region (adaptive β, Schulman et al. §4).
+  # When > 0, adds β · KL(π_rollout ‖ π_now) to each minibatch loss.
+  # KL is the analytic pre-tanh Gaussian KL (+ categorical term for hybrid actors).
+  # β is initialized to this value and adapted (per minibatch by default,
+  # or once per epoch if ppo_kl_penalty_adapt_epoch):
+  #   β ← β/2  if KL < target/1.5
+  #   β ← 2·β  if KL > 1.5·target
+  # optional floor ppo_kl_penalty_beta_min. 0 = off (default).
+  ppo_kl_penalty_coef: float = 0.0
+  # Target KL for adaptive β adaptation (d_targ in the PPO paper; default 0.01).
+  ppo_kl_penalty_target: float = 0.01
+  # Floor on adaptive β. 0 = no floor (β can underflow to 0, the old behavior).
+  ppo_kl_penalty_beta_min: float = 0.0
+  # If True, adapt β once per epoch from mean analytic KL of kept minibatches
+  # instead of after every minibatch.
+  ppo_kl_penalty_adapt_epoch: bool = False
+  # If True, a minibatch with approx_kl > ppo_target_kl rolls back that
+  # update and ends the iteration immediately (does not finish the epoch).
+  ppo_kl_early_stop_rollback: bool = False
+  # After an actor reset, skip target-KL early-stop / rollback for this many
+  # subsequent iterations (0 = no cooldown).
+  ppo_target_kl_reset_cooldown: int = 0
   # Minimum policy std for the PPO actor.  The shared `make_networks`
   # floor is 1e-6 (fine for SAC where adaptive-α controls entropy); PPO
   # has no such mechanism and historically used a larger floor (~0.01)
@@ -232,6 +254,8 @@ class ContrastiveConfig:
   ppo_crl_sf_perturb_eps: float = 1e-2
   # Same L2-ball jitter on the packed state slice s (φ input) before InfoNCE.
   # Independent of s_f perturb.  0 disables (default).
+  # BuilderBench: noise is on cube xyz only (start_index:end_index); the
+  # trailing select scalar is left unchanged.  Other envs: all of s.
   ppo_crl_s_perturb_prob: float = 0.0
   ppo_crl_s_perturb_eps: float = 1e-2
   # Penalty on ‖∇_s (φ(s,a)·ψ(s_f))‖ during InfoNCE:
@@ -248,6 +272,13 @@ class ContrastiveConfig:
   # NF analog of the CRL hinge, off by default.  ∇_s log p stats are always
   # logged; the hinge enters the NLL only when this flag is True (and coef>0).
   ppo_nf_grad_reg: bool = False
+  # NF λ for L = NLL + λ·E[‖∇_s log p‖].  <0 → init from
+  # ppo_crl_grad_reg_coef.  Set to 1.0 with ppo_nf_grad_reg_lam_lr=0 for a
+  # fixed-λ ablation.
+  ppo_nf_grad_reg_lam: float = -1.0
+  # Dual step size for λ.  <0 → auto 100×nf_critic_lr (primal-dual).
+  # 0 → λ fixed (no dual update).  >0 → that absolute lr.
+  ppo_nf_grad_reg_lam_lr: float = -1.0
   # EMA decay τ for φ, ψ used in the PPO reward r = φ·ψ (CRL mode only).
   # Reward uses EMA params: ema ← τ·ema + (1−τ)·online after each CRL step.
   # τ=0 uses online params directly (no EMA).  Higher τ = slower / smoother reward.
@@ -340,6 +371,9 @@ class ContrastiveConfig:
   # r = −φ(s0,a)·ψ(g).  s0 is the episode initial state; a ~ π(·|s).
   # 'kde_dirac': same formula but CRL dot products replaced by Gaussian KDE
   # log-densities estimated from the replay buffer.
+  # 'env_dense': BuilderBench-only opt-in baseline. PPO uses the env's tanh
+  # cube–goal distance reward (CreativeCube state.reward), not φ·ψ. Default
+  # remains '' — do not enable this unless running that baseline.
   ppo_reward_mode: str = ''
   ppo_dirac_eps: float = 1e-6
   # Density estimator used for the PPO shaped reward.
@@ -446,8 +480,25 @@ class ContrastiveConfig:
   nf_critic_weight_decay: float = 1e-6  # AdamW wd for RealNVP (ref)
   nf_grad_clip: float = 1.0     # global-norm gradient clipping for NF (0 = disabled)
   nf_noise_std: float = 0.05   # Gaussian noise added to goals during NF training (0 = disabled)
+  nf_mask_prob: float = 0.0    # P(zero (s,a) in NLL); 0 = off. TD-NF uses ppo_nf_td_mask_prob.
   nf_goal_std_min: float = 0.1  # floor on per-dim replay std (avoids blow-ups on static dims)
+  nf_normalize_goals: bool = True  # if False, skip (g-μ)/σ in NF train + reward (raw goals)
+  nf_reward_tanh: bool = False  # if True, PPO NF reward is scale*tanh(log_p/scale); density NLL unchanged
+  nf_reward_tanh_scale: float = 50.0  # scale for nf_reward_tanh (ignored if flag is False)
+  # PPO NF reward map. Density NLL is always raw log p.
+  #   forward     — r = log p (default)
+  #   reverse     — r = exp(clip(log p, ±80)) = p(g|s,a)
+  #   chi_squared — r = −exp(−clip(log p, ±80)) = −1/p(g|s,a)
+  # nf_reward_tanh is only valid with forward.
+  nf_reward_mode: str = 'forward'
+  # Coupling-scale soft clamp: s = c * tanh(s_raw) inside each affine block.
+  # Off by default (unbounded s, original RealNVP). No extra parameters.
+  nf_scale_tanh: bool = False
+  nf_scale_tanh_c: float = 2.0
   nf_mix_env_goal_stats: bool = False  # also include rollout env goals when computing NF normalisation stats
+  # If True, NF μ/σ is computed from batch_size replay s_f plus batch_size
+  # copies of the current env task goal (obs[:, obs_dim:]), so g_task is not OOD.
+  nf_mix_task_goal_stats: bool = False
   # If True, NF learns p(g|s) / reward r(s) instead of p(g|s,a) / r(s,a).
   # Encoder input is state only; action is ignored at train and reward time.
   nf_state_only: bool = False

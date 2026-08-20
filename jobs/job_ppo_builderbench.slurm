@@ -76,7 +76,7 @@ SEED=${SEED:-0}
 NUM_STEPS=${NUM_STEPS:-200000000}
 LOG_DIR="${LOG_DIR:-logs/ppo_${ENV}/}"
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-8}
-CRL_STEPS=${CRL_STEPS:-128}
+CRL_STEPS=${CRL_STEPS:-10}
 # Replay buffer defaults in ppo_contrastive (when --max_replay_size omitted):
 #   E>=1024 → 10M transitions, E>=256 → 1M transitions.
 ENT_COEF=0.05
