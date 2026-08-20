@@ -128,7 +128,7 @@ python -u ppo_contrastive.py \
   --builderbench_use_pd=true \
   --builderbench_pd_duration=5 \
   --ppo_rollout_length=50 \
-  --ppo_crl_steps_per_iter=25 \
+  --ppo_crl_steps_per_iter=10 \
   --ppo_skip_first_eval=true \
   --ppo_eval_interval=0 \
   --max_replay_size="${MAX_REPLAY_SIZE}" \

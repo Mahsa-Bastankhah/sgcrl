@@ -78,6 +78,36 @@ flags.DEFINE_float(
     'ppo_clip_coef', -1.0,
     'If >0, overrides PPO clip coefficient.')
 flags.DEFINE_float(
+    'ppo_target_kl', -1.0,
+    'If >0, stop remaining PPO epochs this iteration when a minibatch '
+    'approx_kl exceeds this threshold (CleanRL-style). <=0 disables.')
+flags.DEFINE_float(
+    'ppo_kl_penalty_coef', -1.0,
+    'Initial β for PPO-penalty trust region (adaptive β, Schulman §4). '
+    'When >0, adds β·KL(π_rollout‖π_now) to each minibatch loss; β is '
+    'adapted (÷2 if KL<target/1.5, ×2 if KL>1.5·target) per minibatch by '
+    'default, or once per epoch if --ppo_kl_penalty_adapt_epoch. '
+    'KL is the analytic pre-tanh Gaussian KL (+ categorical for hybrid actors). '
+    '<=0 disables (default). Typical starting value: 1.0.')
+flags.DEFINE_float(
+    'ppo_kl_penalty_target', -1.0,
+    'Target KL for adaptive β (d_targ in PPO paper). <=0 keeps config default (0.01).')
+flags.DEFINE_float(
+    'ppo_kl_penalty_beta_min', -1.0,
+    'Floor on adaptive β. >0 enables (e.g. 0.05). <=0 keeps config default (0).')
+flags.DEFINE_bool(
+    'ppo_kl_penalty_adapt_epoch', False,
+    'If True, adapt β once per epoch from mean analytic KL of kept '
+    'minibatches instead of after every minibatch.')
+flags.DEFINE_bool(
+    'ppo_kl_early_stop_rollback', False,
+    'If True and ppo_target_kl>0, a minibatch with approx_kl above the '
+    'threshold rolls back that update and ends the iteration immediately.')
+flags.DEFINE_integer(
+    'ppo_target_kl_reset_cooldown', -1,
+    'After an actor reset, skip target-KL early-stop/rollback for this many '
+    'iters. <0 keeps config default (0).')
+flags.DEFINE_float(
     'ppo_actor_min_std', -1.0,
     'If >0, overrides PPO actor min std.')
 flags.DEFINE_bool(
@@ -125,10 +155,12 @@ flags.DEFINE_bool(
     'distribution, half from the replay future-state distribution.')
 flags.DEFINE_string(
     'ppo_reward_mode', '',
-    "PPO rollout reward baseline. '' = φ(s,a)·ψ(g); "
+    "PPO rollout reward baseline. '' = φ(s,a)·ψ(g) (default); "
     "'dirac_target' = log(eps)−φ(s0,a)·ψ(s) off-goal, −φ(s0,a)·ψ(g) at goal; "
     "'kde_dirac' = same formula but densities estimated via Gaussian KDE on "
-    "the replay buffer instead of CRL dot products.")
+    "the replay buffer instead of CRL dot products; "
+    "'env_dense' = BuilderBench-only baseline using the env tanh "
+    "cube–goal distance reward (not used unless set).")
 flags.DEFINE_string(
     'ppo_repr_mode', 'crl',
     "Density estimator for the PPO shaped reward. "
@@ -267,8 +299,42 @@ flags.DEFINE_float(
     'nf_noise_std', 0.05,
     'NF mode: std of Gaussian noise added to goals during training (0 = disabled).')
 flags.DEFINE_float(
+    'nf_mask_prob', 0.0,
+    'NF NLL: probability of zero-masking (s,a) so the flow also learns '
+    'p(g|MASK). 0 (default) = off. Independent of --ppo_nf_td_mask_prob.')
+flags.DEFINE_float(
     'nf_goal_std_min', 0.02,
     'NF mode: minimum per-dim goal std from replay stats (prevents div-by-tiny-std on static dims).')
+flags.DEFINE_boolean(
+    'nf_normalize_goals', True,
+    'NF mode: if True (default), z-score goals with running replay mean/std '
+    'before the flow, in both density training and reward. If False, pass raw '
+    'goals (internally mean=0, std=1). Replay stats are still logged.')
+flags.DEFINE_boolean(
+    'nf_reward_tanh', False,
+    'NF mode: if True, PPO reward is scale*tanh(log_p/scale) instead of raw '
+    'log p. Density training is unchanged. External bonus is added after this. '
+    'Default False.')
+flags.DEFINE_float(
+    'nf_reward_tanh_scale', 50.0,
+    'Scale for --nf_reward_tanh: r = scale * tanh(log_p / scale). Ignored if '
+    'the tanh flag is off.')
+flags.DEFINE_string(
+    'nf_reward_mode', 'forward',
+    'NF PPO reward map (density NLL is always raw log p). '
+    "'forward' (default): r = log p. "
+    "'reverse': r = exp(clip(log p, ±80)) = p(g|s,a). "
+    "'chi_squared': r = -exp(-clip(log p, ±80)) = -1/p(g|s,a). "
+    '--nf_reward_tanh is only valid with forward.')
+flags.DEFINE_boolean(
+    'nf_scale_tanh', False,
+    'NF mode: if True, each coupling scale is s = c * tanh(s_raw) (FrEIA '
+    'soft clamp). Density NLL and reward both use the clamped flow. '
+    'Default False (unbounded s).')
+flags.DEFINE_float(
+    'nf_scale_tanh_c', 2.0,
+    'Clamp radius for --nf_scale_tanh: s = c * tanh(s_raw). Ignored if the '
+    'flag is off.')
 flags.DEFINE_string(
     'nf_no_norm_goal_dims', '',
     'Deprecated; ignored. NF uses running replay mean/std with nf_goal_std_min floor.')
@@ -307,6 +373,10 @@ flags.DEFINE_boolean(
     'nf_mix_env_goal_stats', False,
     'NF mode: when computing normalisation stats, also include the actual env goals '
     '(obs[obs_dim:] from current rollout) so the normaliser covers reward goals too.')
+flags.DEFINE_boolean(
+    'nf_mix_task_goal_stats', False,
+    'NF mode: compute goal μ/σ from batch_size replay s_f plus batch_size '
+    'copies of the env task goal (obs[:, obs_dim:]) so g_task is in-distribution.')
 flags.DEFINE_boolean(
     'nf_state_only', False,
     'NF mode: if True, learn log p_NF(g|s) and use reward r(s)=log p_NF(g|s) '
@@ -430,13 +500,15 @@ flags.DEFINE_float(
     '(‖δ‖₂ ≤ eps). <0 keeps config default (1e-2).')
 flags.DEFINE_float(
     'ppo_crl_s_perturb_prob', -1.0,
-    'CRL training: probability of perturbing each packed state s '
-    'before InfoNCE (φ input). Independent of s_f perturb. 0 disables. '
-    '<0 keeps config default (0).')
+    'CRL/NF training: probability of perturbing each packed state s '
+    'before InfoNCE / the SA encoder. Independent of s_f perturb. '
+    'BuilderBench: cube xyz only (select dim unchanged). Other envs: '
+    'all of s. 0 disables. <0 keeps config default (0).')
 flags.DEFINE_float(
     'ppo_crl_s_perturb_eps', -1.0,
-    'CRL training: max L2 radius of s noise when perturbing '
-    '(‖δ‖₂ ≤ eps). <0 keeps config default (1e-2).')
+    'CRL/NF training: max L2 radius of s noise when perturbing '
+    '(‖δ‖₂ ≤ eps). BuilderBench: ball is over xyz dims only. '
+    '<0 keeps config default (1e-2).')
 flags.DEFINE_float(
     'ppo_crl_grad_reg_c', -1.0,
     'CRL: threshold c on ‖∇_s (φ(s,a)·ψ(s_f))‖. '
@@ -452,8 +524,18 @@ flags.DEFINE_float(
     '<0 keeps config default.')
 flags.DEFINE_boolean(
     'ppo_nf_grad_reg', False,
-    'NF: add the CRL-style hinge on ‖∇_s log p_NF(g|s,a)‖ to the NLL '
-    '(uses ppo_crl_grad_reg_{c,coef,rel}; ∇_s stats are always logged).')
+    'NF: add λ·E[‖∇_s log p_NF(g|s,a)‖] to the NLL '
+    '(uses ppo_crl_grad_reg_{c,coef}; ∇_s stats are always logged).')
+flags.DEFINE_float(
+    'ppo_nf_grad_reg_lam', -1.0,
+    'NF: fixed/init λ for the ∇_s log p penalty. '
+    '<0 → init from ppo_crl_grad_reg_coef. '
+    'Use with ppo_nf_grad_reg_lam_lr=0 for a fixed-λ run (e.g. lam=1).')
+flags.DEFINE_float(
+    'ppo_nf_grad_reg_lam_lr', -1.0,
+    'NF: dual ascent lr for λ. '
+    '<0 → auto 100×nf_critic_lr (primal-dual). '
+    '0 → λ fixed (no dual update). >0 → that absolute lr.')
 flags.DEFINE_float(
     'ppo_crl_repr_tau', -1.0,
     'CRL mode: EMA decay τ for φ, ψ used in PPO reward r=φ·ψ. '
@@ -502,11 +584,13 @@ flags.DEFINE_boolean(
     'builderbench_permute_start_boxes', True,
     'BuilderBench: if True (default), randomly permute which cube gets which '
     'start-box lane (y assignment) at reset. Set False to freeze lane order '
-    'from the task file (still samples x within each lane box).')
+    'from the task file (still samples x within each lane box). '
+    'NF BuilderBench always forces False (ppo_repr_mode=nf).')
 flags.DEFINE_float(
     'builderbench_fixed_start_x', -1.0,
     'BuilderBench: if >=0, collapse every start-box x low/high to this value '
-    '(fixed cube init x; y lanes unchanged). <0 keeps the task-file x range.')
+    '(fixed cube init x; y lanes unchanged). <0 keeps the task-file x range. '
+    'NF BuilderBench always forces 0.1 (ppo_repr_mode=nf).')
 flags.DEFINE_integer(
     'builderbench_mj_episode_length', -1,
     'BuilderBench: if >0, override MuJoCo episode_length (before PD macro '
@@ -745,12 +829,10 @@ def main(_):
           f'(T={config.ppo_rollout_length}, '
           f'crl_steps={config.ppo_crl_steps_per_iter}).')
   else:
-    # BuilderBench PD mode deliberately omits these two keys now (see
-    # envs/builderbench_utils.ppo_env_defaults docstring): rollout_length
-    # and crl_steps_per_iter must always come from an explicit
-    # --ppo_rollout_length / --ppo_crl_steps_per_iter flag for PD jobs, not
-    # a hidden per-env formula. Non-PD envs still get them from
-    # PPO_ENV_DEFAULTS above.
+    # BuilderBench PD omits rollout_length (jobs pass --ppo_rollout_length
+    # for ep=50/60/70) but defaults crl_steps_per_iter=10. Override with
+    # --ppo_crl_steps_per_iter. Non-PD / other envs still come from
+    # PPO_ENV_DEFAULTS / builderbench_utils.
     if 'rollout_length' in env_defaults:
       config.ppo_rollout_length = int(env_defaults['rollout_length'])
     if 'crl_steps_per_iter' in env_defaults:
@@ -809,6 +891,18 @@ def main(_):
     config.ppo_discount = float(FLAGS.ppo_discount)
   if FLAGS.ppo_clip_coef > 0.0:
     config.ppo_clip_coef = float(FLAGS.ppo_clip_coef)
+  if FLAGS.ppo_target_kl > 0.0:
+    config.ppo_target_kl = float(FLAGS.ppo_target_kl)
+  if FLAGS.ppo_kl_penalty_coef > 0.0:
+    config.ppo_kl_penalty_coef = float(FLAGS.ppo_kl_penalty_coef)
+  if FLAGS.ppo_kl_penalty_target > 0.0:
+    config.ppo_kl_penalty_target = float(FLAGS.ppo_kl_penalty_target)
+  if FLAGS.ppo_kl_penalty_beta_min > 0.0:
+    config.ppo_kl_penalty_beta_min = float(FLAGS.ppo_kl_penalty_beta_min)
+  config.ppo_kl_penalty_adapt_epoch = bool(FLAGS.ppo_kl_penalty_adapt_epoch)
+  config.ppo_kl_early_stop_rollback = bool(FLAGS.ppo_kl_early_stop_rollback)
+  if FLAGS.ppo_target_kl_reset_cooldown >= 0:
+    config.ppo_target_kl_reset_cooldown = int(FLAGS.ppo_target_kl_reset_cooldown)
   if FLAGS.ppo_actor_min_std > 0.0:
     config.ppo_actor_min_std = float(FLAGS.ppo_actor_min_std)
   config.ppo_deterministic_select_dim = bool(
@@ -826,6 +920,12 @@ def main(_):
   config.ppo_ent_coef_final = float(FLAGS.ppo_ent_coef_final)
   config.uniform_sampling = bool(FLAGS.uniform_sampling)
   config.ppo_reward_mode = str(FLAGS.ppo_reward_mode).strip()
+  if str(config.ppo_reward_mode).strip().lower() == 'env_dense':
+    # Baseline: PPO on BuilderBench env tanh reward; never train φ/ψ.
+    if int(config.ppo_crl_steps_per_iter) != 0:
+      print('[ppo_contrastive] ppo_reward_mode=env_dense: forcing '
+            f'ppo_crl_steps_per_iter {config.ppo_crl_steps_per_iter} -> 0')
+      config.ppo_crl_steps_per_iter = 0
   config.ppo_repr_mode = str(FLAGS.ppo_repr_mode).strip()
   if FLAGS.ppo_td_infonce_target_tau >= 0.0:
     config.ppo_td_infonce_target_tau = float(FLAGS.ppo_td_infonce_target_tau)
@@ -880,8 +980,24 @@ def main(_):
   config.nf_critic_weight_decay = float(FLAGS.nf_critic_weight_decay)
   config.nf_grad_clip = float(FLAGS.nf_grad_clip)
   config.nf_noise_std = float(FLAGS.nf_noise_std)
+  config.nf_mask_prob = float(FLAGS.nf_mask_prob)
   config.nf_goal_std_min = float(FLAGS.nf_goal_std_min)
+  config.nf_normalize_goals = bool(FLAGS.nf_normalize_goals)
+  config.nf_reward_tanh = bool(FLAGS.nf_reward_tanh)
+  config.nf_reward_tanh_scale = float(FLAGS.nf_reward_tanh_scale)
+  config.nf_reward_mode = str(FLAGS.nf_reward_mode or 'forward').strip().lower()
+  if config.nf_reward_mode not in ('forward', 'reverse', 'chi_squared'):
+    raise ValueError(
+        f'Unknown --nf_reward_mode={FLAGS.nf_reward_mode!r}; '
+        f"expected 'forward', 'reverse', or 'chi_squared'")
+  if config.nf_reward_tanh and config.nf_reward_mode != 'forward':
+    raise ValueError(
+        f'--nf_reward_tanh requires --nf_reward_mode=forward '
+        f'(got {config.nf_reward_mode!r})')
+  config.nf_scale_tanh = bool(FLAGS.nf_scale_tanh)
+  config.nf_scale_tanh_c = float(FLAGS.nf_scale_tanh_c)
   config.nf_mix_env_goal_stats = bool(FLAGS.nf_mix_env_goal_stats)
+  config.nf_mix_task_goal_stats = bool(FLAGS.nf_mix_task_goal_stats)
   config.nf_state_only = bool(FLAGS.nf_state_only)
   config.crl_state_only = bool(FLAGS.crl_state_only)
   config.ppo_skip_first_eval = bool(FLAGS.ppo_skip_first_eval)
@@ -964,6 +1080,10 @@ def main(_):
   if FLAGS.ppo_crl_grad_reg_rel >= 0.0:
     config.ppo_crl_grad_reg_rel = float(FLAGS.ppo_crl_grad_reg_rel)
   config.ppo_nf_grad_reg = bool(FLAGS.ppo_nf_grad_reg)
+  if FLAGS.ppo_nf_grad_reg_lam >= 0.0:
+    config.ppo_nf_grad_reg_lam = float(FLAGS.ppo_nf_grad_reg_lam)
+  if FLAGS.ppo_nf_grad_reg_lam_lr >= 0.0:
+    config.ppo_nf_grad_reg_lam_lr = float(FLAGS.ppo_nf_grad_reg_lam_lr)
   if FLAGS.ppo_crl_repr_tau >= 0.0:
     config.ppo_crl_repr_tau = float(FLAGS.ppo_crl_repr_tau)
   if FLAGS.ppo_nf_reward_tau >= 0.0:
@@ -986,6 +1106,13 @@ def main(_):
         f'num_epochs={config.ppo_num_epochs}, '
         f'num_minibatches={config.ppo_num_minibatches}, '
         f'clip_coef={config.ppo_clip_coef}, '
+        f'target_kl={config.ppo_target_kl}, '
+        f'kl_penalty_coef={config.ppo_kl_penalty_coef}, '
+        f'kl_penalty_target={config.ppo_kl_penalty_target}, '
+        f'kl_penalty_beta_min={config.ppo_kl_penalty_beta_min}, '
+        f'kl_penalty_adapt_epoch={config.ppo_kl_penalty_adapt_epoch}, '
+        f'kl_early_stop_rollback={config.ppo_kl_early_stop_rollback}, '
+        f'target_kl_reset_cooldown={config.ppo_target_kl_reset_cooldown}, '
         f'actor_min_std={config.ppo_actor_min_std}, '
         f'deterministic_select_dim={config.ppo_deterministic_select_dim}, '
         f'categorical_select={config.ppo_categorical_select}, '
@@ -1022,12 +1149,22 @@ def main(_):
         f'ppo_crl_grad_reg_coef={config.ppo_crl_grad_reg_coef}  '
         f'ppo_crl_grad_reg_rel={config.ppo_crl_grad_reg_rel}  '
         f'ppo_nf_grad_reg={config.ppo_nf_grad_reg}  '
+        f'ppo_nf_grad_reg_lam={config.ppo_nf_grad_reg_lam}  '
+        f'ppo_nf_grad_reg_lam_lr={config.ppo_nf_grad_reg_lam_lr}  '
         f'ppo_nf_reward_tau={config.ppo_nf_reward_tau}  '
         f'ppo_nf_td={config.ppo_nf_td}  '
         f'ppo_nf_td_target_tau={config.ppo_nf_td_target_tau}  '
         f'ppo_nf_td_discount={config.ppo_nf_td_discount}  '
         f'ppo_nf_td_mask_prob={config.ppo_nf_td_mask_prob}  '
         f'nf_state_only={config.nf_state_only}  '
+        f'nf_normalize_goals={config.nf_normalize_goals}  '
+        f'nf_mix_task_goal_stats={config.nf_mix_task_goal_stats}  '
+        f'nf_mask_prob={config.nf_mask_prob}  '
+        f'nf_reward_mode={config.nf_reward_mode!r}  '
+        f'nf_reward_tanh={config.nf_reward_tanh}'
+        f'{f"(scale={config.nf_reward_tanh_scale:g})" if config.nf_reward_tanh else ""}  '
+        f'nf_scale_tanh={config.nf_scale_tanh}'
+        f'{f"(c={config.nf_scale_tanh_c:g})" if config.nf_scale_tanh else ""}  '
         f'crl_state_only={config.crl_state_only}  '
         f'ppo_gaussian_reward_tau={config.ppo_gaussian_reward_tau}  '
         f'ppo_fm_reward_tau={config.ppo_fm_reward_tau}  '
@@ -1102,6 +1239,19 @@ def main(_):
       print('[ppo] sawyer_bin init: ignoring --bin_randomize_gripper_init '
             '(frozen by --sawyer_randomize_init=false)')
   if env_name.startswith('builderbench_'):
+    # NF + BuilderBench: freeze cube layout (no lane permute, fixed init x).
+    # Overrides job-script flags so copied old NF jobs still get fixedx01.
+    if str(config.ppo_repr_mode).strip().lower() == 'nf':
+      _nf_bb_fx = 0.1
+      _was_perm = bool(FLAGS.builderbench_permute_start_boxes)
+      _was_fx = float(FLAGS.builderbench_fixed_start_x)
+      FLAGS.builderbench_permute_start_boxes = False
+      FLAGS.builderbench_fixed_start_x = _nf_bb_fx
+      if _was_perm or _was_fx < 0 or abs(_was_fx - _nf_bb_fx) > 1e-9:
+        print('[ppo] NF+BuilderBench: forcing nopermute + fixed_start_x=0.1 '
+              f'(was permute={_was_perm} fixed_start_x={_was_fx})')
+      else:
+        print('[ppo] NF+BuilderBench: nopermute + fixed_start_x=0.1')
     _env_kwargs['builderbench_use_pd'] = bool(FLAGS.builderbench_use_pd)
     _env_kwargs['builderbench_pd_duration'] = int(FLAGS.builderbench_pd_duration)
     _env_kwargs['builderbench_permute_start_boxes'] = bool(
@@ -1116,10 +1266,10 @@ def main(_):
       _env_kwargs['builderbench_success_terminate_steps'] = int(
           FLAGS.builderbench_success_terminate_steps)
     # NOTE: this used to silently recompute ppo_rollout_length /
-    # ppo_crl_steps_per_iter a second time (duplicating the block above at
-    # ~line 476) whenever the flags were left unset. Removed: for PD mode
-    # these must always be explicit --ppo_rollout_length /
-    # --ppo_crl_steps_per_iter flags now.
+    # ppo_crl_steps_per_iter a second time whenever the flags were left
+    # unset. Removed. PD jobs still pass --ppo_rollout_length; CRL steps
+    # default to 10 from builderbench_utils unless --ppo_crl_steps_per_iter
+    # is set.
     _mj_ep = int(FLAGS.builderbench_mj_episode_length)
     _mj_msg = (
         f' mj_episode_length={_mj_ep}'
@@ -1178,16 +1328,23 @@ def main(_):
       config.ppo_categorical_select_waypoint = False
     else:
       _, _num_cubes, _ = parse_sgcrl_builderbench_env_name(env_name)
-      _cat_select_classes = int(_num_cubes)
-      _cat_select_waypoint = bool(config.ppo_categorical_select_waypoint)
-      if _cat_select_waypoint:
-        print(f'[ppo_contrastive] categorical select + per-cube waypoint '
-              f'actor: {_cat_select_classes} cube classes, '
-              f'{_cat_select_classes}×3 waypoint heads + shared yaw')
+      if int(_num_cubes) < 2:
+        print('[ppo_contrastive] ppo_categorical_select ignored: '
+              f'{env_name} has {_num_cubes} cube(s); categorical select '
+              'needs >= 2 classes (using a plain Gaussian actor)')
+        config.ppo_categorical_select = False
+        config.ppo_categorical_select_waypoint = False
       else:
-        print(f'[ppo_contrastive] categorical select actor: '
-              f'{_cat_select_classes} cube classes, '
-              f'Gaussian on {5 - 1} continuous dims')
+        _cat_select_classes = int(_num_cubes)
+        _cat_select_waypoint = bool(config.ppo_categorical_select_waypoint)
+        if _cat_select_waypoint:
+          print(f'[ppo_contrastive] categorical select + per-cube waypoint '
+                f'actor: {_cat_select_classes} cube classes, '
+                f'{_cat_select_classes}×3 waypoint heads + shared yaw')
+        else:
+          print(f'[ppo_contrastive] categorical select actor: '
+                f'{_cat_select_classes} cube classes, '
+                f'Gaussian on {5 - 1} continuous dims')
   if bool(config.crl_state_only):
     print('[ppo_contrastive] crl_state_only=True: φ encodes state only '
           '(r(s)=φ(s)·ψ(g); InfoNCE uses φ(s))')

@@ -156,7 +156,7 @@ python -u ppo_contrastive.py \
   --builderbench_permute_start_boxes=false \
   --builderbench_fixed_start_x="${FIXED_START_X}" \
   --ppo_rollout_length=50 \
-  --ppo_crl_steps_per_iter=25 \
+  --ppo_crl_steps_per_iter=10 \
   --ppo_skip_first_eval=true \
   --ppo_eval_interval=30 \
   --ppo_eval_episodes=5 \

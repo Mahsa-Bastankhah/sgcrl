@@ -102,7 +102,7 @@ REWARD_TAU=${REWARD_TAU:-0.5}
 EP_LEN=${EP_LEN:-50}
 PD_DURATION=${PD_DURATION:-5}
 MJ_EP_LEN=$((EP_LEN * PD_DURATION))
-CRL_STEPS=${CRL_STEPS:-25}
+CRL_STEPS=${CRL_STEPS:-10}
 
 LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative5_task2_e1024_pd_crl_tau05_nopermute_catselect_ent0005to0001/}"
 

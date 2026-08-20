@@ -232,7 +232,9 @@ def _build_nf_networks(env_name: str, seed: int, run_cfg: dict, q_params: dict):
             obs_dim=obs_dim, act_dim=act_dim, goal_dim=obs_dim,
             hidden_layer_sizes=hidden, rep_size=rep_size,
             num_blocks=num_blocks, channels=channels,
-            state_only=bool(run_cfg.get('nf_state_only', False)))
+            state_only=bool(run_cfg.get('nf_state_only', False)),
+            scale_tanh=bool(run_cfg.get('nf_scale_tanh', False)),
+            scale_tanh_c=float(run_cfg.get('nf_scale_tanh_c', 2.0)))
     return nf_nets, obs_dim
 
 

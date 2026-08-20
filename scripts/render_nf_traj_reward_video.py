@@ -70,6 +70,8 @@ assert _crl_spec.loader is not None
 _crl_spec.loader.exec_module(_crl)
 _render_reward_strip = _crl._render_reward_strip
 _render_grad_norm_strip = _crl._render_grad_norm_strip
+_render_policy_loc_scale_strip = _crl._render_policy_loc_scale_strip
+_render_gae_strip = _crl._render_gae_strip
 _render_select_strip = _crl._render_select_strip
 _render_pos_delta_strip = _crl._render_pos_delta_strip
 _compose_frame = _crl._compose_frame
@@ -110,10 +112,26 @@ def _load_nf_arch(run_dir: str):
           'nf_sa_num_layers', flags.get('nf_sa_num_layers', 4))),
       'nf_state_only': bool(resolved.get(
           'nf_state_only', flags.get('nf_state_only', False))),
+      'nf_scale_tanh': bool(resolved.get(
+          'nf_scale_tanh', flags.get('nf_scale_tanh', False))),
+      'nf_scale_tanh_c': float(resolved.get(
+          'nf_scale_tanh_c', flags.get('nf_scale_tanh_c', 2.0))),
       'nf_goal_std_min': float(resolved.get(
           'nf_goal_std_min', flags.get('nf_goal_std_min', 0.02))),
       'hidden_layer_sizes': tuple(int(x) for x in resolved.get(
           'hidden_layer_sizes', (256,) * 6)),
+      'ppo_discount': float(resolved.get(
+          'ppo_discount', flags.get('ppo_discount', 0.99))),
+      'ppo_gae_lambda': float(resolved.get(
+          'ppo_gae_lambda', flags.get('ppo_gae_lambda', 0.95))),
+      'ppo_norm_reward': bool(resolved.get(
+          'ppo_norm_reward', flags.get('ppo_norm_reward', True))),
+      'ppo_use_external_reward': bool(resolved.get(
+          'ppo_use_external_reward',
+          flags.get('ppo_use_external_reward', False))),
+      'ppo_external_reward_scale': float(resolved.get(
+          'ppo_external_reward_scale',
+          flags.get('ppo_external_reward_scale', 1.0))),
   }
 
 
@@ -179,6 +197,7 @@ def _build_networks(env_name: str, seed: int, ctx, arch: dict):
   print(f'[vid] NF arch: rep={arch["nf_rep_size"]} blocks={arch["nf_num_blocks"]} '
         f'channels={arch["nf_coupling_width"]} sa={arch["nf_sa_num_layers"]}x'
         f'{arch["nf_sa_hidden"]} state_only={arch["nf_state_only"]} '
+        f'scale_tanh={arch.get("nf_scale_tanh", False)} '
         f'goal_dim={goal_dim}', flush=True)
   nf_nets = _nf.make_nf_density_networks(
       obs_dim=int(ctx.obs_dim),
@@ -192,6 +211,8 @@ def _build_networks(env_name: str, seed: int, ctx, arch: dict):
       sa_hidden=arch['nf_sa_hidden'],
       sa_num_layers=arch['nf_sa_num_layers'],
       state_only=bool(arch['nf_state_only']),
+      scale_tanh=bool(arch.get('nf_scale_tanh', False)),
+      scale_tanh_c=float(arch.get('nf_scale_tanh_c', 2.0)),
   )
   return networks, nf_nets, goal_dim
 
@@ -225,6 +246,100 @@ def make_nf_logp_grad_norm_fn(nf_nets, obs_dim: int):
   return grad_norm_fn
 
 
+def make_policy_loc_scale_fn(networks):
+  """Pre-tanh loc/scale of the continuous head at each packed (s,g).
+
+  Cat-waypoint actor: mode-cube ``[xyz, yaw]`` (4-D). Shared-head actor:
+  all continuous dims.
+  """
+
+  def _one(policy_params, packed):
+    dist = networks.policy_network.apply(policy_params, packed[None])
+    loc, scale = ppo_learner._policy_normal_loc_scale(dist)
+    return loc[0], scale[0]
+
+  @jax.jit
+  def _fn(policy_params, packed_t):
+    loc, scale = jax.vmap(lambda p: _one(policy_params, p))(packed_t)
+    return loc, scale
+
+  return _fn
+
+
+def make_value_fn(networks):
+  @jax.jit
+  def _fn(value_params, packed_t):
+    v = networks.value_network.apply(value_params, packed_t)
+    return jnp.reshape(v, (packed_t.shape[0],))
+  return _fn
+
+
+def _frozen_return_norm_std(ckpt, run_dir: str, iteration: int) -> float:
+  extra = ckpt.get('extra_state') or {}
+  rn = extra.get('reward_normalizer')
+  if isinstance(rn, dict) and 'rms_var' in rn:
+    var = float(np.asarray(rn['rms_var']).reshape(-1)[0])
+    std = float(np.sqrt(max(var, 0.0) + 1e-8))
+    print(f'[vid] frozen return-norm std from ckpt extra={std:.6g}',
+          flush=True)
+    return std
+  csv_path = os.path.join(run_dir, 'logs', 'learner', 'logs.csv')
+  best, best_dist = None, None
+  with open(csv_path, 'r', encoding='utf-8') as fh:
+    for row in csv.DictReader(fh):
+      it = int(float(row.get('iteration') or row.get('learner_steps') or 0))
+      dist = abs(it - int(iteration))
+      v = row.get('reward_return_norm_std')
+      if v in (None, '', 'nan'):
+        continue
+      if best_dist is None or dist < best_dist:
+        best_dist = dist
+        best = float(v)
+  if best is None:
+    print('[vid] WARNING: no return-norm std; using 1.0', flush=True)
+    return 1.0
+  print(f'[vid] frozen return-norm std from CSV={best:.6g} (|Δ|={best_dist})',
+        flush=True)
+  return float(best)
+
+
+def _gae_one_episode(rewards, values, gamma: float, gae_lambda: float):
+  """GAE on one episode; last step treated as timeout/terminal (no bootstrap)."""
+  r = np.asarray(rewards, dtype=np.float32).reshape(-1)
+  v = np.asarray(values, dtype=np.float32).reshape(-1)
+  t_len = r.shape[0]
+  next_v = np.concatenate([v[1:], np.zeros(1, dtype=np.float32)])
+  nnt = np.ones(t_len, dtype=np.float32)
+  nnt[-1] = 0.0
+  deltas = r + float(gamma) * next_v * nnt - v
+  adv = np.zeros(t_len, dtype=np.float32)
+  last = 0.0
+  g = float(gamma) * float(gae_lambda)
+  for t in range(t_len - 1, -1, -1):
+    last = float(deltas[t] + g * nnt[t] * last)
+    adv[t] = last
+  return adv
+
+
+def _seeds_from_args(args) -> list:
+  raw = (getattr(args, 'seeds', '') or '').strip()
+  if raw:
+    return [int(x) for x in raw.split(',') if x.strip() != '']
+  return [int(args.seed)]
+
+
+def _episode_tag(args, label: str, seed: int, n_seeds: int) -> str:
+  if args.tag and not args.checkpoint_dir:
+    base = args.tag
+  else:
+    base = f'{args.tag_prefix}_{label}'
+  if args.stochastic:
+    return f'{args.tag_prefix}_stoch_s{seed}_{label}'
+  if n_seeds > 1:
+    return f'{base}_s{seed}'
+  return base
+
+
 def _enumerate_ckpts(checkpoint: str, checkpoint_dir: str):
   if checkpoint_dir:
     files = sorted(
@@ -252,6 +367,10 @@ def _parse_args():
   p.add_argument('--allow_no_success', action='store_true')
   p.add_argument('--max_tries', type=int, default=MAX_TRIES)
   p.add_argument('--seed', type=int, default=SEED)
+  p.add_argument('--seeds', default='',
+                 help='Comma-separated rollout seeds (overrides --seed)')
+  p.add_argument('--stochastic', action='store_true',
+                 help='Sample the actor instead of mode()')
   p.add_argument('--fps', type=int, default=FPS)
   p.add_argument('--skip_existing', action='store_true')
   p.add_argument('--show_select', action='store_true',
@@ -263,6 +382,12 @@ def _parse_args():
   p.add_argument('--show_logp_grad', action='store_true',
                  help='Add ||∇_s log p_NF|| and ||∇_a log p_NF|| strips '
                       '(g held fixed)')
+  p.add_argument('--show_policy_loc_scale', action='store_true',
+                 help='Add pre-tanh policy σ mean/min and mean |μ| strip '
+                      '(mode-cube xyz+yaw for cat-waypoint actors)')
+  p.add_argument('--show_gae', action='store_true',
+                 help='Add raw GAE A_t from return-std NF reward + extrew '
+                      'and V (no minibatch advantage-norm)')
   p.add_argument('--match_run_init', action='store_true',
                  help='Use permute/fixed_start_x from run_config (default: '
                       'force nopermute + fixed_start_x=0.1)')
@@ -273,18 +398,10 @@ def _parse_args():
 
 def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
                 mocap_targets, ep_len, num_cubes, goal_dim, arch, out_dir):
-  tag = args.tag if (args.tag and not args.checkpoint_dir) else (
-      f'{args.tag_prefix}_{label}')
-  out_mp4 = os.path.join(out_dir, f'{tag}.mp4')
-  still_path = os.path.join(out_dir, f'{tag}_still.png')
-  csv_path = os.path.join(out_dir, f'{tag}.csv')
-  if args.skip_existing and os.path.isfile(out_mp4):
-    print(f'[vid] skip existing {out_mp4}', flush=True)
-    return
-
+  seeds = _seeds_from_args(args)
+  n_seeds = len(seeds)
   print(f'[vid] === {label} ({ckpt_path}) ===', flush=True)
   ckpt = ppo_learner.load_checkpoint(ckpt_path)
-  # Online only.
   nf_params = ckpt['q_params']
   iteration = int(ckpt.get('iteration') or 0)
   run_dir = _run_dir_from_ckpt(ckpt_path)
@@ -292,12 +409,14 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
   goal_std = np.maximum(goal_std, arch['nf_goal_std_min']).astype(np.float32)
 
   reward_fn = _nf.make_nf_reward_fn(nf_nets, obs_dim=int(ctx.obs_dim))
+  stochastic = bool(args.stochastic)
   print(f'[vid] policy_iter={iteration} ep_len={ep_len} '
-        f'reward_src=q_params(online) state_only={arch["nf_state_only"]}',
+        f'reward_src=q_params(online) state_only={arch["nf_state_only"]} '
+        f'stochastic={stochastic} seeds={seeds}',
         flush=True)
 
   policy = _make_policy_fn(
-      networks, ckpt['policy_params'], stochastic=False,
+      networks, ckpt['policy_params'], stochastic=stochastic,
       filter_policy_obs=ctx.filter_policy_obs, num_cubes=num_cubes,
       normalize_obs=False, obs_dim=ctx.obs_dim,
       start_index=ctx.start_index, end_index=ctx.end_index)
@@ -305,172 +424,242 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
       policy, env, ep_len, ctx.fixed_target_goal, mocap_targets, num_cubes,
       ctx.filter_policy_obs)
 
-  key = jax.random.PRNGKey(args.seed)
-  key, warm_key = jax.random.split(key)
   print('[vid] warming compile...', flush=True)
-  _ = jax.block_until_ready(run(warm_key))
+  _ = jax.block_until_ready(run(jax.random.PRNGKey(seeds[0])))
   print('[vid] compile done', flush=True)
 
   gmean = jnp.asarray(goal_mean)
   gstd = jnp.asarray(goal_std)
-  best = None
-  for attempt in range(int(args.max_tries)):
-    key, roll_key = jax.random.split(key)
-    traj, states = run(roll_key)
-    packed = np.asarray(traj['packed'], dtype=np.float32)
-    actions = np.asarray(traj['action'], dtype=np.float32)
-    succ = np.asarray(traj['success'], dtype=np.float32)
-    rewards = np.asarray(
-        reward_fn(nf_params, jnp.asarray(packed), jnp.asarray(actions),
-                  gmean, gstd), dtype=np.float32)
-    reached = bool(np.any(succ >= 0.5))
-    print(f'[vid] try={attempt} success={reached} '
-          f'logp_sum={rewards.sum():.2f} first_succ='
-          f'{int(np.argmax(succ >= 0.5)) if reached else -1}', flush=True)
-    # State select after each env step (PD info / obs last dim).
-    sel = np.asarray(states.info['select_action'], dtype=np.float32)
-    if sel.ndim > 1:
-      sel = sel.reshape(sel.shape[0], -1)[:, 0]
-    # packed state matches the reward input (policy obs before step).
-    cur = dict(rewards=rewards, success=succ, states=states, select=sel,
-               packed=packed, actions=actions, attempt=attempt)
-    if reached:
-      best = cur
-      break
-    if best is None or rewards.sum() > best['rewards'].sum():
-      best = cur
-
-  if best is None:
-    raise RuntimeError('no trajectory collected')
-  if (not np.any(best['success'] >= 0.5)) and (not args.allow_no_success):
-    raise RuntimeError('no successful trajectory found '
-                       '(pass --allow_no_success)')
-
-  rewards = best['rewards']
-  success = best['success']
-  states = best['states']
-  select = np.asarray(best['select'], dtype=np.float32)
-  cube = select_action_to_cube(select, num_cubes)
-  packed = np.asarray(best['packed'], dtype=np.float32)
-  actions = np.asarray(best['actions'], dtype=np.float32)
-  # Same xyz layout as PD policy obs / NF state_only input.
-  cube_pos = packed[:, :3 * num_cubes].reshape(len(packed), num_cubes, 3)
-  step_delta = cube_step_deltas_from_pos(cube_pos)
   show_grad = bool(args.show_logp_grad)
-  grad_s = np.zeros(len(packed), dtype=np.float32)
-  grad_a = np.zeros(len(packed), dtype=np.float32)
-  if show_grad:
-    grad_fn = make_nf_logp_grad_norm_fn(nf_nets, obs_dim=int(ctx.obs_dim))
-    gs, ga = grad_fn(
-        nf_params, jnp.asarray(packed), jnp.asarray(actions), gmean, gstd)
-    grad_s = np.asarray(gs, dtype=np.float32)
-    grad_a = np.asarray(ga, dtype=np.float32)
-    print(f'[vid] ||∇_s logp|| range=[{grad_s.min():.4g},{grad_s.max():.4g}] '
-          f'||∇_a logp|| range=[{grad_a.min():.4g},{grad_a.max():.4g}]',
-          flush=True)
-  T = len(rewards)
-  first_succ = (int(np.argmax(success >= 0.5))
-                if np.any(success >= 0.5) else -1)
-  print(f'[vid] using attempt={best["attempt"]} first_success_t={first_succ} '
-        f'logp_sum={rewards.sum():.3f}', flush=True)
-  print(f'[vid] select range=[{select.min():+.3f},{select.max():+.3f}] '
-        f'cubes_used={sorted(set(int(x) for x in cube))}', flush=True)
-  print(f'[vid] pos Δ after t=45: sum={step_delta[45:].sum():.5f} '
-        f'max_step={step_delta[45:].max():.5f} m', flush=True)
+  show_pol = bool(args.show_policy_loc_scale)
+  show_gae = bool(args.show_gae)
+  loc_scale_fn = make_policy_loc_scale_fn(networks) if show_pol else None
+  value_fn = make_value_fn(networks) if show_gae else None
+  ret_std = (
+      _frozen_return_norm_std(ckpt, run_dir, iteration)
+      if show_gae else 1.0)
+  if 'value_params' not in ckpt and show_gae:
+    raise RuntimeError('checkpoint has no value_params; cannot plot GAE')
 
-  csv_cols = [
-      np.arange(T), rewards, success,
-      np.full(T, np.nan, dtype=np.float32),
-      select, cube.astype(np.float32),
-      step_delta.sum(axis=1).astype(np.float32),
-      grad_s.astype(np.float32),
-      grad_a.astype(np.float32),
-  ]
-  header = ('t,reward_logp_online,success,dist,select_action,select_cube,'
-            'pos_delta_sum,grad_s_norm,grad_a_norm')
-  for c in range(num_cubes):
-    csv_cols.append(step_delta[:, c].astype(np.float32))
-    header += f',pos_delta_c{c}'
-  np.savetxt(
-      csv_path, np.stack(csv_cols, axis=1), delimiter=',',
-      header=header, comments='')
+  for seed in seeds:
+    tag = _episode_tag(args, label, seed, n_seeds)
+    out_mp4 = os.path.join(out_dir, f'{tag}.mp4')
+    still_path = os.path.join(out_dir, f'{tag}_still.png')
+    csv_path = os.path.join(out_dir, f'{tag}.csv')
+    if args.skip_existing and os.path.isfile(out_mp4):
+      print(f'[vid] skip existing {out_mp4}', flush=True)
+      continue
 
-  print('[vid] rendering frames...', flush=True)
-  renders = []
-  for i in range(T):
-    renders.append(np.asarray(env.render_from_info(
-        np.asarray(states.data.qpos[i][0]),
-        np.asarray(states.data.qvel[i][0]),
-        np.asarray(states.info['target_mocap_pos'][i][0]),
-        np.asarray(states.info['target_mocap_quat'][i][0]),
-    )))
-  width = int(renders[0].shape[1])
-  if width % 2:
-    width -= 1
+    key = jax.random.PRNGKey(int(seed))
+    best = None
+    for attempt in range(int(args.max_tries)):
+      key, roll_key = jax.random.split(key)
+      traj, states = run(roll_key)
+      packed = np.asarray(traj['packed'], dtype=np.float32)
+      actions = np.asarray(traj['action'], dtype=np.float32)
+      succ = np.asarray(traj['success'], dtype=np.float32)
+      rewards = np.asarray(
+          reward_fn(nf_params, jnp.asarray(packed), jnp.asarray(actions),
+                    gmean, gstd), dtype=np.float32)
+      reached = bool(np.any(succ >= 0.5))
+      print(f'[vid] seed={seed} try={attempt} success={reached} '
+            f'logp_sum={rewards.sum():.2f} first_succ='
+            f'{int(np.argmax(succ >= 0.5)) if reached else -1}', flush=True)
+      sel = np.asarray(states.info['select_action'], dtype=np.float32)
+      if sel.ndim > 1:
+        sel = sel.reshape(sel.shape[0], -1)[:, 0]
+      cur = dict(rewards=rewards, success=succ, states=states, select=sel,
+                 packed=packed, actions=actions, attempt=attempt)
+      if reached:
+        best = cur
+        break
+      if best is None or rewards.sum() > best['rewards'].sum():
+        best = cur
 
-  if args.title:
-    title = args.title
-  elif arch['nf_state_only']:
-    title = rf'online NF  $r=\log p(g\mid s)$  ·  {tag}'
-  else:
-    title = rf'online NF  $r=\log p(g\mid s,a)$  ·  {tag}'
-  ylabel = r'$\log p_{\mathrm{NF}}$'
+    if best is None:
+      raise RuntimeError('no trajectory collected')
+    if (not np.any(best['success'] >= 0.5)) and (not args.allow_no_success):
+      raise RuntimeError('no successful trajectory found '
+                         '(pass --allow_no_success)')
 
-  rewards_norm = rewards / (float(np.std(rewards)) + 1e-8)
-  print('[vid] composing reward overlay...', flush=True)
-  frames = []
-  for t in range(T):
-    strip = _render_reward_strip(
-        rewards, success, t, width=width, height=220,
-        title=title, ylabel=ylabel, line_color='#5ec8ff', ylim=None)
-    extra = []
-    select_badge = None
-    if args.normalize_reward:
-      extra.append(_render_reward_strip(
-          rewards_norm, success, t, width=width, height=180,
-          title=rf'normalised reward  $r/\sigma_r$  ·  {tag}',
-          ylabel=r'$r/\sigma_r$',
-          line_color='#ffb347'))
+    rewards = best['rewards']
+    success = best['success']
+    states = best['states']
+    select = np.asarray(best['select'], dtype=np.float32)
+    cube = select_action_to_cube(select, num_cubes)
+    packed = np.asarray(best['packed'], dtype=np.float32)
+    actions = np.asarray(best['actions'], dtype=np.float32)
+    cube_pos = packed[:, :3 * num_cubes].reshape(len(packed), num_cubes, 3)
+    step_delta = cube_step_deltas_from_pos(cube_pos)
+    grad_s = np.zeros(len(packed), dtype=np.float32)
+    grad_a = np.zeros(len(packed), dtype=np.float32)
     if show_grad:
-      if arch['nf_state_only']:
-        grad_title = (
-            r'$\Vert\nabla_s\log p_{\mathrm{NF}}(g\mid s)\Vert$  /  '
-            r'$\Vert\nabla_a\log p_{\mathrm{NF}}\Vert$ (unused)'
-            rf'  ·  {tag}')
+      grad_fn = make_nf_logp_grad_norm_fn(nf_nets, obs_dim=int(ctx.obs_dim))
+      gs, ga = grad_fn(
+          nf_params, jnp.asarray(packed), jnp.asarray(actions), gmean, gstd)
+      grad_s = np.asarray(gs, dtype=np.float32)
+      grad_a = np.asarray(ga, dtype=np.float32)
+      print(f'[vid] ||∇_s logp|| range=[{grad_s.min():.4g},{grad_s.max():.4g}] '
+            f'||∇_a logp|| range=[{grad_a.min():.4g},{grad_a.max():.4g}]',
+            flush=True)
+    loc_abs = np.zeros(len(packed), dtype=np.float32)
+    scale_mean = np.zeros(len(packed), dtype=np.float32)
+    scale_min = np.zeros(len(packed), dtype=np.float32)
+    if show_pol:
+      loc_t, scale_t = loc_scale_fn(
+          ckpt['policy_params'], jnp.asarray(packed))
+      loc_np = np.asarray(loc_t, dtype=np.float32)
+      scale_np = np.asarray(scale_t, dtype=np.float32)
+      loc_abs = np.mean(np.abs(loc_np), axis=-1)
+      scale_mean = np.mean(scale_np, axis=-1)
+      scale_min = np.min(scale_np, axis=-1)
+      print(f'[vid] policy σ mean range=[{scale_mean.min():.4g},'
+            f'{scale_mean.max():.4g}] σ min range=[{scale_min.min():.4g},'
+            f'{scale_min.max():.4g}] |μ| mean range=[{loc_abs.min():.4g},'
+            f'{loc_abs.max():.4g}]', flush=True)
+    ppo_r = np.zeros(len(packed), dtype=np.float32)
+    values = np.zeros(len(packed), dtype=np.float32)
+    adv = np.zeros(len(packed), dtype=np.float32)
+    if show_gae:
+      logp = rewards.astype(np.float32)
+      if arch['ppo_norm_reward']:
+        ppo_r = logp / float(ret_std)
       else:
-        grad_title = (
-            r'$\Vert\nabla_s\log p_{\mathrm{NF}}(g\mid s,a)\Vert$  /  '
-            r'$\Vert\nabla_a\log p_{\mathrm{NF}}(g\mid s,a)\Vert$'
-            rf'  ·  {tag}')
-      extra.append(_render_grad_norm_strip(
-          grad_s, grad_a, success, t, width=width, height=220,
-          title=grad_title,
-          ylabel_s=r'$\Vert\nabla_s\log p_{\mathrm{NF}}\Vert$',
-          ylabel_a=r'$\Vert\nabla_a\log p_{\mathrm{NF}}\Vert$'))
-    if args.show_select:
-      extra.append(_render_select_strip(
-          select, cube, t, width=width, num_cubes=num_cubes, height=180,
-          title=rf'state select_action → cube  ·  {tag}'))
-      select_badge = (float(select[t]), int(cube[t]))
-    if args.show_pos_delta:
-      extra.append(_render_pos_delta_strip(
-          step_delta, t, width=width, selected_cube=cube, height=200,
-          title=rf'per-cube $\Vert\Delta xyz\Vert$ in $s$  ·  {tag}'))
-    composed = _compose_frame(
-        strip, renders[t], float(rewards[t]), bool(success[t] >= 0.5),
-        extra_strips=extra or None, select_badge=select_badge)
-    h, w = composed.shape[:2]
-    if h % 2 or w % 2:
-      composed = composed[: h - (h % 2), : w - (w % 2)]
-    frames.append(composed)
-    if (t + 1) % 10 == 0 or t == T - 1:
-      print(f'[vid]   framed {t + 1}/{T}', flush=True)
-  frames.extend([frames[-1]] * HOLD_LAST)
-  _write_mp4(frames, out_mp4, args.fps)
-  still_t = min(first_succ + 2, T - 1) if first_succ >= 0 else T // 2
-  Image.fromarray(frames[still_t]).save(still_path)
-  print(f'[vid] wrote {out_mp4} ({os.path.getsize(out_mp4) / 1e6:.2f} MB)',
-        flush=True)
+        ppo_r = logp.copy()
+      if arch['ppo_use_external_reward']:
+        ppo_r = ppo_r + (
+            float(arch['ppo_external_reward_scale'])
+            * (success >= 0.5).astype(np.float32))
+      values = np.asarray(
+          value_fn(ckpt['value_params'], jnp.asarray(packed)),
+          dtype=np.float32)
+      adv = _gae_one_episode(
+          ppo_r, values, arch['ppo_discount'], arch['ppo_gae_lambda'])
+      frac_neg = float(np.mean(adv < 0.0))
+      print(f'[vid] GAE γ={arch["ppo_discount"]} λ={arch["ppo_gae_lambda"]} '
+            f'ret_std={ret_std:.4g} A range=[{adv.min():+.3f},{adv.max():+.3f}] '
+            f'frac_neg={frac_neg:.2f} V range=[{values.min():.3f},'
+            f'{values.max():.3f}] ppo_r range=[{ppo_r.min():+.3f},'
+            f'{ppo_r.max():+.3f}]', flush=True)
+    T = len(rewards)
+    first_succ = (int(np.argmax(success >= 0.5))
+                  if np.any(success >= 0.5) else -1)
+    print(f'[vid] seed={seed} attempt={best["attempt"]} '
+          f'first_success_t={first_succ} logp_sum={rewards.sum():.3f}',
+          flush=True)
+
+    csv_cols = [
+        np.arange(T), rewards, success,
+        np.full(T, np.nan, dtype=np.float32),
+        select, cube.astype(np.float32),
+        step_delta.sum(axis=1).astype(np.float32),
+        grad_s.astype(np.float32),
+        grad_a.astype(np.float32),
+    ]
+    header = ('t,reward_logp_online,success,dist,select_action,select_cube,'
+              'pos_delta_sum,grad_s_norm,grad_a_norm,'
+              'policy_scale_mean,policy_scale_min,policy_loc_abs_mean,'
+              'ppo_reward,value,gae_advantage')
+    csv_cols.extend([
+        scale_mean.astype(np.float32),
+        scale_min.astype(np.float32),
+        loc_abs.astype(np.float32),
+        ppo_r.astype(np.float32),
+        values.astype(np.float32),
+        adv.astype(np.float32),
+    ])
+    for c in range(num_cubes):
+      csv_cols.append(step_delta[:, c].astype(np.float32))
+      header += f',pos_delta_c{c}'
+    np.savetxt(
+        csv_path, np.stack(csv_cols, axis=1), delimiter=',',
+        header=header, comments='')
+
+    print('[vid] rendering frames...', flush=True)
+    renders = []
+    for i in range(T):
+      renders.append(np.asarray(env.render_from_info(
+          np.asarray(states.data.qpos[i][0]),
+          np.asarray(states.data.qvel[i][0]),
+          np.asarray(states.info['target_mocap_pos'][i][0]),
+          np.asarray(states.info['target_mocap_quat'][i][0]),
+      )))
+    width = int(renders[0].shape[1])
+    if width % 2:
+      width -= 1
+
+    if args.title:
+      title = args.title
+    elif arch['nf_state_only']:
+      title = rf'online NF  $r=\log p(g\mid s)$  ·  {tag}'
+    else:
+      title = rf'online NF  $r=\log p(g\mid s,a)$  ·  {tag}'
+    ylabel = r'$\log p_{\mathrm{NF}}$'
+
+    rewards_norm = rewards / (float(np.std(rewards)) + 1e-8)
+    print('[vid] composing reward overlay...', flush=True)
+    frames = []
+    for t in range(T):
+      strip = _render_reward_strip(
+          rewards, success, t, width=width, height=220,
+          title=title, ylabel=ylabel, line_color='#5ec8ff', ylim=None)
+      extra = []
+      select_badge = None
+      if args.normalize_reward:
+        extra.append(_render_reward_strip(
+            rewards_norm, success, t, width=width, height=180,
+            title=rf'normalised reward  $r/\sigma_r$  ·  {tag}',
+            ylabel=r'$r/\sigma_r$',
+            line_color='#ffb347'))
+      if show_grad:
+        if arch['nf_state_only']:
+          grad_title = (
+              r'$\Vert\nabla_s\log p_{\mathrm{NF}}(g\mid s)\Vert$  /  '
+              r'$\Vert\nabla_a\log p_{\mathrm{NF}}\Vert$ (unused)'
+              rf'  ·  {tag}')
+        else:
+          grad_title = (
+              r'$\Vert\nabla_s\log p_{\mathrm{NF}}(g\mid s,a)\Vert$  /  '
+              r'$\Vert\nabla_a\log p_{\mathrm{NF}}(g\mid s,a)\Vert$'
+              rf'  ·  {tag}')
+        extra.append(_render_grad_norm_strip(
+            grad_s, grad_a, success, t, width=width, height=220,
+            title=grad_title,
+            ylabel_s=r'$\Vert\nabla_s\log p_{\mathrm{NF}}\Vert$',
+            ylabel_a=r'$\Vert\nabla_a\log p_{\mathrm{NF}}\Vert$'))
+      if show_pol:
+        extra.append(_render_policy_loc_scale_strip(
+            scale_mean, scale_min, loc_abs, success, t,
+            width=width, height=220,
+            title=rf'policy $\mu,\sigma$ (mode-cube xyz+yaw)  ·  {tag}'))
+      if show_gae:
+        extra.append(_render_gae_strip(
+            adv, values, success, t, width=width, height=220,
+            title=rf'GAE $A_t$ (return-std $r$, no minibatch-norm)  ·  {tag}'))
+      if args.show_select:
+        extra.append(_render_select_strip(
+            select, cube, t, width=width, num_cubes=num_cubes, height=180,
+            title=rf'state select_action → cube  ·  {tag}'))
+        select_badge = (float(select[t]), int(cube[t]))
+      if args.show_pos_delta:
+        extra.append(_render_pos_delta_strip(
+            step_delta, t, width=width, selected_cube=cube, height=200,
+            title=rf'per-cube $\Vert\Delta xyz\Vert$ in $s$  ·  {tag}'))
+      composed = _compose_frame(
+          strip, renders[t], float(rewards[t]), bool(success[t] >= 0.5),
+          extra_strips=extra or None, select_badge=select_badge)
+      h, w = composed.shape[:2]
+      if h % 2 or w % 2:
+        composed = composed[: h - (h % 2), : w - (w % 2)]
+      frames.append(composed)
+      if (t + 1) % 10 == 0 or t == T - 1:
+        print(f'[vid]   framed {t + 1}/{T}', flush=True)
+    frames.extend([frames[-1]] * HOLD_LAST)
+    _write_mp4(frames, out_mp4, args.fps)
+    still_t = min(first_succ + 2, T - 1) if first_succ >= 0 else T // 2
+    Image.fromarray(frames[still_t]).save(still_path)
+    print(f'[vid] wrote {out_mp4} ({os.path.getsize(out_mp4) / 1e6:.2f} MB)',
+          flush=True)
 
 
 def main():

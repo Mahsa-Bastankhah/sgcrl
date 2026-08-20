@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=c7t2_crl_catwp_c8
-#SBATCH --output=slurm/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_entanneal_ep60_300m_crl8_%A_%a.log
-#SBATCH --error=slurm/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_entanneal_ep60_300m_crl8_%A_%a.log
+#SBATCH --job-name=c5t2_nfcs_dgr_c100_lamlr1e6
+#SBATCH --output=slurm/ppo_builderbench_creative5_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catselect_dualgradreg_c100_lamlr1e6_ent0005to0001_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative5_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catselect_dualgradreg_c100_lamlr1e6_ent0005to0001_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -11,7 +11,11 @@
 #SBATCH --account=seas
 #SBATCH --array=0-0
 
-# c7t2 CRL catwp: same as succ but ppo_crl_steps_per_iter=8. Seed 0.
+# Clone of dualgradreg_c200_lamlr1e4_ent0005to0001 (3718557): same except
+# c=100 and lam_lr=1e-6 (was c=200, lam_lr=1e-4).
+# Ent 0.0005 -> 0.0001. nopermute, fixedx01, catselect, NO extrew.
+
+# Compact-small NF: sa3x192 r64 b6 w192. Seed 0, ep=50, 200M.
 unset LD_PRELOAD
 
 module purge
@@ -86,56 +90,79 @@ export PIP_CACHE_DIR=/n/fs/mislresearch/mb6458-tmp/pip-cache
 export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-ENV=${ENV:-builderbench_creative_7_task2}
+ENV=${ENV:-builderbench_creative_5_task2}
 SEED=${SEED:-${SLURM_ARRAY_TASK_ID:-0}}
-NUM_STEPS=${NUM_STEPS:-300000000}
+NUM_STEPS=${NUM_STEPS:-200000000}
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
 MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
-ENT_COEF=0.05
-ENT_COEF_FINAL=0.0
-MIN_STD=1e-5
+ENT_COEF=0.0005
+ENT_COEF_FINAL=0.0001
+MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
-REWARD_TAU=${REWARD_TAU:-0.5}
-EXT_REW_SCALE=${EXT_REW_SCALE:-1}
-FIXED_START_X=${FIXED_START_X:-0.1}
-EP_LEN=${EP_LEN:-60}
+NF_REWARD_TAU=${NF_REWARD_TAU:-0.5}
+EP_LEN=${EP_LEN:-50}
 PD_DURATION=${PD_DURATION:-5}
 MJ_EP_LEN=$((EP_LEN * PD_DURATION))
-CRL_STEPS=${CRL_STEPS:-8}
+CRL_STEPS=${CRL_STEPS:-10}
 
-LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative7_task2_e1024_pd_crl_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_entanneal_ep60_300m_crl8/}"
+NF_REP_SIZE=${NF_REP_SIZE:-64}
+NF_NUM_BLOCKS=${NF_NUM_BLOCKS:-6}
+NF_COUPLING_WIDTH=${NF_COUPLING_WIDTH:-192}
+NF_SA_HIDDEN=${NF_SA_HIDDEN:-192}
+NF_SA_NUM_LAYERS=${NF_SA_NUM_LAYERS:-3}
+NF_GRAD_CLIP=${NF_GRAD_CLIP:-1.0}
+NF_NOISE_STD=${NF_NOISE_STD:-0.05}
+NF_GOAL_STD_MIN=${NF_GOAL_STD_MIN:-0.02}
+FIXED_START_X=${FIXED_START_X:-0.1}
+GRAD_REG_COEF=${GRAD_REG_COEF:-5e-4}
+GRAD_REG_C=${GRAD_REG_C:-100.0}
+GRAD_REG_REL=${GRAD_REG_REL:-0.1}
+GRAD_REG_LAM_LR=${GRAD_REG_LAM_LR:-1e-6}
+
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative5_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catselect_dualgradreg_c100_lamlr1e6_ent0005to0001/}"
 
 mkdir -p slurm "${LOG_DIR}"
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=crl reward_tau=${REWARD_TAU}"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=nf nf_reward_tau=${NF_REWARD_TAU}"
 echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
 echo "max_replay_size=${MAX_REPLAY_SIZE}"
-echo "builderbench_use_pd=true pd_duration=${PD_DURATION} permute_start_boxes=false fixed_start_x=${FIXED_START_X} goals=MID+offsets(task2)"
+echo "builderbench_use_pd=true pd_duration=${PD_DURATION} permute_start_boxes=false fixed_start_x=${FIXED_START_X} (fixedx01) goals=MID+offsets(task2 pyramid)"
 echo "episode_length=${EP_LEN} (mj_episode_length=${MJ_EP_LEN}, rollout_length=${EP_LEN})"
 echo "ppo_norm_obs=false"
-echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} (AFTER return-norm)"
+echo "ppo_use_external_reward=false"
 echo "ppo_actor_min_std=${MIN_STD}"
-echo "ppo_anneal_lr=true ppo_anneal_ent_coef=true"
-echo "ppo_categorical_select=true ppo_categorical_select_waypoint=true (n-way select + n×3 waypoint heads)"
+echo "ppo_anneal_ent_coef=true ${ENT_COEF} -> ${ENT_COEF_FINAL}"
+echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
 echo "ppo_crl_steps_per_iter=${CRL_STEPS}"
+echo "nf_compact_small: sa${NF_SA_NUM_LAYERS}x${NF_SA_HIDDEN} r${NF_REP_SIZE} b${NF_NUM_BLOCKS} w${NF_COUPLING_WIDTH}"
+echo "nf_grad_clip=${NF_GRAD_CLIP} nf_noise_std=${NF_NOISE_STD} nf_goal_std_min=${NF_GOAL_STD_MIN}"
+echo "no s/sf perturb"
+echo "nf_grad_reg: dual primal-dual, coef=${GRAD_REG_COEF} c=${GRAD_REG_C} lam_lr=${GRAD_REG_LAM_LR}"
 echo "ppo_eval_interval=30 ppo_video_interval=400"
 echo "steps_per_iter=$((PPO_NUM_ENVS * EP_LEN))"
 echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * EP_LEN)))"
 
 python -u -c "
-from envs.builderbench_utils import default_fixed_target_goal, num_creative_tasks, load_task_goal_offsets
+from envs.builderbench_utils import default_fixed_target_goal, num_creative_tasks
 import numpy as np
-load_task_goal_offsets.cache_clear()
-print('creative-7 n_tasks=', num_creative_tasks(7))
-g = default_fixed_target_goal(7, 1)
+print('creative-5 n_tasks=', num_creative_tasks(5))
+g = default_fixed_target_goal(5, 1)
 print('hard_goal (flat)=', g.tolist())
 print('hard_goal (cubes)=')
 print(np.asarray(g).reshape(-1, 3))
 "
 nvidia-smi || true
 python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
+
+source /n/fs/mislresearch/sgcrl/scripts/bb_injob_reward_probe.sh
+export PROBE_MODE=nf
+export PROBE_ENV="${ENV}"
+export PROBE_SEED="${SEED}"
+export PROBE_CKPT_DIR="${LOG_DIR%/}/ppo_${ENV}_${SEED}/checkpoints"
+export PROBE_OUT_DIR=figs/builderbench/nf_logp_reward_probe/c5t2_nfcs_catselect_dualgradreg_c100_lamlr1e6_ent0005to0001_s0_online_all
+export PROBE_TAG_PREFIX=c5t2_nfcs_catselect_dualgradreg_c100_lamlr1e6_ent0005to0001_s0_online
 
 python -u ppo_contrastive.py \
   --env="${ENV}" \
@@ -164,13 +191,32 @@ python -u ppo_contrastive.py \
   --ppo_video_fps=10 \
   --ppo_skip_first_video=true \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
-  --ppo_repr_mode=crl \
-  --ppo_crl_repr_tau="${REWARD_TAU}" \
-  --ppo_use_external_reward \
-  --ppo_external_reward_scale="${EXT_REW_SCALE}" \
+  --ppo_repr_mode=nf \
+  --ppo_nf_reward_tau="${NF_REWARD_TAU}" \
+  --nf_rep_size="${NF_REP_SIZE}" \
+  --nf_num_blocks="${NF_NUM_BLOCKS}" \
+  --nf_coupling_width="${NF_COUPLING_WIDTH}" \
+  --nf_sa_hidden="${NF_SA_HIDDEN}" \
+  --nf_sa_num_layers="${NF_SA_NUM_LAYERS}" \
+  --nf_grad_clip="${NF_GRAD_CLIP}" \
+  --nf_noise_std="${NF_NOISE_STD}" \
+  --nf_goal_std_min="${NF_GOAL_STD_MIN}" \
+  --nf_goal_enc_size=0 \
+  --ppo_nf_grad_reg \
+  --ppo_crl_grad_reg_coef="${GRAD_REG_COEF}" \
+  --ppo_crl_grad_reg_c="${GRAD_REG_C}" \
+  --ppo_crl_grad_reg_rel="${GRAD_REG_REL}" \
+  --ppo_nf_grad_reg_lam_lr="${GRAD_REG_LAM_LR}" \
   --ppo_categorical_select \
-  --ppo_categorical_select_waypoint \
-  --hidden_layer_sizes="256,256,256,256,256,256"
+  --hidden_layer_sizes="256,256,256,256,256,256" &
+TRAIN_PID=$!
+export PROBE_TRAIN_PID="${TRAIN_PID}"
+bb_probe_sidecar &
+PROBE_PID=$!
+wait "${TRAIN_PID}"
 PY_EXIT=$?
+bb_probe_sweep
+kill "${PROBE_PID}" 2>/dev/null || true
+wait "${PROBE_PID}" 2>/dev/null || true
 pkill -P $$ 2>/dev/null || true
 exit $PY_EXIT

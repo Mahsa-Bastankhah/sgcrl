@@ -1,18 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_bb_c4t2_crl5
-#SBATCH --output=slurm/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_catselect_crl5_%A_%a.log
-#SBATCH --error=slurm/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_catselect_crl5_%A_%a.log
+#SBATCH --job-name=c3t1_envdense
+#SBATCH --output=slurm/ppo_builderbench_creative3_task1_e1024_pd_envdense_nopermute_catselect_ent005_20m_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative3_task1_e1024_pd_envdense_nopermute_catselect_ent005_20m_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=14:00:00
+#SBATCH --time=04:00:00
 #SBATCH --account=seas
-#SBATCH --array=0-1
+#SBATCH --array=0-0
 
-# 4-cube creative-4-task2, PD + CRL tau=0.5, seeds 0-1.
-# Same as catselect baseline (no external reward) but 5 CRL updates/iter.
+# Three-cube (creative-3-task1) PPO env_dense baseline. Same recipe as the
+# cancelled c1/c2 envdense jobs: ent_coef=0.05 (no anneal), 20M steps,
+# default 3-cube episode (250 MJ / 50 PD macros). catselect (3 classes),
+# return-norm on, NO extrew, no CRL, nopermute, seed 0.
 unset LD_PRELOAD
 
 module purge
@@ -87,36 +89,46 @@ export PIP_CACHE_DIR=/n/fs/mislresearch/mb6458-tmp/pip-cache
 export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-ENV=${ENV:-builderbench_creative_4_task2}
+ENV=${ENV:-builderbench_creative_3_task1}
 SEED=${SEED:-${SLURM_ARRAY_TASK_ID:-0}}
-NUM_STEPS=${NUM_STEPS:-200000000}
+NUM_STEPS=${NUM_STEPS:-20000000}
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
 MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
 ENT_COEF=0.05
 MIN_STD=0.01
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
-CRL_REPR_TAU=${CRL_REPR_TAU:-0.5}
-CRL_STEPS_PER_ITER=${CRL_STEPS_PER_ITER:-5}
+EP_LEN=${EP_LEN:-50}
+PD_DURATION=${PD_DURATION:-5}
+MJ_EP_LEN=$((EP_LEN * PD_DURATION))
+CRL_STEPS=${CRL_STEPS:-0}
 
-LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative4_task2_e1024_pd_crl_tau05_catselect_crl5/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative3_task1_e1024_pd_envdense_nopermute_catselect_ent005_20m/}"
 
 mkdir -p slurm "${LOG_DIR}"
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
-echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=crl crl_repr_tau=${CRL_REPR_TAU}"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} ppo_reward_mode=env_dense"
 echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
 echo "max_replay_size=${MAX_REPLAY_SIZE}"
-echo "builderbench_use_pd=true pd_duration=5 permute_start_boxes=true goals=MID+offsets(default)"
+echo "builderbench_use_pd=true pd_duration=${PD_DURATION} permute_start_boxes=false"
+echo "goals=MID+offsets from creative-3.npz task1"
+echo "episode_length=${EP_LEN} (mj_episode_length=${MJ_EP_LEN}, rollout_length=${EP_LEN})"
+echo "ppo_norm_obs=false ppo_norm_reward=true (return-norm kept)"
+echo "ppo_use_external_reward=false"
+echo "ppo_actor_min_std=${MIN_STD}"
+echo "ppo_ent_coef=${ENT_COEF} (no anneal)"
 echo "ppo_categorical_select=true (hybrid Gaussian + categorical select)"
-echo "ppo_crl_steps_per_iter=${CRL_STEPS_PER_ITER}"
-echo "external_reward=none (ppo_env_reward_coef default 0)"
-echo "steps_per_iter=$((PPO_NUM_ENVS * 50))"
-echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * 50)))"
+echo "ppo_crl_steps_per_iter=${CRL_STEPS} (no φ/ψ updates)"
+echo "ppo_eval_interval=30 ppo_video_interval=100"
+echo "steps_per_iter=$((PPO_NUM_ENVS * EP_LEN))"
+echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * EP_LEN)))"
+
 python -u -c "
-from envs.builderbench_utils import default_fixed_target_goal
+from envs.builderbench_utils import default_fixed_target_goal, num_creative_tasks
 import numpy as np
-g = default_fixed_target_goal(4, 1)
+print('creative-3 n_tasks=', num_creative_tasks(3))
+g = default_fixed_target_goal(3, 0)
 print('hard_goal (flat)=', g.tolist())
 print('hard_goal (cubes)=')
 print(np.asarray(g).reshape(-1, 3))
@@ -134,17 +146,23 @@ python -u ppo_contrastive.py \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
-  --ppo_checkpoint_interval=300 \
+  --ppo_checkpoint_interval=50 \
+  --ppo_checkpoint_replay_max="${MAX_REPLAY_SIZE}" \
   --builderbench_use_pd=true \
-  --builderbench_pd_duration=5 \
-  --builderbench_permute_start_boxes=true \
-  --ppo_rollout_length=50 \
-  --ppo_crl_steps_per_iter="${CRL_STEPS_PER_ITER}" \
+  --builderbench_pd_duration="${PD_DURATION}" \
+  --builderbench_permute_start_boxes=false \
+  --builderbench_mj_episode_length="${MJ_EP_LEN}" \
+  --ppo_rollout_length="${EP_LEN}" \
+  --ppo_crl_steps_per_iter="${CRL_STEPS}" \
   --ppo_skip_first_eval=true \
-  --ppo_eval_interval=0 \
+  --ppo_eval_interval=30 \
+  --ppo_eval_episodes=5 \
+  --ppo_video_interval=100 \
+  --ppo_video_fps=10 \
+  --ppo_skip_first_video=true \
   --max_replay_size="${MAX_REPLAY_SIZE}" \
-  --ppo_repr_mode=crl \
-  --ppo_crl_repr_tau="${CRL_REPR_TAU}" \
+  --ppo_reward_mode=env_dense \
+  --ppo_norm_reward=true \
   --ppo_categorical_select \
   --hidden_layer_sizes="256,256,256,256,256,256"
 PY_EXIT=$?
