@@ -27,17 +27,33 @@ STEPS_PER_ITER = 1024
 OUT_PATH = os.path.join(
     REPO, 'figs', 'metaworld', 'peg_nf_tiny_mixtaskg_train_eval_success.png')
 
-_LOG_PREFIX = (
-    'ppo_peg_nf_tiny_sa2x128_r32_b4_w128_tau085_crl10_40m_extrew1_rand'
-    '_minstd1e5_ent0005_mixtaskg'
-)
 # (legend, log_dir, seed run dir, color)
+# All four: mixtaskg + ent_coef=0.005. Rand vs norand is sawyer_randomize_init.
 RUNS = (
-    ('mixtaskg s0', _LOG_PREFIX, 'ppo_sawyer_peg_0', '#4C9BE8'),
-    ('mixtaskg s1', _LOG_PREFIX, 'ppo_sawyer_peg_1', '#9B59B6'),
-    ('mask10', f'{_LOG_PREFIX}_mask10', 'ppo_sawyer_peg_0', '#2A9D8F'),
-    ('grdual', f'{_LOG_PREFIX}_grdual', 'ppo_sawyer_peg_0', '#E07A3D'),
-    ('retnormW1e6', f'{_LOG_PREFIX}_retnormW1e6', 'ppo_sawyer_peg_0', '#C44E52'),
+    (
+        'mixtaskg · rand (3717918)',
+        'ppo_peg_nf_tiny_sa2x128_r32_b4_w128_tau085_crl10_40m_extrew1_rand_minstd1e5_ent0005_mixtaskg',
+        'ppo_sawyer_peg_1',
+        '#4C9BE8',
+    ),
+    (
+        'mixtaskg · rand · grdual_c200_lamlr1e4 (3718391)',
+        'ppo_peg_nf_tiny_sa2x128_r32_b4_w128_tau085_crl10_40m_extrew1_rand_minstd1e5_ent0005_mixtaskg_grdual_c200_lamlr1e4',
+        'ppo_sawyer_peg_0',
+        '#E07A3D',
+    ),
+    (
+        'mixtaskg · norand (3717968)',
+        'ppo_peg_nf_tiny_sa2x128_r32_b4_w128_tau085_crl10_40m_extrew1_norand_minstd1e5_ent0005_mixtaskg',
+        'ppo_sawyer_peg_1',
+        '#2A9D8F',
+    ),
+    (
+        'mixtaskg · norand · noextrew (3717984)',
+        'ppo_peg_nf_tiny_sa2x128_r32_b4_w128_tau085_crl10_40m_extrew0_norand_minstd1e5_ent0005_mixtaskg',
+        'ppo_sawyer_peg_0',
+        '#C44E52',
+    ),
 )
 
 
@@ -63,7 +79,7 @@ def _load_xy(path: str, x_col: str, y_col: str) -> tuple[list[float], list[float
 
 
 def main() -> None:
-  fig, axes = plt.subplots(2, 1, figsize=(9.5, 6.6), sharex=True)
+  fig, axes = plt.subplots(2, 1, figsize=(10.0, 6.8), sharex=True)
   ax_tr, ax_ev = axes
 
   for label, log_dir, run, color in RUNS:
@@ -95,16 +111,17 @@ def main() -> None:
     else:
       print(f'{label} eval: no data under {log_dir}/{run}')
 
-  ax_tr.set_title('Sawyer peg · tiny NF — train success (last 1000)',
-                  fontsize=11, fontweight='bold')
+  ax_tr.set_title(
+      'Sawyer peg · tiny NF · ent=0.005 — train success (last 1000)',
+      fontsize=11, fontweight='bold')
   ax_tr.set_ylabel('Train Success (last 1000)', fontsize=10)
   ax_tr.set_ylim(-0.05, 1.05)
   ax_tr.spines[['top', 'right']].set_visible(False)
   ax_tr.grid(axis='y', linestyle='--', alpha=0.4)
-  ax_tr.legend(loc='upper left', fontsize=9, framealpha=0.95, ncol=3)
+  ax_tr.legend(loc='upper left', fontsize=7.5, framealpha=0.95, ncol=1)
 
   ax_ev.set_title(
-      f'Sawyer peg · tiny NF — eval success '
+      f'Sawyer peg · tiny NF · ent=0.005 — eval success '
       f'(roll mean w={base.EVAL_SMOOTH_WINDOW})',
       fontsize=11, fontweight='bold')
   ax_ev.set_xlabel('Env Steps', fontsize=10)
@@ -114,7 +131,7 @@ def main() -> None:
   ax_ev.set_ylim(-0.05, 1.05)
   ax_ev.spines[['top', 'right']].set_visible(False)
   ax_ev.grid(axis='y', linestyle='--', alpha=0.4)
-  ax_ev.legend(loc='upper left', fontsize=9, framealpha=0.95, ncol=3)
+  ax_ev.legend(loc='upper left', fontsize=7.5, framealpha=0.95, ncol=1)
 
   os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
   fig.tight_layout()

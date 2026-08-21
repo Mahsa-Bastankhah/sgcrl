@@ -455,6 +455,8 @@ def make_nf_density_update_fn(
     grad_reg_c: float = 100.0,
     grad_reg_coef: float = 0.0,
     lam_lr: float = 0.0,
+    task_goal_frac: float = 0.0,
+    task_goal: Optional[np.ndarray] = None,
 ):
     """Jitted update with separate grads for SA encoder, goal encoder, and NF flow.
 
@@ -478,6 +480,10 @@ def make_nf_density_update_fn(
     ∇_s log p diagnostics are always computed and logged; coef=0 keeps
     them out of the loss.
 
+    task_goal_frac in (0, 1]: for that fraction of the batch, the ∇_s log p
+    regularizer / diagnostics use the env task goal instead of replay g.
+    The NLL is never mixed.  task_goal is raw (unnormalized) goal-space.
+
     goal_mean / goal_std are per-dim running stats passed at call time to
     normalise goals to approximately zero mean / unit variance before the flow.
     Both are 1-D arrays of length goal_dim.  Pass zeros/ones to disable.
@@ -497,6 +503,18 @@ def make_nf_density_update_fn(
     _log_grad_reg = obs_dim > 0
     _do_grad_reg = _log_grad_reg and _grad_reg_coef > 0.0
     _dual = _do_grad_reg and _lam_lr > 0.0
+    _task_goal_frac = float(task_goal_frac)
+    if not (0.0 <= _task_goal_frac <= 1.0):
+        raise ValueError(
+            'task_goal_frac must be in [0, 1], '
+            f'got {_task_goal_frac}')
+    _do_task_g_mix = _log_grad_reg and _task_goal_frac > 0.0
+    if _do_task_g_mix and task_goal is None:
+        raise ValueError(
+            'task_goal_frac>0 requires task_goal (raw env task goal)')
+    _task_goal = (
+        None if task_goal is None
+        else jnp.asarray(task_goal, dtype=jnp.float32).reshape(-1))
     _init_lam = jnp.array(
         max(_grad_reg_coef, 5e-4) if _do_grad_reg else 0.0,
         dtype=jnp.float32)
@@ -527,8 +545,10 @@ def make_nf_density_update_fn(
         # Normalise goals to ~N(0,1) using caller-supplied running stats.
         goal = (goal - goal_mean) / (goal_std + 1e-8)
 
+        goal_noise = None
         if noise_std > 0.0:
-            goal = goal + noise_std * jax.random.normal(k_g, goal.shape)
+            goal_noise = noise_std * jax.random.normal(k_g, goal.shape)
+            goal = goal + goal_noise
 
         y = nf_networks.sa_encoder_net.apply(params['sa_encoder'], state, action)
         g = _encode_goal(nf_networks, params, goal)
@@ -543,6 +563,7 @@ def make_nf_density_update_fn(
         grad_reg_raw = zero
         grad_reg_lam = zero
         grad_reg = zero
+        task_g_frac = zero
         if _log_grad_reg:
             def _one_logp(s, a, g_one):
                 # Flow/encoder expect a batch dim; vmap supplies unbatched rows.
@@ -559,7 +580,30 @@ def make_nf_density_update_fn(
                 # when the hinge is in the loss. CRL's φ·ψ grads are rarely 0.
                 return optax.safe_norm(gs, 1e-8)
 
-            gnorms = jax.vmap(_gnorm)(state, action, goal)
+            # NLL keeps replay g. Mix task g into the score regularizer only.
+            goal_reg = goal
+            if _do_task_g_mix:
+                g_task_n = (_task_goal - goal_mean) / (goal_std + 1e-8)
+                g_task_b = jnp.broadcast_to(g_task_n[None, :], goal.shape)
+                if goal_noise is not None:
+                    g_task_b = g_task_b + goal_noise
+                n_b = int(goal.shape[0])
+                k_task = int(round(_task_goal_frac * n_b))
+                k_task = max(0, min(n_b, k_task))
+                if k_task == n_b:
+                    goal_reg = g_task_b
+                    task_g_frac = jnp.array(1.0, dtype=nll.dtype)
+                elif k_task > 0:
+                    key, k_mix = jax.random.split(key)
+                    perm = jax.random.permutation(k_mix, n_b)
+                    is_task = jnp.zeros((n_b,), dtype=goal.dtype).at[
+                        perm[:k_task]].set(1.0)
+                    goal_reg = (
+                        goal * (1.0 - is_task[:, None])
+                        + g_task_b * is_task[:, None])
+                    task_g_frac = jnp.mean(is_task)
+
+            gnorms = jax.vmap(_gnorm)(state, action, goal_reg)
             gnorm_mean = jnp.mean(gnorms)
             gnorm_max = jnp.max(gnorms)
             gnorm_frac_above = jnp.mean(
@@ -590,6 +634,8 @@ def make_nf_density_update_fn(
             's_raw_mean': s_raw_mean,
             's_mean': s_mean,
         }
+        if _do_task_g_mix:
+            metrics['nf_grad_reg_task_g_frac'] = task_g_frac
         return loss, metrics
 
     grad_fn = jax.value_and_grad(_loss, has_aux=True)
@@ -654,6 +700,8 @@ def make_scan_nf_update_fn(
     grad_reg_c: float = 100.0,
     grad_reg_coef: float = 0.0,
     lam_lr: float = 0.0,
+    task_goal_frac: float = 0.0,
+    task_goal: Optional[np.ndarray] = None,
 ):
   """Scan-based NF updater: N density steps in one JIT call.
 
@@ -677,7 +725,8 @@ def make_scan_nf_update_fn(
       s_pert_prob=s_pert_prob, s_pert_eps=s_pert_eps,
       s_pert_lo=s_pert_lo, s_pert_hi=s_pert_hi,
       grad_reg_c=grad_reg_c, grad_reg_coef=grad_reg_coef,
-      lam_lr=lam_lr)
+      lam_lr=lam_lr,
+      task_goal_frac=task_goal_frac, task_goal=task_goal)
   use_ema = 0.0 < float(repr_tau) < 1.0
   _tau = float(repr_tau)
   _init_lam_py = max(grad_reg_coef, 5e-4) if grad_reg_coef > 0.0 else 0.0

@@ -272,6 +272,9 @@ class ContrastiveConfig:
   # Dual step size for λ.  <0 → auto 100×nf_critic_lr (primal-dual).
   # 0 → λ fixed (no dual update).  >0 → that absolute lr.
   ppo_nf_grad_reg_lam_lr: float = -1.0
+  # Fraction of the NF batch whose ∇_s log p regularizer uses the env task
+  # goal instead of replay g.  0 = off (replay g only).  NLL is never mixed.
+  ppo_nf_grad_reg_task_g_frac: float = 0.0
   # EMA decay τ for φ, ψ used in the PPO reward r = φ·ψ (CRL mode only).
   # Reward uses EMA params: ema ← τ·ema + (1−τ)·online after each CRL step.
   # τ=0 uses online params directly (no EMA).  Higher τ = slower / smoother reward.

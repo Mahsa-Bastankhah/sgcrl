@@ -2201,6 +2201,95 @@ class VecEnv:
     return tuple(self._action_spec.shape)
 
 
+class IsaacGymVecEnv:
+  """Native-batched Isaac Gym vec env matching the ``VecEnv`` interface.
+
+  Drives NVIDIA IsaacGymEnvs' ``AllegroKukaThrow`` (via
+  ``envs/allegro_kuka_throw_env.AllegroKukaThrowVecEnv``) which steps *all E
+  envs in one GPU PhysX call*.  Presents the same numpy CleanRL-style API as
+  :class:`VecEnv` so ``run_ppo_training``'s host-loop rollout works unchanged:
+
+      obs = vec_env.reset()                                    # (E, obs_dim_total)
+      next_obs, env_rew, dones, terminal_obs, info_rew = vec_env.step(actions)
+
+  Notes / approximations vs :class:`VecEnv`:
+    * Isaac Gym auto-resets terminated envs *inside* ``step()``; the pre-reset
+      terminal observation is not recoverable from the obs buffer, so
+      ``terminal_obs`` is set equal to ``next_obs``.  This is a minor GAE /
+      episode-buffer boundary approximation (episodes are long — 300 steps —
+      and the common reset is a timeout that resets all envs together).
+    * ``info_rewards`` is NaN (no separate dense-reward channel).
+
+  The numpy boundary (torch CUDA -> numpy per step) is negligible here: the
+  packed obs is 52-D and actions are 23-D, so the per-step transfer is ~300 KB
+  vs. the far larger cost of stepping E dexterous-hand PhysX sims.
+  """
+
+  def __init__(self, env_name: str, num_envs: int, seed: int,
+               isaacgym_kwargs: Optional[Dict[str, Any]] = None):
+    from envs.allegro_kuka_throw_env import AllegroKukaThrowVecEnv
+    kw = dict(isaacgym_kwargs or {})
+    self._env = AllegroKukaThrowVecEnv(
+        num_envs=int(num_envs),
+        seed=int(seed),
+        episode_length=int(kw.get('episode_length', 300)),
+        fixed_target_xyz=tuple(kw.get('fixed_target_xyz', (0.5, -0.3, 0.4))),
+        pipeline=str(kw.get('pipeline', 'gpu')),
+        headless=True,
+    )
+    self._num_envs = int(self._env.num_envs)
+    self._obs_dim_total = int(self._env.obs_dim + self._env.goal_dim)
+    self._act_dim = int(self._env.action_dim)
+    self.episode_length = int(self._env.max_episode_steps)
+    self.last_success = np.zeros(self._num_envs, dtype=np.float32)
+
+  def reset(self) -> np.ndarray:
+    obs = self._env.reset()  # torch (E, obs_dim_total)
+    try:
+      self.last_success = (
+          self._env.success().detach().cpu().numpy().astype(np.float32).reshape(-1))
+    except Exception:
+      self.last_success = np.zeros(self._num_envs, dtype=np.float32)
+    return obs.detach().cpu().numpy().astype(np.float32)
+
+  def step(
+      self, actions: np.ndarray
+  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    import torch
+    a = np.asarray(actions, dtype=np.float32)
+    a = np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=-1.0)
+    a = np.clip(a, -1.0, 1.0)
+    a_t = torch.as_tensor(a, device=self._env.device)
+    next_obs_t, rew_t, done_t = self._env.step(a_t)
+    next_obs = next_obs_t.detach().cpu().numpy().astype(np.float32)
+    env_rewards = rew_t.detach().cpu().numpy().astype(np.float32).reshape(-1)
+    dones = done_t.detach().cpu().numpy().astype(bool).reshape(-1)
+    # terminal_obs approximation (see class docstring).
+    terminal_obs = next_obs.copy()
+    info_rewards = np.full(self._num_envs, np.nan, dtype=np.float32)
+    # Sparse throw success: object xyz within env success_tolerance of the
+    # fixed target.  Not the dense Isaac Gym shaping reward.
+    self.last_success = (
+        self._env.success().detach().cpu().numpy().astype(np.float32).reshape(-1))
+    return next_obs, env_rewards, dones, terminal_obs, info_rewards
+
+  @property
+  def num_envs(self) -> int:
+    return self._num_envs
+
+  @property
+  def observation_shape(self) -> Tuple[int, ...]:
+    return (self._obs_dim_total,)
+
+  @property
+  def action_shape(self) -> Tuple[int, ...]:
+    return (self._act_dim,)
+
+  @property
+  def goal_dim(self) -> int:
+    return int(self._env.goal_dim)
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint helpers.
 # ---------------------------------------------------------------------------
@@ -2489,19 +2578,66 @@ def run_ppo_training(
   The CRL side is InfoNCE + logsumexp penalty on replay batches only.
   The PPO side follows CleanRL.
   """
-  # ---- build networks from env spec -------------------------------------
   from acme import specs as _specs
   import contrastive.utils as _cu
 
-  probe_env = env_factory(seed)
-  spec = _specs.make_environment_spec(probe_env)
-  networks = network_factory(spec=spec)
-  del probe_env
-
-  # ---- vec env ----------------------------------------------------------
   _env_name = str(getattr(config, 'env_name', '') or '')
+  _use_isaacgym = _env_name.startswith('allegro_kuka')
   _use_jax_bb_vec = _env_name.startswith('builderbench_')
-  if _use_jax_bb_vec:
+
+  # Isaac Gym GPU PhysX must create_sim BEFORE JAX initializes a CUDA context.
+  # Preview 4 otherwise fails with missing kernels
+  # (mergeChangedAABBMgrHandlesLaunch) and PhysX Internal CUDA errors.
+  vec_env = None
+  if _use_isaacgym:
+    _ig_kw = dict(builderbench_kwargs or {})
+    vec_env = IsaacGymVecEnv(
+        env_name=_env_name,
+        num_envs=int(config.ppo_num_envs),
+        seed=int(seed * 31),
+        isaacgym_kwargs={
+            'episode_length': int(_ig_kw.get('isaacgym_episode_length', 300)),
+            'fixed_target_xyz': _ig_kw.get(
+                'isaacgym_fixed_target_xyz', (0.5, -0.3, 0.4)),
+            'pipeline': str(_ig_kw.get('isaacgym_pipeline', 'gpu')),
+        },
+    )
+    print(f'[ppo] using native-batched Isaac Gym vec env '
+          f'(AllegroKukaThrow, E={config.ppo_num_envs}, '
+          f'pipeline={_ig_kw.get("isaacgym_pipeline", "gpu")})')
+
+  # ---- build networks from env spec -------------------------------------
+  if _use_isaacgym:
+    # Isaac Gym allows only one PhysX sim per process, so we must NOT create a
+    # throwaway probe env just to read the spec.  Build the spec manually from
+    # the known packed dims: obs = [state(obs_dim) | goal(goal_dim)], act = 23,
+    # actions bounded in [-1, 1] (Isaac Gym normalized action space).
+    _obs_total = int(config.obs_dim) + int(
+        getattr(config, 'goal_dim', 0) or 0)
+    if _obs_total <= int(config.obs_dim):
+      # goal_dim not set on config: fall back to packed 52 (=49 state + 3 goal).
+      _obs_total = int(config.obs_dim) + 3
+    _act_dim = 23
+    _obs_spec = _specs.Array(
+        shape=(_obs_total,), dtype=np.float32, name='observation')
+    _act_spec = _specs.BoundedArray(
+        shape=(_act_dim,), dtype=np.float32,
+        minimum=-1.0, maximum=1.0, name='action')
+    _rew_spec = _specs.Array(shape=(), dtype=np.float32, name='reward')
+    _disc_spec = _specs.BoundedArray(
+        shape=(), dtype=np.float32, minimum=0.0, maximum=1.0, name='discount')
+    spec = _specs.EnvironmentSpec(
+        observations=_obs_spec, actions=_act_spec,
+        rewards=_rew_spec, discounts=_disc_spec)
+    networks = network_factory(spec=spec)
+  else:
+    probe_env = env_factory(seed)
+    spec = _specs.make_environment_spec(probe_env)
+    networks = network_factory(spec=spec)
+    del probe_env
+
+  # ---- vec env (non-Isaac-Gym) ------------------------------------------
+  if vec_env is None and _use_jax_bb_vec:
     import importlib.util as _ilu
     _jax_vec_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -2529,7 +2665,7 @@ def run_ppo_training(
     )
     print(f'[ppo] using JAX-batched BuilderBench vec env '
           f'(E={config.ppo_num_envs})')
-  else:
+  elif vec_env is None:
     vec_env = VecEnv(env_factory, config.ppo_num_envs, seed=seed * 31)
   E = vec_env.num_envs
   obs_shape = vec_env.observation_shape
@@ -3900,10 +4036,15 @@ def run_ppo_training(
   _rT_r0_n_succ = 0.0
   _rT_r0_n_fail = 0.0
   _track_train_success = (
-      _use_jax_bb_vec or str(_env_name).startswith('sawyer_'))
-  if _track_train_success and not _use_jax_bb_vec:
+      _use_jax_bb_vec or str(_env_name).startswith('sawyer_')
+      or _use_isaacgym)
+  if _track_train_success and str(_env_name).startswith('sawyer_'):
     print('[ppo] logging train_success_mean / train_success_1000 from '
           'Sawyer sparse env reward (env_rew >= 0.5)', flush=True)
+  if _track_train_success and _use_isaacgym:
+    print('[ppo] logging train_success_mean / train_success_1000 from '
+          'AllegroKukaThrow object-at-target (not dense env reward)',
+          flush=True)
   # Nominal PD/MJ episode length (BuilderBench). Used to detect collapse via
   # short episodes (e.g. repeated OOB early terminations) and reinit the actor.
   _nominal_ep_len = (
@@ -4274,6 +4415,10 @@ def run_ppo_training(
         roll_flow_dense_rew[t] = info_rew
         # Store step-level dones for the post-rollout reward normalizer loop.
         roll_step_dones[t] = dones.astype(np.float32)
+        _step_success = None
+        if _track_train_success and _use_isaacgym:
+          _step_success = np.asarray(
+              getattr(vec_env, 'last_success', None), dtype=np.float32)
 
         # Episode flushing / per-env accounting.
         for i in range(E):
@@ -4283,8 +4428,12 @@ def run_ppo_training(
             ep_flow_dense_return[i] += float(info_rew[i])
             ep_has_flow_dense[i] = True
           ep_len[i] += 1
-          if _track_train_success and float(env_rew[i]) >= 0.5:
-            ep_success_max[i] = 1.0
+          if _track_train_success:
+            if _step_success is not None:
+              if float(_step_success[i]) >= 0.5:
+                ep_success_max[i] = 1.0
+            elif float(env_rew[i]) >= 0.5:
+              ep_success_max[i] = 1.0
           if dones[i]:
             ep_obs[i].append(terminal_obs[i].copy())
             try:
