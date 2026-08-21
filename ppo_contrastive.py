@@ -651,6 +651,10 @@ flags.DEFINE_float(
     '<0 → auto 100×nf_critic_lr (primal-dual). '
     '0 → λ fixed (no dual update). >0 → that absolute lr.')
 flags.DEFINE_float(
+    'ppo_nf_grad_reg_task_g_frac', 0.0,
+    'NF: fraction of the batch whose ∇_s log p regularizer uses the env '
+    'task goal instead of replay g. 0 = off. NLL is never mixed.')
+flags.DEFINE_float(
     'ppo_crl_repr_tau', -1.0,
     'CRL mode: EMA decay τ for φ, ψ used in PPO reward r=φ·ψ. '
     'ema ← τ·ema + (1−τ)·online after each CRL step. '
@@ -724,6 +728,19 @@ flags.DEFINE_integer(
     'BuilderBench: if >0, end the episode after this many consecutive '
     'successful macro-steps (metrics[\'success\'] >= 0.5). 0 = disabled '
     '(default: run until horizon).')
+flags.DEFINE_integer(
+    'isaacgym_episode_length', 300,
+    'Isaac Gym (allegro_kuka_*): episode length in env steps.')
+flags.DEFINE_string(
+    'isaacgym_pipeline', 'gpu',
+    'Isaac Gym PhysX pipeline: "gpu" (default; native GPU PhysX + GPU tensors) '
+    'or "cpu" (CPU PhysX fallback if GPU kernels fail on the node). JAX '
+    'training stays on GPU either way.')
+flags.DEFINE_list(
+    'isaacgym_fixed_target_xyz', ['0.5', '-0.3', '0.4'],
+    'Isaac Gym (allegro_kuka_throw): fixed bucket/goal world-frame xyz '
+    '(3 comma-separated floats). The object absolute position is the NF goal; '
+    'this target is a constant of the env and never appears in the obs.')
 flags.DEFINE_string(
     'hidden_layer_sizes', '',
     'Comma-separated hidden layer widths, e.g. "256,256,256,256,256,256". '
@@ -910,6 +927,9 @@ PPO_ENV_DEFAULTS = {
     'flow_figureeight_2v2rl': dict(
         rollout_length=1500, crl_steps_per_iter=750,
         start_index=0, end_index=2),
+    # Isaac Gym AllegroKukaThrow: 300-step episodes → T=300 keeps ~1 full
+    # episode per env per rollout. CRL off-policy steps like the sawyer envs.
+    'allegro_kuka_throw': dict(rollout_length=300, crl_steps_per_iter=10),
 }
 
 
@@ -1305,6 +1325,11 @@ def main(_):
     config.ppo_nf_grad_reg_lam = float(FLAGS.ppo_nf_grad_reg_lam)
   if FLAGS.ppo_nf_grad_reg_lam_lr >= 0.0:
     config.ppo_nf_grad_reg_lam_lr = float(FLAGS.ppo_nf_grad_reg_lam_lr)
+  config.ppo_nf_grad_reg_task_g_frac = float(FLAGS.ppo_nf_grad_reg_task_g_frac)
+  if not (0.0 <= config.ppo_nf_grad_reg_task_g_frac <= 1.0):
+    raise ValueError(
+        'ppo_nf_grad_reg_task_g_frac must be in [0, 1], '
+        f'got {config.ppo_nf_grad_reg_task_g_frac}')
   if FLAGS.ppo_crl_repr_tau >= 0.0:
     config.ppo_crl_repr_tau = float(FLAGS.ppo_crl_repr_tau)
   if FLAGS.ppo_nf_reward_tau >= 0.0:
@@ -1375,6 +1400,7 @@ def main(_):
         f'ppo_nf_grad_reg={config.ppo_nf_grad_reg}  '
         f'ppo_nf_grad_reg_lam={config.ppo_nf_grad_reg_lam}  '
         f'ppo_nf_grad_reg_lam_lr={config.ppo_nf_grad_reg_lam_lr}  '
+        f'ppo_nf_grad_reg_task_g_frac={config.ppo_nf_grad_reg_task_g_frac}  '
         f'ppo_nf_reward_tau={config.ppo_nf_reward_tau}  '
         f'ppo_nf_td={config.ppo_nf_td}  '
         f'ppo_nf_td_target_tau={config.ppo_nf_td_target_tau}  '
@@ -1433,13 +1459,19 @@ def main(_):
         f'hidden_layers={config.hidden_layer_sizes}')
 
   # ---- Build env factories ----------------------------------------------
-  fixed_start_end = (fixed_goal_for_env(env_name)
-                     if config.fix_goals else None)
-  _hard_goal_print = (
-      fixed_start_end if fixed_start_end is not None
-      else fixed_goal_for_env(env_name))
-  print(f'[ppo_contrastive] hard_goal=\n{_hard_goal_print}')
-  if (getattr(config, 'ppo_crl_hit_bonus', '') or '').strip().lower() == 'goal':
+  # Isaac Gym (AllegroKukaThrow) has no sgcrl fixed-goal dict entry; its goal
+  # is a constant baked into the env wrapper, so skip the fixed-goal lookup.
+  _use_isaacgym = env_name.startswith('allegro_kuka')
+  fixed_start_end = (
+      None if _use_isaacgym
+      else (fixed_goal_for_env(env_name) if config.fix_goals else None))
+  if not _use_isaacgym:
+    _hard_goal_print = (
+        fixed_start_end if fixed_start_end is not None
+        else fixed_goal_for_env(env_name))
+    print(f'[ppo_contrastive] hard_goal=\n{_hard_goal_print}')
+  if (not _use_isaacgym
+      and (getattr(config, 'ppo_crl_hit_bonus', '') or '').strip().lower() == 'goal'):
     config.ppo_crl_hit_bonus_goal = np.asarray(
         fixed_goal_for_env(env_name), dtype=np.float32).reshape(-1)
     print(f'[ppo_contrastive] ppo_crl_hit_bonus=goal → '
@@ -1530,12 +1562,34 @@ def main(_):
     return env
 
   # obs_dim / max_episode_steps inferred from one sample env.
-  probe_env, obs_dim = contrastive_utils.make_environment(
-      env_name, config.start_index, config.end_index, seed,
-      fixed_start_end=fixed_start_end, **_env_kwargs)
-  config.obs_dim = obs_dim
-  config.max_episode_steps = getattr(probe_env, '_step_limit') + 1
-  del probe_env
+  if _use_isaacgym:
+    # Isaac Gym allows only one PhysX sim per process; do NOT create a probe
+    # sim.  Use the known compact packed layout from the wrapper:
+    #   state (49) = joint pos (23) + joint vel (23) + object xyz (3)
+    #   goal  (3)  = fixed target xyz
+    from envs.allegro_kuka_throw_env import STATE_DIM as _IG_STATE_DIM
+    from envs.allegro_kuka_throw_env import GOAL_DIM as _IG_GOAL_DIM
+    obs_dim = int(_IG_STATE_DIM)
+    config.obs_dim = obs_dim
+    config.goal_dim = int(_IG_GOAL_DIM)
+    config.max_episode_steps = int(FLAGS.isaacgym_episode_length)
+    # The hindsight goal is a projection of the state: object xyz occupies the
+    # LAST GOAL_DIM entries of the state (state[46:49] for the 49-D layout).
+    # start/end_index make _obs_to_goal(state) return that 3-D slice, matching
+    # the appended commanded goal (obs[obs_dim:], the fixed target xyz).
+    config.start_index = int(_IG_STATE_DIM - _IG_GOAL_DIM)
+    config.end_index = int(_IG_STATE_DIM)
+    print(f'[ppo_contrastive] isaacgym: obs_dim={obs_dim} '
+          f'goal_dim={config.goal_dim} '
+          f'goal_slice=state[{config.start_index}:{config.end_index}] '
+          f'max_episode_steps={config.max_episode_steps}')
+  else:
+    probe_env, obs_dim = contrastive_utils.make_environment(
+        env_name, config.start_index, config.end_index, seed,
+        fixed_start_end=fixed_start_end, **_env_kwargs)
+    config.obs_dim = obs_dim
+    config.max_episode_steps = getattr(probe_env, '_step_limit') + 1
+    del probe_env
 
   # ---- Network factory (adds value_network via networks.py changes) -----
   # NOTE: `actor_min_std` is raised from the shared default (1e-6) to the
@@ -1656,6 +1710,31 @@ def main(_):
     if fixed_start_end is not None:
       _bb_kwargs['fixed_target_goal'] = np.asarray(
           fixed_start_end, dtype=np.float32)
+
+  if _use_isaacgym:
+    # Route to the Isaac-Gym-native learner (byte-identical to ppo_learner
+    # except the env-interaction path). Isaac Gym kwargs are passed through the
+    # generic ``builderbench_kwargs`` slot that the learner reuses.
+    from contrastive import ppo_learner_isaacgym
+    _ig_kwargs = {
+        'isaacgym_episode_length': int(FLAGS.isaacgym_episode_length),
+        'isaacgym_fixed_target_xyz': tuple(
+            float(v) for v in FLAGS.isaacgym_fixed_target_xyz),
+        'isaacgym_pipeline': str(FLAGS.isaacgym_pipeline).strip().lower(),
+    }
+    ppo_learner_isaacgym.run_ppo_training(
+        config=config,
+        env_factory=env_factory,
+        eval_env_factory=eval_env_factory,
+        network_factory=network_factory,
+        logger_fn=logger_fn,
+        total_steps=total_steps,
+        seed=seed,
+        checkpoint_dir=checkpoint_dir,
+        builderbench_kwargs=_ig_kwargs,
+        fixed_start_end=fixed_start_end,
+    )
+    return
 
   ppo_learner.run_ppo_training(
       config=config,

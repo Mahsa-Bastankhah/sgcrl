@@ -37,7 +37,7 @@ from contrastive import gaussian_density as _gd
 from contrastive import nf_density as _nf
 from contrastive import fm_density as _fm
 from contrastive import td3_density as _td3
-from metrics import compute_analysis_dict
+from contrastive.utils import extract_info_reward
 from distributional import TanhTransformedDistribution
 
 import tensorflow_probability
@@ -894,133 +894,6 @@ def _completed_ep_repr_rT_minus_r0(
 
 
 # ---------------------------------------------------------------------------
-# Good Experience Replay & Progress Evaluation
-# ---------------------------------------------------------------------------
-def compute_max_cubes_stacked(
-    ep_obs: np.ndarray,
-    target_goal: Optional[np.ndarray] = None,
-    num_cubes: int = 4,
-    tol: float = 0.03,
-) -> int:
-  """Calculate max number of cubes at target locations across an episode."""
-  if ep_obs.ndim != 2 or ep_obs.shape[1] < num_cubes * 3:
-    return 0
-  cube_pos = ep_obs[:, :num_cubes * 3].reshape(-1, num_cubes, 3)
-
-  if target_goal is not None and target_goal.size >= num_cubes * 3:
-    target_pos = target_goal.reshape(-1, num_cubes, 3)
-  elif ep_obs.shape[1] >= 2 * num_cubes * 3:
-    target_pos = ep_obs[:, -num_cubes * 3:].reshape(-1, num_cubes, 3)
-  else:
-    z_heights = cube_pos[:, :, 2]
-    elevated_count = np.sum(z_heights > 0.04, axis=-1)
-    return int(np.max(elevated_count))
-
-  dists = np.linalg.norm(cube_pos - target_pos, axis=-1)
-  cubes_stacked_per_step = np.sum(dists < tol, axis=-1)
-  return int(np.max(cubes_stacked_per_step))
-
-
-class GoodTrajectoryReplay:
-  """Host-side buffer storing high-performing rollouts (>= min_cubes stacked).
-  
-  Matches EpisodeReplay design: stores list of episode dicts containing
-  (obs, action, returns, log_probs).
-  """
-
-  def __init__(self, capacity: int = 50000):
-    self._cap = int(capacity)
-    self._episodes: list = []
-    self._ep_lens: list = []
-    self._total_transitions = 0
-    self._episodes_added = 0
-
-  @property
-  def size(self) -> int:
-    return self._total_transitions
-
-  @property
-  def num_episodes(self) -> int:
-    return len(self._episodes)
-
-  @property
-  def episodes_added(self) -> int:
-    return self._episodes_added
-
-  def add_episode(self, obs: np.ndarray, action: np.ndarray, returns: np.ndarray, log_probs: np.ndarray, stacked_cubes: int = 0):
-    T = action.shape[0]
-    if T < 1:
-      return
-    obs_arr = np.asarray(obs[:T], dtype=np.float32)
-    act_arr = np.asarray(action, dtype=np.float32)
-    ret_arr = np.asarray(returns[:T], dtype=np.float32)
-    logp_arr = np.asarray(log_probs[:T], dtype=np.float32)
-
-    assert obs_arr.shape[0] == T, f'Shape mismatch: obs len {obs_arr.shape[0]} != action len {T}'
-    assert ret_arr.shape[0] == T, f'Shape mismatch: returns len {ret_arr.shape[0]} != action len {T}'
-    assert logp_arr.shape[0] == T, f'Shape mismatch: log_probs len {logp_arr.shape[0]} != action len {T}'
-
-    self._episodes.append({
-        'obs': obs_arr,
-        'action': act_arr,
-        'returns': ret_arr,
-        'log_probs': logp_arr,
-    })
-    self._ep_lens.append(T)
-    self._total_transitions += T
-    self._episodes_added += 1
-
-    print(f'[GoodTrajectoryReplay] Ingested episode #{self._episodes_added} '
-          f'({stacked_cubes} cubes stacked, len={T}, return={ret_arr[0]:.2f}). '
-          f'Buffer size: {self._total_transitions}/{self._cap} transitions.')
-
-    while self._total_transitions > self._cap and len(self._episodes) > 1:
-      self._episodes.pop(0)
-      self._total_transitions -= self._ep_lens.pop(0)
-
-  def sample(self, batch_size: int, rng: np.random.Generator) -> Dict[str, np.ndarray]:
-    assert self.size > 0, 'Cannot sample from an empty GoodTrajectoryReplay.'
-    B = int(batch_size)
-    num_eps = len(self._episodes)
-    ep_lens = np.asarray(self._ep_lens, dtype=np.int64)
-
-    ep_ids = rng.integers(0, num_eps, size=B)
-    lens = ep_lens[ep_ids]
-
-    u_t = rng.random(B)
-    t = np.floor(u_t * lens).astype(np.int64)
-    t = np.minimum(t, lens - 1)
-
-    first_ep = self._episodes[0]
-    obs_dim = first_ep['obs'].shape[1]
-    act_dim = first_ep['action'].shape[1]
-
-    obs_out = np.empty((B, obs_dim), dtype=np.float32)
-    act_out = np.empty((B, act_dim), dtype=np.float32)
-    returns_out = np.empty((B,), dtype=np.float32)
-    log_probs_out = np.empty((B,), dtype=np.float32)
-
-    for i in range(B):
-      ep = self._episodes[int(ep_ids[i])]
-      ti = int(t[i])
-      obs_out[i] = ep['obs'][ti]
-      act_out[i] = ep['action'][ti]
-      returns_out[i] = ep['returns'][ti]
-      log_probs_out[i] = ep['log_probs'][ti]
-
-    assert obs_out.shape == (B, obs_dim), f'Sample obs shape error: {obs_out.shape} vs ({B}, {obs_dim})'
-    assert act_out.shape == (B, act_dim), f'Sample action shape error: {act_out.shape} vs ({B}, {act_dim})'
-    assert returns_out.shape == (B,), f'Sample returns shape error: {returns_out.shape} vs ({B},)'
-
-    return {
-        'obs': obs_out,
-        'action': act_out,
-        'returns': returns_out,
-        'log_probs': log_probs_out,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Core factories.  Each returns a jitted function plus any needed metadata.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -1406,18 +1279,8 @@ def make_ppo_update_fn(
     entropy_mean = jnp.mean(entropy_est)
     entropy_loss_term = -ent_coef * entropy_mean
 
-    # ---- Self-Imitation Learning (SIL) loss (Approach 1) ----
-    sil_loss = jnp.array(0.0, dtype=jnp.float32)
-    if 'good_obs' in batch:
-      good_dist = networks.policy_network.apply(params['policy'], batch['good_obs'])
-      good_logprob = networks.log_prob(good_dist, batch['good_actions'])
-      good_value = networks.value_network.apply(params['value'], batch['good_obs'])
-      sil_adv = jnp.maximum(batch['good_returns'] - good_value, 0.0)
-      sil_loss = -jnp.mean(good_logprob * sil_adv)
-
     # ---- combined loss ----
-    sil_coef = float(getattr(config, 'ppo_good_buffer_coef', 0.1)) if 'good_obs' in batch else 0.0
-    total = pg_loss - ent_coef * entropy_mean + vf_coef * v_loss + sil_coef * sil_loss
+    total = pg_loss - ent_coef * entropy_mean + vf_coef * v_loss
 
     # ---- diagnostics ----
     approx_kl = jnp.mean((ratio - 1.0) - logratio)  # http://joschu.net/blog/kl-approx.html
@@ -1429,7 +1292,6 @@ def make_ppo_update_fn(
         'ppo_total_loss': total,
         'pg_loss': pg_loss,
         'v_loss': v_loss,
-        'sil_loss': sil_loss,
         'entropy': entropy_mean,
         'entropy_loss': entropy_loss_term,
         'approx_kl': approx_kl,
@@ -1507,12 +1369,6 @@ def make_ppo_update_fn(
       def update(params, opt_state, batch, key, obs_mean, obs_var, step):
         (_, metrics), grads = grad_fn(
             params, batch, key, obs_mean, obs_var, step)
-        actor_metrics = compute_analysis_dict(
-            prefix="actor",
-            params=params['policy'],
-            grads=grads['policy']
-        )
-        metrics.update(actor_metrics)
         updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, metrics
@@ -1521,12 +1377,6 @@ def make_ppo_update_fn(
       def update(params, opt_state, batch, key, obs_mean, obs_var):
         (_, metrics), grads = grad_fn(
             params, batch, key, obs_mean, obs_var)
-        actor_metrics = compute_analysis_dict(
-            prefix="actor",
-            params=params['policy'],
-            grads=grads['policy']
-        )
-        metrics.update(actor_metrics)
         updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, metrics
@@ -1788,19 +1638,6 @@ def make_crl_update_fn(
     else:
       logsumexp_val = jax.nn.logsumexp(train_logits, axis=1) ** 2
 
-    # Action gradient norm ||grad_a (phi(s,a) . psi(g))||_2 on positive pairs
-    b_grad = min(int(batch_size), 128)
-    def _single_crl_score(a_i, obs_i):
-      _l, _, _ = networks.q_network.apply(q_params, obs_i[None, :], a_i[None, :])
-      if _l.ndim == 3:
-        return _l[0, 0, 0]
-      return _l[0, 0]
-
-    grad_a_fn = jax.vmap(jax.grad(_single_crl_score, argnums=0), in_axes=(0, 0))
-    grads_a = grad_a_fn(action[:b_grad], obs[:b_grad])
-    action_grad_norm = jax.lax.stop_gradient(
-        jnp.mean(jnp.linalg.norm(grads_a, axis=-1)))
-
     metrics = {
         'crl_loss': nce_loss,
         'crl_total_loss': total_loss,
@@ -1809,7 +1646,6 @@ def make_crl_update_fn(
         'logits_pos': logits_pos,
         'logits_neg': logits_neg,
         'logsumexp': logsumexp_val.mean(),
-        'action_grad_norm': action_grad_norm,
         'crl_hit_bonus_frac': hit_frac,
         'crl_sf_perturb_frac': sf_pert_frac,
         'crl_sf_perturb_norm': sf_pert_norm,
@@ -1836,12 +1672,6 @@ def make_crl_update_fn(
     _lam = _init_lam if lam_val is None else lam_val
     (_, metrics), grads = grad_fn(
         q_params, _lam, batch, key, obs_mean, obs_var)
-    critic_metrics = compute_analysis_dict(
-          prefix="critic",
-          params=q_params,
-          grads=grads,
-    )
-    metrics.update(critic_metrics)
     grads_finite = jnp.all(jnp.asarray(jax.tree_util.tree_leaves(
         jax.tree_util.tree_map(lambda x: jnp.all(jnp.isfinite(x)), grads))))
     loss_finite = jnp.logical_and(
@@ -2371,6 +2201,95 @@ class VecEnv:
     return tuple(self._action_spec.shape)
 
 
+class IsaacGymVecEnv:
+  """Native-batched Isaac Gym vec env matching the ``VecEnv`` interface.
+
+  Drives NVIDIA IsaacGymEnvs' ``AllegroKukaThrow`` (via
+  ``envs/allegro_kuka_throw_env.AllegroKukaThrowVecEnv``) which steps *all E
+  envs in one GPU PhysX call*.  Presents the same numpy CleanRL-style API as
+  :class:`VecEnv` so ``run_ppo_training``'s host-loop rollout works unchanged:
+
+      obs = vec_env.reset()                                    # (E, obs_dim_total)
+      next_obs, env_rew, dones, terminal_obs, info_rew = vec_env.step(actions)
+
+  Notes / approximations vs :class:`VecEnv`:
+    * Isaac Gym auto-resets terminated envs *inside* ``step()``; the pre-reset
+      terminal observation is not recoverable from the obs buffer, so
+      ``terminal_obs`` is set equal to ``next_obs``.  This is a minor GAE /
+      episode-buffer boundary approximation (episodes are long — 300 steps —
+      and the common reset is a timeout that resets all envs together).
+    * ``info_rewards`` is NaN (no separate dense-reward channel).
+
+  The numpy boundary (torch CUDA -> numpy per step) is negligible here: the
+  packed obs is 52-D and actions are 23-D, so the per-step transfer is ~300 KB
+  vs. the far larger cost of stepping E dexterous-hand PhysX sims.
+  """
+
+  def __init__(self, env_name: str, num_envs: int, seed: int,
+               isaacgym_kwargs: Optional[Dict[str, Any]] = None):
+    from envs.allegro_kuka_throw_env import AllegroKukaThrowVecEnv
+    kw = dict(isaacgym_kwargs or {})
+    self._env = AllegroKukaThrowVecEnv(
+        num_envs=int(num_envs),
+        seed=int(seed),
+        episode_length=int(kw.get('episode_length', 300)),
+        fixed_target_xyz=tuple(kw.get('fixed_target_xyz', (0.5, -0.3, 0.4))),
+        pipeline=str(kw.get('pipeline', 'gpu')),
+        headless=True,
+    )
+    self._num_envs = int(self._env.num_envs)
+    self._obs_dim_total = int(self._env.obs_dim + self._env.goal_dim)
+    self._act_dim = int(self._env.action_dim)
+    self.episode_length = int(self._env.max_episode_steps)
+    self.last_success = np.zeros(self._num_envs, dtype=np.float32)
+
+  def reset(self) -> np.ndarray:
+    obs = self._env.reset()  # torch (E, obs_dim_total)
+    try:
+      self.last_success = (
+          self._env.success().detach().cpu().numpy().astype(np.float32).reshape(-1))
+    except Exception:
+      self.last_success = np.zeros(self._num_envs, dtype=np.float32)
+    return obs.detach().cpu().numpy().astype(np.float32)
+
+  def step(
+      self, actions: np.ndarray
+  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    import torch
+    a = np.asarray(actions, dtype=np.float32)
+    a = np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=-1.0)
+    a = np.clip(a, -1.0, 1.0)
+    a_t = torch.as_tensor(a, device=self._env.device)
+    next_obs_t, rew_t, done_t = self._env.step(a_t)
+    next_obs = next_obs_t.detach().cpu().numpy().astype(np.float32)
+    env_rewards = rew_t.detach().cpu().numpy().astype(np.float32).reshape(-1)
+    dones = done_t.detach().cpu().numpy().astype(bool).reshape(-1)
+    # terminal_obs approximation (see class docstring).
+    terminal_obs = next_obs.copy()
+    info_rewards = np.full(self._num_envs, np.nan, dtype=np.float32)
+    # Sparse throw success: object xyz within env success_tolerance of the
+    # fixed target.  Not the dense Isaac Gym shaping reward.
+    self.last_success = (
+        self._env.success().detach().cpu().numpy().astype(np.float32).reshape(-1))
+    return next_obs, env_rewards, dones, terminal_obs, info_rewards
+
+  @property
+  def num_envs(self) -> int:
+    return self._num_envs
+
+  @property
+  def observation_shape(self) -> Tuple[int, ...]:
+    return (self._obs_dim_total,)
+
+  @property
+  def action_shape(self) -> Tuple[int, ...]:
+    return (self._act_dim,)
+
+  @property
+  def goal_dim(self) -> int:
+    return int(self._env.goal_dim)
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint helpers.
 # ---------------------------------------------------------------------------
@@ -2454,12 +2373,7 @@ def _save_checkpoint(path: str,
                      iteration: int, global_step: int, key,
                      q_params_ema=None,
                      td3_policy_target=None,
-                     obs_norm_mean=None,
-                     obs_norm_var=None,
-                     obs_norm_count=None,
-                     obs_norm_mode=None,
-                     extra_state=None,
-                     **kwargs):
+                     extra_state=None):
   """Write a pickle checkpoint atomically (write to tmp → rename)."""
   import pickle as _pkl
   import os as _os
@@ -2478,11 +2392,6 @@ def _save_checkpoint(path: str,
     ckpt['q_params_ema'] = q_params_ema
   if td3_policy_target is not None:
     ckpt['td3_policy_target'] = td3_policy_target
-  if obs_norm_mean is not None:
-    ckpt['obs_norm_mean'] = obs_norm_mean
-    ckpt['obs_norm_var'] = obs_norm_var
-    ckpt['obs_norm_count'] = obs_norm_count
-    ckpt['obs_norm_mode'] = obs_norm_mode
   if extra_state is not None:
     ckpt['extra_state'] = extra_state
   tmp_path = path + '.tmp'
@@ -2669,19 +2578,66 @@ def run_ppo_training(
   The CRL side is InfoNCE + logsumexp penalty on replay batches only.
   The PPO side follows CleanRL.
   """
-  # ---- build networks from env spec -------------------------------------
   from acme import specs as _specs
   import contrastive.utils as _cu
 
-  probe_env = env_factory(seed)
-  spec = _specs.make_environment_spec(probe_env)
-  networks = network_factory(spec=spec)
-  del probe_env
-
-  # ---- vec env ----------------------------------------------------------
   _env_name = str(getattr(config, 'env_name', '') or '')
+  _use_isaacgym = _env_name.startswith('allegro_kuka')
   _use_jax_bb_vec = _env_name.startswith('builderbench_')
-  if _use_jax_bb_vec:
+
+  # Isaac Gym GPU PhysX must create_sim BEFORE JAX initializes a CUDA context.
+  # Preview 4 otherwise fails with missing kernels
+  # (mergeChangedAABBMgrHandlesLaunch) and PhysX Internal CUDA errors.
+  vec_env = None
+  if _use_isaacgym:
+    _ig_kw = dict(builderbench_kwargs or {})
+    vec_env = IsaacGymVecEnv(
+        env_name=_env_name,
+        num_envs=int(config.ppo_num_envs),
+        seed=int(seed * 31),
+        isaacgym_kwargs={
+            'episode_length': int(_ig_kw.get('isaacgym_episode_length', 300)),
+            'fixed_target_xyz': _ig_kw.get(
+                'isaacgym_fixed_target_xyz', (0.5, -0.3, 0.4)),
+            'pipeline': str(_ig_kw.get('isaacgym_pipeline', 'gpu')),
+        },
+    )
+    print(f'[ppo] using native-batched Isaac Gym vec env '
+          f'(AllegroKukaThrow, E={config.ppo_num_envs}, '
+          f'pipeline={_ig_kw.get("isaacgym_pipeline", "gpu")})')
+
+  # ---- build networks from env spec -------------------------------------
+  if _use_isaacgym:
+    # Isaac Gym allows only one PhysX sim per process, so we must NOT create a
+    # throwaway probe env just to read the spec.  Build the spec manually from
+    # the known packed dims: obs = [state(obs_dim) | goal(goal_dim)], act = 23,
+    # actions bounded in [-1, 1] (Isaac Gym normalized action space).
+    _obs_total = int(config.obs_dim) + int(
+        getattr(config, 'goal_dim', 0) or 0)
+    if _obs_total <= int(config.obs_dim):
+      # goal_dim not set on config: fall back to packed 52 (=49 state + 3 goal).
+      _obs_total = int(config.obs_dim) + 3
+    _act_dim = 23
+    _obs_spec = _specs.Array(
+        shape=(_obs_total,), dtype=np.float32, name='observation')
+    _act_spec = _specs.BoundedArray(
+        shape=(_act_dim,), dtype=np.float32,
+        minimum=-1.0, maximum=1.0, name='action')
+    _rew_spec = _specs.Array(shape=(), dtype=np.float32, name='reward')
+    _disc_spec = _specs.BoundedArray(
+        shape=(), dtype=np.float32, minimum=0.0, maximum=1.0, name='discount')
+    spec = _specs.EnvironmentSpec(
+        observations=_obs_spec, actions=_act_spec,
+        rewards=_rew_spec, discounts=_disc_spec)
+    networks = network_factory(spec=spec)
+  else:
+    probe_env = env_factory(seed)
+    spec = _specs.make_environment_spec(probe_env)
+    networks = network_factory(spec=spec)
+    del probe_env
+
+  # ---- vec env (non-Isaac-Gym) ------------------------------------------
+  if vec_env is None and _use_jax_bb_vec:
     import importlib.util as _ilu
     _jax_vec_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -2709,7 +2665,7 @@ def run_ppo_training(
     )
     print(f'[ppo] using JAX-batched BuilderBench vec env '
           f'(E={config.ppo_num_envs})')
-  else:
+  elif vec_env is None:
     vec_env = VecEnv(env_factory, config.ppo_num_envs, seed=seed * 31)
   E = vec_env.num_envs
   obs_shape = vec_env.observation_shape
@@ -2838,9 +2794,6 @@ def run_ppo_training(
         getattr(config, 'fm_logp_mode', 'exact') or 'exact').strip().lower()
     _fm_hutch_probes = int(getattr(config, 'fm_hutch_probes', 8))
     _fm_layer_norm = bool(getattr(config, 'fm_layer_norm', False))
-    _fm_time_embed = bool(getattr(config, 'fm_time_embedding', False))
-    _fm_embed_dim = int(getattr(config, 'fm_time_embed_dim', 32))
-    _fm_ode_solver = str(getattr(config, 'fm_ode_solver', 'euler') or 'euler').strip().lower()
     fm_density_nets = _fm.make_fm_density_networks(
         obs_dim=obs_dim_cfg,
         act_dim=act_dim_cfg,
@@ -2848,16 +2801,12 @@ def run_ppo_training(
         hidden_layer_sizes=config.hidden_layer_sizes,
         flow_steps=_fm_flow_steps,
         layer_norm=_fm_layer_norm,
-        time_embedding=_fm_time_embed,
-        time_embed_dim=_fm_embed_dim,
-        ode_solver=_fm_ode_solver,
     )
     print(f'[ppo] repr_mode=fm (OT flow matching)  obs_dim={obs_dim_cfg}  '
           f'act_dim={act_dim_cfg}  goal_dim={goal_dim_cfg}  '
           f'hidden_layers={config.hidden_layer_sizes}  '
           f'flow_steps={_fm_flow_steps}  logp_mode={_fm_logp_mode}  '
-          f'time_embed={_fm_time_embed}(dim={_fm_embed_dim})  '
-          f'ode_solver={_fm_ode_solver}')
+          f'velocity=ResidualMLP')
   elif use_nf:
     nf_rep_size      = int(getattr(config, 'nf_rep_size', 64))
     nf_num_blocks    = int(getattr(config, 'nf_num_blocks', 8))
@@ -2948,7 +2897,6 @@ def run_ppo_training(
     q_params = density_nets.density_net.init(k_q)
   elif use_fm:
     q_params = _fm.init_fm_params(fm_density_nets, k_q)
-    target_fm_params = q_params if bool(getattr(config, 'fm_td_mode', False)) else None
   elif use_nf:
     q_params = _nf.init_nf_params(nf_density_nets, k_q)
   elif use_td3:
@@ -3274,18 +3222,6 @@ def run_ppo_training(
       networks, config, ppo_optimizer, ent_coef_schedule=ent_coef_schedule)
   print('[ppo] init: ppo_update ready', flush=True)
 
-  use_good_buffer = bool(getattr(config, 'ppo_use_good_buffer', False))
-  good_replay: Optional[GoodTrajectoryReplay] = None
-  if use_good_buffer:
-    good_capacity = int(getattr(config, 'ppo_good_buffer_max_size', 50000))
-    good_replay = GoodTrajectoryReplay(capacity=good_capacity)
-    print(f'[ppo] Good Experience Replay buffer initialized: '
-          f'mode={config.ppo_good_buffer_mode}, '
-          f'min_cubes={config.ppo_good_buffer_min_cubes}, '
-          f'coef={config.ppo_good_buffer_coef}, '
-          f'capacity={good_capacity}')
-
-  fm_grad_norm_fn = None
   td3_scan_update = None
   fm_scan_update = None
   td_infonce_scan_update = None
@@ -3313,14 +3249,6 @@ def run_ppo_training(
         logp_mode=str(getattr(config, 'fm_logp_mode', 'exact') or 'exact'),
         flow_steps=int(getattr(config, 'fm_flow_steps', 10)),
         hutch_probes=int(getattr(config, 'fm_hutch_probes', 8)),
-        ode_solver=_fm_ode_solver,
-        reward_clip=_fm_reward_clip,
-    )
-    fm_grad_norm_fn = _fm.make_fm_grad_norm_fn(
-        fm_density_nets,
-        obs_dim=int(config.obs_dim),
-        flow_steps=min(int(getattr(config, 'fm_flow_steps', 10)), 5),
-        ode_solver=_fm_ode_solver,
     )
     gaussian_reward_fn = None
     nf_reward_fn = None
@@ -4108,10 +4036,15 @@ def run_ppo_training(
   _rT_r0_n_succ = 0.0
   _rT_r0_n_fail = 0.0
   _track_train_success = (
-      _use_jax_bb_vec or str(_env_name).startswith('sawyer_'))
-  if _track_train_success and not _use_jax_bb_vec:
+      _use_jax_bb_vec or str(_env_name).startswith('sawyer_')
+      or _use_isaacgym)
+  if _track_train_success and str(_env_name).startswith('sawyer_'):
     print('[ppo] logging train_success_mean / train_success_1000 from '
           'Sawyer sparse env reward (env_rew >= 0.5)', flush=True)
+  if _track_train_success and _use_isaacgym:
+    print('[ppo] logging train_success_mean / train_success_1000 from '
+          'AllegroKukaThrow object-at-target (not dense env reward)',
+          flush=True)
   # Nominal PD/MJ episode length (BuilderBench). Used to detect collapse via
   # short episodes (e.g. repeated OOB early terminations) and reinit the actor.
   _nominal_ep_len = (
@@ -4133,12 +4066,10 @@ def run_ppo_training(
     print(f'[ppo] actor-reset schedule: force FULL policy reinit at iters '
           f'{sorted(_force_reset_iters)}')
 
-  # Running goal normalisation stats for NF & FM modes.
+  # Running goal normalisation stats for NF mode.
   # Updated from replay buffer each iteration; broadcast-compatible with goals.
   nf_goal_mean = np.zeros(goal_dim_cfg, dtype=np.float32)
   nf_goal_std  = np.ones(goal_dim_cfg,  dtype=np.float32)
-  fm_goal_mean = np.zeros(goal_dim_cfg, dtype=np.float32)
-  fm_goal_std  = np.ones(goal_dim_cfg,  dtype=np.float32)
   _nf_normalize_goals = bool(getattr(config, 'nf_normalize_goals', True))
   _nf_zero_mean_j = jnp.zeros((goal_dim_cfg,), dtype=jnp.float32)
   _nf_unit_std_j = jnp.ones((goal_dim_cfg,), dtype=jnp.float32)
@@ -4251,36 +4182,6 @@ def run_ppo_training(
   _extrew_diag_max = 20
   _extrew_diag_warmup_iters = 10
 
-  # ---- Observation Normalizer & Preprocessing ------------------------------
-  _obs_norm_mode = getattr(config, 'obs_norm_mode', 'none')
-  _z_scale_mult = float(getattr(config, 'z_scale_multiplier', 3.0))
-  _rsnorm_clip = float(getattr(config, 'rsnorm_clip', 10.0))
-  _num_cubes = 1
-  if _env.startswith('builderbench_creative_'):
-    import re
-    _m_cubes = re.search(r'builderbench_creative_(\d+)', _env)
-    if _m_cubes:
-      _num_cubes = int(_m_cubes.group(1))
-
-  _state_obs_dim = int(config.obs_dim)
-  _goal_dim = total_obs_dim - _state_obs_dim
-
-  from envs.builderbench_obs_norm import BuilderBenchObsNormalizer, compute_per_axis_diagnostics
-  obs_normalizer = BuilderBenchObsNormalizer(
-      mode=_obs_norm_mode,
-      num_cubes=_num_cubes,
-      state_obs_dim=_state_obs_dim,
-      goal_dim=_goal_dim,
-      z_scale_multiplier=_z_scale_mult,
-      rsnorm_clip=_rsnorm_clip,
-  )
-  if '_ckpt' in locals() and _ckpt is not None:
-    if 'obs_norm_mean' in _ckpt:
-      obs_normalizer.mean = np.asarray(_ckpt['obs_norm_mean'], dtype=np.float64)
-      obs_normalizer.var = np.asarray(_ckpt['obs_norm_var'], dtype=np.float64)
-      obs_normalizer.count = float(_ckpt['obs_norm_count'])
-      print(f"[ppo] restored obs_normalizer stats from checkpoint: count={obs_normalizer.count:.0f}")
-
   # ---- checkpointing ----------------------------------------------------
   ckpt_interval = int(getattr(config, 'ppo_checkpoint_interval', 0))
   ckpt_keep_last = int(getattr(config, 'ppo_checkpoint_keep_last', 0))
@@ -4295,55 +4196,6 @@ def run_ppo_training(
                        f'replay transitions')
     print(f'[ppo] checkpoints → {checkpoint_dir} '
           f'(every {ckpt_interval} iters, {keep_msg}, {replay_msg})')
-
-  best_eval_success = -1.0
-  best_train_success = -1.0
-  save_success_checkpoint_enabled = bool(getattr(config, 'ppo_save_success_checkpoint', True))
-  video_include_reward_plot_enabled = bool(getattr(config, 'ppo_video_include_reward_plot', True))
-  max_train_success_videos = int(getattr(config, 'ppo_video_max_train_success_videos_per_iter', 1))
-  save_train_success_video_enabled = bool(getattr(config, 'ppo_save_train_success_video', True))
-  train_success_min_interval = int(getattr(config, 'ppo_train_success_min_interval', 10))
-  last_train_success_iter = -9999
-
-
-  def _save_success_checkpoint_fn(kind: str, iteration: int, global_step: int, key_val, metric_val: float):
-    if not save_success_checkpoint_enabled or checkpoint_dir is None:
-      return
-    nonlocal best_eval_success, best_train_success
-    _checkpoint_extra = {
-        'obs_rms': {
-            'mean': np.asarray(obs_rms.mean, dtype=np.float64),
-            'var': np.asarray(obs_rms.var, dtype=np.float64),
-            'count': float(obs_rms.count),
-        },
-    } if norm_obs else {}
-    ckpt_kw = dict(
-        policy_params=ppo_params['policy'],
-        value_params=ppo_params['value'],
-        q_params=q_params,
-        ppo_opt_state=ppo_opt_state,
-        q_opt_state=q_opt_state,
-        iteration=iteration,
-        global_step=global_step,
-        key=key_val,
-        q_params_ema=(q_params_reward if _use_repr_ema else None),
-        td3_policy_target=(td3_policy_target if _use_td3_target_policy else None),
-        obs_norm_mean=obs_normalizer.mean,
-        obs_norm_var=obs_normalizer.var,
-        obs_norm_count=obs_normalizer.count,
-        obs_norm_mode=obs_normalizer.mode,
-        extra_state=(_checkpoint_extra if _checkpoint_extra else None))
-    milestone_path = os.path.join(
-        checkpoint_dir, f'ckpt_{kind}_success_iter_{iteration:07d}.pkl')
-    _save_checkpoint(milestone_path, **ckpt_kw)
-    if kind == 'eval' and metric_val >= best_eval_success:
-      best_eval_success = metric_val
-      _save_checkpoint(os.path.join(checkpoint_dir, 'best_eval_success.pkl'), **ckpt_kw)
-    elif kind == 'train' and metric_val >= best_train_success:
-      best_train_success = metric_val
-      _save_checkpoint(os.path.join(checkpoint_dir, 'best_train_success.pkl'), **ckpt_kw)
-    print(f'[ppo] SUCCESS CHECKPOINT ({kind}) iter={iteration} (metric={metric_val:.3f}) saved to {milestone_path}', flush=True)
-
 
   start_time = time.time()
   # global_step, ppo_sgd_step, start_iteration set above (0 for fresh runs,
@@ -4537,8 +4389,7 @@ def run_ppo_training(
       global_step += T * E
     else:
       for t in range(T):
-        norm_obs = obs_normalizer.normalize(obs, update_stats=True)
-        roll_obs[t] = norm_obs
+        roll_obs[t] = obs
         roll_dones[t] = next_done
 
         key, k_act = jax.random.split(key)
@@ -4564,6 +4415,10 @@ def run_ppo_training(
         roll_flow_dense_rew[t] = info_rew
         # Store step-level dones for the post-rollout reward normalizer loop.
         roll_step_dones[t] = dones.astype(np.float32)
+        _step_success = None
+        if _track_train_success and _use_isaacgym:
+          _step_success = np.asarray(
+              getattr(vec_env, 'last_success', None), dtype=np.float32)
 
         # Episode flushing / per-env accounting.
         for i in range(E):
@@ -4573,24 +4428,18 @@ def run_ppo_training(
             ep_flow_dense_return[i] += float(info_rew[i])
             ep_has_flow_dense[i] = True
           ep_len[i] += 1
-          if _track_train_success and float(env_rew[i]) >= 0.5:
-            ep_success_max[i] = 1.0
+          if _track_train_success:
+            if _step_success is not None:
+              if float(_step_success[i]) >= 0.5:
+                ep_success_max[i] = 1.0
+            elif float(env_rew[i]) >= 0.5:
+              ep_success_max[i] = 1.0
           if dones[i]:
             ep_obs[i].append(terminal_obs[i].copy())
             try:
-              _stack_obs = np.stack(ep_obs[i], axis=0)
-              _stack_act = np.stack(ep_act[i], axis=0)
-              replay.add_episode(_stack_obs, _stack_act)
-              if use_good_buffer and good_replay is not None:
-                _st_cnt = compute_max_cubes_stacked(_stack_obs, num_cubes=4, tol=0.03)
-                if _st_cnt >= int(getattr(config, 'ppo_good_buffer_min_cubes', 2)):
-                  good_replay.add_episode(
-                      obs=_stack_obs,
-                      action=_stack_act,
-                      returns=np.full(len(_stack_act), ep_return[i], dtype=np.float32),
-                      log_probs=np.zeros(len(_stack_act), dtype=np.float32),
-                      stacked_cubes=_st_cnt,
-                  )
+              replay.add_episode(
+                  np.stack(ep_obs[i], axis=0),
+                  np.stack(ep_act[i], axis=0))
             except AssertionError:
               pass  # degenerate len-0 episodes; skip
             ep_obs[i] = [next_obs[i].copy()]  # auto-reset state seeds next ep
@@ -4679,9 +4528,6 @@ def run_ppo_training(
       elif use_fm:
         _fm_mode = (
             getattr(config, 'fm_logp_mode', 'exact') or 'exact').strip().lower()
-        _use_fm_norm = bool(getattr(config, 'fm_norm_goals', False))
-        _g_mean = jnp.asarray(fm_goal_mean) if _use_fm_norm else None
-        _g_std  = jnp.asarray(fm_goal_std)  if _use_fm_norm else None
         if 'hutch' in _fm_mode:
           key, k_fm_rew = jax.random.split(key)
           _rew_flat_j = fm_reward_fn(
@@ -4769,66 +4615,6 @@ def run_ppo_training(
             and not external_reward_before_norm
             and not sparse_reward_only):
       roll_rew += _ext
-
-    # Train success handling: checkpoint save + lockstep video render (rate limited)
-    if (_roll_success is not None and np.any(_roll_success >= 0.5)
-        and (iteration - last_train_success_iter >= train_success_min_interval)):
-      last_train_success_iter = iteration
-      _curr_tr_succ = float(np.mean(recent_success[-100:])) if recent_success else 1.0
-      _save_success_checkpoint_fn('train', iteration, global_step, key, _curr_tr_succ)
-      if (bb_video_env is not None and video_include_reward_plot_enabled and save_train_success_video_enabled
-          and '_steps_j' in locals() and 'qpos' in _steps_j):
-
-        from contrastive import builderbench_video as _bb_vid
-        _succ_env_indices = np.where(np.any(_roll_success >= 0.5, axis=0))[0]
-        for _v_idx, _e_idx in enumerate(_succ_env_indices[:max_train_success_videos]):
-          _tr_vid_path = os.path.join(
-              bb_video_dir, f'train_success_iter_{int(iteration):07d}_env{int(_e_idx)}.mp4')
-          try:
-            _qpos_e = np.asarray(_steps_j['qpos'][:, _e_idx], dtype=np.float32)
-            _qvel_e = np.asarray(_steps_j['qvel'][:, _e_idx], dtype=np.float32)
-            _mocap_pos_e = np.asarray(_steps_j['target_mocap_pos'][:, _e_idx], dtype=np.float32)
-            _mocap_quat_e = np.asarray(_steps_j['target_mocap_quat'][:, _e_idx], dtype=np.float32)
-            _raw_r_e = np.asarray(roll_rew_raw[:, _e_idx], dtype=np.float32)
-            _tot_r_e = np.asarray(roll_rew[:, _e_idx], dtype=np.float32)
-            _succ_e = np.asarray(_roll_success[:, _e_idx], dtype=np.float32)
-            _grad_s_e = None
-            if use_fm and fm_grad_norm_fn is not None:
-              try:
-                _s_norms_j, _ = fm_grad_norm_fn(
-                    _reward_q_params(),
-                    jnp.asarray(roll_obs[:, _e_idx]),
-                    jnp.asarray(roll_acts[:, _e_idx]),
-                )
-                _grad_s_e = np.asarray(_s_norms_j, dtype=np.float32).reshape(-1)
-              except Exception:
-                _grad_s_e = None
-            _bb_vid.render_rollout_trajectory_video(
-                video_env=bb_video_env,
-                qpos=_qpos_e,
-                qvel=_qvel_e,
-                target_mocap_pos=_mocap_pos_e,
-                target_mocap_quat=_mocap_quat_e,
-                rewards_raw=_raw_r_e,
-                rewards_total=_tot_r_e,
-                success=_succ_e,
-                fps=int(_video_fps),
-                out_path=_tr_vid_path,
-                include_reward_plot=True,
-                title=f'Train Success (iter {iteration}, env {_e_idx})',
-                state_grad_norms=_grad_s_e,
-            )
-            try:
-              import wandb
-              if wandb.run is not None:
-                wandb.log(
-                    {"train_success_videos": wandb.Video(str(_tr_vid_path), fps=int(_video_fps), format="mp4")},
-                    step=int(iteration),
-                )
-            except Exception as _wb_tr_err:
-              print(f'[ppo] train success video wandb log failed: {_wb_tr_err}', flush=True)
-          except Exception as _tr_vid_err:
-            print(f'[ppo] train success video render failed: {_tr_vid_err}', flush=True)
 
     # Latch after sustained high train success: sparse-only reward and/or
     # freeze representations. Sparse-after always uses 2cm train_success_mean.
@@ -4987,32 +4773,6 @@ def run_ppo_training(
             'returns':      flat_ret_j[mb],
             'old_values':   flat_vals_j[mb],
         }
-
-        good_mode = str(getattr(config, 'ppo_good_buffer_mode', 'sil')).lower()
-        if use_good_buffer and good_replay is not None and good_replay.size > 0:
-          if good_mode == 'mixed':
-            mix_ratio = float(getattr(config, 'ppo_good_buffer_coef', 0.5))
-            n_mix = min(int(len(mb) * mix_ratio), good_replay.size)
-            if n_mix > 0:
-              good_sample = good_replay.sample(n_mix, np_rng)
-              m_obs = flat_obs[mb].copy()
-              m_acts = flat_acts[mb].copy()
-              m_logp = flat_logp[mb].copy()
-              m_ret = flat_ret[mb].copy()
-              m_obs[:n_mix] = good_sample['obs']
-              m_acts[:n_mix] = good_sample['action']
-              m_logp[:n_mix] = good_sample['log_probs']
-              m_ret[:n_mix] = good_sample['returns']
-              batch['obs'] = jnp.asarray(m_obs)
-              batch['actions'] = jnp.asarray(m_acts)
-              batch['old_logprobs'] = jnp.asarray(m_logp)
-              batch['returns'] = jnp.asarray(m_ret)
-          else:
-            good_sample = good_replay.sample(len(mb), np_rng)
-            batch['good_obs'] = jnp.asarray(good_sample['obs'])
-            batch['good_actions'] = jnp.asarray(good_sample['action'])
-            batch['good_returns'] = jnp.asarray(good_sample['returns'])
-
         key, k_mb = jax.random.split(key)
         params_before = ppo_params
         opt_before = ppo_opt_state
@@ -5074,11 +4834,9 @@ def run_ppo_training(
           if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic[:-1]:
             _adapt_kl_beta(float(np.mean(epoch_mb_analytic[:-1])))
           break
+        ppo_sgd_step += 1
         ppo_metrics_device.append(m)
         epoch_mb_approx.append(_mb_approx)
-        if use_good_buffer and good_replay is not None:
-          ppo_metrics_agg.setdefault('good_buffer_size', []).append(float(good_replay.size))
-          ppo_metrics_agg.setdefault('good_buffer_episodes', []).append(float(good_replay.episodes_added))
         if _need_kl_sync:
           epoch_kl_max = max(epoch_kl_max, _mb_approx)
         if _kl_penalty_on:
@@ -5142,10 +4900,10 @@ def run_ppo_training(
     crl_metrics_agg: Dict[str, list] = {}
     hybrid_td3_metrics_agg: Dict[str, list] = {}
     if replay.size >= int(config.ppo_min_replay_size):
-      # Update goal normalisation stats from a fresh replay sample (NF or FM).
-      if (use_nf or (use_fm and getattr(config, 'fm_norm_goals', False))) and not _nf_normalizer_reset_done:
-        # First time normalizer activates: reset the return normalizer so the extreme
-        # rewards from the untrained model don't permanently corrupt the running
+      # Update goal normalisation stats from a fresh replay sample (NF only).
+      if use_nf and not _nf_normalizer_reset_done:
+        # First time NF activates: reset the return normalizer so the extreme
+        # rewards from the untrained flow don't permanently corrupt the running
         # std that PPO uses to scale advantages.
         if reward_normalizer is not None:
           reward_normalizer._rms = RunningMeanStd(shape=())
@@ -5191,16 +4949,6 @@ def run_ppo_training(
         for _di, (_gm, _gs) in enumerate(zip(nf_goal_mean, nf_goal_std)):
           _nf_stat_log[f'nf/goal_mean_{_di}'] = float(_gm)
           _nf_stat_log[f'nf/goal_std_{_di}']  = float(_gs)
-      elif use_fm and getattr(config, 'fm_norm_goals', False):
-        _std_floor = float(getattr(config, 'fm_goal_std_min', 0.02))
-        _stat_batch = replay.sample(min(2048, replay.size), np_rng)
-        _goals = _stat_batch['obs'][:, int(config.obs_dim):]
-        fm_goal_mean = _goals.mean(axis=0).astype(np.float32)
-        fm_goal_std  = _goals.std(axis=0).astype(np.float32)
-        fm_goal_std  = np.maximum(fm_goal_std, _std_floor).astype(np.float32)
-        for _di, (_gm, _gs) in enumerate(zip(fm_goal_mean, fm_goal_std)):
-          _nf_stat_log[f'fm/goal_mean_{_di}'] = float(_gm)
-          _nf_stat_log[f'fm/goal_std_{_di}']  = float(_gs)
 
       _n_crl = int(config.ppo_crl_steps_per_iter)
       # Frozen-reward / stationary φ·ψ sets crl_steps=0: skip updates. The
@@ -5500,20 +5248,8 @@ def run_ppo_training(
           'fm/vel_target_norm': float('nan'),
           'fm/x1_norm': float('nan'),
           'fm/grad_norm': float('nan'),
-          'fm/action_grad_norm': float('nan'),
-          'fm/state_grad_norm': float('nan'),
-          'fm/state_action_grad_ratio': float('nan'),
           'fm/update_skipped_nonfinite': float('nan'),
           'fm/update_steps': 0,
-          'fm_diag/logp_seen_mean': float('nan'),
-          'fm_diag/logp_seen_min': float('nan'),
-          'fm_diag/logp_seen_max': float('nan'),
-          'fm_diag/logp_seen_std': float('nan'),
-          'fm_diag/logp_unseen_mean': float('nan'),
-          'fm_diag/logp_unseen_min': float('nan'),
-          'fm_diag/logp_unseen_max': float('nan'),
-          'fm_diag/logp_unseen_std': float('nan'),
-          'fm_diag/logp_gap': float('nan'),
       })
     if use_nf:
       log.update({
@@ -5662,109 +5398,6 @@ def run_ppo_training(
     log['ppo/learning_rate'] = round(lr_log, 7)
     if use_nf:
       log.update(_nf_stat_log)
-
-    if _env.startswith('builderbench_'):
-      diag_metrics = compute_per_axis_diagnostics(
-          roll_obs, _num_cubes, _state_obs_dim)
-      for k_d, v_d in diag_metrics.items():
-        log[f'obs/{k_d}'] = v_d
-
-    # =================================================================
-    # Network Dormancy & Vector Field Diagnostics Logging
-    # =================================================================
-    _log_dormancy = bool(getattr(config, 'ppo_log_dormancy', True))
-    _dormancy_interval = int(getattr(config, 'ppo_dormancy_interval', 50))
-    _dormancy_tau = float(getattr(config, 'ppo_dormancy_tau', 0.01))
-    if (_log_dormancy and _dormancy_interval > 0
-        and (iteration % _dormancy_interval == 0 or iteration == num_iterations - 1)):
-      try:
-        from contrastive import dormancy as _dorm
-        _flat_obs = roll_obs.reshape(-1, total_obs_dim)
-        _diag_s = jnp.asarray(_flat_obs[:, :obs_dim_cfg])
-        _diag_a = jnp.asarray(roll_acts.reshape(-1, act_dim_cfg))
-        _diag_g = (jnp.asarray(_flat_obs[:, obs_dim_cfg:])
-                   if total_obs_dim > obs_dim_cfg else None)
-
-        if ppo_params.get('policy') is not None:
-          _pol_acts = _dorm.extract_pytree_layer_activations(
-              ppo_params['policy'], _diag_s[:256])
-          _pol_dorm = _dorm.compute_layer_dormancy_and_gma(
-              _pol_acts, tau=_dormancy_tau, prefix='dormancy/actor')
-          log.update(_pol_dorm)
-
-        if ppo_params.get('value') is not None:
-          _val_acts = _dorm.extract_pytree_layer_activations(
-              ppo_params['value'], _diag_s[:256])
-          _val_dorm = _dorm.compute_layer_dormancy_and_gma(
-              _val_acts, tau=_dormancy_tau, prefix='dormancy/critic')
-          log.update(_val_dorm)
-
-        if use_fm and fm_density_nets is not None and _diag_g is not None and _diag_g.shape[1] > 0:
-          _fm_apply = fm_density_nets.velocity_net.apply
-          _fm_diag = _dorm.compute_vector_field_diagnostics(
-              fm_apply_fn=_fm_apply,
-              fm_params=q_params,
-              states=_diag_s[:256],
-              actions=_diag_a[:256],
-              goals=_diag_g[:256],
-              tau=_dormancy_tau,
-          )
-          log.update(_fm_diag)
-        elif use_crl and q_params is not None:
-          _crl_acts = _dorm.extract_pytree_layer_activations(
-              q_params, _diag_s[:256])
-          _crl_dorm = _dorm.compute_layer_dormancy_and_gma(
-              _crl_acts, tau=_dormancy_tau, prefix='dormancy/crl')
-          log.update(_crl_dorm)
-      except Exception as _dorm_err:
-        print(f'[ppo] dormancy metric calculation warning at iter={iteration}: {_dorm_err}', flush=True)
-
-    # =================================================================
-    # Flow Matching Seen vs Unseen Log-Prob Peakedness Diagnostics
-    # =================================================================
-    _fm_logp_diag_interval = int(getattr(config, 'fm_logp_diag_interval', 50))
-    if (use_fm and fm_density_nets is not None and _fm_logp_diag_interval > 0
-        and replay.size > 0
-        and (iteration % _fm_logp_diag_interval == 0 or iteration == num_iterations - 1)):
-      try:
-        _diag_bs = min(int(getattr(config, 'fm_logp_diag_batch_size', 64)), replay.size)
-        if _diag_bs > 0:
-          _diag_batch_np = replay.sample(_diag_bs, np_rng)
-          _diag_obs = _diag_batch_np['obs']
-          _diag_state = jnp.asarray(_diag_obs[:, :obs_dim_cfg])
-          _diag_seen_g = jnp.asarray(_diag_obs[:, obs_dim_cfg:])
-          _diag_act = jnp.asarray(_diag_batch_np['action'])
-
-          # Unseen goals: sample conditioning goals from current rollout observations
-          _flat_roll_obs = roll_obs.reshape(-1, total_obs_dim)
-          if total_obs_dim > obs_dim_cfg:
-            _unseen_g_all = _flat_roll_obs[:, obs_dim_cfg:]
-            _unseen_idx = np_rng.choice(len(_unseen_g_all), size=_diag_bs, replace=True)
-            _diag_unseen_g = jnp.asarray(_unseen_g_all[_unseen_idx])
-          else:
-            _diag_unseen_g = _diag_seen_g
-
-          _use_fm_norm = bool(getattr(config, 'fm_norm_goals', False))
-          _g_mean = jnp.asarray(fm_goal_mean) if _use_fm_norm else None
-          _g_std = jnp.asarray(fm_goal_std) if _use_fm_norm else None
-          _diag_steps = int(getattr(config, 'fm_logp_diag_flow_steps', 5))
-          _diag_solver = str(getattr(config, 'fm_logp_diag_ode_solver', 'euler')).lower()
-
-          _fm_logp_stats = _fm.compute_fm_logp_diagnostics(
-              fm_networks=fm_density_nets,
-              params=_reward_q_params(),
-              state=_diag_state,
-              action=_diag_act,
-              seen_goals=_diag_seen_g,
-              unseen_goals=_diag_unseen_g,
-              flow_steps=_diag_steps,
-              ode_solver=_diag_solver,
-              goal_mean=_g_mean,
-              goal_std=_g_std,
-          )
-          log.update(_fm_logp_stats)
-      except Exception as _fm_diag_err:
-        print(f'[ppo] FM logp diagnostic warning at iter={iteration}: {_fm_diag_err}', flush=True)
     learner_logger.write(log)
 
     if _switch_after_this_iteration:
@@ -5899,8 +5532,6 @@ def run_ppo_training(
           ep_metrics_list.append(ep_metrics)
 
       agg = _cu.aggregate_eval_metrics(ep_metrics_list, iteration)
-      if 'steps' in log:
-        agg['steps'] = log['steps']
       eval_logger.write(agg)
       _eval_total_s = time.time() - _eval_t0
       _gpu_part = (f'gpu={_eval_gpu_s:.2f}s '
@@ -5911,62 +5542,12 @@ def run_ppo_training(
             f'very_hard={agg.get("very_hard_success", float("nan")):.3f}',
             flush=True)
 
-      _eval_succ_val = float(agg.get("success", 0.0))
-      if save_success_checkpoint_enabled and _eval_succ_val > 0.0:
-        _save_success_checkpoint_fn('eval', iteration, global_step, key, _eval_succ_val)
-        if bb_video_env is not None and video_include_reward_plot_enabled:
-          from contrastive import builderbench_video as _bb_vid
-          _eval_vid_path = os.path.join(
-              bb_video_dir, f'eval_success_iter_{int(iteration):07d}.mp4')
-          try:
-            _bb_vid.render_deterministic_episode(
-                video_env=bb_video_env,
-                mocap_targets=bb_video_mocap,
-                num_cubes=int(bb_video_num_cubes),
-                episode_length=int(bb_video_ep_len),
-                networks=networks,
-                policy_params=ppo_params['policy'],
-                obs_mean=np.asarray(iter_obs_mean, dtype=np.float32),
-                obs_var=np.asarray(iter_obs_var, dtype=np.float32),
-                fixed_target_goal=_bb_kw.get('fixed_target_goal'),
-                seed=int(seed + 17_000 + iteration),
-                filter_policy_obs=bool(bb_video_filter),
-                normalize_obs=bool(norm_obs),
-                obs_dim=int(obs_dim_cfg),
-                start_index=int(norm_si),
-                end_index=int(norm_ei),
-                obs_norm_clip=float(obs_norm_clip),
-                fps=int(_video_fps),
-                out_path=_eval_vid_path,
-                goal_state_indices=_goal_state_indices,
-                reward_fn=(fm_reward_fn if use_fm else (reward_fn if use_crl else None)),
-                reward_params=_reward_q_params(),
-                grad_norm_fn=(fm_grad_norm_fn if use_fm else None),
-                reward_normalizer=reward_normalizer,
-                use_external_reward=use_external_reward,
-                external_reward_scale=external_reward_scale,
-                include_reward_plot=True,
-                title=f'Eval Success (iter {iteration})',
-            )
-            try:
-              import wandb
-              if wandb.run is not None:
-                wandb.log(
-                    {"eval_success_videos": wandb.Video(str(_eval_vid_path), fps=int(_video_fps), format="mp4")},
-                    step=int(iteration),
-                )
-            except Exception:
-              pass
-          except Exception as _ev_vid_err:
-            print(f'[ppo] eval success video render failed: {_ev_vid_err}', flush=True)
-
     # =================================================================
     # 6b. Periodic deterministic video (same frozen obs_rms as eval)
     # =================================================================
-    _is_final_iter = (iteration == num_iterations - 1 or ppo_sgd_step >= total_steps)
     if (bb_video_env is not None
         and _video_interval > 0
-        and (iteration % _video_interval == 0 or _is_final_iter)
+        and iteration % _video_interval == 0
         and not (iteration == 0 and _skip_first_video)):
       from contrastive import builderbench_video as _bb_vid
       _vid_t0 = time.time()
@@ -5993,31 +5574,10 @@ def run_ppo_training(
             fps=int(_video_fps),
             out_path=_vid_path,
             goal_state_indices=_goal_state_indices,
-            reward_fn=(fm_reward_fn if use_fm else (reward_fn if use_crl else None)),
-            reward_params=_reward_q_params(),
-            grad_norm_fn=(fm_grad_norm_fn if use_fm else None),
-            reward_normalizer=reward_normalizer,
-            use_external_reward=use_external_reward,
-            external_reward_scale=external_reward_scale,
-            include_reward_plot=video_include_reward_plot_enabled,
-            title=f'Periodic Rollout (iter {iteration})',
         )
-
         print(f'[ppo] video iter={iteration}: wrote {_out} '
               f'({_n_frames} frames) in {time.time() - _vid_t0:.1f}s',
               flush=True)
-        try:
-          import wandb
-          if wandb.run is not None:
-            _run_root = os.path.dirname(bb_video_dir) if bb_video_dir else None
-            if _run_root:
-              wandb.save(str(_vid_path), base_path=str(_run_root), policy="now")
-            wandb.log(
-                {"rollout_videos": wandb.Video(str(_vid_path), fps=int(_video_fps), format="mp4")},
-                step=int(iteration),
-            )
-        except Exception as _wb_v_err:
-          print(f'[ppo] video wandb log failed at iter={iteration}: {_wb_v_err}', flush=True)
       except Exception as _vid_exc:
         print(f'[ppo] video iter={iteration}: FAILED after '
               f'{time.time() - _vid_t0:.1f}s: {_vid_exc}', flush=True)
@@ -6132,10 +5692,6 @@ def run_ppo_training(
           q_params_ema=(q_params_reward if _use_repr_ema else None),
           td3_policy_target=(
               td3_policy_target if _use_td3_target_policy else None),
-          obs_norm_mean=obs_normalizer.mean,
-          obs_norm_var=obs_normalizer.var,
-          obs_norm_count=obs_normalizer.count,
-          obs_norm_mode=obs_normalizer.mode,
           extra_state=(_checkpoint_extra if _checkpoint_extra else None))
       milestone_path = os.path.join(
           checkpoint_dir, f'ckpt_iter_{iteration:07d}.pkl')
