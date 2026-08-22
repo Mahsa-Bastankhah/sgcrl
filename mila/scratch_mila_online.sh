@@ -6,25 +6,84 @@
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # ---------- USER CONFIGURATION ------------------------------------------------
-SEEDS=( 0  1 )
+SEEDS=( 0 1 )
 
 LOG_ROOT="/network/scratch/m/mohammad-sami-nur.islam/dist_matching/logs"
 # ------------------------------------------------------------------------------
 
-BASE_FLAGS="--num_steps=200000000 --ppo_num_envs=1024 --ppo_ent_coef=0.05 --ppo_actor_min_std=0.01 --ppo_discount=0.99 --ppo_clip_coef=0.2 --ppo_checkpoint_interval=150 --builderbench_use_pd=true --builderbench_pd_duration=5 --ppo_skip_first_eval=true --ppo_eval_interval=150 --ppo_video_interval=150 --ppo_video_fps=10 --max_replay_size=10000000 --ppo_crl_repr_tau=0 --hidden_layer_sizes=\"256,256,256,256,256,256\" --env=builderbench_creative_3_task1 --ppo_rollout_length=50 --ppo_crl_steps_per_iter=25 --use_wandb=true --wandb_project=dist-matching --wandb_entity=doina-precup --wandb_mode=online"
+BASE_FLAGS="--num_steps=200000000 --ppo_num_envs=1024 --ppo_ent_coef=0.05 --ppo_actor_min_std=0.01 --ppo_discount=0.99 --ppo_clip_coef=0.2 --ppo_checkpoint_interval=150 --builderbench_use_pd=true --builderbench_pd_duration=5 --ppo_skip_first_eval=true --ppo_eval_interval=150 --ppo_video_interval=150 --ppo_video_fps=10 --max_replay_size=10000000 --ppo_crl_repr_tau=0 --hidden_layer_sizes=\"256,256,256,256,256,256\" --env=builderbench_creative_3_task1 --ppo_rollout_length=50 --ppo_crl_steps_per_iter=25 --use_wandb=true --wandb_project=dist-matching --wandb_entity=doina-precup --wandb_mode=online --ppo_categorical_select --ppo_use_external_reward "
 
 EXPERIMENTS=( 
+
+    "pd_fm_creative4_task2_all_tricks_diff_ext_reward_scales_50_anneal_goal_noise|--env=builderbench_creative_4_task2 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --fm_goal_noise_std=0.01 --ppo_use_external_reward --ppo_external_reward_scale=50 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --num_steps=400_000_000 --ppo_ent_coef=0.0005  --ppo_ent_coef_final=0.0001 --ppo_anneal_ent_coef=True"
+
+    # "pd_crl_creative3_task1_catselect_extrew1|--env=builderbench_creative_3_task1 --ppo_repr_mode=crl --ppo_crl_repr_tau=0.5 --ppo_external_reward_scale=1 --ppo_eval_interval=200"
+    #
+    #
+    #
+    ## FUTURE  (With best of ACTIVE)
+
+    #
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_0_anneal|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=0 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --num_steps=400_000_000 --ppo_ent_coef=0.0005  --ppo_ent_coef_final=0.0001 --ppo_anneal_ent_coef=True"
+
+
+
+    ### ACTIVE 
+
+
+    # "pd_fm_creative4_task2_all_tricks_diff_ext_reward_scales_50_0|--env=builderbench_creative_4_task2 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=50 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --num_steps=400_000_000 --ppo_ent_coef=0.0005  --ppo_ent_coef_final=0.0001 --ppo_anneal_ent_coef=True"
+
+    # "pd_fm_creative4_task1_all_tricks_diff_ext_reward_scales_50_0|--env=builderbench_creative_4_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=50 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --num_steps=400_000_000 --ppo_ent_coef=0.0005  --ppo_ent_coef_final=0.0001 --ppo_anneal_ent_coef=True"
+    #
+    # "pd_fm_creative4_task2_all_tricks_diff_ext_reward_scales_5_anneal|--env=builderbench_creative_4_task2 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=5 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --num_steps=400_000_000 --ppo_ent_coef=0.0005  --ppo_ent_coef_final=0.0001 --ppo_anneal_ent_coef=True"
+
+    # "pd_fm_creative4_task1_all_tricks_diff_ext_reward_scales_5_anneal|--env=builderbench_creative_4_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=5 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --num_steps=400_000_000 --ppo_ent_coef=0.0005  --ppo_ent_coef_final=0.0001 --ppo_anneal_ent_coef=True"
+
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_1_anneal|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=1 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --num_steps=400_000_000 --ppo_ent_coef=0.0005  --ppo_ent_coef_final=0.0001 --ppo_anneal_ent_coef=True"
+    #
+    #
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_5_anneal|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=5 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --num_steps=400_000_000 --ppo_ent_coef=0.0005  --ppo_ent_coef_final=0.0001 --ppo_anneal_ent_coef=True"
+
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_100_0|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=100 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --ppo_ent_coef=0.0005  --ppo_ent_coef_final=0.0001 --ppo_anneal_ent_coef=True"
+
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_50_0|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=50 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --num_steps=400_000_000 --ppo_ent_coef=0.0005  --ppo_ent_coef_final=0.0001 --ppo_anneal_ent_coef=True"
+    #
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_50_0|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=50 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --num_steps=400_000_000 --ppo_ent_coef=0.0005  --ppo_ent_coef_final=0.0001 --ppo_anneal_ent_coef=True"
+    #
+    #
+    #
+    #
+    #
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_100_0|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=100 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm"
+    #
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_50_0|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=50 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm"
+    #
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_1_smaller_net|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_external_reward_scale=1 --hidden_layer_sizes=\"256,256,256\""
+
+    # "pd_fm_creative3_task1_all_tricks_longer_rollout|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=400000000 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01 --ppo_external_reward_scale=1"
+    #
+    # "pd_fm_creative3_task1_all_tricks_synergy_600m|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --fm_goal_noise_std=0.02 --fm_norm_goals=True --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01 --ppo_external_reward_scale=1 --num_steps=600000000"
+    #
+    # "pd_fm_creative3_task1_all_tricks_exact_cond_drop15_reward_clip|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --fm_norm_goals=True --fm_cond_dropout=0.15 --fm_reward_clip=20.0 --ppo_external_reward_scale=1 --num_steps=400000000 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01" 
+
     # "ext_ent_anneal_05_precision_online|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.01 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000"
     # "ext_ent_anneal_05_precision_online_cat_select|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.01 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=600000000 --ppo_categorical_select"
     # "ext_ent_anneal_05_precision_online_cat_select_ext_reward|--env=builderbench_creative_4_task1 --ppo_actor_min_std=0.01 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=400000000 --ppo_categorical_select --ppo_external_reward_scale=1"
     # --- Active Flow Matching Experiments ---
     # Baseline
     # "pd_fm_creative3_task1_baseline|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select"
-    "pd_fm_creative3_task1_baseline_ext_reward_cat_select_anneal_ent|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1 --num_steps=400000000 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
-    "pd_fm_creative3_task1_baseline_ext_reward_cat_select_no_permute_anneal_ent|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1 --num_steps=400000000 --builderbench_permute_start_boxes=false --builderbench_fixed_start_x=0.1 ---ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
-    "pd_fm_creative3_task1_all_tricks|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0"
-    "pd_fm_creative3_task1_all_tricks_ext_reward_cat_select_anneal_ent|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_external_reward_scale=1 --num_steps=400000000 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
-    "pd_fm_creative3_task1_all_tricks_ext_reward_cat_select_no_permute_anneal_ent|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_external_reward_scale=1 --num_steps=400000000 --builderbench_permute_start_boxes=false --builderbench_fixed_start_x=0.1 ---ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
+    # "pd_fm_creative3_task1_baseline_ext_reward_cat_select_anneal_ent|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1 --num_steps=400000000 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
+    # "pd_fm_creative3_task1_baseline_ext_reward_cat_select_no_permute_anneal_ent|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --ppo_external_reward_scale=1 --num_steps=400000000 --builderbench_permute_start_boxes=false --builderbench_fixed_start_x=0.1 ---ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
+    # "pd_fm_creative3_task1_all_tricks|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0"
+    #
+    
+    # LOG p for cat acc computation.
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_1|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=1 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --fm_cat_acc_mode=logp --fm_cat_acc_subbatch=128"
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_0_25|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=0.25 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --fm_cat_acc_mode=logp --fm_cat_acc_subbatch=128"
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_0_5|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=0.5 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --fm_cat_acc_mode=logp --fm_cat_acc_subbatch=128"
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_1_5|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=1.5 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --fm_cat_acc_mode=logp --fm_cat_acc_subbatch=128"
+    # "pd_fm_creative3_task1_all_tricks_diff_ext_reward_scales_2_0|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_use_external_reward --ppo_external_reward_scale=2 --ppo_eval_interval=200 --ppo_save_train_success_video=true --ppo_repr_mode=fm --fm_cat_acc_mode=logp --fm_cat_acc_subbatch=128"
+
     #
     # # Goal Normalization
     # "pd_fm_creative3_task1_goal_norm|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_norm_goals=True"
@@ -93,7 +152,7 @@ for EXPERIMENT in "${EXPERIMENTS[@]}"; do
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
-#SBATCH --time=48:00:00
+#SBATCH --time=23:00:00
 #SBATCH --mem=256G
 #SBATCH --output=%j.out
 
@@ -102,6 +161,12 @@ conda activate sgcrl_builderbench
 
 export BUILDERBENCH_ROOT=/home/mila/m/mohammad-sami-nur.islam/sgcrl/builderbench
 export MUJOCO_GL=egl
+
+export WANDB_DIR=\$SLURM_TMPDIR/wandb
+export WANDB_CACHE_DIR=\$SLURM_TMPDIR/.cache/wandb
+export WANDB_CONFIG_DIR=\$SLURM_TMPDIR/.config/wandb
+export WANDB_DATA_DIR=\$SLURM_TMPDIR/.data/wandb
+export CHECKPOINT_BASE_DIR=\$SCRATCH/jaxgcrl/checkpoints
 
 if [ -d "${LOG_ROOT}/${SAFE_NAME}" ]; then
     echo "Warning: Directory exists, deleting to ensure clean restart."
