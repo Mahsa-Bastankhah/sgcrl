@@ -341,7 +341,12 @@ class JaxBuilderBenchVecEnv:
             'terminal_obs': term_obs,
             'next_obs': next_packed,
             's0_states': s0_states,
+            'qpos': env_state.data.qpos,
+            'qvel': env_state.data.qvel,
+            'target_mocap_pos': env_state.info['target_mocap_pos'],
+            'target_mocap_quat': env_state.info['target_mocap_quat'],
         }
+
         s0_next = jnp.where(
             dones[:, None], next_packed[:, :_obs_dim], s0_states)
         next_done_out = dones.astype(jnp.float32)

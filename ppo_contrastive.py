@@ -264,6 +264,24 @@ flags.DEFINE_float(
 flags.DEFINE_boolean(
     'fm_norm_goals', False,
     'FM mode: normalize goal vectors s_f to unit variance before flow density updates.')
+flags.DEFINE_float(
+    'fm_goal_std_min', 0.02,
+    'FM mode: floor on per-dim replay std (avoids division by zero on static dims).')
+flags.DEFINE_float(
+    'fm_cond_dropout', 0.0,
+    'FM mode: probability of condition dropout, replacing (s, a) with (0, 0) during flow training.')
+flags.DEFINE_float(
+    'fm_reward_clip', 0.0,
+    'FM mode: reward clipping bound for reverse ODE logp (0 = disabled, e.g. 20.0 clips to [-20, 20]).')
+flags.DEFINE_string(
+    'fm_cat_acc_mode', 'midpoint',
+    "FM mode: categorical accuracy mode ('midpoint' | 'logp').")
+flags.DEFINE_integer(
+    'fm_cat_acc_subbatch', 128,
+    'FM mode: sub-batch size for categorical accuracy retrieval matrix.')
+flags.DEFINE_integer(
+    'fm_cat_acc_flow_steps', -1,
+    'FM mode: reverse ODE steps for categorical accuracy logp (-1 uses fm_flow_steps).')
 flags.DEFINE_boolean(
     'fm_td_mode', False,
     'FM mode: use TD-Flow (Bellman probability path targets) for density updates.')
@@ -276,6 +294,18 @@ flags.DEFINE_float(
 flags.DEFINE_integer(
     'fm_td_boot_steps', 1,
     'FM mode: ODE integration steps for target goal bootstrapping during training.')
+flags.DEFINE_integer(
+    'fm_logp_diag_interval', 50,
+    'FM mode: PPO iteration interval for seen vs unseen FM log-prob diagnostics (0 = disabled).')
+flags.DEFINE_integer(
+    'fm_logp_diag_batch_size', 64,
+    'FM mode: batch size of transitions for FM log-prob diagnostics.')
+flags.DEFINE_integer(
+    'fm_logp_diag_flow_steps', 5,
+    'FM mode: ODE integration steps for FM log-prob diagnostics.')
+flags.DEFINE_string(
+    'fm_logp_diag_ode_solver', 'euler',
+    'FM mode: ODE solver for FM log-prob diagnostics (euler | heun).')
 flags.DEFINE_integer(
     'nf_rep_size', 64,
     'NF mode: SA encoder output dim (conditioning vector size).')
@@ -340,6 +370,24 @@ flags.DEFINE_integer(
 flags.DEFINE_boolean(
     'ppo_skip_first_video', True,
     'Skip the iteration-0 in-train video (random init policy).')
+flags.DEFINE_boolean(
+    'ppo_save_success_checkpoint', True,
+    'Save dedicated checkpoint (ckpt_eval_success_iter_*.pkl, best_eval_success.pkl) '
+    'whenever success is achieved.')
+flags.DEFINE_boolean(
+    'ppo_video_include_reward_plot', True,
+    'Include dual-curve synchronized lockstep reward timeline plot above MuJoCo frames.')
+flags.DEFINE_integer(
+    'ppo_video_max_train_success_videos', 1,
+    'Max train-success video renders per iteration.')
+flags.DEFINE_boolean(
+    'ppo_save_train_success_video', True,
+    'Whether to render and log train success videos when on-policy training envs succeed.')
+flags.DEFINE_integer(
+    'ppo_train_success_min_interval', 10,
+    'Minimum PPO iterations between train success video/checkpoint logs to prevent overwhelming.')
+
+
 flags.DEFINE_boolean(
     'use_wandb', True,
     'Whether to log metrics and videos online to Weights & Biases.')
@@ -429,6 +477,15 @@ flags.DEFINE_float(
     'ema ← τ·ema + (1−τ)·online after each NF density step. '
     '0 = use online params (default). Higher τ = slower / smoother reward. '
     'Independent of ppo_crl_repr_tau. <0 keeps config default.')
+flags.DEFINE_boolean(
+    'ppo_log_dormancy', True,
+    'Whether to log network dormancy (DNR, GMA) and vector field diagnostics.')
+flags.DEFINE_integer(
+    'ppo_dormancy_interval', 50,
+    'Log network dormancy and vector field diagnostics every N PPO iterations.')
+flags.DEFINE_float(
+    'ppo_dormancy_tau', 0.01,
+    'Dormancy threshold relative to layer mean activation (default 0.01).')
 flags.DEFINE_boolean(
     'bin_randomize_gripper_init', False,
     'SawyerBin: randomize initial gripper TCP offset around the object at reset.')
@@ -866,10 +923,23 @@ def main(_):
   config.fm_t_logit_scale = float(FLAGS.fm_t_logit_scale)
   config.fm_goal_noise_std = float(FLAGS.fm_goal_noise_std)
   config.fm_norm_goals = bool(FLAGS.fm_norm_goals)
+  config.fm_goal_std_min = float(FLAGS.fm_goal_std_min)
+  config.fm_cond_dropout = float(FLAGS.fm_cond_dropout)
+  config.fm_reward_clip = float(FLAGS.fm_reward_clip)
+  if str(FLAGS.fm_cat_acc_mode or '').strip():
+    config.fm_cat_acc_mode = str(FLAGS.fm_cat_acc_mode).strip().lower()
+  if FLAGS.fm_cat_acc_subbatch > 0:
+    config.fm_cat_acc_subbatch = int(FLAGS.fm_cat_acc_subbatch)
+  config.fm_cat_acc_flow_steps = int(FLAGS.fm_cat_acc_flow_steps)
   config.fm_td_mode = bool(FLAGS.fm_td_mode)
   config.fm_td_gamma = float(FLAGS.fm_td_gamma)
   config.fm_td_target_tau = float(FLAGS.fm_td_target_tau)
   config.fm_td_boot_steps = int(FLAGS.fm_td_boot_steps)
+  config.fm_logp_diag_interval = int(FLAGS.fm_logp_diag_interval)
+  config.fm_logp_diag_batch_size = int(FLAGS.fm_logp_diag_batch_size)
+  config.fm_logp_diag_flow_steps = int(FLAGS.fm_logp_diag_flow_steps)
+  if str(FLAGS.fm_logp_diag_ode_solver or '').strip():
+    config.fm_logp_diag_ode_solver = str(FLAGS.fm_logp_diag_ode_solver).strip().lower()
   config.ppo_dirac_eps = float(FLAGS.ppo_dirac_eps)
   config.nf_rep_size = int(FLAGS.nf_rep_size)
   config.nf_num_blocks = int(FLAGS.nf_num_blocks)
@@ -906,6 +976,13 @@ def main(_):
   if FLAGS.ppo_video_fps >= 0:
     config.ppo_video_fps = int(FLAGS.ppo_video_fps)
   config.ppo_skip_first_video = bool(FLAGS.ppo_skip_first_video)
+  config.ppo_save_success_checkpoint = bool(FLAGS.ppo_save_success_checkpoint)
+  config.ppo_video_include_reward_plot = bool(FLAGS.ppo_video_include_reward_plot)
+  config.ppo_video_max_train_success_videos_per_iter = int(FLAGS.ppo_video_max_train_success_videos)
+  config.ppo_save_train_success_video = bool(FLAGS.ppo_save_train_success_video)
+  config.ppo_train_success_min_interval = int(FLAGS.ppo_train_success_min_interval)
+
+
   config.use_wandb = bool(FLAGS.use_wandb)
   config.wandb_project = str(FLAGS.wandb_project)
   config.wandb_entity = str(FLAGS.wandb_entity)
@@ -942,6 +1019,9 @@ def main(_):
     config.ppo_crl_repr_tau = float(FLAGS.ppo_crl_repr_tau)
   if FLAGS.ppo_nf_reward_tau >= 0.0:
     config.ppo_nf_reward_tau = float(FLAGS.ppo_nf_reward_tau)
+  config.ppo_log_dormancy = bool(FLAGS.ppo_log_dormancy)
+  config.ppo_dormancy_interval = int(FLAGS.ppo_dormancy_interval)
+  config.ppo_dormancy_tau = float(FLAGS.ppo_dormancy_tau)
   if FLAGS.hidden_layer_sizes.strip():
     config.hidden_layer_sizes = tuple(
         int(x) for x in FLAGS.hidden_layer_sizes.split(',') if x.strip())
@@ -1147,12 +1227,13 @@ def main(_):
   # ---- WandB -------------------------------------------------------------
   if FLAGS.use_wandb:
     try:
+      import time
       import wandb
       parent_name = os.path.basename(os.path.normpath(config.log_dir))
       folder_name = f'{config.alg_name}_{config.env_name}_{seed}'
       wandb_run_name = f'{parent_name}--{folder_name}' if parent_name else folder_name
       wandb_group = FLAGS.wandb_group or FLAGS.exp_name or parent_name
-      wandb_run_id = f'{parent_name}_{folder_name}'.replace('/', '_')
+      wandb_run_id = f'{parent_name}_{folder_name}_{int(time.time())}'.replace('/', '_')
       wandb.init(
           project=FLAGS.wandb_project,
           entity=FLAGS.wandb_entity or None,
@@ -1166,6 +1247,7 @@ def main(_):
       print(f'[ppo_contrastive] initialized wandb run: {wandb_run_name} (id={wandb_run_id}, mode={FLAGS.wandb_mode})')
     except Exception as _wb_err:
       print(f'[ppo_contrastive] WARNING: Failed to initialize WandB: {_wb_err}')
+
 
   from default import make_default_logger
   logger_fn = functools.partial(

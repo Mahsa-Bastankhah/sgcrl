@@ -1107,6 +1107,19 @@ def make_crl_update_fn(
     else:
       logsumexp_val = jax.nn.logsumexp(train_logits, axis=1) ** 2
 
+    # Action gradient norm ||grad_a (phi(s,a) . psi(g))||_2 on positive pairs
+    b_grad = min(int(batch_size), 128)
+    def _single_crl_score(a_i, obs_i):
+      _l, _, _ = networks.q_network.apply(q_params, obs_i[None, :], a_i[None, :])
+      if _l.ndim == 3:
+        return _l[0, 0, 0]
+      return _l[0, 0]
+
+    grad_a_fn = jax.vmap(jax.grad(_single_crl_score, argnums=0), in_axes=(0, 0))
+    grads_a = grad_a_fn(action[:b_grad], obs[:b_grad])
+    action_grad_norm = jax.lax.stop_gradient(
+        jnp.mean(jnp.linalg.norm(grads_a, axis=-1)))
+
     metrics = {
         'crl_loss': loss,
         'binary_accuracy': jnp.mean((logits_flat > 0) == labels),
@@ -1114,6 +1127,7 @@ def make_crl_update_fn(
         'logits_pos': logits_pos,
         'logits_neg': logits_neg,
         'logsumexp': logsumexp_val.mean(),
+        'action_grad_norm': action_grad_norm,
     }
     return loss, metrics
 
@@ -2373,6 +2387,7 @@ def run_ppo_training(
           f'coef={config.ppo_good_buffer_coef}, '
           f'capacity={good_capacity}')
 
+  fm_grad_norm_fn = None
   if use_gaussian:
     crl_update = _gd.make_gaussian_density_update_fn(
         density_nets, q_optimizer, obs_dim=int(config.obs_dim))
@@ -2390,7 +2405,14 @@ def run_ppo_training(
     _fm_t_logit_scale = float(getattr(config, 'fm_t_logit_scale', 1.0))
     _fm_ode_solver = str(getattr(config, 'fm_ode_solver', 'euler') or 'euler').strip().lower()
     _fm_goal_noise_std = float(getattr(config, 'fm_goal_noise_std', 0.0))
+    _fm_cond_dropout = float(getattr(config, 'fm_cond_dropout', 0.0))
+    _fm_reward_clip = float(getattr(config, 'fm_reward_clip', 0.0))
     _fm_td_mode = bool(getattr(config, 'fm_td_mode', False))
+    _fm_cat_acc_mode = str(getattr(config, 'fm_cat_acc_mode', 'midpoint') or 'midpoint').strip().lower()
+    _fm_cat_acc_subbatch = int(getattr(config, 'fm_cat_acc_subbatch', 128))
+    _fm_cat_acc_flow_steps = int(getattr(config, 'fm_cat_acc_flow_steps', -1))
+    _fm_logp_mode = str(getattr(config, 'fm_logp_mode', 'exact') or 'exact').strip().lower()
+    _fm_hutch_probes = int(getattr(config, 'fm_hutch_probes', 8))
 
     if _fm_td_mode:
       _fm_td_gamma = float(getattr(config, 'fm_td_gamma', 0.99))
@@ -2406,9 +2428,17 @@ def run_ppo_training(
           t_logit_loc=_fm_t_logit_loc,
           t_logit_scale=_fm_t_logit_scale,
           goal_noise_std=_fm_goal_noise_std,
+          cond_dropout=_fm_cond_dropout,
+          cat_acc_mode=_fm_cat_acc_mode,
+          cat_acc_subbatch=_fm_cat_acc_subbatch,
+          cat_acc_flow_steps=_fm_cat_acc_flow_steps,
+          logp_mode=_fm_logp_mode,
+          hutch_probes=_fm_hutch_probes,
+          reward_clip=_fm_reward_clip,
       )
       print(f'[ppo] FM density using TD-Flow (Bellman probability path targets: '
-            f'gamma={_fm_td_gamma}, target_tau={_fm_td_target_tau}, boot_steps={_fm_td_boot_steps})')
+            f'gamma={_fm_td_gamma}, target_tau={_fm_td_target_tau}, boot_steps={_fm_td_boot_steps}, '
+            f'cond_dropout={_fm_cond_dropout}, cat_acc_mode={_fm_cat_acc_mode})')
     else:
       crl_update = _fm.make_fm_density_update_fn(
           fm_density_nets, q_optimizer, obs_dim=int(config.obs_dim),
@@ -2416,13 +2446,30 @@ def run_ppo_training(
           t_logit_loc=_fm_t_logit_loc,
           t_logit_scale=_fm_t_logit_scale,
           goal_noise_std=_fm_goal_noise_std,
+          cond_dropout=_fm_cond_dropout,
+          cat_acc_mode=_fm_cat_acc_mode,
+          cat_acc_subbatch=_fm_cat_acc_subbatch,
+          cat_acc_flow_steps=_fm_cat_acc_flow_steps,
+          logp_mode=_fm_logp_mode,
+          ode_solver=_fm_ode_solver,
+          hutch_probes=_fm_hutch_probes,
+          reward_clip=_fm_reward_clip,
       )
+      print(f'[ppo] FM density update: cond_dropout={_fm_cond_dropout}, cat_acc_mode={_fm_cat_acc_mode} '
+            f'(subbatch={_fm_cat_acc_subbatch}, flow_steps={_fm_cat_acc_flow_steps})')
     fm_reward_fn = _fm.make_fm_reward_fn(
         fm_density_nets,
         obs_dim=int(config.obs_dim),
         logp_mode=str(getattr(config, 'fm_logp_mode', 'exact') or 'exact'),
         flow_steps=int(getattr(config, 'fm_flow_steps', 10)),
         hutch_probes=int(getattr(config, 'fm_hutch_probes', 8)),
+        ode_solver=_fm_ode_solver,
+        reward_clip=_fm_reward_clip,
+    )
+    fm_grad_norm_fn = _fm.make_fm_grad_norm_fn(
+        fm_density_nets,
+        obs_dim=int(config.obs_dim),
+        flow_steps=min(int(getattr(config, 'fm_flow_steps', 10)), 5),
         ode_solver=_fm_ode_solver,
     )
     gaussian_reward_fn = None
@@ -2880,10 +2927,12 @@ def run_ppo_training(
     print(f'[ppo] actor-reset schedule: force reinit at iters '
           f'{sorted(_force_reset_iters)}')
 
-  # Running goal normalisation stats for NF mode.
+  # Running goal normalisation stats for NF & FM modes.
   # Updated from replay buffer each iteration; broadcast-compatible with goals.
   nf_goal_mean = np.zeros(goal_dim_cfg, dtype=np.float32)
   nf_goal_std  = np.ones(goal_dim_cfg,  dtype=np.float32)
+  fm_goal_mean = np.zeros(goal_dim_cfg, dtype=np.float32)
+  fm_goal_std  = np.ones(goal_dim_cfg,  dtype=np.float32)
 
   obs = vec_env.reset()
   next_done = np.zeros(E, dtype=np.float32)
@@ -2989,6 +3038,55 @@ def run_ppo_training(
                 else f'keep last {ckpt_keep_last} milestones')
     print(f'[ppo] checkpoints → {checkpoint_dir} '
           f'(every {ckpt_interval} iters, {keep_msg})')
+
+  best_eval_success = -1.0
+  best_train_success = -1.0
+  save_success_checkpoint_enabled = bool(getattr(config, 'ppo_save_success_checkpoint', True))
+  video_include_reward_plot_enabled = bool(getattr(config, 'ppo_video_include_reward_plot', True))
+  max_train_success_videos = int(getattr(config, 'ppo_video_max_train_success_videos_per_iter', 1))
+  save_train_success_video_enabled = bool(getattr(config, 'ppo_save_train_success_video', True))
+  train_success_min_interval = int(getattr(config, 'ppo_train_success_min_interval', 10))
+  last_train_success_iter = -9999
+
+
+  def _save_success_checkpoint_fn(kind: str, iteration: int, global_step: int, key_val, metric_val: float):
+    if not save_success_checkpoint_enabled or checkpoint_dir is None:
+      return
+    nonlocal best_eval_success, best_train_success
+    _checkpoint_extra = {
+        'obs_rms': {
+            'mean': np.asarray(obs_rms.mean, dtype=np.float64),
+            'var': np.asarray(obs_rms.var, dtype=np.float64),
+            'count': float(obs_rms.count),
+        },
+    } if norm_obs else {}
+    ckpt_kw = dict(
+        policy_params=ppo_params['policy'],
+        value_params=ppo_params['value'],
+        q_params=q_params,
+        ppo_opt_state=ppo_opt_state,
+        q_opt_state=q_opt_state,
+        iteration=iteration,
+        global_step=global_step,
+        key=key_val,
+        q_params_ema=(q_params_reward if _use_repr_ema else None),
+        td3_policy_target=(td3_policy_target if _use_td3_target_policy else None),
+        obs_norm_mean=obs_normalizer.mean,
+        obs_norm_var=obs_normalizer.var,
+        obs_norm_count=obs_normalizer.count,
+        obs_norm_mode=obs_normalizer.mode,
+        extra_state=(_checkpoint_extra if _checkpoint_extra else None))
+    milestone_path = os.path.join(
+        checkpoint_dir, f'ckpt_{kind}_success_iter_{iteration:07d}.pkl')
+    _save_checkpoint(milestone_path, **ckpt_kw)
+    if kind == 'eval' and metric_val >= best_eval_success:
+      best_eval_success = metric_val
+      _save_checkpoint(os.path.join(checkpoint_dir, 'best_eval_success.pkl'), **ckpt_kw)
+    elif kind == 'train' and metric_val >= best_train_success:
+      best_train_success = metric_val
+      _save_checkpoint(os.path.join(checkpoint_dir, 'best_train_success.pkl'), **ckpt_kw)
+    print(f'[ppo] SUCCESS CHECKPOINT ({kind}) iter={iteration} (metric={metric_val:.3f}) saved to {milestone_path}', flush=True)
+
 
   start_time = time.time()
   # global_step, ppo_sgd_step, start_iteration set above (0 for fresh runs,
@@ -3233,15 +3331,20 @@ def run_ppo_training(
       elif use_fm:
         _fm_mode = (
             getattr(config, 'fm_logp_mode', 'exact') or 'exact').strip().lower()
+        _use_fm_norm = bool(getattr(config, 'fm_norm_goals', False))
+        _g_mean = jnp.asarray(fm_goal_mean) if _use_fm_norm else None
+        _g_std  = jnp.asarray(fm_goal_std)  if _use_fm_norm else None
         if 'hutch' in _fm_mode:
           key, k_fm_rew = jax.random.split(key)
           _rew_flat = np.asarray(
               fm_reward_fn(
-                  _reward_q_params(), _flat_obs_j, _flat_acts_j, k_fm_rew))
+                  _reward_q_params(), _flat_obs_j, _flat_acts_j, k_fm_rew,
+                  _g_mean, _g_std))
         else:
           _rew_flat = np.asarray(
               fm_reward_fn(
-                  _reward_q_params(), _flat_obs_j, _flat_acts_j))
+                  _reward_q_params(), _flat_obs_j, _flat_acts_j,
+                  _g_mean, _g_std))
       elif use_td3:
         _rew_flat = np.asarray(
             td3_reward_fn(
@@ -3295,6 +3398,67 @@ def run_ppo_training(
     if (use_external_reward and _roll_success is not None
             and not external_reward_before_norm):
       roll_rew += _ext
+
+    # Train success handling: checkpoint save + lockstep video render (rate limited)
+    if (_roll_success is not None and np.any(_roll_success >= 0.5)
+        and (iteration - last_train_success_iter >= train_success_min_interval)):
+      last_train_success_iter = iteration
+      _curr_tr_succ = float(np.mean(recent_success[-100:])) if recent_success else 1.0
+      _save_success_checkpoint_fn('train', iteration, global_step, key, _curr_tr_succ)
+      if (bb_video_env is not None and video_include_reward_plot_enabled and save_train_success_video_enabled
+          and '_steps_j' in locals() and 'qpos' in _steps_j):
+
+        from contrastive import builderbench_video as _bb_vid
+        _succ_env_indices = np.where(np.any(_roll_success >= 0.5, axis=0))[0]
+        for _v_idx, _e_idx in enumerate(_succ_env_indices[:max_train_success_videos]):
+          _tr_vid_path = os.path.join(
+              bb_video_dir, f'train_success_iter_{int(iteration):07d}_env{int(_e_idx)}.mp4')
+          try:
+            _qpos_e = np.asarray(_steps_j['qpos'][:, _e_idx], dtype=np.float32)
+            _qvel_e = np.asarray(_steps_j['qvel'][:, _e_idx], dtype=np.float32)
+            _mocap_pos_e = np.asarray(_steps_j['target_mocap_pos'][:, _e_idx], dtype=np.float32)
+            _mocap_quat_e = np.asarray(_steps_j['target_mocap_quat'][:, _e_idx], dtype=np.float32)
+            _raw_r_e = np.asarray(roll_rew_raw[:, _e_idx], dtype=np.float32)
+            _tot_r_e = np.asarray(roll_rew[:, _e_idx], dtype=np.float32)
+            _succ_e = np.asarray(_roll_success[:, _e_idx], dtype=np.float32)
+            _grad_s_e = None
+            if use_fm and fm_grad_norm_fn is not None:
+              try:
+                _s_norms_j, _ = fm_grad_norm_fn(
+                    _reward_q_params(),
+                    jnp.asarray(roll_obs[:, _e_idx]),
+                    jnp.asarray(roll_acts[:, _e_idx]),
+                )
+                _grad_s_e = np.asarray(_s_norms_j, dtype=np.float32).reshape(-1)
+              except Exception:
+                _grad_s_e = None
+            _bb_vid.render_rollout_trajectory_video(
+                video_env=bb_video_env,
+                qpos=_qpos_e,
+                qvel=_qvel_e,
+                target_mocap_pos=_mocap_pos_e,
+                target_mocap_quat=_mocap_quat_e,
+                rewards_raw=_raw_r_e,
+                rewards_total=_tot_r_e,
+                success=_succ_e,
+                fps=int(_video_fps),
+                out_path=_tr_vid_path,
+                include_reward_plot=True,
+                title=f'Train Success (iter {iteration}, env {_e_idx})',
+                state_grad_norms=_grad_s_e,
+            )
+            try:
+              import wandb
+              if wandb.run is not None:
+                wandb.log(
+                    {"train_success_videos": wandb.Video(str(_tr_vid_path), fps=int(_video_fps), format="mp4")},
+                    step=int(iteration),
+                )
+            except Exception as _wb_tr_err:
+              print(f'[ppo] train success video wandb log failed: {_wb_tr_err}', flush=True)
+          except Exception as _tr_vid_err:
+            print(f'[ppo] train success video render failed: {_tr_vid_err}', flush=True)
+
 
     # Occasional success-step dump (after warmup): intrinsic / extrinsic / full.
     if (use_external_reward and _roll_success is not None
@@ -3417,10 +3581,10 @@ def run_ppo_training(
     crl_metrics_agg: Dict[str, list] = {}
     hybrid_td3_metrics_agg: Dict[str, list] = {}
     if replay.size >= int(config.ppo_min_replay_size):
-      # Update goal normalisation stats from a fresh replay sample (NF only).
-      if use_nf and not _nf_normalizer_reset_done:
-        # First time NF activates: reset the return normalizer so the extreme
-        # rewards from the untrained flow don't permanently corrupt the running
+      # Update goal normalisation stats from a fresh replay sample (NF or FM).
+      if (use_nf or (use_fm and getattr(config, 'fm_norm_goals', False))) and not _nf_normalizer_reset_done:
+        # First time normalizer activates: reset the return normalizer so the extreme
+        # rewards from the untrained model don't permanently corrupt the running
         # std that PPO uses to scale advantages.
         if reward_normalizer is not None:
           reward_normalizer._rms = RunningMeanStd(shape=())
@@ -3441,6 +3605,16 @@ def run_ppo_training(
         for _di, (_gm, _gs) in enumerate(zip(nf_goal_mean, nf_goal_std)):
           _nf_stat_log[f'nf/goal_mean_{_di}'] = float(_gm)
           _nf_stat_log[f'nf/goal_std_{_di}']  = float(_gs)
+      elif use_fm and getattr(config, 'fm_norm_goals', False):
+        _std_floor = float(getattr(config, 'fm_goal_std_min', 0.02))
+        _stat_batch = replay.sample(min(2048, replay.size), np_rng)
+        _goals = _stat_batch['obs'][:, int(config.obs_dim):]
+        fm_goal_mean = _goals.mean(axis=0).astype(np.float32)
+        fm_goal_std  = _goals.std(axis=0).astype(np.float32)
+        fm_goal_std  = np.maximum(fm_goal_std, _std_floor).astype(np.float32)
+        for _di, (_gm, _gs) in enumerate(zip(fm_goal_mean, fm_goal_std)):
+          _nf_stat_log[f'fm/goal_mean_{_di}'] = float(_gm)
+          _nf_stat_log[f'fm/goal_std_{_di}']  = float(_gs)
 
       _n_crl = int(config.ppo_crl_steps_per_iter)
       # Frozen-reward / stationary φ·ψ sets crl_steps=0: skip updates. The
@@ -3545,11 +3719,19 @@ def run_ppo_training(
                 q_params, q_opt_state, td_infonce_target_q,
                 ppo_params['policy'], crl_batch, k_crl)
           elif use_fm and _fm_td_mode:
+            _use_fm_norm = bool(getattr(config, 'fm_norm_goals', False))
+            _g_mean = jnp.asarray(fm_goal_mean) if _use_fm_norm else None
+            _g_std  = jnp.asarray(fm_goal_std)  if _use_fm_norm else None
             q_params, target_fm_params, q_opt_state, m = crl_update(
-                q_params, target_fm_params, q_opt_state, crl_batch, k_crl)
-          else:
+                q_params, target_fm_params, q_opt_state, crl_batch, k_crl,
+                _g_mean, _g_std)
+          elif use_fm:
+            _use_fm_norm = bool(getattr(config, 'fm_norm_goals', False))
+            _g_mean = jnp.asarray(fm_goal_mean) if _use_fm_norm else None
+            _g_std  = jnp.asarray(fm_goal_std)  if _use_fm_norm else None
             q_params, q_opt_state, m = crl_update(
-                q_params, q_opt_state, crl_batch, k_crl)
+                q_params, q_opt_state, crl_batch, k_crl,
+                _g_mean, _g_std)
           if _use_repr_ema:
             q_params_reward = _ema_tree(q_params_reward, q_params, _repr_tau)
           for k_, v in m.items():
@@ -3646,8 +3828,20 @@ def run_ppo_training(
           'fm/vel_target_norm': float('nan'),
           'fm/x1_norm': float('nan'),
           'fm/grad_norm': float('nan'),
+          'fm/action_grad_norm': float('nan'),
+          'fm/state_grad_norm': float('nan'),
+          'fm/state_action_grad_ratio': float('nan'),
           'fm/update_skipped_nonfinite': float('nan'),
           'fm/update_steps': 0,
+          'fm_diag/logp_seen_mean': float('nan'),
+          'fm_diag/logp_seen_min': float('nan'),
+          'fm_diag/logp_seen_max': float('nan'),
+          'fm_diag/logp_seen_std': float('nan'),
+          'fm_diag/logp_unseen_mean': float('nan'),
+          'fm_diag/logp_unseen_min': float('nan'),
+          'fm_diag/logp_unseen_max': float('nan'),
+          'fm_diag/logp_unseen_std': float('nan'),
+          'fm_diag/logp_gap': float('nan'),
       })
     if use_nf:
       log.update({
@@ -3731,6 +3925,103 @@ def run_ppo_training(
           roll_obs, _num_cubes, _state_obs_dim)
       for k_d, v_d in diag_metrics.items():
         log[f'obs/{k_d}'] = v_d
+
+    # =================================================================
+    # Network Dormancy & Vector Field Diagnostics Logging
+    # =================================================================
+    _log_dormancy = bool(getattr(config, 'ppo_log_dormancy', True))
+    _dormancy_interval = int(getattr(config, 'ppo_dormancy_interval', 50))
+    _dormancy_tau = float(getattr(config, 'ppo_dormancy_tau', 0.01))
+    if (_log_dormancy and _dormancy_interval > 0
+        and (iteration % _dormancy_interval == 0 or iteration == num_iterations - 1)):
+      try:
+        from contrastive import dormancy as _dorm
+        _flat_obs = roll_obs.reshape(-1, total_obs_dim)
+        _diag_s = jnp.asarray(_flat_obs[:, :obs_dim_cfg])
+        _diag_a = jnp.asarray(roll_acts.reshape(-1, act_dim_cfg))
+        _diag_g = (jnp.asarray(_flat_obs[:, obs_dim_cfg:])
+                   if total_obs_dim > obs_dim_cfg else None)
+
+        if ppo_params.get('policy') is not None:
+          _pol_acts = _dorm.extract_pytree_layer_activations(
+              ppo_params['policy'], _diag_s[:256])
+          _pol_dorm = _dorm.compute_layer_dormancy_and_gma(
+              _pol_acts, tau=_dormancy_tau, prefix='dormancy/actor')
+          log.update(_pol_dorm)
+
+        if ppo_params.get('value') is not None:
+          _val_acts = _dorm.extract_pytree_layer_activations(
+              ppo_params['value'], _diag_s[:256])
+          _val_dorm = _dorm.compute_layer_dormancy_and_gma(
+              _val_acts, tau=_dormancy_tau, prefix='dormancy/critic')
+          log.update(_val_dorm)
+
+        if use_fm and fm_density_nets is not None and _diag_g is not None and _diag_g.shape[1] > 0:
+          _fm_apply = fm_density_nets.velocity_net.apply
+          _fm_diag = _dorm.compute_vector_field_diagnostics(
+              fm_apply_fn=_fm_apply,
+              fm_params=q_params,
+              states=_diag_s[:256],
+              actions=_diag_a[:256],
+              goals=_diag_g[:256],
+              tau=_dormancy_tau,
+          )
+          log.update(_fm_diag)
+        elif use_crl and q_params is not None:
+          _crl_acts = _dorm.extract_pytree_layer_activations(
+              q_params, _diag_s[:256])
+          _crl_dorm = _dorm.compute_layer_dormancy_and_gma(
+              _crl_acts, tau=_dormancy_tau, prefix='dormancy/crl')
+          log.update(_crl_dorm)
+      except Exception as _dorm_err:
+        print(f'[ppo] dormancy metric calculation warning at iter={iteration}: {_dorm_err}', flush=True)
+
+    # =================================================================
+    # Flow Matching Seen vs Unseen Log-Prob Peakedness Diagnostics
+    # =================================================================
+    _fm_logp_diag_interval = int(getattr(config, 'fm_logp_diag_interval', 50))
+    if (use_fm and fm_density_nets is not None and _fm_logp_diag_interval > 0
+        and replay.size > 0
+        and (iteration % _fm_logp_diag_interval == 0 or iteration == num_iterations - 1)):
+      try:
+        _diag_bs = min(int(getattr(config, 'fm_logp_diag_batch_size', 64)), replay.size)
+        if _diag_bs > 0:
+          _diag_batch_np = replay.sample(_diag_bs, np_rng)
+          _diag_obs = _diag_batch_np['obs']
+          _diag_state = jnp.asarray(_diag_obs[:, :obs_dim_cfg])
+          _diag_seen_g = jnp.asarray(_diag_obs[:, obs_dim_cfg:])
+          _diag_act = jnp.asarray(_diag_batch_np['action'])
+
+          # Unseen goals: sample conditioning goals from current rollout observations
+          _flat_roll_obs = roll_obs.reshape(-1, total_obs_dim)
+          if total_obs_dim > obs_dim_cfg:
+            _unseen_g_all = _flat_roll_obs[:, obs_dim_cfg:]
+            _unseen_idx = np_rng.choice(len(_unseen_g_all), size=_diag_bs, replace=True)
+            _diag_unseen_g = jnp.asarray(_unseen_g_all[_unseen_idx])
+          else:
+            _diag_unseen_g = _diag_seen_g
+
+          _use_fm_norm = bool(getattr(config, 'fm_norm_goals', False))
+          _g_mean = jnp.asarray(fm_goal_mean) if _use_fm_norm else None
+          _g_std = jnp.asarray(fm_goal_std) if _use_fm_norm else None
+          _diag_steps = int(getattr(config, 'fm_logp_diag_flow_steps', 5))
+          _diag_solver = str(getattr(config, 'fm_logp_diag_ode_solver', 'euler')).lower()
+
+          _fm_logp_stats = _fm.compute_fm_logp_diagnostics(
+              fm_networks=fm_density_nets,
+              params=_reward_q_params(),
+              state=_diag_state,
+              action=_diag_act,
+              seen_goals=_diag_seen_g,
+              unseen_goals=_diag_unseen_g,
+              flow_steps=_diag_steps,
+              ode_solver=_diag_solver,
+              goal_mean=_g_mean,
+              goal_std=_g_std,
+          )
+          log.update(_fm_logp_stats)
+      except Exception as _fm_diag_err:
+        print(f'[ppo] FM logp diagnostic warning at iter={iteration}: {_fm_diag_err}', flush=True)
 
     learner_logger.write(log)
 
@@ -3858,6 +4149,55 @@ def run_ppo_training(
             f'success={agg.get("success", float("nan")):.3f}',
             flush=True)
 
+      _eval_succ_val = float(agg.get("success", 0.0))
+      if save_success_checkpoint_enabled and _eval_succ_val > 0.0:
+        _save_success_checkpoint_fn('eval', iteration, global_step, key, _eval_succ_val)
+        if bb_video_env is not None and video_include_reward_plot_enabled:
+          from contrastive import builderbench_video as _bb_vid
+          _eval_vid_path = os.path.join(
+              bb_video_dir, f'eval_success_iter_{int(iteration):07d}.mp4')
+          try:
+            _bb_vid.render_deterministic_episode(
+                video_env=bb_video_env,
+                mocap_targets=bb_video_mocap,
+                num_cubes=int(bb_video_num_cubes),
+                episode_length=int(bb_video_ep_len),
+                networks=networks,
+                policy_params=ppo_params['policy'],
+                obs_mean=np.asarray(iter_obs_mean, dtype=np.float32),
+                obs_var=np.asarray(iter_obs_var, dtype=np.float32),
+                fixed_target_goal=_bb_kw.get('fixed_target_goal'),
+                seed=int(seed + 17_000 + iteration),
+                filter_policy_obs=bool(bb_video_filter),
+                normalize_obs=bool(norm_obs),
+                obs_dim=int(obs_dim_cfg),
+                start_index=int(norm_si),
+                end_index=int(norm_ei),
+                obs_norm_clip=float(obs_norm_clip),
+                fps=int(_video_fps),
+                out_path=_eval_vid_path,
+                goal_state_indices=_goal_state_indices,
+                reward_fn=(fm_reward_fn if use_fm else (reward_fn if use_crl else None)),
+                reward_params=_reward_q_params(),
+                grad_norm_fn=(fm_grad_norm_fn if use_fm else None),
+                reward_normalizer=reward_normalizer,
+                use_external_reward=use_external_reward,
+                external_reward_scale=external_reward_scale,
+                include_reward_plot=True,
+                title=f'Eval Success (iter {iteration})',
+            )
+            try:
+              import wandb
+              if wandb.run is not None:
+                wandb.log(
+                    {"eval_success_videos": wandb.Video(str(_eval_vid_path), fps=int(_video_fps), format="mp4")},
+                    step=int(iteration),
+                )
+            except Exception:
+              pass
+          except Exception as _ev_vid_err:
+            print(f'[ppo] eval success video render failed: {_ev_vid_err}', flush=True)
+
     # =================================================================
     # 6b. Periodic deterministic video (same frozen obs_rms as eval)
     # =================================================================
@@ -3891,7 +4231,16 @@ def run_ppo_training(
             fps=int(_video_fps),
             out_path=_vid_path,
             goal_state_indices=_goal_state_indices,
+            reward_fn=(fm_reward_fn if use_fm else (reward_fn if use_crl else None)),
+            reward_params=_reward_q_params(),
+            grad_norm_fn=(fm_grad_norm_fn if use_fm else None),
+            reward_normalizer=reward_normalizer,
+            use_external_reward=use_external_reward,
+            external_reward_scale=external_reward_scale,
+            include_reward_plot=video_include_reward_plot_enabled,
+            title=f'Periodic Rollout (iter {iteration})',
         )
+
         print(f'[ppo] video iter={iteration}: wrote {_out} '
               f'({_n_frames} frames) in {time.time() - _vid_t0:.1f}s',
               flush=True)

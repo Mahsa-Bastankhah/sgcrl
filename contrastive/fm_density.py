@@ -251,12 +251,22 @@ def fm_log_prob(
     flow_steps: Optional[int] = None,
     hutch_probes: int = 8,
     ode_solver: Optional[str] = None,
+    goal_mean: Optional[jnp.ndarray] = None,
+    goal_std: Optional[jnp.ndarray] = None,
+    reward_clip: float = 0.0,
 ) -> jnp.ndarray:
   """log p_θ(goal | state, action) via reverse ODE + base Gaussian."""
   n = int(flow_steps if flow_steps is not None else fm_networks.flow_steps)
   solver = str(ode_solver if ode_solver is not None else fm_networks.ode_solver).lower()
   dt = 1.0 / n
   b, g_dim = goal.shape
+
+  if goal_mean is not None and goal_std is not None:
+    x_t = (goal - goal_mean) / goal_std
+    log_det_adj = -jnp.sum(jnp.log(goal_std))
+  else:
+    x_t = goal
+    log_det_adj = 0.0
 
   def v_apply(s_b, a_b, x_b, t_b):
     return fm_networks.velocity_net.apply(params, s_b, a_b, x_b, t_b)
@@ -277,7 +287,6 @@ def fm_log_prob(
   else:
     raise ValueError(f'Unknown fm logp mode: {mode!r}')
 
-  x_t = goal
   logp_acc = jnp.zeros((b,), dtype=goal.dtype)
   if need_key:
     rngs = jax.random.split(rng, n * b).reshape(n, b, 2)
@@ -333,7 +342,10 @@ def fm_log_prob(
       -0.5 * jnp.sum(x_0 ** 2, axis=-1)
       - 0.5 * g_dim * jnp.log(2.0 * jnp.pi)
   )
-  return base_logp - logp_div
+  logp = base_logp - logp_div + log_det_adj
+  if reward_clip > 0.0:
+    logp = jnp.clip(logp, -reward_clip, reward_clip)
+  return logp
 
 
 # ---------------------------------------------------------------------------
@@ -348,19 +360,35 @@ def make_fm_density_update_fn(
     t_logit_loc: float = 0.0,
     t_logit_scale: float = 1.0,
     goal_noise_std: float = 0.0,
+    cond_dropout: float = 0.0,
+    cat_acc_mode: str = 'midpoint',
+    cat_acc_subbatch: int = 128,
+    cat_acc_flow_steps: int = -1,
+    logp_mode: str = 'exact',
+    ode_solver: str = 'euler',
+    hutch_probes: int = 8,
+    reward_clip: float = 0.0,
 ):
   """Jitted OT conditional flow-matching update with diagnostic metrics."""
 
-  def _loss(params, batch, key):
+  def _loss(params, batch, key, goal_mean=None, goal_std=None):
     obs = batch['obs']
     action = batch['action']
     state = obs[:, :obs_dim]
     x_1 = obs[:, obs_dim:]  # g = obs_to_goal(s_f), s_f ~ p_γ
 
+    if goal_mean is not None and goal_std is not None:
+      x_1 = (x_1 - goal_mean) / goal_std
+
     b = x_1.shape[0]
-    key_x, key_t, key_g = jax.random.split(key, 3)
+    key_x, key_t, key_g, key_mask, key_logp = jax.random.split(key, 5)
     if goal_noise_std > 0.0:
       x_1 = x_1 + jax.random.normal(key_g, x_1.shape, dtype=x_1.dtype) * goal_noise_std
+
+    if cond_dropout > 0.0:
+      mask = jax.random.bernoulli(key_mask, p=1.0 - cond_dropout, shape=(b, 1))
+      state = state * mask
+      action = action * mask
 
     x_0 = jax.random.normal(key_x, x_1.shape, dtype=x_1.dtype)
     t = sample_timesteps(
@@ -392,9 +420,80 @@ def make_fm_density_update_fn(
     v_minus = fm_networks.velocity_net.apply(params, state, action, x_t, t_minus)
     vel_dt_norm = jnp.mean(jnp.linalg.norm((v_plus - v_minus) / (2.0 * eps_t), axis=-1))
 
+    # --- Sub-batch Pairwise Top-1 Goal Retrieval Categorical Accuracy ---
+    b_sub = min(int(x_1.shape[0]), int(cat_acc_subbatch))
+    sub_state = state[:b_sub]
+    sub_action = action[:b_sub]
+    sub_x1 = x_1[:b_sub]
+    sub_x0 = x_0[:b_sub]
+
+    if str(cat_acc_mode).lower() == 'logp':
+      # Full reverse-ODE conditional log-likelihood matrix log p_FM(g_j | s_i, a_i)
+      state_rep = jnp.repeat(sub_state, b_sub, axis=0)
+      action_rep = jnp.repeat(sub_action, b_sub, axis=0)
+      goal_rep = jnp.tile(sub_x1, (b_sub, 1))
+
+      eval_steps = (int(cat_acc_flow_steps) if int(cat_acc_flow_steps) > 0
+                    else int(fm_networks.flow_steps))
+      logp_flat = fm_log_prob(
+          fm_networks, params, state_rep, action_rep, goal_rep,
+          rng=key_logp, mode=logp_mode, flow_steps=eval_steps,
+          hutch_probes=hutch_probes, ode_solver=ode_solver,
+          goal_mean=None, goal_std=None, reward_clip=reward_clip,
+      )
+      scores = logp_flat.reshape(b_sub, b_sub)
+    else:
+      # Midpoint velocity prediction error proxy at t = 0.5
+      t_mid = jnp.full((b_sub, 1), 0.5, dtype=sub_x1.dtype)
+      x0_expanded = sub_x0[:, None, :]
+      x1_expanded = sub_x1[None, :, :]
+      x_t_pair = 0.5 * x0_expanded + 0.5 * x1_expanded
+      target_pair = x1_expanded - x0_expanded
+
+      state_rep = jnp.repeat(sub_state, b_sub, axis=0)
+      action_rep = jnp.repeat(sub_action, b_sub, axis=0)
+      t_rep = jnp.repeat(t_mid, b_sub, axis=0)
+      x_t_flat = x_t_pair.reshape(-1, sub_x1.shape[-1])
+
+      vel_pair_pred = fm_networks.velocity_net.apply(
+          params, state_rep, action_rep, x_t_flat, t_rep)
+      vel_pair_pred = vel_pair_pred.reshape(b_sub, b_sub, -1)
+
+      sq_err_pair = jnp.mean((vel_pair_pred - target_pair) ** 2, axis=-1)
+      scores = -sq_err_pair
+
+    correct = (jnp.argmax(scores, axis=1) == jnp.arange(b_sub))
+    cat_acc = jnp.mean(correct.astype(jnp.float32))
+
+    # Score gradient norms ||grad_a log p(g | s, a)||_2 and ||grad_s log p(g | s, a)||_2
+    b_grad = min(int(x_1.shape[0]), 64)
+    def _single_logp(a_i, s_i, g_i):
+      return fm_log_prob(
+          fm_networks, params, s_i[None, :], a_i[None, :], g_i[None, :],
+          mode='exact', flow_steps=min(int(fm_networks.flow_steps), 5),
+          ode_solver='euler'
+      )[0]
+
+    grad_a_fn = jax.vmap(jax.grad(_single_logp, argnums=0), in_axes=(0, 0, 0))
+    grad_s_fn = jax.vmap(jax.grad(_single_logp, argnums=1), in_axes=(0, 0, 0))
+    grads_a = grad_a_fn(action[:b_grad], state[:b_grad], x_1[:b_grad])
+    grads_s = grad_s_fn(action[:b_grad], state[:b_grad], x_1[:b_grad])
+    action_grad_norm = jax.lax.stop_gradient(
+        jnp.mean(jnp.linalg.norm(grads_a, axis=-1)))
+    state_grad_norm = jax.lax.stop_gradient(
+        jnp.mean(jnp.linalg.norm(grads_s, axis=-1)))
+    state_action_grad_ratio = jax.lax.stop_gradient(
+        state_grad_norm / (action_grad_norm + 1e-6))
+    labels = jnp.eye(b_sub)
+    logits_pos = jnp.sum(scores * labels) / b_sub
+    logits_neg = jnp.sum(scores * (1.0 - labels)) / jnp.maximum(b_sub * (b_sub - 1), 1)
+
     metrics = {
         'density_loss': loss,
         'fm_flow_loss': loss,
+        'categorical_accuracy': cat_acc,
+        'logits_pos': logits_pos,
+        'logits_neg': logits_neg,
         'vel_pred_norm': jnp.mean(jnp.linalg.norm(vel_pred, axis=-1)),
         'vel_target_norm': jnp.mean(jnp.linalg.norm(vel_target, axis=-1)),
         'x1_norm': jnp.mean(jnp.linalg.norm(x_1, axis=-1)),
@@ -402,13 +501,16 @@ def make_fm_density_update_fn(
         'loss_t_mid': loss_mid,
         'loss_t_late': loss_late,
         'vel_dt_norm': vel_dt_norm,
+        'action_grad_norm': action_grad_norm,
+        'state_grad_norm': state_grad_norm,
+        'state_action_grad_ratio': state_action_grad_ratio,
     }
     return loss, metrics
 
   grad_fn = jax.value_and_grad(_loss, has_aux=True)
 
-  def update(params, opt_state, batch, key):
-    (_, metrics), grads = grad_fn(params, batch, key)
+  def update(params, opt_state, batch, key, goal_mean=None, goal_std=None):
+    (_, metrics), grads = grad_fn(params, batch, key, goal_mean, goal_std)
 
     grads_finite = jnp.all(jnp.asarray(jax.tree_util.tree_leaves(
         jax.tree_util.tree_map(lambda g: jnp.all(jnp.isfinite(g)), grads))))
@@ -497,10 +599,17 @@ def make_td_fm_density_update_fn(
     t_logit_loc: float = 0.0,
     t_logit_scale: float = 1.0,
     goal_noise_std: float = 0.0,
+    cond_dropout: float = 0.0,
+    cat_acc_mode: str = 'midpoint',
+    cat_acc_subbatch: int = 128,
+    cat_acc_flow_steps: int = -1,
+    logp_mode: str = 'exact',
+    hutch_probes: int = 8,
+    reward_clip: float = 0.0,
 ):
   """Jitted TD-Flow update function leveraging Bellman targets on probability paths."""
 
-  def _loss(online_params, target_params, batch, key):
+  def _loss(online_params, target_params, batch, key, goal_mean=None, goal_std=None):
     obs = batch['obs']
     action = batch['action']
     next_obs = batch['next_obs']
@@ -514,12 +623,21 @@ def make_td_fm_density_update_fn(
 
     # 1-step next state goal: g_1 = obs_to_goal(s_1)
     g_1 = next_obs[:, obs_dim:]
+    if goal_mean is not None and goal_std is not None:
+      g_1 = (g_1 - goal_mean) / goal_std
 
     b = state.shape[0]
-    key_x0, key_t, key_m, key_boot, key_g = jax.random.split(key, 5)
+    key_x0, key_t, key_m, key_boot, key_g, key_mask, key_logp = jax.random.split(key, 7)
 
     if goal_noise_std > 0.0:
       g_1 = g_1 + jax.random.normal(key_g, g_1.shape, dtype=g_1.dtype) * goal_noise_std
+
+    if cond_dropout > 0.0:
+      mask = jax.random.bernoulli(key_mask, p=1.0 - cond_dropout, shape=(b, 1))
+      state = state * mask
+      action = action * mask
+      next_state = next_state * mask
+      next_action = next_action * mask
 
     # Bootstrapped goal sample x_1_boot starting from s_1
     x_1_boot = generate_target_goals_bootstrapped(
@@ -546,21 +664,95 @@ def make_td_fm_density_update_fn(
     sq_err = jnp.mean((vel_pred - vel_target) ** 2, axis=-1)
     loss = jnp.mean(sq_err)
 
+    # --- Sub-batch Pairwise Top-1 Goal Retrieval Categorical Accuracy ---
+    b_sub = min(int(x_1_target.shape[0]), int(cat_acc_subbatch))
+    sub_state = state[:b_sub]
+    sub_action = action[:b_sub]
+    sub_x1 = x_1_target[:b_sub]
+    sub_x0 = x_0[:b_sub]
+
+    if str(cat_acc_mode).lower() == 'logp':
+      # Full reverse-ODE conditional log-likelihood matrix log p_FM(g_j | s_i, a_i)
+      state_rep = jnp.repeat(sub_state, b_sub, axis=0)
+      action_rep = jnp.repeat(sub_action, b_sub, axis=0)
+      goal_rep = jnp.tile(sub_x1, (b_sub, 1))
+
+      eval_steps = (int(cat_acc_flow_steps) if int(cat_acc_flow_steps) > 0
+                    else int(fm_networks.flow_steps))
+      logp_flat = fm_log_prob(
+          fm_networks, online_params, state_rep, action_rep, goal_rep,
+          rng=key_logp, mode=logp_mode, flow_steps=eval_steps,
+          hutch_probes=hutch_probes, ode_solver=ode_solver,
+          goal_mean=None, goal_std=None, reward_clip=reward_clip,
+      )
+      scores = logp_flat.reshape(b_sub, b_sub)
+    else:
+      # Midpoint velocity prediction error proxy at t = 0.5
+      t_mid = jnp.full((b_sub, 1), 0.5, dtype=sub_x1.dtype)
+      x0_expanded = sub_x0[:, None, :]
+      x1_expanded = sub_x1[None, :, :]
+      x_t_pair = 0.5 * x0_expanded + 0.5 * x1_expanded
+      target_pair = x1_expanded - x0_expanded
+
+      state_rep = jnp.repeat(sub_state, b_sub, axis=0)
+      action_rep = jnp.repeat(sub_action, b_sub, axis=0)
+      t_rep = jnp.repeat(t_mid, b_sub, axis=0)
+      x_t_flat = x_t_pair.reshape(-1, sub_x1.shape[-1])
+
+      vel_pair_pred = fm_networks.velocity_net.apply(
+          online_params, state_rep, action_rep, x_t_flat, t_rep)
+      vel_pair_pred = vel_pair_pred.reshape(b_sub, b_sub, -1)
+
+      sq_err_pair = jnp.mean((vel_pair_pred - target_pair) ** 2, axis=-1)
+      scores = -sq_err_pair
+
+    correct = (jnp.argmax(scores, axis=1) == jnp.arange(b_sub))
+    cat_acc = jnp.mean(correct.astype(jnp.float32))
+
+    # Score gradient norms ||grad_a log p(g | s, a)||_2 and ||grad_s log p(g | s, a)||_2
+    b_grad = min(int(x_1_target.shape[0]), 64)
+    def _single_logp_td(a_i, s_i, g_i):
+      return fm_log_prob(
+          fm_networks, online_params, s_i[None, :], a_i[None, :], g_i[None, :],
+          mode='exact', flow_steps=min(int(fm_networks.flow_steps), 5),
+          ode_solver='euler'
+      )[0]
+
+    grad_a_fn = jax.vmap(jax.grad(_single_logp_td, argnums=0), in_axes=(0, 0, 0))
+    grad_s_fn = jax.vmap(jax.grad(_single_logp_td, argnums=1), in_axes=(0, 0, 0))
+    grads_a = grad_a_fn(action[:b_grad], state[:b_grad], x_1_target[:b_grad])
+    grads_s = grad_s_fn(action[:b_grad], state[:b_grad], x_1_target[:b_grad])
+    action_grad_norm = jax.lax.stop_gradient(
+        jnp.mean(jnp.linalg.norm(grads_a, axis=-1)))
+    state_grad_norm = jax.lax.stop_gradient(
+        jnp.mean(jnp.linalg.norm(grads_s, axis=-1)))
+    state_action_grad_ratio = jax.lax.stop_gradient(
+        state_grad_norm / (action_grad_norm + 1e-6))
+    labels = jnp.eye(b_sub)
+    logits_pos = jnp.sum(scores * labels) / b_sub
+    logits_neg = jnp.sum(scores * (1.0 - labels)) / jnp.maximum(b_sub * (b_sub - 1), 1)
+
     metrics = {
         'density_loss': loss,
         'td_fm_loss': loss,
+        'categorical_accuracy': cat_acc,
+        'logits_pos': logits_pos,
+        'logits_neg': logits_neg,
         'vel_pred_norm': jnp.mean(jnp.linalg.norm(vel_pred, axis=-1)),
         'vel_target_norm': jnp.mean(jnp.linalg.norm(vel_target, axis=-1)),
         'x1_target_norm': jnp.mean(jnp.linalg.norm(x_1_target, axis=-1)),
         'x1_boot_norm': jnp.mean(jnp.linalg.norm(x_1_boot, axis=-1)),
         'ratio_1step': jnp.mean(mask_1step.astype(jnp.float32)),
+        'action_grad_norm': action_grad_norm,
+        'state_grad_norm': state_grad_norm,
+        'state_action_grad_ratio': state_action_grad_ratio,
     }
     return loss, metrics
 
   grad_fn = jax.value_and_grad(_loss, has_aux=True)
 
-  def update(online_params, target_params, opt_state, batch, key):
-    (_, metrics), grads = grad_fn(online_params, target_params, batch, key)
+  def update(online_params, target_params, opt_state, batch, key, goal_mean=None, goal_std=None):
+    (_, metrics), grads = grad_fn(online_params, target_params, batch, key, goal_mean, goal_std)
 
     grads_finite = jnp.all(jnp.asarray(jax.tree_util.tree_leaves(
         jax.tree_util.tree_map(lambda g: jnp.all(jnp.isfinite(g)), grads))))
@@ -600,6 +792,7 @@ def make_fm_reward_fn(
     flow_steps: Optional[int] = None,
     hutch_probes: int = 8,
     ode_solver: Optional[str] = None,
+    reward_clip: float = 0.0,
 ):
   """Jitted reward: log-density of the episode goal under the flow."""
   n = int(flow_steps if flow_steps is not None else fm_networks.flow_steps)
@@ -608,21 +801,105 @@ def make_fm_reward_fn(
 
   if need_key:
     @jax.jit
-    def reward_fn(params, obs, action, key):
+    def reward_fn(params, obs, action, key, goal_mean=None, goal_std=None):
       state = obs[:, :obs_dim]
       goal = obs[:, obs_dim:]
       return fm_log_prob(
           fm_networks, params, state, action, goal,
           rng=key, mode=logp_mode, flow_steps=n,
-          hutch_probes=hutch_probes, ode_solver=solver)
+          hutch_probes=hutch_probes, ode_solver=solver,
+          goal_mean=goal_mean, goal_std=goal_std,
+          reward_clip=reward_clip)
   else:
     @jax.jit
-    def reward_fn(params, obs, action):
+    def reward_fn(params, obs, action, goal_mean=None, goal_std=None):
       state = obs[:, :obs_dim]
       goal = obs[:, obs_dim:]
       return fm_log_prob(
           fm_networks, params, state, action, goal,
           rng=None, mode=logp_mode, flow_steps=n,
-          hutch_probes=hutch_probes, ode_solver=solver)
+          hutch_probes=hutch_probes, ode_solver=solver,
+          goal_mean=goal_mean, goal_std=goal_std,
+          reward_clip=reward_clip)
 
   return reward_fn
+
+
+# ---------------------------------------------------------------------------
+# 7.  Score gradient norm evaluator ||grad_s log p(g | s, a)|| and ||grad_a log p(g | s, a)||
+# ---------------------------------------------------------------------------
+
+def make_fm_grad_norm_fn(
+    fm_networks: FMDensityNetworks,
+    obs_dim: int,
+    flow_steps: Optional[int] = 5,
+    ode_solver: str = 'euler',
+):
+  """Jitted evaluator returning (state_grad_norm, action_grad_norm) for a batch of (obs, action)."""
+  eval_steps = int(flow_steps if flow_steps is not None else min(int(fm_networks.flow_steps), 5))
+  solver = str(ode_solver).lower()
+
+  def _single_logp(a_i, s_i, g_i, params):
+    return fm_log_prob(
+        fm_networks, params, s_i[None, :], a_i[None, :], g_i[None, :],
+        mode='exact', flow_steps=eval_steps,
+        ode_solver=solver,
+    )[0]
+
+  @jax.jit
+  def grad_norm_fn(params, obs, action):
+    state = obs[:, :obs_dim]
+    goal = obs[:, obs_dim:]
+    grad_s_fn = jax.vmap(
+        lambda a, s, g: jax.grad(_single_logp, argnums=1)(a, s, g, params),
+        in_axes=(0, 0, 0))
+    grad_a_fn = jax.vmap(
+        lambda a, s, g: jax.grad(_single_logp, argnums=0)(a, s, g, params),
+        in_axes=(0, 0, 0))
+    grads_s = grad_s_fn(action, state, goal)
+    grads_a = grad_a_fn(action, state, goal)
+    s_norms = jnp.linalg.norm(grads_s, axis=-1)
+    a_norms = jnp.linalg.norm(grads_a, axis=-1)
+    return s_norms, a_norms
+
+  return grad_norm_fn
+
+
+# ---------------------------------------------------------------------------
+# 8.  Seen vs Unseen Log-Probability Diagnostics Evaluator
+# ---------------------------------------------------------------------------
+
+def compute_fm_logp_diagnostics(
+    fm_networks: FMDensityNetworks,
+    params,
+    state: jnp.ndarray,
+    action: jnp.ndarray,
+    seen_goals: jnp.ndarray,
+    unseen_goals: jnp.ndarray,
+    flow_steps: int = 5,
+    ode_solver: str = 'euler',
+    goal_mean: Optional[jnp.ndarray] = None,
+    goal_std: Optional[jnp.ndarray] = None,
+) -> dict:
+  """Evaluate summary statistics of seen vs unseen log probabilities."""
+  logp_seen = fm_log_prob(
+      fm_networks, params, state, action, seen_goals,
+      mode='exact', flow_steps=flow_steps, ode_solver=ode_solver,
+      goal_mean=goal_mean, goal_std=goal_std)
+
+  logp_unseen = fm_log_prob(
+      fm_networks, params, state, action, unseen_goals,
+      mode='exact', flow_steps=flow_steps, ode_solver=ode_solver,
+      goal_mean=goal_mean, goal_std=goal_std)
+
+  return {
+      'fm_diag/logp_seen_mean': float(jnp.mean(logp_seen)),
+      'fm_diag/logp_seen_min': float(jnp.min(logp_seen)),
+      'fm_diag/logp_seen_max': float(jnp.max(logp_seen)),
+      'fm_diag/logp_seen_std': float(jnp.std(logp_seen)),
+      'fm_diag/logp_unseen_mean': float(jnp.mean(logp_unseen)),
+      'fm_diag/logp_unseen_min': float(jnp.min(logp_unseen)),
+      'fm_diag/logp_unseen_max': float(jnp.max(logp_unseen)),
+      'fm_diag/logp_unseen_std': float(jnp.std(logp_unseen)),
+      'fm_diag/logp_gap': float(jnp.mean(logp_seen) - jnp.mean(logp_unseen)),
+  }

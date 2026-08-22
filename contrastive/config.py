@@ -339,10 +339,20 @@ class ContrastiveConfig:
   fm_t_logit_scale: float = 1.0    # Logit-Normal std scale
   fm_goal_noise_std: float = 0.0   # Gaussian noise added to future goals s_f during training (0 = disabled)
   fm_norm_goals: bool = False      # Normalize goal vectors s_f to unit variance before flow estimation
+  fm_goal_std_min: float = 0.02    # Floor on per-dim goal std when fm_norm_goals is True
+  fm_cond_dropout: float = 0.0     # Condition dropout probability: replace (s, a) with (0, 0) during flow training
+  fm_reward_clip: float = 0.0      # Reward clipping limit for reverse ODE logp (0 = disabled, e.g. 20.0 clips to [-20, 20])
+  fm_cat_acc_mode: str = 'midpoint' # Categorical accuracy mode: 'midpoint' (fast velocity error at t=0.5) | 'logp' (reverse-ODE log-likelihood)
+  fm_cat_acc_subbatch: int = 128   # Sub-batch size for FM categorical accuracy (default 128)
+  fm_cat_acc_flow_steps: int = -1  # ODE steps for FM cat acc logp (-1 inherits fm_flow_steps)
   fm_td_mode: bool = False         # If True, use TD-Flow (Bellman probability path targets)
   fm_td_gamma: float = 0.99        # Discount factor gamma for TD-Flow Bellman target mixture
   fm_td_target_tau: float = 0.005  # Polyak EMA soft update rate for target vector field v_phi
   fm_td_boot_steps: int = 1        # ODE steps for train-time bootstrapped target state generation
+  fm_logp_diag_interval: int = 50  # PPO iteration interval for seen vs unseen FM log-prob diagnostics (0 = disabled)
+  fm_logp_diag_batch_size: int = 64 # Batch size of transitions for FM log-prob diagnostics
+  fm_logp_diag_flow_steps: int = 5 # ODE steps for FM log-prob diagnostics
+  fm_logp_diag_ode_solver: str = 'euler' # ODE solver for FM log-prob diagnostics ('euler' | 'heun')
   # NF-specific options (only used when ppo_repr_mode == 'nf').
   nf_rep_size: int = 256       # SA encoder output dim (conditioning vector)
   nf_num_blocks: int = 12      # number of affine coupling blocks
@@ -377,6 +387,13 @@ class ContrastiveConfig:
   ppo_video_interval: int = 0
   ppo_video_fps: int = 10
   ppo_skip_first_video: bool = True
+  ppo_save_success_checkpoint: bool = True
+  ppo_video_include_reward_plot: bool = True
+  ppo_video_max_train_success_videos_per_iter: int = 1
+  ppo_save_train_success_video: bool = True
+  ppo_train_success_min_interval: int = 10
+
+
   # KDE options (only used when ppo_reward_mode == 'kde_dirac').
   # kde_max_points: number of replay states to fit the KDE on.
   # kde_refit_interval: refit the KDE every N PPO iterations (1 = every iter).

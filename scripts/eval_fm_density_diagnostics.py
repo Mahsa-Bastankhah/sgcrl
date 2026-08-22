@@ -235,6 +235,14 @@ def evaluate_fm_diagnostics_on_run(run_dir, num_episodes=16, num_eval_timesteps=
     logp_neg = _fm.fm_log_prob(fm_nets, q_params, sub_obs, sub_act, sub_neg_g, rng=logp_rng, mode='exact')
     
     log_prob_gap = float(jnp.mean(logp_pos - logp_neg))
+
+    # 4. Compute state and action score gradient norms on pos vs neg goals
+    grad_norm_fn = _fm.make_fm_grad_norm_fn(fm_nets, obs_dim, flow_steps=5, ode_solver='euler')
+    s_norms_pos, a_norms_pos = grad_norm_fn(q_params, jnp.concatenate([sub_obs, sub_pos_g], axis=-1), sub_act)
+    s_norms_neg, a_norms_neg = grad_norm_fn(q_params, jnp.concatenate([sub_obs, sub_neg_g], axis=-1), sub_act)
+    grad_s_norm_pos = float(jnp.mean(s_norms_pos))
+    grad_s_norm_neg = float(jnp.mean(s_norms_neg))
+    grad_a_norm_pos = float(jnp.mean(a_norms_pos))
     
     return {
         'checkpoint': os.path.basename(ckpt_path),
@@ -246,6 +254,9 @@ def evaluate_fm_diagnostics_on_run(run_dir, num_episodes=16, num_eval_timesteps=
         'logp_pos': float(jnp.mean(logp_pos)),
         'logp_neg': float(jnp.mean(logp_neg)),
         'log_prob_gap': log_prob_gap,
+        'grad_s_norm_pos': grad_s_norm_pos,
+        'grad_s_norm_neg': grad_s_norm_neg,
+        'grad_a_norm_pos': grad_a_norm_pos,
     }
 
 def main():
