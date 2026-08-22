@@ -101,13 +101,22 @@ EXPERIMENTS=(
     # "pd_fm_creative3_task1_all_tricks|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --num_steps=600000_000"
 
     # Hue: Goal Noise Augmentation (std=0.02)
-    "pd_fm_creative3_task1_goal_noise|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_goal_noise_std=0.02"
+    # "pd_fm_creative3_task1_goal_noise|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_goal_noise_std=0.02"
 
     # Hue: Goal Normalization
-    "pd_fm_creative3_task1_goal_norm|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_norm_goals=True"
+    # "pd_fm_creative3_task1_goal_norm|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_norm_goals=True"
 
     # Hue: All Tricks + Goal Noise + Goal Norm
-    "pd_fm_creative3_task1_all_tricks_noise_norm|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --fm_goal_noise_std=0.02 --fm_norm_goals=True"
+    # "pd_fm_creative3_task1_all_tricks_noise_norm|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --fm_goal_noise_std=0.02 --fm_norm_goals=True"
+
+    # 1. Longer Rollouts with Flow Matching (Rollout 100, CRL steps 50)
+    "pd_fm_creative3_task1_all_tricks_longer_rollout|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --ppo_rollout_length=100 --ppo_crl_steps_per_iter=50 --num_steps=400000000 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01 --ppo_external_reward_scale=1"
+
+    # 2. Full Synergy Run: All Tricks + Goal Noise + Goal Norm + Entropy Annealing + 600M Steps
+    "pd_fm_creative3_task1_all_tricks_synergy_600m|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --fm_goal_noise_std=0.02 --fm_norm_goals=True --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01 --ppo_external_reward_scale=1 --num_steps=600000000"
+
+    # 3. Conditioning Dropout + Reward Clip with Exact Log-Prob
+    "pd_fm_creative3_task1_all_tricks_exact_cond_drop15_reward_clip|--env=builderbench_creative_3_task1 --ppo_repr_mode=fm --ppo_fm_reward_tau=0.5 --fm_flow_steps=10 --fm_logp_mode=exact --ppo_categorical_select --fm_time_embedding=True --fm_time_embed_dim=32 --fm_ode_solver=heun --fm_t_sample_mode=logit_normal --fm_t_logit_loc=0.0 --fm_t_logit_scale=1.0 --fm_norm_goals=True --fm_cond_dropout=0.15 --fm_reward_clip=20.0 --ppo_external_reward_scale=1 --num_steps=400000000 --ppo_anneal_ent_coef=True --ppo_ent_coef=0.05 --ppo_ent_coef_final=0.01 --ppo_actor_min_std=0.01"
 )
 
 mkdir -p "$SCRIPT_DIR/slurm_logs"
@@ -159,6 +168,12 @@ for EXPERIMENT in "${EXPERIMENTS[@]}"; do
 
 module unload python; module load anaconda/3
 conda activate sgcrl_builderbench
+
+export WANDB_DIR=\$SLURM_TMPDIR/wandb
+export WANDB_CACHE_DIR=\$SLURM_TMPDIR/.cache/wandb
+export WANDB_CONFIG_DIR=\$SLURM_TMPDIR/.config/wandb
+export WANDB_DATA_DIR=\$SLURM_TMPDIR/.data/wandb
+export CHECKPOINT_BASE_DIR=\$SCRATCH/jaxgcrl/checkpoints
 
 export BUILDERBENCH_ROOT=/home/mila/m/mohammad-sami-nur.islam/sgcrl/builderbench
 if [ -d "${LOG_ROOT}/${SAFE_NAME}" ]; then
