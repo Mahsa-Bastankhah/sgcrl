@@ -35,7 +35,7 @@ LEARNER_CSV = os.path.join(
 EVAL_CSV = os.path.join(
     REPO, 'logs', LOG_DIR, RUN, 'logs', 'eval', 'logs.csv')
 OUT_PATH = os.path.join(
-    REPO, 'figs', 'builderbench',
+    REPO, 'figs', 'builderbench', 'c7t2',
     'c7t2_nf_compact_small_ep70_300m_success.png')
 
 # 1024 envs × rollout 70 (do not use DEFAULT_STEPS_PER_ITER=50×1024).

@@ -34,7 +34,8 @@ RUN_DIR = os.path.join(
 LEARNER_CSV = os.path.join(RUN_DIR, 'logs', 'learner', 'logs.csv')
 EVAL_CSV = os.path.join(RUN_DIR, 'logs', 'eval', 'logs.csv')
 OUT_PATH = os.path.join(
-    REPO, 'figs', 'builderbench', 'c5t2_nf_gradreg_diagnostics.png')
+    REPO, 'figs', 'builderbench', 'c5t2',
+    'c5t2_nf_gradreg_diagnostics.png')
 
 # Train-success windows (2cm). First lock collapses ~510; main lock peaks
 # at iter 1051 (train_success_1000=0.93) then decays.

@@ -32,7 +32,8 @@ LEARNER_CSV = os.path.join(
     REPO, 'logs', LOG_DIR, RUN, 'logs', 'learner', 'logs.csv')
 EVAL_CSV = os.path.join(
     REPO, 'logs', LOG_DIR, RUN, 'logs', 'eval', 'logs.csv')
-OUT_PATH = os.path.join(REPO, 'figs', 'builderbench', 'c8t2_nf_success.png')
+OUT_PATH = os.path.join(
+    REPO, 'figs', 'builderbench', 'c8t2', 'c8t2_nf_success.png')
 
 LOCK_LO, LOCK_HI = 1680, 1872  # inclusive; collapse starts 1873
 SPI = base.DEFAULT_STEPS_PER_ITER

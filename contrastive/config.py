@@ -181,6 +181,9 @@ class ContrastiveConfig:
   # runs keep a fixed entropy bonus unless explicitly opted in.
   ppo_anneal_ent_coef: bool = False
   ppo_ent_coef_final: float = 0.0
+  # If set, stop the PPO update as soon as any minibatch has
+  # approx_kl > this threshold (keeps that minibatch; skips the rest of
+  # the epoch and remaining epochs). Rollback is a separate flag.
   ppo_target_kl: Optional[float] = None
   # PPO-penalty trust region (adaptive β, Schulman et al. §4).
   # When > 0, adds β · KL(π_rollout ‖ π_now) to each minibatch loss.
@@ -275,6 +278,15 @@ class ContrastiveConfig:
   # Fraction of the NF batch whose ∇_s log p regularizer uses the env task
   # goal instead of replay g.  0 = off (replay g only).  NLL is never mixed.
   ppo_nf_grad_reg_task_g_frac: float = 0.0
+  # NF time-reg: η E[(log p_θ(g|s,a) − log p_old(g|s',a'))²] with
+  # a' ∼ π(·|s', g_task) (stopgrad).  0 = off.  p_old is stopgrad.
+  # target='iter': p_old = θ at the start of this PPO iter (before the
+  #   N density steps).
+  # target='ema':  p_old = a slow copy mixed once per PPO iter
+  #   ema ← τ·ema + (1−τ)·θ  (not the reward EMA; not per density step).
+  ppo_nf_time_reg_eta: float = 0.0
+  ppo_nf_time_reg_target: str = 'iter'  # 'iter' | 'ema'
+  ppo_nf_time_reg_ema_tau: float = 0.99
   # EMA decay τ for φ, ψ used in the PPO reward r = φ·ψ (CRL mode only).
   # Reward uses EMA params: ema ← τ·ema + (1−τ)·online after each CRL step.
   # τ=0 uses online params directly (no EMA).  Higher τ = slower / smoother reward.
@@ -476,6 +488,13 @@ class ContrastiveConfig:
   # If True, NF learns p(g|s) / reward r(s) instead of p(g|s,a) / r(s,a).
   # Encoder input is state only; action is ignored at train and reward time.
   nf_state_only: bool = False
+  # Sidecar backward NF p(obs_to_goal(s)|s_f) trained on the same batches.
+  # Unused for PPO reward.  Off by default; opt in with nf_train_backward.
+  nf_train_backward: bool = False
+  # Extra lightweight nf_bwd/ckpt_iter_*.pkl cadence.  0 = auto twice the
+  # main ppo_checkpoint_interval when nf_train_backward is on.  <0 disables
+  # the extra files (params still live in the full PPO checkpoints).
+  nf_backward_checkpoint_interval: int = 0
   # If True, CRL φ encodes state only → r(s)=φ(s)·ψ(g) instead of r(s,a)=φ(s,a)·ψ(g).
   # InfoNCE training uses the same φ(s). Default False keeps φ(s,a).
   crl_state_only: bool = False
@@ -510,6 +529,9 @@ class ContrastiveConfig:
 
 
   use_image_obs: bool = False
+  # BuilderBench only: rasterize compact xyz → 64×64, CNN, then existing
+  # policy / value / NF MLPs. Env obs and replay stay vectors. Default off.
+  ppo_bb_pixel_obs: bool = False
   random_goals: float = 0.5
   jit: bool = True
   add_mc_to_td: bool = False

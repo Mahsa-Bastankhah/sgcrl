@@ -18,6 +18,11 @@ PPO is on-policy and single-process; this script does NOT go through
 Launchpad.  The SAC-based kappa actor stays untouched and is still
 launched via lp_contrastive.py --alg=kappa_sac.
 """
+# Allegro / Isaac Gym: create GPU PhysX BEFORE JAX/TF take the CUDA context.
+# Preview 4 otherwise fails with mergeChangedAABBMgrHandlesLaunch.
+from envs.isaacgym_physx_bootstrap import maybe_create_from_argv as _ig_boot
+_ig_boot()
+
 import sgcrl_jax_acme_compat  # noqa: F401 — must precede all acme/jax imports
 import functools
 import json
@@ -367,6 +372,11 @@ flags.DEFINE_boolean(
     'ppo_skip_first_video', True,
     'Skip the iteration-0 in-train video (random init policy).')
 flags.DEFINE_boolean(
+    'ppo_bb_pixel_obs', False,
+    'BuilderBench only: rasterize compact cube xyz to 64x64, run a CNN, '
+    'then policy / value / NF MLPs. Env obs and replay stay vectors. '
+    'Default off (no change to existing runs).')
+flags.DEFINE_boolean(
     'ppo_norm_reward', True,
     'Normalize the repr reward by the running std of discounted returns. Set False to pass raw reward directly to PPO.')
 flags.DEFINE_boolean(
@@ -381,6 +391,16 @@ flags.DEFINE_boolean(
     'nf_state_only', False,
     'NF mode: if True, learn log p_NF(g|s) and use reward r(s)=log p_NF(g|s) '
     '(conditioning encoder ignores action). Default False keeps log p_NF(g|s,a) / r(s,a).')
+flags.DEFINE_boolean(
+    'nf_train_backward', False,
+    'NF mode: also train a sidecar backward flow p(obs_to_goal(s)|s_f) on the '
+    'same replay batches. Not used for PPO reward. Checkpoints store params + '
+    's_goal normalizer (nf_bwd_s_mean / nf_bwd_s_std). Default False.')
+flags.DEFINE_integer(
+    'nf_backward_checkpoint_interval', -1,
+    'Save lightweight nf_bwd/ckpt_iter_*.pkl every N PPO iters. '
+    '<0 keeps config default (0 = auto twice as often as '
+    '--ppo_checkpoint_interval when --nf_train_backward).')
 flags.DEFINE_boolean(
     'crl_state_only', False,
     'CRL mode: if True, φ encodes state only so reward is r(s)=φ(s)·ψ(g) '
@@ -540,6 +560,20 @@ flags.DEFINE_float(
     'ppo_nf_grad_reg_task_g_frac', 0.0,
     'NF: fraction of the batch whose ∇_s log p regularizer uses the env '
     'task goal instead of replay g. 0 = off. NLL is never mixed.')
+flags.DEFINE_float(
+    'ppo_nf_time_reg_eta', 0.0,
+    'NF: coefficient η on E[(log p_θ(g|s,a) − log p_old(g|s\',a\'))²] '
+    'with a\' ∼ π(·|s\', g_task) (stopgrad π).  Same NLL goal g.  '
+    '0 = off.')
+flags.DEFINE_string(
+    'ppo_nf_time_reg_target', 'iter',
+    'NF time-reg p_old: "iter" = stopgrad(θ) at the start of this PPO '
+    'iter; "ema" = slow copy mixed once per PPO iter at '
+    'ppo_nf_time_reg_ema_tau (not the reward EMA).')
+flags.DEFINE_float(
+    'ppo_nf_time_reg_ema_tau', 0.99,
+    'NF time-reg: keep-rate for the slow p_old copy when target=ema. '
+    'ema ← τ·ema + (1−τ)·θ once after the density scan (per PPO iter).')
 flags.DEFINE_float(
     'ppo_crl_repr_tau', -1.0,
     'CRL mode: EMA decay τ for φ, ψ used in PPO reward r=φ·ψ. '
@@ -1019,6 +1053,10 @@ def main(_):
   config.nf_mix_env_goal_stats = bool(FLAGS.nf_mix_env_goal_stats)
   config.nf_mix_task_goal_stats = bool(FLAGS.nf_mix_task_goal_stats)
   config.nf_state_only = bool(FLAGS.nf_state_only)
+  config.nf_train_backward = bool(FLAGS.nf_train_backward)
+  if FLAGS.nf_backward_checkpoint_interval >= 0:
+    config.nf_backward_checkpoint_interval = int(
+        FLAGS.nf_backward_checkpoint_interval)
   config.crl_state_only = bool(FLAGS.crl_state_only)
   config.ppo_skip_first_eval = bool(FLAGS.ppo_skip_first_eval)
   if str(FLAGS.ppo_frozen_reward_ckpt or '').strip():
@@ -1041,6 +1079,7 @@ def main(_):
   config.ppo_skip_first_video = bool(FLAGS.ppo_skip_first_video)
   config.ppo_norm_reward = bool(FLAGS.ppo_norm_reward)
   config.ppo_norm_obs = bool(FLAGS.ppo_norm_obs)
+  config.ppo_bb_pixel_obs = bool(FLAGS.ppo_bb_pixel_obs)
   config.ppo_obs_norm_clip = float(FLAGS.ppo_obs_norm_clip)
   config.nf_goal_enc_size = int(FLAGS.nf_goal_enc_size)
   config.ppo_return_norm_window = int(FLAGS.ppo_return_norm_window)
@@ -1109,6 +1148,23 @@ def main(_):
     raise ValueError(
         'ppo_nf_grad_reg_task_g_frac must be in [0, 1], '
         f'got {config.ppo_nf_grad_reg_task_g_frac}')
+  config.ppo_nf_time_reg_eta = float(FLAGS.ppo_nf_time_reg_eta)
+  if config.ppo_nf_time_reg_eta < 0.0:
+    raise ValueError(
+        'ppo_nf_time_reg_eta must be >= 0, '
+        f'got {config.ppo_nf_time_reg_eta}')
+  config.ppo_nf_time_reg_target = str(
+      FLAGS.ppo_nf_time_reg_target).strip().lower()
+  if config.ppo_nf_time_reg_target not in ('iter', 'ema'):
+    raise ValueError(
+        'ppo_nf_time_reg_target must be "iter" or "ema", '
+        f'got {config.ppo_nf_time_reg_target!r}')
+  config.ppo_nf_time_reg_ema_tau = float(FLAGS.ppo_nf_time_reg_ema_tau)
+  if config.ppo_nf_time_reg_target == 'ema' and config.ppo_nf_time_reg_eta > 0.0:
+    if not (0.0 < config.ppo_nf_time_reg_ema_tau < 1.0):
+      raise ValueError(
+          'ppo_nf_time_reg_ema_tau must be in (0, 1) when target=ema, '
+          f'got {config.ppo_nf_time_reg_ema_tau}')
   if FLAGS.ppo_crl_repr_tau >= 0.0:
     config.ppo_crl_repr_tau = float(FLAGS.ppo_crl_repr_tau)
   if FLAGS.ppo_nf_reward_tau >= 0.0:
@@ -1151,6 +1207,7 @@ def main(_):
         f'norm_reward={config.ppo_norm_reward}, '
         f'norm_obs={config.ppo_norm_obs}'
         f'{f"(clip={config.ppo_obs_norm_clip})" if config.ppo_norm_obs else ""}, '
+        f'bb_pixel_obs={config.ppo_bb_pixel_obs}, '
         f'eval_interval={config.ppo_eval_interval}, '
         f'video_interval={config.ppo_video_interval}, '
         f'repr_norm={config.repr_norm}, '
@@ -1177,12 +1234,16 @@ def main(_):
         f'ppo_nf_grad_reg_lam={config.ppo_nf_grad_reg_lam}  '
         f'ppo_nf_grad_reg_lam_lr={config.ppo_nf_grad_reg_lam_lr}  '
         f'ppo_nf_grad_reg_task_g_frac={config.ppo_nf_grad_reg_task_g_frac}  '
+        f'ppo_nf_time_reg_eta={config.ppo_nf_time_reg_eta}  '
+        f'ppo_nf_time_reg_target={config.ppo_nf_time_reg_target!r}  '
+        f'ppo_nf_time_reg_ema_tau={config.ppo_nf_time_reg_ema_tau}  '
         f'ppo_nf_reward_tau={config.ppo_nf_reward_tau}  '
         f'ppo_nf_td={config.ppo_nf_td}  '
         f'ppo_nf_td_target_tau={config.ppo_nf_td_target_tau}  '
         f'ppo_nf_td_discount={config.ppo_nf_td_discount}  '
         f'ppo_nf_td_mask_prob={config.ppo_nf_td_mask_prob}  '
         f'nf_state_only={config.nf_state_only}  '
+        f'nf_train_backward={config.nf_train_backward}  '
         f'nf_normalize_goals={config.nf_normalize_goals}  '
         f'nf_mix_task_goal_stats={config.nf_mix_task_goal_stats}  '
         f'nf_mask_prob={config.nf_mask_prob}  '
@@ -1229,6 +1290,7 @@ def main(_):
         f'kde_refit_interval={config.kde_refit_interval}  '
         f'kde_bandwidth={config.kde_bandwidth}  '
         f'ckpt_interval={config.ppo_checkpoint_interval}  '
+        f'nf_bwd_ckpt_interval={config.nf_backward_checkpoint_interval}  '
         f'ckpt_keep_last={config.ppo_checkpoint_keep_last} '
         f'({"all milestones" if config.ppo_checkpoint_keep_last <= 0 else "FIFO prune"})  '
         f'ckpt_replay_max={config.ppo_checkpoint_replay_max}  '
@@ -1402,6 +1464,11 @@ def main(_):
   if bool(config.crl_state_only):
     print('[ppo_contrastive] crl_state_only=True: φ encodes state only '
           '(r(s)=φ(s)·ψ(g); InfoNCE uses φ(s))')
+  from envs.builderbench_raster import pixel_network_kwargs as _bb_pix_kw
+  _bb_pixel_kw = _bb_pix_kw(env_name, bool(config.ppo_bb_pixel_obs))
+  if _bb_pixel_kw['bb_pixel_obs']:
+    print('[ppo_contrastive] ppo_bb_pixel_obs=True: policy/value/CRL CNN '
+          f'on rasterized xyz (num_cubes={_bb_pixel_kw["bb_num_cubes"]})')
   network_factory = functools.partial(
       contrastive.make_networks,
       obs_dim=obs_dim,
@@ -1413,7 +1480,8 @@ def main(_):
       actor_min_std=float(config.ppo_actor_min_std),
       categorical_select_classes=_cat_select_classes,
       categorical_select_waypoint=_cat_select_waypoint,
-      state_only=bool(config.crl_state_only))
+      state_only=bool(config.crl_state_only),
+      **_bb_pixel_kw)
 
   # ---- Logger ------------------------------------------------------------
   run_dir = os.path.join(

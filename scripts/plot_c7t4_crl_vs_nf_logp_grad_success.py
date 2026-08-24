@@ -24,7 +24,8 @@ import plot_builderbench_train_success1000 as base  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_PATH = os.path.join(
-    REPO, 'figs', 'builderbench', 'c7t4_crl_vs_nf_logp_grad_success.png')
+    REPO, 'figs', 'builderbench', 'c7t4',
+    'c7t4_crl_vs_nf_logp_grad_success.png')
 SPI = 1024 * 60  # num_envs × episode_length (ep60 jobs)
 PLOT_MAX_PTS = 2500
 

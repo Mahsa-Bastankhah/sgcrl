@@ -29,7 +29,8 @@ LOG_DIR = (
 )
 RUN = 'ppo_builderbench_creative_5_task2_0'
 OUT_PATH = os.path.join(
-    REPO, 'figs', 'builderbench', 'c5t2_nf_dualgradreg_c200_lamlr1e4.png')
+    REPO, 'figs', 'builderbench', 'c5t2',
+    'c5t2_nf_dualgradreg_c200_lamlr1e4.png')
 SPI = 1024 * 50  # num_envs × episode_length (ep50)
 PLOT_MAX_PTS = 2500
 GRAD_REG_C = 200.0

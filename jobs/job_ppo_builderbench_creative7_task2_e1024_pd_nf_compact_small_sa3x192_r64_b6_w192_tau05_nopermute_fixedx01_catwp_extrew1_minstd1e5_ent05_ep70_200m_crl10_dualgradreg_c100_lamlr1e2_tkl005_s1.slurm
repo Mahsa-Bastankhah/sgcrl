@@ -1,0 +1,206 @@
+#!/bin/bash
+#SBATCH --job-name=c7t2_nfcsm_dgr_ep70_lamlr1e2_tkl005_s1
+#SBATCH --output=slurm/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_ent05_ep70_200m_crl10_dualgradreg_c100_lamlr1e2_tkl005_s1_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_ent05_ep70_200m_crl10_dualgradreg_c100_lamlr1e2_tkl005_s1_%A_%a.log
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --gres=gpu:1
+#SBATCH --time=14:59:00
+#SBATCH --account=seas
+#SBATCH --array=0-0
+
+# c7t2 NF compact-small catwp seed1: clone of 3748350 with dualgradreg
+# lam_lr=1e-2 and ppo_target_kl=0.05 (keep minibatch, stop rest of epoch;
+# no rollback). ent 0.05 fixed, c=100, ep70 T=ep, 200M. nopermute fixedx01.
+unset LD_PRELOAD
+
+module purge
+
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+  export LD_LIBRARY_PATH="$(
+    printf '%s\n' "${LD_LIBRARY_PATH//:/$'\n'}" |
+      grep -vF '/usr/local/cuda-11.3' |
+      grep -vF '/usr/local/cuda-12' |
+      paste -sd: -
+  )"
+fi
+
+CUDA_LOADED=0
+try_cuda() {
+  if module load "$@" 2>/dev/null; then
+    export CUDA_HOME="${CUDA_HOME:-${CUDA_ROOT:-}}"
+    if [ -z "${CUDA_HOME:-}" ]; then
+      for _cand in /usr/local/cuda-12.6 /usr/local/cuda-12.5 /usr/local/cuda; do
+        if [ -d "${_cand}/lib64" ]; then
+          export CUDA_HOME="${_cand}"
+          break
+        fi
+      done
+    fi
+    [ -z "${CUDA_HOME:-}" ] && return 1
+    CUDA_LOADED=1
+    echo "Loaded CUDA modules: $*"
+    echo "CUDA_HOME=${CUDA_HOME}"
+    return 0
+  fi
+  return 1
+}
+
+try_cuda cudatoolkit/12.6 || \
+  try_cuda cudatoolkit/12.5 || \
+  try_cuda cudatoolkit/12.4 || true
+
+if [ "$CUDA_LOADED" != 1 ]; then
+  for _cand in /usr/local/cuda-12.6 /usr/local/cuda-12.5 /usr/local/cuda; do
+    if [ -d "${_cand}/lib64" ]; then
+      export CUDA_HOME="${_cand}"
+      export PATH="${CUDA_HOME}/bin${PATH:+:${PATH}}"
+      export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+      CUDA_LOADED=1
+      echo "Fallback CUDA_HOME=${CUDA_HOME} (module load failed)"
+      break
+    fi
+  done
+fi
+
+if [ "$CUDA_LOADED" != 1 ]; then
+  echo "ERROR: Could not load cudatoolkit and no /usr/local/cuda* found."
+  module avail cudatoolkit 2>&1 || true
+  ls -d /usr/local/cuda* 2>&1 || true
+  exit 1
+fi
+
+cd /n/fs/mislresearch/sgcrl
+source /n/fs/mislresearch/miniconda3/etc/profile.d/conda.sh
+conda activate sgcrl_builderbench
+
+source /n/fs/mislresearch/sgcrl/scripts/sgcrl_builderbench_cuda_env.sh
+
+export BUILDERBENCH_ROOT=/n/fs/mislresearch/builderbench
+export BUILDERBENCH_MJX_IMPL=jax
+export MUJOCO_GL=egl
+export PYTHONUNBUFFERED=1
+export TMPDIR=/n/fs/mislresearch/mb6458-tmp
+export MPLCONFIGDIR=/n/fs/mislresearch/mb6458-tmp/mpl-cache
+export PIP_CACHE_DIR=/n/fs/mislresearch/mb6458-tmp/pip-cache
+export TF_CPP_MIN_LOG_LEVEL=2
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+ENV=${ENV:-builderbench_creative_7_task2}
+SEED=${SEED:-1}
+NUM_STEPS=${NUM_STEPS:-200000000}
+PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
+MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
+ENT_COEF=0.05
+MIN_STD=1e-5
+DISCOUNT_FACTOR=0.99
+PPO_CLIP_COEF=0.2
+REWARD_TAU=${REWARD_TAU:-0.5}
+EXT_REW_SCALE=${EXT_REW_SCALE:-1}
+FIXED_START_X=${FIXED_START_X:-0.1}
+EP_LEN=${EP_LEN:-70}
+PD_DURATION=${PD_DURATION:-5}
+MJ_EP_LEN=$((EP_LEN * PD_DURATION))
+CRL_STEPS=${CRL_STEPS:-10}
+
+# NF compact-small (c7t2 PD obs=22 act=5 goal=21 → ~0.76M params)
+NF_REP_SIZE=${NF_REP_SIZE:-64}
+NF_NUM_BLOCKS=${NF_NUM_BLOCKS:-6}
+NF_COUPLING_WIDTH=${NF_COUPLING_WIDTH:-192}
+NF_SA_HIDDEN=${NF_SA_HIDDEN:-192}
+NF_SA_NUM_LAYERS=${NF_SA_NUM_LAYERS:-3}
+GRAD_REG_COEF=${GRAD_REG_COEF:-5e-4}   # initial λ
+GRAD_REG_C=${GRAD_REG_C:-100.0}
+GRAD_REG_REL=${GRAD_REG_REL:-0.1}
+GRAD_REG_LAM_LR=${GRAD_REG_LAM_LR:-1e-2}
+TARGET_KL=${TARGET_KL:-0.05}
+
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative7_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_ent05_ep70_200m_crl10_dualgradreg_c100_lamlr1e2_tkl005_s1/}"
+
+mkdir -p slurm "${LOG_DIR}"
+
+echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
+echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=nf reward_tau=${REWARD_TAU}"
+echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
+echo "max_replay_size=${MAX_REPLAY_SIZE}"
+echo "builderbench_use_pd=true pd_duration=${PD_DURATION} permute_start_boxes=false fixed_start_x=${FIXED_START_X} goals=MID+offsets(task2)"
+echo "episode_length=${EP_LEN} (mj_episode_length=${MJ_EP_LEN}, rollout_length=${EP_LEN}, T=ep)"
+echo "ppo_norm_obs=false"
+echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} (AFTER return-norm)"
+echo "ppo_actor_min_std=${MIN_STD}"
+echo "ppo_anneal_lr=true ppo_anneal_ent_coef=false  ent=${ENT_COEF} (fixed)"
+echo "ppo_categorical_select=true ppo_categorical_select_waypoint=true (n-way select + n×3 waypoint heads)"
+echo "ppo_crl_steps_per_iter=${CRL_STEPS}"
+echo "nf_grad_reg: dual primal-dual, coef=${GRAD_REG_COEF} c=${GRAD_REG_C} rel=${GRAD_REG_REL} lam_lr=${GRAD_REG_LAM_LR}"
+echo "ppo_target_kl=${TARGET_KL} (any mb > kl → keep that update, end epoch+iter; no rollback)"
+echo "ppo_eval_interval=60 ppo_video_interval=400"
+echo "steps_per_iter=$((PPO_NUM_ENVS * EP_LEN))"
+echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * EP_LEN)))"
+echo "nf_compact_small: sa${NF_SA_NUM_LAYERS}x${NF_SA_HIDDEN} r${NF_REP_SIZE} b${NF_NUM_BLOCKS} w${NF_COUPLING_WIDTH} (~0.76M params)"
+
+python -u -c "
+from envs.builderbench_utils import default_fixed_target_goal, num_creative_tasks, load_task_goal_offsets
+import numpy as np
+load_task_goal_offsets.cache_clear()
+print('creative-7 n_tasks=', num_creative_tasks(7))
+g = default_fixed_target_goal(7, 1)
+print('hard_goal (flat)=', g.tolist())
+print('hard_goal (cubes)=')
+print(np.asarray(g).reshape(-1, 3))
+"
+nvidia-smi || true
+python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
+
+python -u ppo_contrastive.py \
+  --env="${ENV}" \
+  --seed="${SEED}" \
+  --num_steps="${NUM_STEPS}" \
+  --log_dir_path="${LOG_DIR}" \
+  --ppo_num_envs="${PPO_NUM_ENVS}" \
+  --ppo_ent_coef="${ENT_COEF}" \
+  --ppo_actor_min_std="${MIN_STD}" \
+  --ppo_discount="${DISCOUNT_FACTOR}" \
+  --ppo_clip_coef="${PPO_CLIP_COEF}" \
+  --ppo_checkpoint_interval=100 \
+  --ppo_checkpoint_replay_max="${MAX_REPLAY_SIZE}" \
+  --builderbench_use_pd=true \
+  --builderbench_pd_duration="${PD_DURATION}" \
+  --builderbench_permute_start_boxes=false \
+  --builderbench_fixed_start_x="${FIXED_START_X}" \
+  --builderbench_mj_episode_length="${MJ_EP_LEN}" \
+  --ppo_rollout_length="${EP_LEN}" \
+  --ppo_crl_steps_per_iter="${CRL_STEPS}" \
+  --ppo_skip_first_eval=true \
+  --ppo_eval_interval=60 \
+  --ppo_eval_episodes=5 \
+  --ppo_video_interval=400 \
+  --ppo_video_fps=10 \
+  --ppo_skip_first_video=true \
+  --max_replay_size="${MAX_REPLAY_SIZE}" \
+  --ppo_repr_mode=nf \
+  --ppo_nf_reward_tau="${REWARD_TAU}" \
+  --nf_rep_size="${NF_REP_SIZE}" \
+  --nf_num_blocks="${NF_NUM_BLOCKS}" \
+  --nf_coupling_width="${NF_COUPLING_WIDTH}" \
+  --nf_sa_hidden="${NF_SA_HIDDEN}" \
+  --nf_sa_num_layers="${NF_SA_NUM_LAYERS}" \
+  --nf_grad_clip=1.0 \
+  --nf_noise_std=0.05 \
+  --nf_goal_std_min=0.02 \
+  --nf_goal_enc_size=0 \
+  --ppo_use_external_reward \
+  --ppo_external_reward_scale="${EXT_REW_SCALE}" \
+  --ppo_categorical_select \
+  --ppo_categorical_select_waypoint \
+  --ppo_nf_grad_reg \
+  --ppo_crl_grad_reg_coef="${GRAD_REG_COEF}" \
+  --ppo_crl_grad_reg_c="${GRAD_REG_C}" \
+  --ppo_crl_grad_reg_rel="${GRAD_REG_REL}" \
+  --ppo_nf_grad_reg_lam_lr="${GRAD_REG_LAM_LR}" \
+  --ppo_target_kl="${TARGET_KL}" \
+  --hidden_layer_sizes="256,256,256,256,256,256"
+PY_EXIT=$?
+pkill -P $$ 2>/dev/null || true
+exit $PY_EXIT

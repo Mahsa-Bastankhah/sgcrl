@@ -21,6 +21,7 @@ Implementation style mirrors CleanRL's ppo_continuous_action.py:
 Everything runs in JAX for consistency with the rest of this codebase.
 """
 import concurrent.futures
+import contextlib
 import os
 import time
 from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple
@@ -48,6 +49,40 @@ tfd = tfp.distributions
 # Near-zero pre-tanh scale used when `ppo_deterministic_select_dim` forces the
 # last action dim (BuilderBench PD select) to μ/mode.
 _SELECT_DET_SCALE = 1e-6
+
+
+def _isaacgym_init_on_cpu_then_gpu(use_isaacgym: bool, trees):
+  """Haiku init must not call GPU cuSolver after PhysX owns CUDA.
+
+  PhysX create_sim runs first (otherwise Isaac Gym GPU kernels fail). After
+  that ``gpusolverDnCreate`` is broken, so Orthogonal / PLU QR-LU on GPU
+  crash. Init on CPU, then device_put; training matmuls still use GPU cuBLAS.
+
+  Do not remove this. A previous working smoke (3744944) used it; dropping
+  it caused the value-net and NF PLU cuSolver crashes.
+  """
+  if not use_isaacgym:
+    return trees
+  gpus = jax.devices('gpu')
+  if not gpus:
+    print('[ppo] WARNING: no JAX GPU after PhysX; training stays on CPU',
+          flush=True)
+    return trees
+  gpu = gpus[0]
+  out = jax.device_put(trees, gpu)
+  print(f'[ppo] init: moved params to {gpu}', flush=True)
+  return out
+
+
+@contextlib.contextmanager
+def _haiku_init_device(use_isaacgym: bool):
+  if use_isaacgym:
+    print('[ppo] Isaac Gym: Haiku param init on CPU '
+          '(GPU cuSolver QR broken after PhysX create_sim)', flush=True)
+    with jax.default_device(jax.devices('cpu')[0]):
+      yield
+  else:
+    yield
 
 
 def _policy_dist_maybe_det_select(dist, enabled: bool):
@@ -2227,16 +2262,32 @@ class IsaacGymVecEnv:
 
   def __init__(self, env_name: str, num_envs: int, seed: int,
                isaacgym_kwargs: Optional[Dict[str, Any]] = None):
+    # One GPU PhysX sim per process.  ppo_contrastive.py bootstraps that sim
+    # before JAX; reuse it here.  A second AllegroKukaThrowVecEnv() after
+    # create_sim segfaults (GymGetActorDofStates on the GPU pipeline).
+    from envs.isaacgym_physx_bootstrap import take_prebuilt_env
     from envs.allegro_kuka_throw_env import AllegroKukaThrowVecEnv
     kw = dict(isaacgym_kwargs or {})
-    self._env = AllegroKukaThrowVecEnv(
-        num_envs=int(num_envs),
-        seed=int(seed),
-        episode_length=int(kw.get('episode_length', 300)),
-        fixed_target_xyz=tuple(kw.get('fixed_target_xyz', (0.5, -0.3, 0.4))),
-        pipeline=str(kw.get('pipeline', 'gpu')),
-        headless=True,
-    )
+    prebuilt = take_prebuilt_env()
+    if prebuilt is not None:
+      self._env = prebuilt
+      self.used_prebuilt = True
+      got_e = int(self._env.num_envs)
+      want_e = int(num_envs)
+      if got_e != want_e:
+        print(f'[ppo] WARNING: prebuilt Allegro env has E={got_e}, '
+              f'requested E={want_e}; using prebuilt (cannot create a '
+              f'second GPU PhysX sim)', flush=True)
+    else:
+      self._env = AllegroKukaThrowVecEnv(
+          num_envs=int(num_envs),
+          seed=int(seed),
+          episode_length=int(kw.get('episode_length', 300)),
+          fixed_target_xyz=tuple(kw.get('fixed_target_xyz', (0.5, -0.3, 0.4))),
+          pipeline=str(kw.get('pipeline', 'gpu')),
+          headless=True,
+      )
+      self.used_prebuilt = False
     self._num_envs = int(self._env.num_envs)
     self._obs_dim_total = int(self._env.obs_dim + self._env.goal_dim)
     self._act_dim = int(self._env.action_dim)
@@ -2604,7 +2655,8 @@ def run_ppo_training(
     )
     print(f'[ppo] using native-batched Isaac Gym vec env '
           f'(AllegroKukaThrow, E={config.ppo_num_envs}, '
-          f'pipeline={_ig_kw.get("isaacgym_pipeline", "gpu")})')
+          f'pipeline={_ig_kw.get("isaacgym_pipeline", "gpu")}, '
+          f'prebuilt={getattr(vec_env, "used_prebuilt", False)})')
 
   # ---- build networks from env spec -------------------------------------
   if _use_isaacgym:
@@ -2883,33 +2935,38 @@ def run_ppo_training(
   print('[ppo] init: policy/value/density params...', flush=True)
   key = jax.random.PRNGKey(seed)
   k_pol, k_val, k_q, key = jax.random.split(key, 4)
-  policy_params = networks.policy_network.init(k_pol)
-  print('[ppo] init: policy done', flush=True)
-  value_params = networks.value_network.init(k_val)
-  print('[ppo] init: value done', flush=True)
-  # q_params holds the density-estimator params in all modes:
-  #   crl mode      → CRL (φ, ψ) contrastive params from networks.q_network
-  #   gaussian mode → Gaussian density p_θ(g|s,a) params from density_nets
-  #   nf mode       → RealNVP log p_NF(g|s,a) params from nf_density_nets
-  #   fm mode       → velocity field v_θ(s,a,x_t,t) params from fm_density_nets
-  #   td3 mode      → twin Q + Polyak targets from td3_density_nets
-  if use_gaussian:
-    q_params = density_nets.density_net.init(k_q)
-  elif use_fm:
-    q_params = _fm.init_fm_params(fm_density_nets, k_q)
-  elif use_nf:
-    q_params = _nf.init_nf_params(nf_density_nets, k_q)
-  elif use_td3:
-    q_params = _td3.init_td3_params(td3_density_nets, k_q)
-    print('[ppo] init: td3 density done', flush=True)
-  else:
-    q_params = networks.q_network.init(k_q)
-  hybrid_td3_params = None
-  if use_crl_td3_switch:
-    key, k_hybrid_td3 = jax.random.split(key)
-    hybrid_td3_params = _td3.init_td3_params(
-        td3_density_nets, k_hybrid_td3)
-  ppo_params = {'policy': policy_params, 'value': value_params}
+  with _haiku_init_device(_use_isaacgym):
+    policy_params = networks.policy_network.init(k_pol)
+    print('[ppo] init: policy done', flush=True)
+    value_params = networks.value_network.init(k_val)
+    print('[ppo] init: value done', flush=True)
+    # q_params holds the density-estimator params in all modes:
+    #   crl mode      → CRL (φ, ψ) contrastive params from networks.q_network
+    #   gaussian mode → Gaussian density p_θ(g|s,a) params from density_nets
+    #   nf mode       → RealNVP log p_NF(g|s,a) params from nf_density_nets
+    #   fm mode       → velocity field v_θ(s,a,x_t,t) params from fm_density_nets
+    #   td3 mode      → twin Q + Polyak targets from td3_density_nets
+    if use_gaussian:
+      q_params = density_nets.density_net.init(k_q)
+    elif use_fm:
+      q_params = _fm.init_fm_params(fm_density_nets, k_q)
+    elif use_nf:
+      q_params = _nf.init_nf_params(nf_density_nets, k_q)
+      print('[ppo] init: nf density done', flush=True)
+    elif use_td3:
+      q_params = _td3.init_td3_params(td3_density_nets, k_q)
+      print('[ppo] init: td3 density done', flush=True)
+    else:
+      q_params = networks.q_network.init(k_q)
+    hybrid_td3_params = None
+    if use_crl_td3_switch:
+      key, k_hybrid_td3 = jax.random.split(key)
+      hybrid_td3_params = _td3.init_td3_params(
+          td3_density_nets, k_hybrid_td3)
+    ppo_params = {'policy': policy_params, 'value': value_params}
+  if _use_isaacgym:
+    ppo_params, q_params, hybrid_td3_params = _isaacgym_init_on_cpu_then_gpu(
+        True, (ppo_params, q_params, hybrid_td3_params))
 
   # ---- optimizers -------------------------------------------------------
   # Total PPO SGD steps over the whole run; used by both the LR anneal and
@@ -3013,6 +3070,9 @@ def run_ppo_training(
   use_nf_td = use_nf and bool(getattr(config, 'ppo_nf_td', False))
   nf_td_target = _tree_copy(q_params) if use_nf_td else None
   nf_scan_td_update = None
+  nf_time_ema = None
+  _nf_tr_eta = 0.0
+  _nf_tr_tau = 0.99
   _hybrid_td3_reward_tau = float(
       getattr(config, 'ppo_td3_reward_tau', 0.0))
   _use_hybrid_td3_reward_ema = (
@@ -3303,6 +3363,50 @@ def run_ppo_training(
     if not (0.0 <= _nf_mask_prob <= 1.0):
       raise ValueError(
           f'nf_mask_prob must be in [0, 1], got {_nf_mask_prob}')
+    _nf_tr_eta = float(getattr(config, 'ppo_nf_time_reg_eta', 0.0))
+    if _nf_tr_eta < 0.0:
+      raise ValueError(
+          f'ppo_nf_time_reg_eta must be >= 0, got {_nf_tr_eta}')
+    _nf_tr_target = str(
+        getattr(config, 'ppo_nf_time_reg_target', 'iter')).strip().lower()
+    if _nf_tr_eta > 0.0 and _nf_tr_target not in ('iter', 'ema'):
+      raise ValueError(
+          'ppo_nf_time_reg_target must be "iter" or "ema", '
+          f'got {_nf_tr_target!r}')
+    _nf_tr_tau = float(getattr(config, 'ppo_nf_time_reg_ema_tau', 0.99))
+    if _nf_tr_eta > 0.0 and _nf_tr_target == 'ema':
+      if not (0.0 < _nf_tr_tau < 1.0):
+        raise ValueError(
+            'ppo_nf_time_reg_ema_tau must be in (0, 1) when target=ema, '
+            f'got {_nf_tr_tau}')
+      _tr_ckpt = (_resume_extra or {}).get('nf_time_ema')
+      nf_time_ema = (
+          _tr_ckpt if _tr_ckpt is not None else _tree_copy(q_params))
+    _nf_tr_policy_apply = None
+    _nf_tr_sample_fn = None
+    _nf_tr_policy_goal = None
+    if _nf_tr_eta > 0.0:
+      if (builderbench_kwargs
+          and builderbench_kwargs.get('fixed_target_goal') is not None):
+        _nf_tr_policy_goal = np.asarray(
+            builderbench_kwargs['fixed_target_goal'],
+            dtype=np.float32).reshape(-1)
+      elif fixed_start_end is not None:
+        fse = fixed_start_end
+        if (isinstance(fse, (list, tuple)) and len(fse) == 2
+            and not isinstance(fse[0], (int, float, np.floating))):
+          _nf_tr_policy_goal = np.asarray(
+              fse[1], dtype=np.float32).reshape(-1)
+        else:
+          _nf_tr_policy_goal = np.asarray(
+              fse, dtype=np.float32).reshape(-1)
+      if _nf_tr_policy_goal is None:
+        raise ValueError(
+            'ppo_nf_time_reg_eta>0 requires a fixed task goal for '
+            "a'∼π(·|s', g_task) (builderbench fixed_target_goal / "
+            'fixed_start_end)')
+      _nf_tr_policy_apply = networks.policy_network.apply
+      _nf_tr_sample_fn = networks.sample
     crl_update = _nf.make_nf_density_update_fn(
         nf_density_nets, q_optimizer, obs_dim=int(config.obs_dim),
         noise_std=float(getattr(config, 'nf_noise_std', 0.0)),
@@ -3310,7 +3414,11 @@ def run_ppo_training(
         s_pert_prob=_nf_s_p, s_pert_eps=_nf_s_eps,
         s_pert_lo=_nf_s_lo, s_pert_hi=_nf_s_hi,
         grad_reg_c=_nf_gr_c, grad_reg_coef=_nf_gr_coef,
-        task_goal_frac=_nf_task_g_frac, task_goal=_nf_task_goal)
+        task_goal_frac=_nf_task_g_frac, task_goal=_nf_task_goal,
+        time_reg_eta=_nf_tr_eta,
+        policy_network_apply=_nf_tr_policy_apply,
+        sample_fn=_nf_tr_sample_fn,
+        policy_goal=_nf_tr_policy_goal)
     # Pre-sample N batches → one H→D transfer → one scanned JIT (like CRL).
     # lam_lr > 0 enables dual (primal-dual) λ updates inside the scan.
     # <0 config → auto 100× flow lr; 0 → fixed λ (no dual).
@@ -3331,7 +3439,11 @@ def run_ppo_training(
         s_pert_lo=_nf_s_lo, s_pert_hi=_nf_s_hi,
         grad_reg_c=_nf_gr_c, grad_reg_coef=_nf_gr_coef,
         lam_lr=_nf_lam_lr,
-        task_goal_frac=_nf_task_g_frac, task_goal=_nf_task_goal)
+        task_goal_frac=_nf_task_g_frac, task_goal=_nf_task_goal,
+        time_reg_eta=_nf_tr_eta,
+        policy_network_apply=_nf_tr_policy_apply,
+        sample_fn=_nf_tr_sample_fn,
+        policy_goal=_nf_tr_policy_goal)
     if _nf_s_p > 0.0 and _nf_s_eps > 0.0:
       if _nf_is_bb:
         print(f'[ppo] NF s perturb: prob={_nf_s_p}  eps={_nf_s_eps}  '
@@ -3349,6 +3461,17 @@ def run_ppo_training(
           f'λ_init={_nf_gr_coef}  '
           f'lam_lr={_nf_lam_lr}'
           f'{" (dual)" if _nf_lam_lr > 0.0 else " (fixed λ)"}')
+    if _nf_tr_eta > 0.0:
+      if _nf_tr_target == 'ema':
+        print(f'[ppo] NF time-reg: eta={_nf_tr_eta} target=ema '
+              f'tau={_nf_tr_tau} (mix once per PPO iter)  '
+              f"a'∼π(·|s', g_task) stopgrad",
+              flush=True)
+      else:
+        print(f'[ppo] NF time-reg: eta={_nf_tr_eta} target=iter '
+              f'(p_old = θ at start of PPO iter)  '
+              f"a'∼π(·|s', g_task) stopgrad",
+              flush=True)
     if _nf_task_g_frac > 0.0:
       print(f'[ppo] NF ∇_s log p task-g mix: frac={_nf_task_g_frac}  '
             f'(regularizer only; NLL still uses replay g)',
@@ -4844,28 +4967,31 @@ def run_ppo_training(
           if not _kl_adapt_epoch:
             _adapt_kl_beta(_mb_analytic)
           epoch_mb_beta.append(_kl_beta)
-      if _rolled_back:
+        if _trip and _es_this_iter and (not _kl_rollback):
+          # Keep this minibatch update; stop remaining minibatches/epochs.
+          early_stop = True
+          _es_epoch = int(epoch)
+          _es_mb_approx = epoch_mb_approx
+          _es_mb_analytic = epoch_mb_analytic
+          _es_mb_beta = epoch_mb_beta
+          _approx_s = ', '.join(f'{x:.6g}' for x in _es_mb_approx)
+          print(f'[ppo] target_kl early-stop iter={iteration} '
+                f'epoch={epoch}/{_n_epochs - 1} mb={mb_i}/{_n_mb - 1} '
+                f'threshold={_target_kl:g} approx_kl={_mb_approx:.6g} '
+                f'mb_approx_kl=[{_approx_s}]',
+                flush=True)
+          if _kl_penalty_on:
+            _an_s = ', '.join(f'{x:.6g}' for x in _es_mb_analytic)
+            _b_s = ', '.join(f'{x:.6g}' for x in _es_mb_beta)
+            print(f'[ppo]   mb_analytic_kl=[{_an_s}]', flush=True)
+            print(f'[ppo]   mb_beta_after=[{_b_s}]', flush=True)
+          if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic:
+            _adapt_kl_beta(float(np.mean(epoch_mb_analytic)))
+          break
+      if _rolled_back or early_stop:
         break
       if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic:
         _adapt_kl_beta(float(np.mean(epoch_mb_analytic)))
-      if _es_this_iter and (not _kl_rollback) and epoch_kl_max > _target_kl:
-        early_stop = True
-        _es_epoch = int(epoch)
-        _es_mb_approx = epoch_mb_approx
-        _es_mb_analytic = epoch_mb_analytic
-        _es_mb_beta = epoch_mb_beta
-        _approx_s = ', '.join(f'{x:.6g}' for x in _es_mb_approx)
-        print(f'[ppo] target_kl early-stop iter={iteration} '
-              f'epoch={epoch}/{_n_epochs - 1} '
-              f'threshold={_target_kl:g} max={epoch_kl_max:.6g} '
-              f'mb_approx_kl=[{_approx_s}]',
-              flush=True)
-        if _kl_penalty_on:
-          _an_s = ', '.join(f'{x:.6g}' for x in _es_mb_analytic)
-          _b_s = ', '.join(f'{x:.6g}' for x in _es_mb_beta)
-          print(f'[ppo]   mb_analytic_kl=[{_an_s}]', flush=True)
-          print(f'[ppo]   mb_beta_after=[{_b_s}]', flush=True)
-        break
 
     if _kl_es_cooldown > 0:
       _kl_es_cooldown -= 1
@@ -5020,11 +5146,20 @@ def run_ppo_training(
               _gmean_j, _gstd_j,
               ppo_params['policy'])
         else:
-          (q_params, q_opt_state, q_params_reward,
-           key, _gr_lam_j, m) = nf_scan_update(
+          _nf_scan_args = (
               q_params, q_opt_state, q_params_reward, _stacked, key,
               _gmean_j, _gstd_j,
               jnp.array(_gr_lam, dtype=jnp.float32))
+          if _nf_tr_eta > 0.0:
+            _p_old = nf_time_ema if nf_time_ema is not None else q_params
+            (q_params, q_opt_state, q_params_reward,
+             key, _gr_lam_j, m) = nf_scan_update(
+                 *_nf_scan_args, _p_old, ppo_params['policy'])
+            if nf_time_ema is not None:
+              nf_time_ema = _ema_tree(nf_time_ema, q_params, _nf_tr_tau)
+          else:
+            (q_params, q_opt_state, q_params_reward,
+             key, _gr_lam_j, m) = nf_scan_update(*_nf_scan_args)
           # Dual mode: λ updated inside scan; keep Python float for next iter.
           _gr_lam = float(_gr_lam_j)
         crl_metrics_agg = {k_: [float(v)] for k_, v in m.items()}
@@ -5277,6 +5412,10 @@ def run_ppo_training(
         log['nf/nf_mask_frac'] = float('nan')
       if float(getattr(config, 'ppo_nf_grad_reg_task_g_frac', 0.0)) > 0.0:
         log['nf/nf_grad_reg_task_g_frac'] = float('nan')
+      if float(getattr(config, 'ppo_nf_time_reg_eta', 0.0)) > 0.0:
+        log['nf/nf_time_reg'] = float('nan')
+        log['nf/nf_time_reg_raw'] = float('nan')
+        log['nf/nf_time_reg_nll_ratio'] = float('nan')
       if nf_density_nets.goal_encoder_net is not None:
         log['nf/goal_enc_grad_norm'] = float('nan')
       if bool(getattr(config, 'nf_scale_tanh', False)):
@@ -5428,7 +5567,10 @@ def run_ppo_training(
     if _short_ep or _forced:
       _thresh = _actor_reset_ep_frac * float(_nominal_ep_len)
       key, k_pol = jax.random.split(key)
-      _fresh_policy = networks.policy_network.init(k_pol)
+      with _haiku_init_device(_use_isaacgym):
+        _fresh_policy = networks.policy_network.init(k_pol)
+      if _use_isaacgym:
+        _fresh_policy, = _isaacgym_init_on_cpu_then_gpu(True, (_fresh_policy,))
       # Short-ep collapse: only reinit action head (last layer). Forced
       # schedule alone still does a full policy reinit.
       if _short_ep:
@@ -5678,6 +5820,8 @@ def run_ppo_training(
         _checkpoint_extra['td_infonce_target_q'] = td_infonce_target_q
       if use_nf_td:
         _checkpoint_extra['nf_td_target'] = nf_td_target
+      if nf_time_ema is not None:
+        _checkpoint_extra['nf_time_ema'] = nf_time_ema
       if reward_normalizer is not None:
         _checkpoint_extra['reward_normalizer'] = reward_normalizer.state_dict()
       ckpt_kw = dict(

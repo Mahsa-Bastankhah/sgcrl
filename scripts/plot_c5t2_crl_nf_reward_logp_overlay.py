@@ -26,7 +26,7 @@ import plot_builderbench_train_success1000 as base  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_PATH = os.path.join(
-    REPO, 'figs', 'builderbench',
+    REPO, 'figs', 'builderbench', 'c5t2',
     'c5t2_crl_nf_reward_logp_overlay_mean_matched.png')
 PLOT_MAX_PTS = 2500
 RUN = 'ppo_builderbench_creative_5_task2_0'

@@ -1,6 +1,6 @@
 """Contrastive RL networks definition."""
 import dataclasses
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Any, Callable, Optional, Sequence, Tuple
 
 from acme import specs
 from acme.agents.jax import actor_core as actor_core_lib
@@ -33,6 +33,36 @@ def _use_residual_mlp(hidden_layer_sizes: Sequence[int]) -> bool:
 _RESIDUAL_SKIP_EVERY = 2
 _RESIDUAL_ACTIVATION = jax.nn.swish
 _RESIDUAL_USE_LAYER_NORM = True
+
+
+class OrthogonalHostQR(hk.initializers.Initializer):
+  """Same distribution as ``hk.initializers.Orthogonal``, QR on the host.
+
+  Haiku Orthogonal uses ``jnp.linalg.qr`` (cuSolver). After Isaac Gym PhysX
+  owns the CUDA context, ``gpusolverDnCreate`` fails. Numpy QR is a one-shot
+  at param init; the returned array is placed on the default JAX device
+  (GPU). Training matmuls are unchanged.
+  """
+
+  def __init__(self, scale=1.0, axis=-1):
+    self.scale = scale
+    self.axis = axis
+
+  def __call__(self, shape: Sequence[int], dtype: Any) -> jax.Array:
+    if len(shape) < 2:
+      raise ValueError('Orthogonal initializer requires at least a 2D shape.')
+    n_rows = shape[self.axis]
+    n_cols = int(np.prod(shape)) // n_rows
+    matrix_shape = (n_rows, n_cols) if n_rows > n_cols else (n_cols, n_rows)
+    norm_dst = jax.random.normal(hk.next_rng_key(), matrix_shape, dtype)
+    q_np, r_np = np.linalg.qr(np.asarray(jax.device_get(norm_dst)))
+    q_np = q_np * np.sign(np.diag(r_np))
+    if n_rows < n_cols:
+      q_np = q_np.T
+    q_np = np.reshape(q_np, (n_rows,) + tuple(np.delete(shape, self.axis)))
+    q_np = np.moveaxis(q_np, 0, self.axis)
+    scale = np.asarray(self.scale, dtype=np.dtype(dtype).type)
+    return jnp.asarray(scale * q_np, dtype=dtype)
 
 
 class ResidualMLP(hk.Module):
@@ -173,7 +203,10 @@ def make_networks(
     use_image_obs = False,
     categorical_select_classes: Optional[int] = None,
     categorical_select_waypoint: bool = False,
-    state_only: bool = False):
+    state_only: bool = False,
+    bb_pixel_obs: bool = False,
+    bb_num_cubes: int = 0,
+    bb_goal_color_indices: Optional[Sequence[int]] = None):
   """Creates networks used by the agent.
 
   Args:
@@ -188,6 +221,10 @@ def make_networks(
     state_only: If True, φ encodes state only (not concat[s,a]), so CRL
       learns / rewards with φ(s)·ψ(g) instead of φ(s,a)·ψ(g).  Action is
       still accepted by the critic apply API but ignored by the SA encoder.
+    bb_pixel_obs: If True, rasterize BuilderBench compact xyz to 64×64 and
+      run a CNN before the existing MLPs.  Replay / env obs stay vectors.
+      Incompatible with ``use_image_obs`` (that path expects flattened
+      images already in ``obs``).
   """
 
   num_dimensions = np.prod(spec.actions.shape, dtype=int)
@@ -195,6 +232,17 @@ def make_networks(
                  else int(categorical_select_classes))
   _cat_wp = bool(categorical_select_waypoint)
   _state_only = bool(state_only)
+  _bb_pixel = bool(bb_pixel_obs)
+  _bb_num_cubes = int(bb_num_cubes)
+  _bb_goal_colors = tuple(
+      int(i) for i in (bb_goal_color_indices or ()))
+  if _bb_pixel and use_image_obs:
+    raise ValueError(
+        'bb_pixel_obs and use_image_obs cannot both be True')
+  if _bb_pixel:
+    if _bb_num_cubes < 1 or not _bb_goal_colors:
+      raise ValueError(
+          'bb_pixel_obs requires bb_num_cubes>=1 and bb_goal_color_indices')
   if _cat_select is not None and _cat_select < 2:
     raise ValueError(
         f'categorical_select_classes must be >= 2, got {_cat_select}')
@@ -216,12 +264,20 @@ def make_networks(
     goal = jnp.reshape(obs[:, obs_dim:], (-1, 64, 64, 3)) / 255.0
     return state, goal
 
+  def _bb_encode_pair(obs):
+    from envs.builderbench_raster import encode_state_goal_images
+    return encode_state_goal_images(
+        obs[:, :obs_dim], obs[:, obs_dim:],
+        _bb_num_cubes, _bb_goal_colors)
+
   def _repr_fn(obs, action, hidden=None):
     # The optional input hidden is the image representations. We include this
     # as an input for the second Q value when twin_q = True, so that the two Q
     # values use the same underlying image representation.
     if hidden is None:
-      if use_image_obs:
+      if _bb_pixel:
+        state, goal = _bb_encode_pair(obs)
+      elif use_image_obs:
         state, goal = _unflatten_obs(obs)
         img_encoder = TORSO()
         state = img_encoder(state)
@@ -280,7 +336,10 @@ def make_networks(
     return critic_val, sa_repr, g_repr
 
   def _actor_fn(obs):
-    if use_image_obs:
+    if _bb_pixel:
+      state, goal = _bb_encode_pair(obs)
+      obs = jnp.concatenate([state, goal], axis=-1)
+    elif use_image_obs:
       state, goal = _unflatten_obs(obs)
       obs = jnp.concatenate([state, goal], axis=-1)
       obs = TORSO()(obs)
@@ -315,7 +374,12 @@ def make_networks(
     Takes the full obs = [state; goal] (same format the policy consumes).
     CleanRL uses tanh activations + orthogonal init for PPO; we follow suit
     since it's notably more stable than relu+fan_avg for value learning.
+    OrthogonalHostQR is Haiku Orthogonal with host numpy QR (GPU cuSolver
+    breaks after Isaac Gym PhysX create_sim).
     """
+    if _bb_pixel:
+      state, goal = _bb_encode_pair(obs)
+      obs = jnp.concatenate([state, goal], axis=-1)
     if _use_residual_mlp(hidden_layer_sizes):
       h = _mlp_or_residual(
           obs,
@@ -324,17 +388,17 @@ def make_networks(
           name='value_mlp',
           activation=jnp.tanh,
           activate_final=True,
-          w_init=hk.initializers.Orthogonal(scale=np.sqrt(2.0)),
+          w_init=OrthogonalHostQR(scale=np.sqrt(2.0)),
       )
-      out = hk.Linear(1, w_init=hk.initializers.Orthogonal(scale=1.0))(h)
+      out = hk.Linear(1, w_init=OrthogonalHostQR(scale=1.0))(h)
       return jnp.squeeze(out, axis=-1)
     net = hk.Sequential([
         hk.nets.MLP(
             list(hidden_layer_sizes),
-            w_init=hk.initializers.Orthogonal(scale=np.sqrt(2.0)),
+            w_init=OrthogonalHostQR(scale=np.sqrt(2.0)),
             activation=jnp.tanh,
             activate_final=True),
-        hk.Linear(1, w_init=hk.initializers.Orthogonal(scale=1.0)),
+        hk.Linear(1, w_init=OrthogonalHostQR(scale=1.0)),
     ])
     return jnp.squeeze(net(obs), axis=-1)
 
@@ -348,7 +412,10 @@ def make_networks(
     an independent Haiku scope so Q1 and Q2 have independent parameters.
     """
     def _q_goal_fn(obs, action):
-      state = obs[:, :obs_dim]
+      if _bb_pixel:
+        state, _ = _bb_encode_pair(obs)
+      else:
+        state = obs[:, :obs_dim]
       trunk_in = jnp.concatenate([state, action], axis=-1)
       trunk = _mlp_or_residual(
           trunk_in,
@@ -372,7 +439,10 @@ def make_networks(
     Uses only the state slice of obs (goal-agnostic, matching φ(s,a)).
     """
     def _kappa_fn(obs, action):
-      state = obs[:, :obs_dim]
+      if _bb_pixel:
+        state, _ = _bb_encode_pair(obs)
+      else:
+        state = obs[:, :obs_dim]
       return _mlp_or_residual(
           jnp.concatenate([state, action], axis=-1),
           list(hidden_layer_sizes) + [repr_dim],

@@ -421,11 +421,7 @@ def _render_policy_loc_scale_strip(
   smin = float(scale_min[t])
   lm = float(loc_abs_mean[t])
   first_succ = int(np.argmax(success >= 0.5)) if np.any(success >= 0.5) else -1
-  dpi = 120
-  fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi,
-                   facecolor='#0f1419')
-  ax = fig.add_axes([0.07, 0.22, 0.72, 0.62])
-  ax.set_facecolor('#0f1419')
+  fig, ax, ax_txt = _strip_figure(width, height)
   xs = np.arange(T)
   ax.plot(xs, scale_mean, color='#3a6a7a', lw=1.4, alpha=0.4, zorder=1)
   ax.plot(xs[: t + 1], scale_mean[: t + 1], color='#5ec8ff', lw=2.2, zorder=2)
@@ -464,9 +460,6 @@ def _render_policy_loc_scale_strip(
   ax2.set_ylabel(r'mean $|\mu|$', color='#e0c3ff', fontsize=8)
   ax2.tick_params(colors='#e0c3ff', labelsize=8)
 
-  ax_txt = fig.add_axes([0.80, 0.22, 0.18, 0.62])
-  ax_txt.set_facecolor('#0f1419')
-  ax_txt.axis('off')
   ax_txt.text(0.05, 0.92, r'$\sigma$ mean', transform=ax_txt.transAxes,
               color='#9aa7b5', fontsize=8, va='center')
   ax_txt.text(0.05, 0.78, f'{sm:.3f}', transform=ax_txt.transAxes,
@@ -479,9 +472,27 @@ def _render_policy_loc_scale_strip(
               color='#9aa7b5', fontsize=8, va='center')
   ax_txt.text(0.05, 0.14, f'{lm:.3f}', transform=ax_txt.transAxes,
               color='#e0c3ff', fontsize=13, fontweight='bold', va='center')
-  fig.suptitle(
-      title or r'policy $\mu,\sigma$ (mode-cube xyz+yaw)',
-      color='#e8eef4', fontsize=10, y=0.96)
+  return _strip_finish(
+      fig, title or r'policy $\mu,\sigma$ (mode-cube xyz+yaw)',
+      width, height)
+
+
+def _strip_figure(width: int, height: int):
+  """Dark strip fig with a reserved top band so the title is not clipped."""
+  dpi = 120
+  fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi,
+                   facecolor='#0f1419')
+  ax = fig.add_axes([0.08, 0.16, 0.70, 0.58])
+  ax.set_facecolor('#0f1419')
+  ax_txt = fig.add_axes([0.80, 0.16, 0.18, 0.58])
+  ax_txt.set_facecolor('#0f1419')
+  ax_txt.axis('off')
+  return fig, ax, ax_txt
+
+
+def _strip_finish(fig, title: str, width: int, height: int) -> np.ndarray:
+  fig.text(0.50, 0.995, title, ha='center', va='top', color='#e8eef4',
+           fontsize=12, fontweight='bold')
   canvas = FigureCanvasAgg(fig)
   canvas.draw()
   buf = np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
@@ -490,6 +501,67 @@ def _render_policy_loc_scale_strip(
     buf = np.asarray(
         Image.fromarray(buf).resize((width, height), Image.Resampling.LANCZOS))
   return buf
+
+
+def _render_timeseries_strip(
+    ys: np.ndarray,
+    success: np.ndarray,
+    t: int,
+    width: int,
+    height: int = 240,
+    *,
+    title: str = '',
+    ylabel: str = '',
+    value_label: str = '',
+    color: str = '#5ec8ff',
+    yref: float | None = None,
+    yref_label: str = '',
+    yfmt: str = '{:.3f}',
+) -> np.ndarray:
+  """Single-series episode strip; title sits in the top band."""
+  T = len(ys)
+  y_now = float(ys[t])
+  first_succ = int(np.argmax(success >= 0.5)) if np.any(success >= 0.5) else -1
+  fig, ax, ax_txt = _strip_figure(width, height)
+  xs = np.arange(T)
+  ax.plot(xs, ys, color='#5a6a7a', lw=1.6, alpha=0.40, zorder=1)
+  ax.plot(xs[: t + 1], ys[: t + 1], color=color, lw=2.4, zorder=2)
+  ax.scatter([t], [y_now], s=55, color='#ffe566', edgecolors='#1a1a1a',
+             linewidths=0.8, zorder=4)
+  ax.axvline(t, color='#ffe566', ls=':', lw=1.0, alpha=0.7, zorder=3)
+  if first_succ >= 0:
+    ax.axvline(first_succ, color='#ff8a4c', ls='--', lw=1.2, alpha=0.85,
+               zorder=2)
+  if yref is not None:
+    ax.axhline(float(yref), color='#9aa7b5', ls='--', lw=1.0, alpha=0.75,
+               zorder=1)
+  y0 = float(np.min(ys))
+  y1 = float(np.max(ys))
+  if yref is not None:
+    y0 = min(y0, float(yref))
+    y1 = max(y1, float(yref))
+  pad = 0.10 * max(y1 - y0, 1e-6)
+  ax.set_xlim(-0.5, T - 0.5)
+  ax.set_ylim(y0 - pad, y1 + pad)
+  ax.set_xlabel('macro step t', color='#c8d0d8', fontsize=9)
+  ax.set_ylabel(ylabel, color=color, fontsize=9)
+  ax.tick_params(colors='#9aa7b5', labelsize=8)
+  ax.tick_params(axis='y', colors=color)
+  for spine in ax.spines.values():
+    spine.set_color('#3a4654')
+  ax.grid(True, color='#2a3540', alpha=0.7, lw=0.6)
+
+  ax_txt.text(0.05, 0.82, value_label or ylabel, transform=ax_txt.transAxes,
+              color='#9aa7b5', fontsize=9, va='center')
+  ax_txt.text(0.05, 0.60, yfmt.format(y_now), transform=ax_txt.transAxes,
+              color=color, fontsize=14, fontweight='bold', va='center')
+  ax_txt.text(0.05, 0.36, f't = {t}/{T - 1}', transform=ax_txt.transAxes,
+              color='#c8d0d8', fontsize=10, va='center')
+  if yref is not None and yref_label:
+    ax_txt.text(0.05, 0.14, f'{yref_label}={float(yref):.2f}',
+                transform=ax_txt.transAxes, color='#9aa7b5', fontsize=8,
+                va='center')
+  return _strip_finish(fig, title, width, height)
 
 
 def _render_gae_strip(
@@ -507,11 +579,7 @@ def _render_gae_strip(
   a_now = float(advantage[t])
   v_now = float(value[t])
   first_succ = int(np.argmax(success >= 0.5)) if np.any(success >= 0.5) else -1
-  dpi = 120
-  fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi,
-                   facecolor='#0f1419')
-  ax = fig.add_axes([0.07, 0.22, 0.72, 0.62])
-  ax.set_facecolor('#0f1419')
+  fig, ax, ax_txt = _strip_figure(width, height)
   xs = np.arange(T)
   ax.axhline(0.0, color='#c8d0d8', ls='-', lw=0.8, alpha=0.55, zorder=1)
   ax.plot(xs, advantage, color='#2a5a4a', lw=1.6, alpha=0.45, zorder=2)
@@ -547,9 +615,6 @@ def _render_gae_strip(
   ax2.set_ylabel(r'$V(s_t)$', color='#4C9BE8', fontsize=8)
   ax2.tick_params(colors='#4C9BE8', labelsize=8)
 
-  ax_txt = fig.add_axes([0.80, 0.22, 0.18, 0.62])
-  ax_txt.set_facecolor('#0f1419')
-  ax_txt.axis('off')
   a_col = '#5ee8a8' if a_now >= 0.0 else '#E8834C'
   ax_txt.text(0.05, 0.88, r'$A_t$', transform=ax_txt.transAxes,
               color='#9aa7b5', fontsize=9, va='center')
@@ -561,17 +626,9 @@ def _render_gae_strip(
               color='#4C9BE8', fontsize=14, fontweight='bold', va='center')
   ax_txt.text(0.05, 0.10, f't = {t}/{T - 1}', transform=ax_txt.transAxes,
               color='#c8d0d8', fontsize=10, va='center')
-  fig.suptitle(
-      title or r'GAE $A_t$  (return-std $r$, no minibatch-norm)',
-      color='#e8eef4', fontsize=10, y=0.96)
-  canvas = FigureCanvasAgg(fig)
-  canvas.draw()
-  buf = np.asarray(canvas.buffer_rgba())[:, :, :3].copy()
-  plt.close(fig)
-  if buf.shape[1] != width or buf.shape[0] != height:
-    buf = np.asarray(
-        Image.fromarray(buf).resize((width, height), Image.Resampling.LANCZOS))
-  return buf
+  return _strip_finish(
+      fig, title or r'GAE $A_t$  (return-std $r$, no minibatch-norm)',
+      width, height)
 
 
 def select_action_to_cube(select: np.ndarray, num_cubes: int,

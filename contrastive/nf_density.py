@@ -23,6 +23,7 @@ Optimizers (reference nf_sac.py):
 """
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import NamedTuple, Optional, Sequence, Tuple
 
 import haiku as hk
@@ -31,6 +32,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from acme.jax import networks as networks_lib
+from scipy.linalg import lu as scipy_lu
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +83,44 @@ def _goal_encoder(goal: jnp.ndarray, goal_enc_size: int) -> jnp.ndarray:
 # InvertiblePLU  (Haiku port of the Flax class in the reference code)
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=None)
+def _host_plu_init(d: int, block_idx: int):
+    """Orthogonal + LU on the host (no GPU cuSolver).
+
+    After Isaac Gym PhysX owns the CUDA context, ``jax.random.orthogonal`` /
+    ``jax.scipy.linalg.lu`` fail with ``gpusolverDnCreate``. Numpy QR + SciPy
+    LU run only inside Haiku parameter init (same reason as OrthogonalHostQR).
+    """
+    rng = np.random.RandomState(int(block_idx) * 1337 + 42)
+    z = rng.randn(d, d).astype(np.float32)
+    q, r = np.linalg.qr(z)
+    w0 = q * np.sign(np.diag(r))
+    P0, L0, U0 = scipy_lu(w0.astype(np.float32, copy=False))
+    s0 = np.diag(U0).astype(np.float32, copy=True)
+    L_strict0 = np.tril(L0, k=-1).astype(np.float32, copy=False)
+    U_strict0 = np.triu(U0, k=1).astype(np.float32, copy=False)
+    P_inv0 = np.linalg.inv(P0).astype(np.float32, copy=False)
+    return (P0.astype(np.float32, copy=False), P_inv0, L_strict0, U_strict0, s0)
+
+
+def _triangular_inv(A: jnp.ndarray, n: int, *, lower: bool,
+                    unit_diagonal: bool) -> jnp.ndarray:
+    """Invert triangular ``A`` by substitution. Pure JAX, no cuSolver."""
+    eye = jnp.eye(n, dtype=A.dtype)
+    arange = jnp.arange(n)
+
+    def _solve(b):
+        def body(t, x):
+            i = t if lower else (n - 1 - t)
+            mask = (arange < i) if lower else (arange > i)
+            aii = (jnp.ones((), dtype=A.dtype) if unit_diagonal else A[i, i])
+            xi = (b[i] - jnp.dot(A[i], jnp.where(mask, x, 0))) / aii
+            return x.at[i].set(xi)
+        return jax.lax.fori_loop(0, n, body, jnp.zeros_like(b))
+
+    return jax.vmap(_solve, in_axes=1, out_axes=1)(eye)
+
+
 class InvertiblePLU(hk.Module):
     """Invertible 1×1 linear layer with PLU parameterization."""
 
@@ -92,27 +132,26 @@ class InvertiblePLU(hk.Module):
 
     def __call__(self, x: jnp.ndarray,
                  reverse: bool = False) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        d = self.features
-        seed_key = jax.random.PRNGKey(self.block_idx * 1337 + 42)
-        w0 = jax.random.orthogonal(seed_key, n=d)
-        P0, L0, U0 = jax.scipy.linalg.lu(w0)
-        s0 = jnp.diag(U0)
-        L_strict0 = jnp.tril(L0, k=-1)
-        U_strict0 = jnp.triu(U0, k=1)
-        P_inv0 = jax.scipy.linalg.inv(P0)
+        d = int(self.features)
+        idx = int(self.block_idx)
 
         P = jax.lax.stop_gradient(
-            hk.get_parameter('P', (d, d), jnp.float32,
-                             init=lambda sh, dt: P0.astype(dt)))
+            hk.get_parameter(
+                'P', (d, d), jnp.float32,
+                init=lambda sh, dt: jnp.asarray(_host_plu_init(d, idx)[0], dt)))
         P_inv = jax.lax.stop_gradient(
-            hk.get_parameter('P_inv', (d, d), jnp.float32,
-                             init=lambda sh, dt: P_inv0.astype(dt)))
-        L_free = hk.get_parameter('L', (d, d), jnp.float32,
-                                   init=lambda sh, dt: L_strict0.astype(dt))
-        U_free = hk.get_parameter('U', (d, d), jnp.float32,
-                                   init=lambda sh, dt: U_strict0.astype(dt))
-        s = hk.get_parameter('s', (d,), jnp.float32,
-                              init=lambda sh, dt: s0.astype(dt))
+            hk.get_parameter(
+                'P_inv', (d, d), jnp.float32,
+                init=lambda sh, dt: jnp.asarray(_host_plu_init(d, idx)[1], dt)))
+        L_free = hk.get_parameter(
+            'L', (d, d), jnp.float32,
+            init=lambda sh, dt: jnp.asarray(_host_plu_init(d, idx)[2], dt))
+        U_free = hk.get_parameter(
+            'U', (d, d), jnp.float32,
+            init=lambda sh, dt: jnp.asarray(_host_plu_init(d, idx)[3], dt))
+        s = hk.get_parameter(
+            's', (d,), jnp.float32,
+            init=lambda sh, dt: jnp.asarray(_host_plu_init(d, idx)[4], dt))
 
         L = jnp.tril(L_free, k=-1) + jnp.eye(d)
         U = jnp.triu(U_free, k=1)
@@ -121,10 +160,9 @@ class InvertiblePLU(hk.Module):
 
         if not reverse:
             return jnp.dot(x, W), logdet_scalar
-        U_inv = jax.scipy.linalg.solve_triangular(
-            U + jnp.diag(s), jnp.eye(d), lower=False)
-        L_inv = jax.scipy.linalg.solve_triangular(
-            L, jnp.eye(d), lower=True, unit_diagonal=True)
+        U_inv = _triangular_inv(U + jnp.diag(s), d, lower=False,
+                                unit_diagonal=False)
+        L_inv = _triangular_inv(L, d, lower=True, unit_diagonal=True)
         W_inv = U_inv @ L_inv @ P_inv
         return jnp.dot(x, W_inv), -logdet_scalar
 
@@ -167,6 +205,9 @@ def make_nf_density_networks(
     state_only: bool = False,
     scale_tanh: bool = False,
     scale_tanh_c: float = 2.0,
+    bb_pixel_obs: bool = False,
+    bb_num_cubes: int = 0,
+    bb_goal_color_indices: Optional[Sequence[int]] = None,
 ) -> NFDensityNetworks:
     """Build SA encoder + optional goal encoder + conditional RealNVP flow.
 
@@ -181,12 +222,27 @@ def make_nf_density_networks(
 
     scale_tanh: if True, coupling scale is ``s = c * tanh(s_raw)`` (FrEIA soft
     clamp).  No extra parameters; old checkpoints still load.  Off by default.
+
+    bb_pixel_obs: if True, rasterize compact BB xyz → CNN before the SA /
+    goal MLPs.  Requires ``bb_num_cubes`` and ``bb_goal_color_indices``.
+    When ``goal_enc_size==0``, a goal encoder is created with size
+    ``rep_size`` so the flow runs on CNN embeddings (not raw xyz).
     """
     del hidden_layer_sizes
     assert goal_dim >= 1, f'NF density requires goal_dim >= 1, got {goal_dim}'
     assert int(sa_hidden) >= 1, f'sa_hidden must be >= 1, got {sa_hidden}'
     assert int(sa_num_layers) >= 1, (
         f'sa_num_layers must be >= 1, got {sa_num_layers}')
+
+    _bb_pixel = bool(bb_pixel_obs)
+    _bb_num_cubes = int(bb_num_cubes)
+    _bb_goal_colors = tuple(int(i) for i in (bb_goal_color_indices or ()))
+    if _bb_pixel:
+      if _bb_num_cubes < 1 or not _bb_goal_colors:
+        raise ValueError(
+            'bb_pixel_obs requires bb_num_cubes>=1 and bb_goal_color_indices')
+      if int(goal_enc_size) <= 0:
+        goal_enc_size = max(int(rep_size), 2)
 
     # Effective dimensionality the flow operates in.
     flow_dim = goal_enc_size if goal_enc_size > 0 else goal_dim
@@ -206,12 +262,49 @@ def make_nf_density_networks(
     _scale_tanh_c = float(scale_tanh_c)
 
     def _sa_fn(state: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+        if _bb_pixel:
+            from envs.builderbench_raster import (
+                BBPixelTorso, rasterize_bb_state)
+            state = BBPixelTorso(name='bb_pixel_torso')(
+                rasterize_bb_state(state, _bb_num_cubes))
         return _sa_encoder(state, action, rep_size,
                            sa_hidden=_sa_hidden, sa_num_layers=_sa_num_layers,
                            state_only=_state_only)
 
     def _goal_enc_fn(goal: jnp.ndarray) -> jnp.ndarray:
+        if _bb_pixel:
+            from envs.builderbench_raster import (
+                BBPixelTorso, rasterize_bb_goal)
+            goal = BBPixelTorso(name='bb_pixel_torso')(
+                rasterize_bb_goal(
+                    goal, _bb_goal_colors, num_cubes=_bb_num_cubes))
         return _goal_encoder(goal, goal_enc_size)
+
+    def _affine_st(i: int, cond_in: jnp.ndarray):
+        """Coupling scale/shift. Names must match in forward and inverse."""
+        s_h = hk.Linear(channels, w_init=w_init, name=f's_{i}_l1')(cond_in)
+        s_h = jax.nn.leaky_relu(s_h)
+        s_h = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
+                           name=f's_{i}_ln1')(s_h)
+        s_h = hk.Linear(channels, w_init=w_init, name=f's_{i}_l2')(s_h)
+        s_h = jax.nn.leaky_relu(s_h)
+        s_h = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
+                           name=f's_{i}_ln2')(s_h)
+        s_raw = hk.Linear(split_trans, w_init=zero_init, b_init=zero_init,
+                          name=f's_{i}_out')(s_h)
+        s = (_scale_tanh_c * jnp.tanh(s_raw)) if _scale_tanh else s_raw
+
+        t_h = hk.Linear(channels, w_init=w_init, name=f't_{i}_l1')(cond_in)
+        t_h = jax.nn.leaky_relu(t_h)
+        t_h = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
+                           name=f't_{i}_ln1')(t_h)
+        t_h = hk.Linear(channels, w_init=w_init, name=f't_{i}_l2')(t_h)
+        t_h = jax.nn.leaky_relu(t_h)
+        t_h = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
+                           name=f't_{i}_ln2')(t_h)
+        t = hk.Linear(split_trans, w_init=zero_init, b_init=zero_init,
+                      name=f't_{i}_out')(t_h)
+        return s, t, s_raw
 
     def _flow_log_prob(goal_enc: jnp.ndarray, y: jnp.ndarray):
         """goal_enc is already encoded (or raw if no goal encoder).
@@ -234,33 +327,9 @@ def make_nf_density_networks(
             x_cond = x[:, :split_cond]
             x_trans = x[:, split_cond:]
             cond_in = jnp.concatenate([x_cond, y], axis=-1)
-
-            s_h = hk.Linear(channels, w_init=w_init,
-                             name=f's_{i}_l1')(cond_in)
-            s_h = jax.nn.leaky_relu(s_h)
-            s_h = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
-                               name=f's_{i}_ln1')(s_h)
-            s_h = hk.Linear(channels, w_init=w_init, name=f's_{i}_l2')(s_h)
-            s_h = jax.nn.leaky_relu(s_h)
-            s_h = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
-                               name=f's_{i}_ln2')(s_h)
-            s_raw = hk.Linear(split_trans, w_init=zero_init, b_init=zero_init,
-                              name=f's_{i}_out')(s_h)
-            s = (_scale_tanh_c * jnp.tanh(s_raw)) if _scale_tanh else s_raw
+            s, t, s_raw = _affine_st(i, cond_in)
             s_raw_sum = s_raw_sum + jnp.mean(s_raw)
             s_sum = s_sum + jnp.mean(s)
-
-            t_h = hk.Linear(channels, w_init=w_init,
-                             name=f't_{i}_l1')(cond_in)
-            t_h = jax.nn.leaky_relu(t_h)
-            t_h = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
-                               name=f't_{i}_ln1')(t_h)
-            t_h = hk.Linear(channels, w_init=w_init, name=f't_{i}_l2')(t_h)
-            t_h = jax.nn.leaky_relu(t_h)
-            t_h = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True,
-                               name=f't_{i}_ln2')(t_h)
-            t = hk.Linear(split_trans, w_init=zero_init, b_init=zero_init,
-                           name=f't_{i}_out')(t_h)
 
             x_trans_new = (x_trans - t) * jnp.exp(-s)
             log_dets = log_dets - jnp.sum(s, axis=-1)
@@ -272,8 +341,23 @@ def make_nf_density_networks(
         return (log_prior + log_dets, s_raw_sum / denom, s_sum / denom,
                 x, log_dets)
 
+    def _flow_inverse(z: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
+        """Latent ``z`` → flow-space ``x`` (normalized goal). Same params as forward."""
+        x = z
+        for i in reversed(range(num_blocks)):
+            x_cond = x[:, :split_cond]
+            x_trans = x[:, split_cond:]
+            cond_in = jnp.concatenate([x_cond, y], axis=-1)
+            s, t, _ = _affine_st(i, cond_in)
+            x_trans_new = x_trans * jnp.exp(s) + t
+            x = jnp.concatenate([x_cond, x_trans_new], axis=-1)
+            plu = InvertiblePLU(features=flow_dim, block_idx=i, name=f'plu_{i}')
+            x, _ = plu(x, reverse=True)
+        return x
+
     sa_transformed   = hk.without_apply_rng(hk.transform(_sa_fn))
     flow_transformed = hk.without_apply_rng(hk.transform(_flow_log_prob))
+    flow_inv_transformed = hk.without_apply_rng(hk.transform(_flow_inverse))
 
     dummy_state  = np.zeros((1, obs_dim),    dtype=np.float32)
     dummy_action = np.zeros((1, act_dim),    dtype=np.float32)
@@ -286,7 +370,9 @@ def make_nf_density_networks(
         apply=sa_transformed.apply,
     )
     def _flow_apply(params, goal_enc, y, return_stats=False,
-                    return_forward=False):
+                    return_forward=False, reverse=False):
+        if reverse:
+            return flow_inv_transformed.apply(params, goal_enc, y)
         log_p, s_raw_mean, s_mean, z, log_dets = flow_transformed.apply(
             params, goal_enc, y)
         if return_forward:
@@ -405,6 +491,30 @@ def nf_forward(nf_networks: NFDensityNetworks, params, state, action, goal):
         params['nf_flow'], g, y, return_forward=True)
 
 
+def nf_inverse(nf_networks: NFDensityNetworks, params, state, action, z):
+    """RealNVP inverse: latent ``z`` → normalized flow-space ``x``.
+
+    Requires ``goal_enc_size=0`` (the goal encoder is not invertible).
+    ``state`` / ``action`` are the conditioning inputs (action ignored if
+    ``state_only``).  Un-normalize ``x`` with the train-time mean/std.
+    """
+    if nf_networks.goal_encoder_net is not None:
+        raise ValueError(
+            'nf_inverse requires goal_enc_size=0 '
+            '(goal encoder is not invertible)')
+    y = nf_networks.sa_encoder_net.apply(params['sa_encoder'], state, action)
+    return nf_networks.flow_net.apply(
+        params['nf_flow'], z, y, reverse=True)
+
+
+def nf_sample(nf_networks: NFDensityNetworks, params, state, action, key):
+    """Draw normalized flow-space samples: ``x = f^{-1}(z|cond), z~N(0,I)``."""
+    batch = int(state.shape[0])
+    z = jax.random.normal(
+        key, (batch, int(nf_networks.flow_dim)), dtype=state.dtype)
+    return nf_inverse(nf_networks, params, state, action, z)
+
+
 def _l2_ball_perturb(x, key, prob, eps):
   """Independent per-row L2-ball jitter: with prob p, add δ with ‖δ‖₂ ≤ eps."""
   key, k_dir, k_rad, k_mask = jax.random.split(key, 4)
@@ -457,6 +567,10 @@ def make_nf_density_update_fn(
     lam_lr: float = 0.0,
     task_goal_frac: float = 0.0,
     task_goal: Optional[np.ndarray] = None,
+    time_reg_eta: float = 0.0,
+    policy_network_apply=None,
+    sample_fn=None,
+    policy_goal: Optional[np.ndarray] = None,
 ):
     """Jitted update with separate grads for SA encoder, goal encoder, and NF flow.
 
@@ -487,6 +601,12 @@ def make_nf_density_update_fn(
     goal_mean / goal_std are per-dim running stats passed at call time to
     normalise goals to approximately zero mean / unit variance before the flow.
     Both are 1-D arrays of length goal_dim.  Pass zeros/ones to disable.
+
+    time_reg_eta > 0 adds η E[(log p_θ(g|s,a) − log p_old(g|s',a'))²]
+    with a' ∼ π(·|s', g_task) (stopgrad π and a').  ``g`` is the same
+    NLL goal; ``s'`` is ``batch['next_obs']``.  ``params_old`` is
+    stopgrad.  eta=0 skips the second forward.  Requires
+    policy_network_apply, sample_fn, and policy_goal.
     """
     _s_pert_prob = float(s_pert_prob)
     _s_pert_eps = float(s_pert_eps)
@@ -518,8 +638,25 @@ def make_nf_density_update_fn(
     _init_lam = jnp.array(
         max(_grad_reg_coef, 5e-4) if _do_grad_reg else 0.0,
         dtype=jnp.float32)
+    _time_reg_eta = float(time_reg_eta)
+    if _time_reg_eta < 0.0:
+        raise ValueError(
+            f'time_reg_eta must be >= 0, got {_time_reg_eta}')
+    _do_time_reg = _time_reg_eta > 0.0
+    _policy_apply = policy_network_apply
+    _policy_sample = sample_fn
+    _policy_goal_j = None
+    if _do_time_reg:
+        if (_policy_apply is None or _policy_sample is None
+                or policy_goal is None):
+            raise ValueError(
+                'time_reg_eta>0 requires policy_network_apply, sample_fn, '
+                'and policy_goal so a\' ∼ π(·|s\', g_task)')
+        _policy_goal_j = jnp.asarray(
+            policy_goal, dtype=jnp.float32).reshape(-1)
 
-    def _loss(params, batch, key, goal_mean, goal_std, lam_val):
+    def _loss(params, batch, key, goal_mean, goal_std, lam_val,
+              params_old, policy_params):
         obs    = batch['obs']
         action = batch['action']
         state  = obs[:, :obs_dim]
@@ -527,7 +664,10 @@ def make_nf_density_update_fn(
         s_pert_frac = jnp.array(0.0, dtype=state.dtype)
         s_pert_norm = jnp.array(0.0, dtype=state.dtype)
         mask_frac = jnp.array(0.0, dtype=state.dtype)
-        key, k_s, k_g, k_mask = jax.random.split(key, 4)
+        if _do_time_reg:
+            key, k_s, k_g, k_mask, k_act = jax.random.split(key, 5)
+        else:
+            key, k_s, k_g, k_mask = jax.random.split(key, 4)
 
         if _do_s_pert:
             state, s_pert_frac, s_pert_norm = _l2_ball_perturb_slice(
@@ -614,7 +754,24 @@ def make_nf_density_update_fn(
                 # Lagrangian penalty: λ · E[‖∇_s log p‖] (dual and fixed-λ).
                 grad_reg = grad_reg_lam * gnorm_mean
 
-        loss = nll + grad_reg
+        time_reg_raw = zero
+        time_reg = zero
+        if _do_time_reg:
+            next_s = batch['next_obs'][:, :obs_dim]
+            pol = jax.lax.stop_gradient(policy_params)
+            env_goal = jnp.broadcast_to(
+                _policy_goal_j[None, :],
+                (next_s.shape[0], _policy_goal_j.shape[0]))
+            next_policy_obs = jnp.concatenate([next_s, env_goal], axis=1)
+            next_dist = _policy_apply(pol, next_policy_obs)
+            next_a = jax.lax.stop_gradient(_policy_sample(next_dist, k_act))
+            log_p_old = nf_log_prob(
+                nf_networks, params_old, next_s, next_a, goal)
+            log_p_old = jax.lax.stop_gradient(log_p_old)
+            time_reg_raw = jnp.mean((log_p - log_p_old) ** 2)
+            time_reg = jnp.asarray(_time_reg_eta, dtype=nll.dtype) * time_reg_raw
+
+        loss = nll + grad_reg + time_reg
         metrics = {
             'density_loss': nll,
             'nf_total_loss': loss,
@@ -634,6 +791,11 @@ def make_nf_density_update_fn(
             's_raw_mean': s_raw_mean,
             's_mean': s_mean,
         }
+        if _do_time_reg:
+            metrics['nf_time_reg'] = time_reg
+            metrics['nf_time_reg_raw'] = time_reg_raw
+            metrics['nf_time_reg_nll_ratio'] = time_reg / (
+                jnp.abs(nll) + jnp.asarray(1e-8, dtype=nll.dtype))
         if _do_task_g_mix:
             metrics['nf_grad_reg_task_g_frac'] = task_g_frac
         return loss, metrics
@@ -641,10 +803,12 @@ def make_nf_density_update_fn(
     grad_fn = jax.value_and_grad(_loss, has_aux=True)
 
     def update(params, opt_state, batch, key, goal_mean, goal_std,
-               lam_val=None):
+               lam_val=None, params_old=None, policy_params=None):
         _lam = _init_lam if lam_val is None else lam_val
+        _p_old = params if params_old is None else params_old
+        _pol = params if policy_params is None else policy_params
         (_, metrics), grads = grad_fn(
-            params, batch, key, goal_mean, goal_std, _lam)
+            params, batch, key, goal_mean, goal_std, _lam, _p_old, _pol)
         metrics = dict(metrics)
         metrics['encoder_grad_norm'] = _tree_l2_norm(grads['sa_encoder'])
         metrics['flow_grad_norm']    = _tree_l2_norm(grads['nf_flow'])
@@ -702,6 +866,10 @@ def make_scan_nf_update_fn(
     lam_lr: float = 0.0,
     task_goal_frac: float = 0.0,
     task_goal: Optional[np.ndarray] = None,
+    time_reg_eta: float = 0.0,
+    policy_network_apply=None,
+    sample_fn=None,
+    policy_goal: Optional[np.ndarray] = None,
 ):
   """Scan-based NF updater: N density steps in one JIT call.
 
@@ -713,9 +881,15 @@ def make_scan_nf_update_fn(
   When lam_lr > 0 the dual λ step runs inside each scan step so λ is
   updated every NF gradient step (not just between PPO iters).
 
+  time_reg_eta > 0: each step uses the same ``params_old`` (caller
+  snapshot / slow EMA) and the same stopgrad policy for
+  a' ∼ π(·|s', g_task).  The time-reg EMA itself is mixed by the
+  caller once per PPO iter, not inside this scan.
+
   Returns:
     ``multi_update(params, opt_state, params_ema, batches, key,
-                   goal_mean, goal_std, lam_val=None)``
+                   goal_mean, goal_std, lam_val=None, params_old=None,
+                   policy_params=None)``
     → ``(new_params, new_opt_state, new_params_ema, new_key,
          new_lam, mean_metrics)``
   """
@@ -726,23 +900,37 @@ def make_scan_nf_update_fn(
       s_pert_lo=s_pert_lo, s_pert_hi=s_pert_hi,
       grad_reg_c=grad_reg_c, grad_reg_coef=grad_reg_coef,
       lam_lr=lam_lr,
-      task_goal_frac=task_goal_frac, task_goal=task_goal)
+      task_goal_frac=task_goal_frac, task_goal=task_goal,
+      time_reg_eta=time_reg_eta,
+      policy_network_apply=policy_network_apply,
+      sample_fn=sample_fn,
+      policy_goal=policy_goal)
   use_ema = 0.0 < float(repr_tau) < 1.0
   _tau = float(repr_tau)
   _init_lam_py = max(grad_reg_coef, 5e-4) if grad_reg_coef > 0.0 else 0.0
+  _do_time_reg = float(time_reg_eta) > 0.0
 
   @jax.jit
   def multi_update(
       params, opt_state, params_ema, batches, key, goal_mean, goal_std,
-      lam_val=None):
+      lam_val=None, params_old=None, policy_params=None):
     lam = (jnp.array(_init_lam_py, dtype=jnp.float32)
            if lam_val is None else lam_val)
+    p_old = params if params_old is None else params_old
+    pol = params if policy_params is None else policy_params
+    if _do_time_reg:
+      p_old = jax.lax.stop_gradient(p_old)
+      pol = jax.lax.stop_gradient(pol)
 
     def scan_step(carry, batch):
       p, opt, ema, k, lam = carry
       k, k_u = jax.random.split(k)
-      p, opt, lam, m = raw_update(
-          p, opt, batch, k_u, goal_mean, goal_std, lam)
+      if _do_time_reg:
+        p, opt, lam, m = raw_update(
+            p, opt, batch, k_u, goal_mean, goal_std, lam, p_old, pol)
+      else:
+        p, opt, lam, m = raw_update(
+            p, opt, batch, k_u, goal_mean, goal_std, lam)
       if use_ema:
         ema = jax.tree_util.tree_map(
             lambda t, o: _tau * t + (1.0 - _tau) * o, ema, p)

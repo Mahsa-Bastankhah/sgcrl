@@ -31,7 +31,8 @@ CSV_PATH = os.path.join(
     'logs.csv',
 )
 OUT_PATH = os.path.join(
-    REPO, 'figs', 'builderbench', 'c8t2_nf_collapse_diagnostics.png')
+    REPO, 'figs', 'builderbench', 'c8t2',
+    'c8t2_nf_collapse_diagnostics.png')
 
 LOCK_LO, LOCK_HI = 1680, 1872  # inclusive lock; collapse starts 1873
 SPIKE_ITER = 1872

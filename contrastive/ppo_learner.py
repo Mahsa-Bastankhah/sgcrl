@@ -35,6 +35,7 @@ from contrastive import config as contrastive_config
 from contrastive import networks as contrastive_networks
 from contrastive import gaussian_density as _gd
 from contrastive import nf_density as _nf
+from contrastive import nf_density_backward as _nfb
 from contrastive import fm_density as _fm
 from contrastive import td3_density as _td3
 from contrastive.utils import extract_info_reward
@@ -1136,6 +1137,27 @@ def make_kde_dirac_reward_fn(config: contrastive_config.ContrastiveConfig):
     return np.where(at_goal, -log_pg, log_rew)
 
   return reward_fn
+
+
+# Pixel CNN reward over T·E=51200 OOMs on one GPU. Chunk only when
+# ppo_bb_pixel_obs is on; non-pixel jobs stay one-shot.
+_PIXEL_REWARD_CHUNK = 4096
+
+
+def _chunked_reward_apply(fn, *batched, chunk: int):
+  """Apply ``fn`` on axis-0 slices of ``batched`` and concat.
+
+  ``chunk <= 0`` → a single call (non-pixel path).
+  """
+  n = int(batched[0].shape[0])
+  if int(chunk) <= 0 or n <= int(chunk):
+    return fn(*batched)
+  c = int(chunk)
+  parts = []
+  for i in range(0, n, c):
+    sl = slice(i, min(i + c, n))
+    parts.append(fn(*(x[sl] for x in batched)))
+  return jnp.concatenate(parts, axis=0)
 
 
 def make_value_fn(networks: contrastive_networks.ContrastiveNetworks):
@@ -2311,6 +2333,29 @@ def _save_checkpoint(path: str,
   _os.replace(tmp_path, path)
 
 
+def _save_nf_backward_checkpoint(path: str, *, iteration: int, global_step: int,
+                                 nf_bwd_params, nf_bwd_opt_state, nf_bwd_key,
+                                 nf_bwd_s_mean, nf_bwd_s_std):
+  """Lightweight sidecar pickle (params + s_goal normalizer only)."""
+  import pickle as _pkl
+  import os as _os
+
+  ckpt = {
+      'iteration': int(iteration),
+      'global_step': int(global_step),
+      'nf_backward_params': nf_bwd_params,
+      'nf_backward_opt_state': nf_bwd_opt_state,
+      'nf_backward_key': nf_bwd_key,
+      'nf_bwd_s_mean': np.asarray(nf_bwd_s_mean, dtype=np.float32),
+      'nf_bwd_s_std': np.asarray(nf_bwd_s_std, dtype=np.float32),
+  }
+  tmp_path = path + '.tmp'
+  _os.makedirs(_os.path.dirname(path) or '.', exist_ok=True)
+  with open(tmp_path, 'wb') as fh:
+    _pkl.dump(ckpt, fh, protocol=_pkl.HIGHEST_PROTOCOL)
+  _os.replace(tmp_path, path)
+
+
 def _prune_old_checkpoints(ckpt_dir: str, keep_last: int):
   """Delete oldest ckpt_iter_*.pkl until at most `keep_last` remain.
 
@@ -2500,6 +2545,26 @@ def run_ppo_training(
 
   # ---- vec env ----------------------------------------------------------
   _env_name = str(getattr(config, 'env_name', '') or '')
+  _bb_pixel = bool(getattr(config, 'ppo_bb_pixel_obs', False))
+  _bb_pixel_kw = dict(
+      bb_pixel_obs=False, bb_num_cubes=0, bb_goal_color_indices=())
+  if _bb_pixel:
+    from envs.builderbench_raster import pixel_network_kwargs as _bb_pix_kw
+    _bb_pixel_kw = _bb_pix_kw(_env_name, True)
+    print('[ppo] BB pixel obs: ON  rasterize xyz→64x64 CNN then '
+          f'policy/value/NF (num_cubes={_bb_pixel_kw["bb_num_cubes"]}, '
+          f'goal_colors={_bb_pixel_kw["bb_goal_color_indices"]})',
+          flush=True)
+    print(f'[ppo] BB pixel: chunk reward apply at {_PIXEL_REWARD_CHUNK} '
+          '(T*E CNN OOM guard)', flush=True)
+    # Rasterizer needs world xyz. Force raw obs/goals at every apply site.
+    if bool(getattr(config, 'ppo_norm_obs', False)):
+      print('[ppo] BB pixel: forcing ppo_norm_obs=False (raw xyz)', flush=True)
+      config.ppo_norm_obs = False
+    if bool(getattr(config, 'nf_normalize_goals', True)):
+      print('[ppo] BB pixel: forcing nf_normalize_goals=False (raw xyz)',
+            flush=True)
+      config.nf_normalize_goals = False
   _use_jax_bb_vec = _env_name.startswith('builderbench_')
   if _use_jax_bb_vec:
     import importlib.util as _ilu
@@ -2579,6 +2644,8 @@ def run_ppo_training(
         'ppo_reward_switch_blend_iters must be >= 0 in crl_td3_switch mode')
   density_nets    = None
   nf_density_nets = None
+  nf_bwd_nets     = None
+  use_nf_bwd      = False
   fm_density_nets = None
   td3_density_nets = None
 
@@ -2695,9 +2762,12 @@ def run_ppo_training(
         state_only=nf_state_only,
         scale_tanh=nf_scale_tanh,
         scale_tanh_c=nf_scale_tanh_c,
+        **_bb_pixel_kw,
     )
-    _goal_enc_desc = (f'goal_encoder=2x256+swish→{nf_goal_enc_size}'
-                      if nf_goal_enc_size > 0 else 'goal_encoder=none (raw goal)')
+    _goal_enc_desc = (
+        f'goal_encoder=2x256+swish→{nf_density_nets.flow_dim}'
+        if nf_density_nets.goal_encoder_net is not None
+        else 'goal_encoder=none (raw goal)')
     _cond_desc = 'p(g|s) / r(s)' if nf_state_only else 'p(g|s,a) / r(s,a)'
     print(f'[ppo] repr_mode=nf (RealNVP)  obs_dim={obs_dim_cfg}  '
           f'act_dim={act_dim_cfg}  goal_dim={goal_dim_cfg}  '
@@ -2708,6 +2778,24 @@ def run_ppo_training(
           f'normalize_goals={bool(getattr(config, "nf_normalize_goals", True))}  '
           f'scale_tanh={nf_scale_tanh}'
           f'{f"(c={nf_scale_tanh_c:g})" if nf_scale_tanh else ""}')
+    use_nf_bwd = bool(getattr(config, 'nf_train_backward', False))
+    if use_nf_bwd:
+      nf_bwd_nets = _nfb.make_nf_backward_networks(
+          goal_dim=goal_dim_cfg,
+          hidden_layer_sizes=config.hidden_layer_sizes,
+          rep_size=nf_rep_size,
+          num_blocks=nf_num_blocks,
+          channels=nf_coupling_w,
+          sa_hidden=nf_sa_hidden,
+          sa_num_layers=nf_sa_num_layers,
+          scale_tanh=nf_scale_tanh,
+          scale_tanh_c=nf_scale_tanh_c,
+      )
+      print(f'[ppo] NF backward sidecar: p(obs_to_goal(s)|s_f)  '
+            f'flow_dim={nf_bwd_nets.flow_dim}  '
+            f'(same arch; not used for PPO reward)', flush=True)
+    else:
+      print('[ppo] NF backward sidecar: OFF', flush=True)
   elif use_td3 or use_crl_td3_switch:
     _td3_bilinear = bool(getattr(config, 'ppo_td3_bilinear', False))
     td3_density_nets = _td3.make_td3_density_networks(
@@ -2768,6 +2856,13 @@ def run_ppo_training(
     print('[ppo] init: td3 density done', flush=True)
   else:
     q_params = networks.q_network.init(k_q)
+  nf_bwd_params = None
+  nf_bwd_key = None
+  if use_nf_bwd:
+    # Dedicated stream: do not split the PPO/forward-NF PRNG.
+    nf_bwd_params = _nf.init_nf_params(
+        nf_bwd_nets, jax.random.fold_in(jax.random.PRNGKey(int(seed)), 0xB4C5))
+    nf_bwd_key = jax.random.fold_in(jax.random.PRNGKey(int(seed)), 0xB4C4)
   hybrid_td3_params = None
   if use_crl_td3_switch:
     key, k_hybrid_td3 = jax.random.split(key)
@@ -2838,6 +2933,19 @@ def run_ppo_training(
   else:
     q_opt_state = q_optimizer.init(q_params)
   print('[ppo] init: q_opt done', flush=True)
+  nf_bwd_optimizer = None
+  nf_bwd_opt_state = None
+  if use_nf_bwd:
+    nf_bwd_optimizer = _nf.make_nf_optimizers(
+        encoder_lr=float(getattr(config, 'nf_encoder_lr', 3e-4)),
+        critic_lr=float(getattr(config, 'nf_critic_lr', 1e-4)),
+        critic_weight_decay=float(getattr(config, 'nf_critic_weight_decay', 1e-6)),
+        grad_clip=float(getattr(config, 'nf_grad_clip', 1.0)),
+        has_goal_encoder=False,
+    )
+    nf_bwd_opt_state = nf_bwd_optimizer.init(nf_bwd_params)
+    print('[ppo] NF backward optimizer: same Adam/AdamW lrs as forward',
+          flush=True)
   hybrid_td3_opt_state = None
   if use_crl_td3_switch:
     hybrid_td3_opt_state = q_optimizer.init(
@@ -2877,6 +2985,9 @@ def run_ppo_training(
   use_nf_td = use_nf and bool(getattr(config, 'ppo_nf_td', False))
   nf_td_target = _tree_copy(q_params) if use_nf_td else None
   nf_scan_td_update = None
+  nf_time_ema = None
+  _nf_tr_eta = 0.0
+  _nf_tr_tau = 0.99
   _hybrid_td3_reward_tau = float(
       getattr(config, 'ppo_td3_reward_tau', 0.0))
   _use_hybrid_td3_reward_ema = (
@@ -2931,6 +3042,13 @@ def run_ppo_training(
         nf_td_target = _extra['nf_td_target']
       elif use_nf_td:
         nf_td_target = _tree_copy(q_params)
+      if use_nf_bwd and 'nf_backward_params' in _extra:
+        nf_bwd_params = _extra['nf_backward_params']
+        if 'nf_backward_opt_state' in _extra:
+          nf_bwd_opt_state = _extra['nf_backward_opt_state']
+        if 'nf_backward_key' in _extra:
+          nf_bwd_key = _extra['nf_backward_key']
+        print('[ppo] resumed NF backward sidecar params', flush=True)
       if norm_obs and 'obs_rms' in _extra:
         _obs_state = _extra['obs_rms']
         obs_rms.mean = np.asarray(
@@ -3167,6 +3285,50 @@ def run_ppo_training(
     if not (0.0 <= _nf_mask_prob <= 1.0):
       raise ValueError(
           f'nf_mask_prob must be in [0, 1], got {_nf_mask_prob}')
+    _nf_tr_eta = float(getattr(config, 'ppo_nf_time_reg_eta', 0.0))
+    if _nf_tr_eta < 0.0:
+      raise ValueError(
+          f'ppo_nf_time_reg_eta must be >= 0, got {_nf_tr_eta}')
+    _nf_tr_target = str(
+        getattr(config, 'ppo_nf_time_reg_target', 'iter')).strip().lower()
+    if _nf_tr_eta > 0.0 and _nf_tr_target not in ('iter', 'ema'):
+      raise ValueError(
+          'ppo_nf_time_reg_target must be "iter" or "ema", '
+          f'got {_nf_tr_target!r}')
+    _nf_tr_tau = float(getattr(config, 'ppo_nf_time_reg_ema_tau', 0.99))
+    if _nf_tr_eta > 0.0 and _nf_tr_target == 'ema':
+      if not (0.0 < _nf_tr_tau < 1.0):
+        raise ValueError(
+            'ppo_nf_time_reg_ema_tau must be in (0, 1) when target=ema, '
+            f'got {_nf_tr_tau}')
+      _tr_ckpt = (_resume_extra or {}).get('nf_time_ema')
+      nf_time_ema = (
+          _tr_ckpt if _tr_ckpt is not None else _tree_copy(q_params))
+    _nf_tr_policy_apply = None
+    _nf_tr_sample_fn = None
+    _nf_tr_policy_goal = None
+    if _nf_tr_eta > 0.0:
+      if (builderbench_kwargs
+          and builderbench_kwargs.get('fixed_target_goal') is not None):
+        _nf_tr_policy_goal = np.asarray(
+            builderbench_kwargs['fixed_target_goal'],
+            dtype=np.float32).reshape(-1)
+      elif fixed_start_end is not None:
+        fse = fixed_start_end
+        if (isinstance(fse, (list, tuple)) and len(fse) == 2
+            and not isinstance(fse[0], (int, float, np.floating))):
+          _nf_tr_policy_goal = np.asarray(
+              fse[1], dtype=np.float32).reshape(-1)
+        else:
+          _nf_tr_policy_goal = np.asarray(
+              fse, dtype=np.float32).reshape(-1)
+      if _nf_tr_policy_goal is None:
+        raise ValueError(
+            'ppo_nf_time_reg_eta>0 requires a fixed task goal for '
+            "a'∼π(·|s', g_task) (builderbench fixed_target_goal / "
+            'fixed_start_end)')
+      _nf_tr_policy_apply = networks.policy_network.apply
+      _nf_tr_sample_fn = networks.sample
     crl_update = _nf.make_nf_density_update_fn(
         nf_density_nets, q_optimizer, obs_dim=int(config.obs_dim),
         noise_std=float(getattr(config, 'nf_noise_std', 0.0)),
@@ -3174,7 +3336,11 @@ def run_ppo_training(
         s_pert_prob=_nf_s_p, s_pert_eps=_nf_s_eps,
         s_pert_lo=_nf_s_lo, s_pert_hi=_nf_s_hi,
         grad_reg_c=_nf_gr_c, grad_reg_coef=_nf_gr_coef,
-        task_goal_frac=_nf_task_g_frac, task_goal=_nf_task_goal)
+        task_goal_frac=_nf_task_g_frac, task_goal=_nf_task_goal,
+        time_reg_eta=_nf_tr_eta,
+        policy_network_apply=_nf_tr_policy_apply,
+        sample_fn=_nf_tr_sample_fn,
+        policy_goal=_nf_tr_policy_goal)
     # Pre-sample N batches → one H→D transfer → one scanned JIT (like CRL).
     # lam_lr > 0 enables dual (primal-dual) λ updates inside the scan.
     # <0 config → auto 100× flow lr; 0 → fixed λ (no dual).
@@ -3195,7 +3361,11 @@ def run_ppo_training(
         s_pert_lo=_nf_s_lo, s_pert_hi=_nf_s_hi,
         grad_reg_c=_nf_gr_c, grad_reg_coef=_nf_gr_coef,
         lam_lr=_nf_lam_lr,
-        task_goal_frac=_nf_task_g_frac, task_goal=_nf_task_goal)
+        task_goal_frac=_nf_task_g_frac, task_goal=_nf_task_goal,
+        time_reg_eta=_nf_tr_eta,
+        policy_network_apply=_nf_tr_policy_apply,
+        sample_fn=_nf_tr_sample_fn,
+        policy_goal=_nf_tr_policy_goal)
     if _nf_s_p > 0.0 and _nf_s_eps > 0.0:
       if _nf_is_bb:
         print(f'[ppo] NF s perturb: prob={_nf_s_p}  eps={_nf_s_eps}  '
@@ -3213,6 +3383,17 @@ def run_ppo_training(
           f'λ_init={_nf_gr_coef}  '
           f'lam_lr={_nf_lam_lr}'
           f'{" (dual)" if _nf_lam_lr > 0.0 else " (fixed λ)"}')
+    if _nf_tr_eta > 0.0:
+      if _nf_tr_target == 'ema':
+        print(f'[ppo] NF time-reg: eta={_nf_tr_eta} target=ema '
+              f'tau={_nf_tr_tau} (mix once per PPO iter)  '
+              f"a'∼π(·|s', g_task) stopgrad",
+              flush=True)
+      else:
+        print(f'[ppo] NF time-reg: eta={_nf_tr_eta} target=iter '
+              f'(p_old = θ at start of PPO iter)  '
+              f"a'∼π(·|s', g_task) stopgrad",
+              flush=True)
     if _nf_task_g_frac > 0.0:
       print(f'[ppo] NF ∇_s log p task-g mix: frac={_nf_task_g_frac}  '
             f'(regularizer only; NLL still uses replay g)',
@@ -3322,6 +3503,17 @@ def run_ppo_training(
     else:
       print('[ppo] NF reward mode: forward  r=log_p', flush=True)
     print('[ppo] NF density updates: jax.lax.scan multi-step', flush=True)
+    nf_bwd_scan_update = None
+    if use_nf_bwd:
+      nf_bwd_scan_update = _nfb.make_scan_nf_backward_update_fn(
+          nf_bwd_nets, nf_bwd_optimizer,
+          obs_dim=int(config.obs_dim),
+          start_index=int(config.start_index),
+          end_index=int(config.end_index),
+          goal_state_indices=_goal_state_indices,
+          noise_std=float(getattr(config, 'nf_noise_std', 0.0)))
+      print('[ppo] NF backward updates: jax.lax.scan on same batches '
+            '(NLL p(s_goal|s_f); dedicated PRNG)', flush=True)
   elif use_td3:
     _td3_tau_cfg = float(getattr(config, 'ppo_td3_tau', -1.0))
     _td3_tau = (_td3_tau_cfg if _td3_tau_cfg >= 0.0
@@ -3929,7 +4121,10 @@ def run_ppo_training(
   # Updated from replay buffer each iteration; broadcast-compatible with goals.
   nf_goal_mean = np.zeros(goal_dim_cfg, dtype=np.float32)
   nf_goal_std  = np.ones(goal_dim_cfg,  dtype=np.float32)
-  _nf_normalize_goals = bool(getattr(config, 'nf_normalize_goals', True))
+  nf_bwd_s_mean = np.zeros(goal_dim_cfg, dtype=np.float32)
+  nf_bwd_s_std  = np.ones(goal_dim_cfg,  dtype=np.float32)
+  _nf_normalize_goals = (
+      bool(getattr(config, 'nf_normalize_goals', True)) and not _bb_pixel)
   _nf_zero_mean_j = jnp.zeros((goal_dim_cfg,), dtype=jnp.float32)
   _nf_unit_std_j = jnp.ones((goal_dim_cfg,), dtype=jnp.float32)
 
@@ -3937,6 +4132,11 @@ def run_ppo_training(
     """Stats actually fed to the flow (identity if normalisation is off)."""
     if _nf_normalize_goals:
       return jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std)
+    return _nf_zero_mean_j, _nf_unit_std_j
+
+  def _nf_apply_bwd_s_stats():
+    if _nf_normalize_goals:
+      return jnp.asarray(nf_bwd_s_mean), jnp.asarray(nf_bwd_s_std)
     return _nf_zero_mean_j, _nf_unit_std_j
 
   if use_nf:
@@ -3951,6 +4151,10 @@ def run_ppo_training(
       print('[ppo] NF goal stats: mix batch_size replay s_f + '
             f'batch_size copies of env task goal '
             f'(batch_size={int(config.batch_size)})', flush=True)
+    if use_nf_bwd:
+      print('[ppo] NF backward s_goal norm: same on/off as forward, '
+            'stats from obs_to_goal(s) on the same replay sample',
+            flush=True)
 
   obs = vec_env.reset()
   next_done = np.zeros(E, dtype=np.float32)
@@ -4031,6 +4235,12 @@ def run_ppo_training(
       else:
         print('[ppo] replay in checkpoint is incompatible with this config; '
               'starting from an empty buffer')
+    if use_nf_bwd and 'nf_bwd_s_mean' in _resume_extra:
+      nf_bwd_s_mean = np.asarray(
+          _resume_extra['nf_bwd_s_mean'], dtype=np.float32).reshape(-1)
+      nf_bwd_s_std = np.asarray(
+          _resume_extra['nf_bwd_s_std'], dtype=np.float32).reshape(-1)
+      print('[ppo] resumed NF backward s_goal normalizer', flush=True)
     _resume_extra = {}
   # One-shot reset when NF first activates; already consumed in the run that
   # wrote the checkpoint, so re-firing it would discard the restored std.
@@ -4055,6 +4265,24 @@ def run_ppo_training(
                        f'replay transitions')
     print(f'[ppo] checkpoints → {checkpoint_dir} '
           f'(every {ckpt_interval} iters, {keep_msg}, {replay_msg})')
+  nf_bwd_ckpt_dir = None
+  nf_bwd_ckpt_interval = 0
+  if use_nf_bwd and checkpoint_dir is not None:
+    _bwd_iv = int(getattr(config, 'nf_backward_checkpoint_interval', 0))
+    if _bwd_iv < 0:
+      nf_bwd_ckpt_interval = 0
+    elif _bwd_iv == 0:
+      nf_bwd_ckpt_interval = (
+          max(1, ckpt_interval // 2) if ckpt_interval > 0 else 0)
+    else:
+      nf_bwd_ckpt_interval = _bwd_iv
+    if nf_bwd_ckpt_interval > 0:
+      nf_bwd_ckpt_dir = os.path.join(checkpoint_dir, 'nf_bwd')
+      os.makedirs(nf_bwd_ckpt_dir, exist_ok=True)
+      print(f'[ppo] NF backward checkpoints → {nf_bwd_ckpt_dir} '
+            f'(every {nf_bwd_ckpt_interval} iters, '
+            f'{ckpt_interval / nf_bwd_ckpt_interval:.1f}× main cadence)',
+            flush=True)
 
   start_time = time.time()
   # global_step, ppo_sgd_step, start_iteration set above (0 for fresh runs,
@@ -4370,37 +4598,55 @@ def run_ppo_training(
         _flat_acts_j = jnp.asarray(roll_acts.reshape(T * E, -1))
       if use_nf:
         _gmean_j, _gstd_j = _nf_apply_goal_stats()
-        _rew_flat_j = nf_reward_fn(
-            _reward_q_params(), _flat_obs_j, _flat_acts_j,
-            _gmean_j, _gstd_j)
+        _rew_flat_j = _chunked_reward_apply(
+            lambda o, a: nf_reward_fn(
+                _reward_q_params(), o, a, _gmean_j, _gstd_j),
+            _flat_obs_j, _flat_acts_j,
+            chunk=(_PIXEL_REWARD_CHUNK if _bb_pixel else 0))
       elif use_gaussian:
-        _rew_flat_j = gaussian_reward_fn(
-            _reward_q_params(), _flat_obs_j, _flat_acts_j)
+        _rew_flat_j = _chunked_reward_apply(
+            lambda o, a: gaussian_reward_fn(_reward_q_params(), o, a),
+            _flat_obs_j, _flat_acts_j,
+            chunk=(_PIXEL_REWARD_CHUNK if _bb_pixel else 0))
       elif use_fm:
         _fm_mode = (
             getattr(config, 'fm_logp_mode', 'exact') or 'exact').strip().lower()
         if 'hutch' in _fm_mode:
           key, k_fm_rew = jax.random.split(key)
-          _rew_flat_j = fm_reward_fn(
-              _reward_q_params(), _flat_obs_j, _flat_acts_j, k_fm_rew)
+          _rew_flat_j = _chunked_reward_apply(
+              lambda o, a: fm_reward_fn(
+                  _reward_q_params(), o, a, k_fm_rew),
+              _flat_obs_j, _flat_acts_j,
+              chunk=(_PIXEL_REWARD_CHUNK if _bb_pixel else 0))
         else:
-          _rew_flat_j = fm_reward_fn(
-              _reward_q_params(), _flat_obs_j, _flat_acts_j)
+          _rew_flat_j = _chunked_reward_apply(
+              lambda o, a: fm_reward_fn(_reward_q_params(), o, a),
+              _flat_obs_j, _flat_acts_j,
+              chunk=(_PIXEL_REWARD_CHUNK if _bb_pixel else 0))
       elif use_td3:
-        _rew_flat_j = td3_reward_fn(
-            _reward_q_params(), _flat_obs_j, _flat_acts_j,
-            iter_obs_mean_j, iter_obs_var_j)
+        _rew_flat_j = _chunked_reward_apply(
+            lambda o, a: td3_reward_fn(
+                _reward_q_params(), o, a,
+                iter_obs_mean_j, iter_obs_var_j),
+            _flat_obs_j, _flat_acts_j,
+            chunk=(_PIXEL_REWARD_CHUNK if _bb_pixel else 0))
       elif use_crl_td3_switch and _reward_uses_td3_this_iter:
-        _rew_td3_j = hybrid_td3_reward_fn(
-            _hybrid_reward_td3_params(), _flat_obs_j, _flat_acts_j,
-            iter_obs_mean_j, iter_obs_var_j)
+        _rew_td3_j = _chunked_reward_apply(
+            lambda o, a: hybrid_td3_reward_fn(
+                _hybrid_reward_td3_params(), o, a,
+                iter_obs_mean_j, iter_obs_var_j),
+            _flat_obs_j, _flat_acts_j,
+            chunk=(_PIXEL_REWARD_CHUNK if _bb_pixel else 0))
         if _reward_td3_weight >= 1.0 - 1e-8:
           _rew_flat_j = _rew_td3_j
         else:
           # Still mix in (frozen) CRL reward during the blend window.
-          _rew_crl_j = reward_fn(
-              _reward_q_params(), _flat_obs_j, _flat_acts_j,
-              iter_obs_mean_j, iter_obs_var_j)
+          _rew_crl_j = _chunked_reward_apply(
+              lambda o, a: reward_fn(
+                  _reward_q_params(), o, a,
+                  iter_obs_mean_j, iter_obs_var_j),
+              _flat_obs_j, _flat_acts_j,
+              chunk=(_PIXEL_REWARD_CHUNK if _bb_pixel else 0))
           _w = float(_reward_td3_weight)
           _rew_flat_j = (1.0 - _w) * _rew_crl_j + _w * _rew_td3_j
       elif use_dirac_target:
@@ -4408,13 +4654,19 @@ def run_ppo_training(
           _flat_s0_j = jnp.reshape(rollout_j['s0_states'], (T * E, -1))
         else:
           _flat_s0_j = jnp.asarray(roll_s0_states.reshape(T * E, -1))
-        _rew_flat_j = reward_fn(
-            _reward_q_params(), _flat_obs_j, _flat_acts_j, _flat_s0_j)
+        _rew_flat_j = _chunked_reward_apply(
+            lambda o, a, s0: reward_fn(
+                _reward_q_params(), o, a, s0),
+            _flat_obs_j, _flat_acts_j, _flat_s0_j,
+            chunk=(_PIXEL_REWARD_CHUNK if _bb_pixel else 0))
       else:
         # Default CRL: r = φ(s,a)·ψ(g)
-        _rew_flat_j = reward_fn(
-            _reward_q_params(), _flat_obs_j, _flat_acts_j,
-            iter_obs_mean_j, iter_obs_var_j)
+        _rew_flat_j = _chunked_reward_apply(
+            lambda o, a: reward_fn(
+                _reward_q_params(), o, a,
+                iter_obs_mean_j, iter_obs_var_j),
+            _flat_obs_j, _flat_acts_j,
+            chunk=(_PIXEL_REWARD_CHUNK if _bb_pixel else 0))
       # ReturnNormalizer is stateful NumPy — one small (T·E,) D2H only.
       roll_rew_raw[:] = np.asarray(_rew_flat_j, dtype=np.float32).reshape(T, E)
 
@@ -4695,28 +4947,31 @@ def run_ppo_training(
           if not _kl_adapt_epoch:
             _adapt_kl_beta(_mb_analytic)
           epoch_mb_beta.append(_kl_beta)
-      if _rolled_back:
+        if _trip and _es_this_iter and (not _kl_rollback):
+          # Keep this minibatch update; stop remaining minibatches/epochs.
+          early_stop = True
+          _es_epoch = int(epoch)
+          _es_mb_approx = epoch_mb_approx
+          _es_mb_analytic = epoch_mb_analytic
+          _es_mb_beta = epoch_mb_beta
+          _approx_s = ', '.join(f'{x:.6g}' for x in _es_mb_approx)
+          print(f'[ppo] target_kl early-stop iter={iteration} '
+                f'epoch={epoch}/{_n_epochs - 1} mb={mb_i}/{_n_mb - 1} '
+                f'threshold={_target_kl:g} approx_kl={_mb_approx:.6g} '
+                f'mb_approx_kl=[{_approx_s}]',
+                flush=True)
+          if _kl_penalty_on:
+            _an_s = ', '.join(f'{x:.6g}' for x in _es_mb_analytic)
+            _b_s = ', '.join(f'{x:.6g}' for x in _es_mb_beta)
+            print(f'[ppo]   mb_analytic_kl=[{_an_s}]', flush=True)
+            print(f'[ppo]   mb_beta_after=[{_b_s}]', flush=True)
+          if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic:
+            _adapt_kl_beta(float(np.mean(epoch_mb_analytic)))
+          break
+      if _rolled_back or early_stop:
         break
       if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic:
         _adapt_kl_beta(float(np.mean(epoch_mb_analytic)))
-      if _es_this_iter and (not _kl_rollback) and epoch_kl_max > _target_kl:
-        early_stop = True
-        _es_epoch = int(epoch)
-        _es_mb_approx = epoch_mb_approx
-        _es_mb_analytic = epoch_mb_analytic
-        _es_mb_beta = epoch_mb_beta
-        _approx_s = ', '.join(f'{x:.6g}' for x in _es_mb_approx)
-        print(f'[ppo] target_kl early-stop iter={iteration} '
-              f'epoch={epoch}/{_n_epochs - 1} '
-              f'threshold={_target_kl:g} max={epoch_kl_max:.6g} '
-              f'mb_approx_kl=[{_approx_s}]',
-              flush=True)
-        if _kl_penalty_on:
-          _an_s = ', '.join(f'{x:.6g}' for x in _es_mb_analytic)
-          _b_s = ', '.join(f'{x:.6g}' for x in _es_mb_beta)
-          print(f'[ppo]   mb_analytic_kl=[{_an_s}]', flush=True)
-          print(f'[ppo]   mb_beta_after=[{_b_s}]', flush=True)
-        break
 
     if _kl_es_cooldown > 0:
       _kl_es_cooldown -= 1
@@ -4749,6 +5004,7 @@ def run_ppo_training(
     # 4. CRL updates (off-policy, from replay)
     # =================================================================
     crl_metrics_agg: Dict[str, list] = {}
+    nfb_metrics_agg: Dict[str, list] = {}
     hybrid_td3_metrics_agg: Dict[str, list] = {}
     if replay.size >= int(config.ppo_min_replay_size):
       # Update goal normalisation stats from a fresh replay sample (NF only).
@@ -4800,6 +5056,18 @@ def run_ppo_training(
         for _di, (_gm, _gs) in enumerate(zip(nf_goal_mean, nf_goal_std)):
           _nf_stat_log[f'nf/goal_mean_{_di}'] = float(_gm)
           _nf_stat_log[f'nf/goal_std_{_di}']  = float(_gs)
+        if use_nf_bwd:
+          _s_goal = _nfb.state_as_goal(
+              _stat_batch['obs'][:, :int(config.obs_dim)],
+              int(config.start_index), int(config.end_index),
+              _goal_state_indices)
+          nf_bwd_s_mean = _s_goal.mean(axis=0).astype(np.float32)
+          nf_bwd_s_std = np.maximum(
+              _s_goal.std(axis=0).astype(np.float32), _std_floor
+          ).astype(np.float32)
+          for _di, (_sm, _ss) in enumerate(zip(nf_bwd_s_mean, nf_bwd_s_std)):
+            _nf_stat_log[f'nfb/s_mean_{_di}'] = float(_sm)
+            _nf_stat_log[f'nfb/s_std_{_di}'] = float(_ss)
 
       _n_crl = int(config.ppo_crl_steps_per_iter)
       # Frozen-reward / stationary φ·ψ sets crl_steps=0: skip updates. The
@@ -4871,14 +5139,30 @@ def run_ppo_training(
               _gmean_j, _gstd_j,
               ppo_params['policy'])
         else:
-          (q_params, q_opt_state, q_params_reward,
-           key, _gr_lam_j, m) = nf_scan_update(
+          _nf_scan_args = (
               q_params, q_opt_state, q_params_reward, _stacked, key,
               _gmean_j, _gstd_j,
               jnp.array(_gr_lam, dtype=jnp.float32))
+          if _nf_tr_eta > 0.0:
+            _p_old = nf_time_ema if nf_time_ema is not None else q_params
+            (q_params, q_opt_state, q_params_reward,
+             key, _gr_lam_j, m) = nf_scan_update(
+                 *_nf_scan_args, _p_old, ppo_params['policy'])
+            if nf_time_ema is not None:
+              nf_time_ema = _ema_tree(nf_time_ema, q_params, _nf_tr_tau)
+          else:
+            (q_params, q_opt_state, q_params_reward,
+             key, _gr_lam_j, m) = nf_scan_update(*_nf_scan_args)
           # Dual mode: λ updated inside scan; keep Python float for next iter.
           _gr_lam = float(_gr_lam_j)
         crl_metrics_agg = {k_: [float(v)] for k_, v in m.items()}
+        if use_nf_bwd:
+          _smean_j, _sstd_j = _nf_apply_bwd_s_stats()
+          (nf_bwd_params, nf_bwd_opt_state,
+           nf_bwd_key, m_bwd) = nf_bwd_scan_update(
+              nf_bwd_params, nf_bwd_opt_state, _stacked, nf_bwd_key,
+              _smean_j, _sstd_j)
+          nfb_metrics_agg = {k_: [float(v)] for k_, v in m_bwd.items()}
       elif use_td3:
         _samples = [
             (replay.sample_with_uniform_negatives(
@@ -5128,6 +5412,10 @@ def run_ppo_training(
         log['nf/nf_mask_frac'] = float('nan')
       if float(getattr(config, 'ppo_nf_grad_reg_task_g_frac', 0.0)) > 0.0:
         log['nf/nf_grad_reg_task_g_frac'] = float('nan')
+      if float(getattr(config, 'ppo_nf_time_reg_eta', 0.0)) > 0.0:
+        log['nf/nf_time_reg'] = float('nan')
+        log['nf/nf_time_reg_raw'] = float('nan')
+        log['nf/nf_time_reg_nll_ratio'] = float('nan')
       if nf_density_nets.goal_encoder_net is not None:
         log['nf/goal_enc_grad_norm'] = float('nan')
       if bool(getattr(config, 'nf_scale_tanh', False)):
@@ -5136,6 +5424,21 @@ def run_ppo_training(
       for _di in range(goal_dim_cfg):
         log[f'nf/goal_mean_{_di}'] = float('nan')
         log[f'nf/goal_std_{_di}']  = float('nan')
+      if use_nf_bwd:
+        log.update({
+            'nfb/density_loss': float('nan'),
+            'nfb/log_p_mean': float('nan'),
+            'nfb/log_p_min': float('nan'),
+            'nfb/log_p_max': float('nan'),
+            'nfb/flow_grad_norm': float('nan'),
+            'nfb/encoder_grad_norm': float('nan'),
+            'nfb/repr_norm': float('nan'),
+            'nfb/update_skipped_nonfinite': float('nan'),
+            'nfb/update_steps': 0,
+        })
+        for _di in range(goal_dim_cfg):
+          log[f'nfb/s_mean_{_di}'] = float('nan')
+          log[f'nfb/s_std_{_di}'] = float('nan')
     elif not (use_gaussian or use_fm or use_td3 or use_td_infonce):
       log.update({
           'crl/crl_loss': float('nan'),
@@ -5223,6 +5526,16 @@ def run_ppo_training(
       # Scan path stores mean metrics (len=1); report configured step count.
       log['nf/update_steps'] = (
           int(config.ppo_crl_steps_per_iter) if crl_metrics_agg else 0)
+      if use_nf_bwd:
+        _nfb_skip = set()
+        if not bool(getattr(config, 'nf_scale_tanh', False)):
+          _nfb_skip.update(('s_raw_mean', 's_mean'))
+        for k_, vs in nfb_metrics_agg.items():
+          if k_ in _nfb_skip:
+            continue
+          log[f'nfb/{k_}'] = float(np.mean(vs))
+        log['nfb/update_steps'] = (
+            int(config.ppo_crl_steps_per_iter) if nfb_metrics_agg else 0)
     elif use_td3:
       _put_metrics(crl_metrics_agg, 'td3')
       log['td3/update_steps'] = (
@@ -5529,6 +5842,16 @@ def run_ppo_training(
         _checkpoint_extra['td_infonce_target_q'] = td_infonce_target_q
       if use_nf_td:
         _checkpoint_extra['nf_td_target'] = nf_td_target
+      if nf_time_ema is not None:
+        _checkpoint_extra['nf_time_ema'] = nf_time_ema
+      if use_nf_bwd:
+        _checkpoint_extra['nf_backward_params'] = nf_bwd_params
+        _checkpoint_extra['nf_backward_opt_state'] = nf_bwd_opt_state
+        _checkpoint_extra['nf_backward_key'] = nf_bwd_key
+        _checkpoint_extra['nf_bwd_s_mean'] = np.asarray(
+            nf_bwd_s_mean, dtype=np.float32)
+        _checkpoint_extra['nf_bwd_s_std'] = np.asarray(
+            nf_bwd_s_std, dtype=np.float32)
       if reward_normalizer is not None:
         _checkpoint_extra['reward_normalizer'] = reward_normalizer.state_dict()
       ckpt_kw = dict(
@@ -5553,6 +5876,30 @@ def run_ppo_training(
             _checkpoint_extra, replay=_replay_state)
       _save_checkpoint(os.path.join(checkpoint_dir, 'latest.pkl'), **ckpt_kw)
       _prune_old_checkpoints(checkpoint_dir, ckpt_keep_last)
+
+    if (use_nf_bwd
+        and nf_bwd_ckpt_dir is not None
+        and nf_bwd_ckpt_interval > 0
+        and (iteration % nf_bwd_ckpt_interval == 0
+             or iteration == num_iterations - 1)):
+      _save_nf_backward_checkpoint(
+          os.path.join(nf_bwd_ckpt_dir, f'ckpt_iter_{iteration:07d}.pkl'),
+          iteration=iteration,
+          global_step=global_step,
+          nf_bwd_params=nf_bwd_params,
+          nf_bwd_opt_state=nf_bwd_opt_state,
+          nf_bwd_key=nf_bwd_key,
+          nf_bwd_s_mean=nf_bwd_s_mean,
+          nf_bwd_s_std=nf_bwd_s_std)
+      _save_nf_backward_checkpoint(
+          os.path.join(nf_bwd_ckpt_dir, 'latest.pkl'),
+          iteration=iteration,
+          global_step=global_step,
+          nf_bwd_params=nf_bwd_params,
+          nf_bwd_opt_state=nf_bwd_opt_state,
+          nf_bwd_key=nf_bwd_key,
+          nf_bwd_s_mean=nf_bwd_s_mean,
+          nf_bwd_s_std=nf_bwd_s_std)
 
   # ---- return final state in case the caller wants to checkpoint --------
   return PPOTrainingState(

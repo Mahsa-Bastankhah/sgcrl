@@ -71,6 +71,7 @@ _crl_spec.loader.exec_module(_crl)
 _render_reward_strip = _crl._render_reward_strip
 _render_grad_norm_strip = _crl._render_grad_norm_strip
 _render_policy_loc_scale_strip = _crl._render_policy_loc_scale_strip
+_render_timeseries_strip = _crl._render_timeseries_strip
 _render_gae_strip = _crl._render_gae_strip
 _render_select_strip = _crl._render_select_strip
 _render_pos_delta_strip = _crl._render_pos_delta_strip
@@ -252,16 +253,32 @@ def make_policy_loc_scale_fn(networks):
   Cat-waypoint actor: mode-cube ``[xyz, yaw]`` (4-D). Shared-head actor:
   all continuous dims.
   """
+  diag_fn = make_policy_diag_fn(networks)
+
+  @jax.jit
+  def _fn(policy_params, packed_t):
+    loc, scale, _ent = diag_fn(policy_params, packed_t)
+    return loc, scale
+
+  return _fn
+
+
+def make_policy_diag_fn(networks):
+  """Pre-tanh loc/scale plus categorical-select entropy at each packed (s,g)."""
 
   def _one(policy_params, packed):
     dist = networks.policy_network.apply(policy_params, packed[None])
     loc, scale = ppo_learner._policy_normal_loc_scale(dist)
-    return loc[0], scale[0]
+    if getattr(dist, 'hybrid_select', False):
+      ent = jnp.reshape(dist.categorical_dist.entropy(), ())
+    else:
+      ent = jnp.zeros((), dtype=loc.dtype)
+    return loc[0], scale[0], ent
 
   @jax.jit
   def _fn(policy_params, packed_t):
-    loc, scale = jax.vmap(lambda p: _one(policy_params, p))(packed_t)
-    return loc, scale
+    loc, scale, ent = jax.vmap(lambda p: _one(policy_params, p))(packed_t)
+    return loc, scale, ent
 
   return _fn
 
@@ -385,6 +402,11 @@ def _parse_args():
   p.add_argument('--show_policy_loc_scale', action='store_true',
                  help='Add pre-tanh policy σ mean/min and mean |μ| strip '
                       '(mode-cube xyz+yaw for cat-waypoint actors)')
+  p.add_argument('--show_policy_std', action='store_true',
+                 help='Add mean pre-tanh Gaussian σ over the episode')
+  p.add_argument('--show_select_entropy', action='store_true',
+                 help='Add categorical-select entropy H(π_select) over the '
+                      'episode (nats; dashed line is log n_cubes)')
   p.add_argument('--show_gae', action='store_true',
                  help='Add raw GAE A_t from return-std NF reward + extrew '
                       'and V (no minibatch advantage-norm)')
@@ -432,8 +454,11 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
   gstd = jnp.asarray(goal_std)
   show_grad = bool(args.show_logp_grad)
   show_pol = bool(args.show_policy_loc_scale)
+  show_std = bool(args.show_policy_std)
+  show_sel_ent = bool(args.show_select_entropy)
   show_gae = bool(args.show_gae)
-  loc_scale_fn = make_policy_loc_scale_fn(networks) if show_pol else None
+  need_diag = show_pol or show_std or show_sel_ent
+  diag_fn = make_policy_diag_fn(networks) if need_diag else None
   value_fn = make_value_fn(networks) if show_gae else None
   ret_std = (
       _frozen_return_norm_std(ckpt, run_dir, iteration)
@@ -505,18 +530,21 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
     loc_abs = np.zeros(len(packed), dtype=np.float32)
     scale_mean = np.zeros(len(packed), dtype=np.float32)
     scale_min = np.zeros(len(packed), dtype=np.float32)
-    if show_pol:
-      loc_t, scale_t = loc_scale_fn(
+    select_ent = np.zeros(len(packed), dtype=np.float32)
+    if need_diag:
+      loc_t, scale_t, ent_t = diag_fn(
           ckpt['policy_params'], jnp.asarray(packed))
       loc_np = np.asarray(loc_t, dtype=np.float32)
       scale_np = np.asarray(scale_t, dtype=np.float32)
       loc_abs = np.mean(np.abs(loc_np), axis=-1)
       scale_mean = np.mean(scale_np, axis=-1)
       scale_min = np.min(scale_np, axis=-1)
+      select_ent = np.asarray(ent_t, dtype=np.float32).reshape(-1)
       print(f'[vid] policy σ mean range=[{scale_mean.min():.4g},'
             f'{scale_mean.max():.4g}] σ min range=[{scale_min.min():.4g},'
             f'{scale_min.max():.4g}] |μ| mean range=[{loc_abs.min():.4g},'
-            f'{loc_abs.max():.4g}]', flush=True)
+            f'{loc_abs.max():.4g}] select H range=[{select_ent.min():.4g},'
+            f'{select_ent.max():.4g}]', flush=True)
     ppo_r = np.zeros(len(packed), dtype=np.float32)
     values = np.zeros(len(packed), dtype=np.float32)
     adv = np.zeros(len(packed), dtype=np.float32)
@@ -559,11 +587,12 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
     header = ('t,reward_logp_online,success,dist,select_action,select_cube,'
               'pos_delta_sum,grad_s_norm,grad_a_norm,'
               'policy_scale_mean,policy_scale_min,policy_loc_abs_mean,'
-              'ppo_reward,value,gae_advantage')
+              'select_entropy,ppo_reward,value,gae_advantage')
     csv_cols.extend([
         scale_mean.astype(np.float32),
         scale_min.astype(np.float32),
         loc_abs.astype(np.float32),
+        select_ent.astype(np.float32),
         ppo_r.astype(np.float32),
         values.astype(np.float32),
         adv.astype(np.float32),
@@ -630,12 +659,31 @@ def _render_one(args, *, label, ckpt_path, ctx, networks, nf_nets, env,
       if show_pol:
         extra.append(_render_policy_loc_scale_strip(
             scale_mean, scale_min, loc_abs, success, t,
-            width=width, height=220,
-            title=rf'policy $\mu,\sigma$ (mode-cube xyz+yaw)  ·  {tag}'))
+            width=width, height=240,
+            title=rf'policy $\mu,\sigma$ (pre-tanh)  ·  {tag}'))
+      if show_std:
+        extra.append(_render_timeseries_strip(
+            scale_mean, success, t, width=width, height=240,
+            title=r'mean Gaussian $\sigma$  (pre-tanh, avg over dims)',
+            ylabel=r'mean $\sigma$',
+            value_label=r'mean $\sigma$',
+            color='#5ec8ff',
+            yfmt='{:.4f}'))
+      if show_sel_ent:
+        h_max = float(np.log(max(int(num_cubes), 2)))
+        extra.append(_render_timeseries_strip(
+            select_ent, success, t, width=width, height=240,
+            title=r'select entropy $H(\pi_{\mathrm{sel}})$  (nats; dashed $=\log n$)',
+            ylabel=r'$H(\pi_{\mathrm{sel}})$',
+            value_label=r'$H(\pi_{\mathrm{sel}})$',
+            color='#e0c3ff',
+            yref=h_max,
+            yref_label=r'$\log n$',
+            yfmt='{:.3f}'))
       if show_gae:
         extra.append(_render_gae_strip(
-            adv, values, success, t, width=width, height=220,
-            title=rf'GAE $A_t$ (return-std $r$, no minibatch-norm)  ·  {tag}'))
+            adv, values, success, t, width=width, height=240,
+            title=r'GAE $A_t$  (return-std $r$, no minibatch-norm)'))
       if args.show_select:
         extra.append(_render_select_strip(
             select, cube, t, width=width, num_cubes=num_cubes, height=180,
