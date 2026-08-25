@@ -38,6 +38,7 @@ from contrastive import nf_density as _nf
 from contrastive import nf_density_backward as _nfb
 from contrastive import fm_density as _fm
 from contrastive import td3_density as _td3
+from contrastive import jax_replay as _jxr
 from contrastive.utils import extract_info_reward
 from distributional import TanhTransformedDistribution
 
@@ -330,6 +331,58 @@ class ReturnNormalizer:
       self._returns = returns
     else:
       self._returns = np.zeros_like(self._returns)
+
+
+def make_return_norm_scan(discount: float, epsilon: float = 1e-8,
+                          window_size: int = 0):
+  """JAX scan of :class:`ReturnNormalizer` over a ``(T, E)`` reward stream."""
+  gamma = float(discount)
+  eps = float(epsilon)
+  max_count = float(window_size) if window_size > 0 else 0.0
+
+  def _welford(mean, var, count, x):
+    batch_mean = jnp.mean(x)
+    batch_var = jnp.var(x)
+    batch_count = jnp.asarray(x.shape[0], dtype=mean.dtype)
+    delta = batch_mean - mean
+    tot = count + batch_count
+    new_mean = mean + delta * (batch_count / tot)
+    m2 = (var * count + batch_var * batch_count
+          + (delta ** 2) * (count * batch_count / tot))
+    new_var = m2 / tot
+    new_count = tot
+    if max_count > 0.0:
+      new_count = jnp.minimum(new_count, jnp.asarray(max_count, dtype=tot.dtype))
+    return new_mean, new_var, new_count
+
+  @jax.jit
+  def apply(mean, var, count, returns, rewards, dones):
+    def f(carry, inputs):
+      mean, var, count, returns = carry
+      r, done = inputs
+      r = r.astype(returns.dtype)
+      returns = returns * jnp.asarray(gamma, dtype=returns.dtype) + r
+      mean, var, count = _welford(mean, var, count, returns)
+      scaled = r / jnp.sqrt(var + jnp.asarray(eps, dtype=var.dtype))
+      returns = jnp.where(done.astype(bool), jnp.zeros_like(returns), returns)
+      return (mean, var, count, returns), scaled.astype(rewards.dtype)
+
+    (mean, var, count, returns), scaled = jax.lax.scan(
+        f, (mean, var, count, returns), (rewards, dones))
+    return mean, var, count, returns, scaled
+
+  return apply
+
+
+def _sync_return_norm_host(normalizer: ReturnNormalizer,
+                           mean_j, var_j, count_j, returns_j):
+  """Copy JAX return-norm state into the NumPy object (checkpoint / log)."""
+  normalizer._rms.mean = np.asarray(mean_j, dtype=np.float64).reshape(())
+  normalizer._rms.var = np.asarray(var_j, dtype=np.float64).reshape(())
+  normalizer._rms.count = float(np.asarray(count_j))
+  ret = np.asarray(returns_j, dtype=np.float64).reshape(-1)
+  if ret.shape == normalizer._returns.shape:
+    normalizer._returns = ret
 
 
 # ---------------------------------------------------------------------------
@@ -838,6 +891,87 @@ def _flush_rollout_episodes_to_replay(
     if track_very_hard and ep_very_hard_success_max is not None:
       ep_very_hard_success_max[i] = np.float32(vh_max[i])
 
+  return hard_goal_visit_count
+
+
+def _account_rollout_episodes(
+    *,
+    env_rew: np.ndarray,
+    dones: np.ndarray,
+    success: Optional[np.ndarray],
+    ep_return: np.ndarray,
+    ep_len: np.ndarray,
+    ep_success_max: np.ndarray,
+    recent_returns: list,
+    recent_lengths: list,
+    recent_success: list,
+    use_crl_td3_switch: bool,
+    hard_goal_visit_count: int,
+    very_hard_success: Optional[np.ndarray] = None,
+    ep_very_hard_success_max: Optional[np.ndarray] = None,
+    recent_very_hard_success: Optional[list] = None,
+) -> int:
+  """Update episode log windows from (T, E) dones/success. No replay writes."""
+  T, E = int(dones.shape[0]), int(dones.shape[1])
+  track_success = success is not None
+  track_very_hard = very_hard_success is not None
+  vh_max = (
+      ep_very_hard_success_max.astype(np.float64, copy=True)
+      if track_very_hard and ep_very_hard_success_max is not None
+      else None)
+  t0 = np.zeros(E, dtype=np.int32)
+  ret = ep_return.astype(np.float64, copy=True)
+  ln = ep_len.astype(np.int64, copy=True)
+  succ_max = ep_success_max.astype(np.float64, copy=True)
+  done_ts, done_is = np.nonzero(dones)
+  for t_end, i in zip(done_ts.tolist(), done_is.tolist()):
+    start = int(t0[i])
+    ret[i] += float(env_rew[start:t_end + 1, i].sum())
+    ln[i] += (t_end - start + 1)
+    if track_success:
+      succ_max[i] = max(
+          float(succ_max[i]), float(success[start:t_end + 1, i].max()))
+    if track_very_hard:
+      vh_max[i] = max(
+          float(vh_max[i]), float(very_hard_success[start:t_end + 1, i].max()))
+    episode_succeeded = bool(track_success and succ_max[i] >= 0.5)
+    recent_returns.append(float(ret[i]))
+    recent_lengths.append(int(ln[i]))
+    if track_success:
+      recent_success.append(float(episode_succeeded))
+      if use_crl_td3_switch and episode_succeeded:
+        hard_goal_visit_count += 1
+      if len(recent_success) > 1000:
+        del recent_success[:-1000]
+    if track_very_hard and recent_very_hard_success is not None:
+      recent_very_hard_success.append(float(vh_max[i] >= 0.5))
+      if len(recent_very_hard_success) > 1000:
+        del recent_very_hard_success[:-1000]
+    if len(recent_returns) > 100:
+      del recent_returns[:-100]
+      del recent_lengths[:-100]
+    ret[i] = 0.0
+    ln[i] = 0
+    succ_max[i] = 0.0
+    if track_very_hard:
+      vh_max[i] = 0.0
+    t0[i] = t_end + 1
+  for i in range(E):
+    start = int(t0[i])
+    if start < T:
+      ret[i] += float(env_rew[start:T, i].sum())
+      ln[i] += (T - start)
+      if track_success:
+        succ_max[i] = max(
+            float(succ_max[i]), float(success[start:T, i].max()))
+      if track_very_hard:
+        vh_max[i] = max(
+            float(vh_max[i]), float(very_hard_success[start:T, i].max()))
+    ep_return[i] = np.float32(ret[i])
+    ep_len[i] = np.int32(ln[i])
+    ep_success_max[i] = np.float32(succ_max[i])
+    if track_very_hard and ep_very_hard_success_max is not None:
+      ep_very_hard_success_max[i] = np.float32(vh_max[i])
   return hard_goal_visit_count
 
 
@@ -1404,6 +1538,78 @@ def make_ppo_update_fn(
         return new_params, new_opt_state, metrics
 
   return update
+
+
+def make_scanned_ppo_fn(
+    ppo_update,
+    *,
+    n_epochs: int,
+    n_mb: int,
+    mb_size: int,
+    batch_n: int,
+    use_ent_schedule: bool,
+    use_kl_penalty: bool,
+):
+  """One JIT: shuffle each epoch, ``lax.scan`` over minibatches and epochs.
+
+  Used when ``ppo_target_kl`` is unset (no per-minibatch host KL read).
+  ``kl_beta`` is frozen for the scan and adapted on the host afterwards.
+  """
+  n_epochs = int(n_epochs)
+  n_mb = int(n_mb)
+  mb_size = int(mb_size)
+  batch_n = int(batch_n)
+
+  def _call_update(params, opt_state, batch, key, obs_mean, obs_var, step,
+                   old_policy, kl_beta):
+    if use_ent_schedule and use_kl_penalty:
+      return ppo_update(
+          params, opt_state, batch, key, obs_mean, obs_var, step,
+          old_policy, kl_beta)
+    if use_ent_schedule:
+      return ppo_update(
+          params, opt_state, batch, key, obs_mean, obs_var, step)
+    if use_kl_penalty:
+      return ppo_update(
+          params, opt_state, batch, key, obs_mean, obs_var,
+          old_policy, kl_beta)
+    return ppo_update(
+        params, opt_state, batch, key, obs_mean, obs_var)
+
+  @jax.jit
+  def scan_ppo(params, opt_state, data, key, obs_mean, obs_var, sgd_step,
+               old_policy, kl_beta):
+    def epoch_body(carry, _):
+      params, opt_state, key, sgd_step = carry
+      key, k_perm, k_mb = jax.random.split(key, 3)
+      perm = jax.random.permutation(k_perm, batch_n)
+      shuffled = jax.tree_util.tree_map(lambda x: x[perm], data)
+
+      def _mb_ax(x):
+        return jnp.reshape(x, (n_mb, mb_size) + x.shape[1:])
+
+      minibatches = jax.tree_util.tree_map(_mb_ax, shuffled)
+
+      def mb_body(mb_carry, batch):
+        params, opt_state, key, sgd_step = mb_carry
+        key, k_up = jax.random.split(key)
+        params, opt_state, metrics = _call_update(
+            params, opt_state, batch, k_up, obs_mean, obs_var, sgd_step,
+            old_policy, kl_beta)
+        return (params, opt_state, key, sgd_step + 1), metrics
+
+      (params, opt_state, key, sgd_step), metrics = jax.lax.scan(
+          mb_body, (params, opt_state, k_mb, sgd_step), minibatches,
+          length=n_mb)
+      return (params, opt_state, key, sgd_step), metrics
+
+    (params, opt_state, key, sgd_step), metrics = jax.lax.scan(
+        epoch_body, (params, opt_state, key, sgd_step), None, length=n_epochs)
+    metrics = jax.tree_util.tree_map(
+        lambda x: jnp.reshape(x, (n_epochs * n_mb,) + x.shape[2:]), metrics)
+    return params, opt_state, key, sgd_step, metrics
+
+  return scan_ppo
 
 
 def _crl_l2_ball_perturb(x, key, prob, eps):
@@ -2550,8 +2756,11 @@ def run_ppo_training(
       bb_pixel_obs=False, bb_num_cubes=0, bb_goal_color_indices=())
   if _bb_pixel:
     from envs.builderbench_raster import pixel_network_kwargs as _bb_pix_kw
-    _bb_pixel_kw = _bb_pix_kw(_env_name, True)
-    print('[ppo] BB pixel obs: ON  rasterize xyz→64x64 CNN then '
+    _bb_pixel_kw = _bb_pix_kw(
+        _env_name, True,
+        hw=int(getattr(config, 'ppo_bb_pixel_hw', 64)))
+    _hw = int(_bb_pixel_kw['bb_pixel_hw'])
+    print(f'[ppo] BB pixel obs: ON  rasterize xyz→{_hw}x{_hw} CNN then '
           f'policy/value/NF (num_cubes={_bb_pixel_kw["bb_num_cubes"]}, '
           f'goal_colors={_bb_pixel_kw["bb_goal_color_indices"]})',
           flush=True)
@@ -3203,6 +3412,25 @@ def run_ppo_training(
   ppo_update = make_ppo_update_fn(
       networks, config, ppo_optimizer, ent_coef_schedule=ent_coef_schedule)
   print('[ppo] init: ppo_update ready', flush=True)
+  _scan_ppo = (config.ppo_target_kl is None)
+  ppo_scan = None
+  if _scan_ppo:
+    ppo_scan = make_scanned_ppo_fn(
+        ppo_update,
+        n_epochs=int(config.ppo_num_epochs),
+        n_mb=int(config.ppo_num_minibatches),
+        mb_size=int(mb_size),
+        batch_n=int(batch_per_iter),
+        use_ent_schedule=(ent_coef_schedule is not None),
+        use_kl_penalty=bool(
+            float(getattr(config, 'ppo_kl_penalty_coef', 0.0)) > 0),
+    )
+    print('[ppo] PPO updates: jax.lax.scan epochs×minibatches '
+          f'({int(config.ppo_num_epochs)}×{int(config.ppo_num_minibatches)})',
+          flush=True)
+  else:
+    print('[ppo] PPO updates: Python minibatch loop '
+          '(ppo_target_kl host-read)', flush=True)
 
   td3_scan_update = None
   fm_scan_update = None
@@ -3961,26 +4189,123 @@ def run_ppo_training(
           int(config.start_index), int(config.end_index))
     print(f'[ppo] uniform_sampling: goal_low={goal_low}, goal_high={goal_high}')
 
-  # ---- replay buffer (episodes) -----------------------------------------
+  # ---- replay buffer ----------------------------------------------------
+  # BuilderBench JAX path: GPU (T, E) ring + in-scan sampler. Sawyer / KDE
+  # keep the host EpisodeReplay (those jobs are not the SPS bottleneck).
   _success_sample_weight = float(
       getattr(config, 'ppo_success_sample_weight', 1.0))
   if _success_sample_weight <= 0.0:
     raise ValueError(
         'ppo_success_sample_weight must be > 0, got '
         f'{_success_sample_weight}')
-  replay = EpisodeReplay(
-      capacity=int(config.max_replay_size),
-      obs_dim=int(config.obs_dim),
-      discount=float(config.discount),
-      start_index=int(config.start_index),
-      end_index=int(config.end_index),
-      success_sample_weight=_success_sample_weight,
-      goal_state_indices=_goal_state_indices)
+  _use_gpu_replay = bool(_use_jax_bb_vec) and not bool(use_kde_dirac)
+  replay = None
+  gpu_replay_api = None
+  gpu_buf = None
+  gpu_filled_t = 0
+  gpu_cap_T = 0
+  traj_id_j = None
+  s0_states_j = None
+  next_done_j = None
+  nf_scan_buf_update = None
+  _glo_j = _ghi_j = None
   np_rng = np.random.default_rng(seed + 12345)
-  if _success_sample_weight != 1.0:
-    print('[ppo] CRL episode sampling: successful trajectories weight='
-          f'{_success_sample_weight:g}, others weight=1 '
-          '(sample proportional to w / sum w)')
+  if _use_gpu_replay:
+    gpu_cap_T = max(T, int(config.max_replay_size) // max(int(E), 1))
+    gpu_replay_api = _jxr.make_traj_replay(
+        cap_T=gpu_cap_T,
+        num_envs=int(E),
+        obs_dim=int(config.obs_dim),
+        act_dim=int(act_dim_cfg),
+        discount=float(config.discount),
+        start_index=int(config.start_index),
+        end_index=int(config.end_index),
+        goal_state_indices=_goal_state_indices)
+    gpu_buf = gpu_replay_api.init()
+    traj_id_j = jnp.zeros((int(E),), dtype=jnp.int32)
+    if uniform_sampling:
+      _glo_j = jnp.asarray(goal_low, dtype=jnp.float32)
+      _ghi_j = jnp.asarray(goal_high, dtype=jnp.float32)
+    print('[ppo] GPU traj replay: '
+          f'cap_T={gpu_cap_T} E={int(E)} '
+          f'(~{gpu_cap_T * int(E)} transitions); '
+          'uniform-over-steps + in-column geometric; '
+          'empty on resume; not written to checkpoints',
+          flush=True)
+    if _success_sample_weight != 1.0:
+      print('[ppo] GPU traj replay: ignoring '
+            f'ppo_success_sample_weight={_success_sample_weight:g} '
+            '(host EpisodeReplay only)',
+            flush=True)
+    if use_nf and not use_nf_td:
+      _B_nf = int(config.batch_size)
+
+      def _nf_gpu_sample(buf, key):
+        key, k_s, k_u = jax.random.split(key, 3)
+        batch, buf = gpu_replay_api.sample(buf, k_s, _B_nf)
+        if uniform_sampling:
+          batch, _ = gpu_replay_api.uniform_half_goals(
+              batch, k_u, _glo_j, _ghi_j)
+        return batch, buf
+
+      nf_scan_buf_update = _nf.make_scan_nf_buffer_update_fn(
+          nf_density_nets, q_optimizer, obs_dim=int(config.obs_dim),
+          sample_batch=_nf_gpu_sample,
+          n_steps=int(config.ppo_crl_steps_per_iter),
+          noise_std=float(getattr(config, 'nf_noise_std', 0.0)),
+          repr_tau=_repr_tau,
+          mask_prob=_nf_mask_prob,
+          s_pert_prob=_nf_s_p, s_pert_eps=_nf_s_eps,
+          s_pert_lo=_nf_s_lo, s_pert_hi=_nf_s_hi,
+          grad_reg_c=_nf_gr_c, grad_reg_coef=_nf_gr_coef,
+          lam_lr=_nf_lam_lr,
+          task_goal_frac=_nf_task_g_frac, task_goal=_nf_task_goal,
+          time_reg_eta=_nf_tr_eta,
+          policy_network_apply=_nf_tr_policy_apply,
+          sample_fn=_nf_tr_sample_fn,
+          policy_goal=_nf_tr_policy_goal)
+      print('[ppo] NF updates: sample from GPU buffer inside scan',
+            flush=True)
+  else:
+    replay = EpisodeReplay(
+        capacity=int(config.max_replay_size),
+        obs_dim=int(config.obs_dim),
+        discount=float(config.discount),
+        start_index=int(config.start_index),
+        end_index=int(config.end_index),
+        success_sample_weight=_success_sample_weight,
+        goal_state_indices=_goal_state_indices)
+    if _success_sample_weight != 1.0:
+      print('[ppo] CRL episode sampling: successful trajectories weight='
+            f'{_success_sample_weight:g}, others weight=1 '
+            '(sample proportional to w / sum w)')
+
+  def _n_replay_trans() -> int:
+    if gpu_buf is not None:
+      return int(gpu_filled_t) * int(E)
+    return int(replay.size)
+
+  def _gpu_stacked_batches(n_steps: int):
+    nonlocal gpu_buf, key
+    stacked, gpu_buf, key = gpu_replay_api.sample_n(
+        gpu_buf, key, int(n_steps), int(config.batch_size))
+    if uniform_sampling:
+      stacked, key = gpu_replay_api.apply_uniform_n(
+          stacked, key, _glo_j, _ghi_j)
+    return stacked
+
+  def _offpolicy_stacked(n_steps: int):
+    if gpu_buf is not None:
+      return _gpu_stacked_batches(n_steps)
+    _samples = [
+        (replay.sample_with_uniform_negatives(
+            int(config.batch_size), np_rng, goal_low, goal_high)
+         if uniform_sampling
+         else replay.sample(int(config.batch_size), np_rng))
+        for _ in range(int(n_steps))]
+    return {
+        k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
+        for k_ in _samples[0]}
 
   use_external_reward = bool(
       getattr(config, 'ppo_use_external_reward', False))
@@ -4159,12 +4484,15 @@ def run_ppo_training(
   obs = vec_env.reset()
   next_done = np.zeros(E, dtype=np.float32)
   s0_states = np.asarray(obs[:, :int(config.obs_dim)], dtype=np.float32).copy()
-  if _use_jax_bb_vec:
-    # ndarray carries for the vectorized episode flush (BB GPU path).
+  if _use_gpu_replay:
+    s0_states_j = jnp.asarray(s0_states)
+    next_done_j = jnp.asarray(next_done)
+  if _use_jax_bb_vec and not _use_gpu_replay:
+    # ndarray carries for the vectorized episode flush (KDE / CPU replay).
     ep_obs = [obs[i:i + 1].astype(np.float32).copy() for i in range(E)]
     ep_act = [
         np.zeros((0, act_dim_cfg), dtype=np.float32) for _ in range(E)]
-  else:
+  elif not _use_jax_bb_vec:
     for i in range(E):
       ep_obs[i].append(obs[i].copy())
 
@@ -4219,6 +4547,18 @@ def run_ppo_training(
       ReturnNormalizer(num_envs=E, discount=ppo_gamma,
                        window_size=_return_norm_window)
       if norm_reward else None)
+  return_norm_scan = (
+      make_return_norm_scan(
+          ppo_gamma, window_size=_return_norm_window)
+      if reward_normalizer is not None else None)
+  if reward_normalizer is not None:
+    _rn = reward_normalizer
+    rn_mean_j = jnp.asarray(_rn._rms.mean, dtype=jnp.float32)
+    rn_var_j = jnp.asarray(_rn._rms.var, dtype=jnp.float32)
+    rn_count_j = jnp.asarray(_rn._rms.count, dtype=jnp.float32)
+    rn_returns_j = jnp.asarray(_rn._returns, dtype=jnp.float32)
+  else:
+    rn_mean_j = rn_var_j = rn_count_j = rn_returns_j = None
   # Restore the host-side state that had to wait for these objects to exist.
   # Without this a requeued run rescales rewards by std=1 against a value
   # head fitted to the old scale, and retrains the critic from an empty buffer.
@@ -4227,14 +4567,15 @@ def run_ppo_training(
     if reward_normalizer is not None and 'reward_normalizer' in _resume_extra:
       reward_normalizer.load_state_dict(_resume_extra['reward_normalizer'])
       _resumed_reward_norm = True
+      rn_mean_j = jnp.asarray(reward_normalizer._rms.mean, dtype=jnp.float32)
+      rn_var_j = jnp.asarray(reward_normalizer._rms.var, dtype=jnp.float32)
+      rn_count_j = jnp.asarray(reward_normalizer._rms.count, dtype=jnp.float32)
+      rn_returns_j = jnp.asarray(reward_normalizer._returns, dtype=jnp.float32)
       print(f'[ppo] resumed reward normalizer: std={reward_normalizer.std:.3f}')
     if 'replay' in _resume_extra:
-      if replay.load_state_dict(_resume_extra['replay']):
-        print(f'[ppo] resumed replay buffer: {replay.size} transitions '
-              f'across {replay.num_episodes} episodes')
-      else:
-        print('[ppo] replay in checkpoint is incompatible with this config; '
-              'starting from an empty buffer')
+      print('[ppo] ignoring replay in checkpoint (not restored; GPU buffer '
+            'starts empty)',
+            flush=True)
     if use_nf_bwd and 'nf_bwd_s_mean' in _resume_extra:
       nf_bwd_s_mean = np.asarray(
           _resume_extra['nf_bwd_s_mean'], dtype=np.float32).reshape(-1)
@@ -4254,17 +4595,17 @@ def run_ppo_training(
   # ---- checkpointing ----------------------------------------------------
   ckpt_interval = int(getattr(config, 'ppo_checkpoint_interval', 0))
   ckpt_keep_last = int(getattr(config, 'ppo_checkpoint_keep_last', 0))
-  ckpt_replay_max = int(getattr(config, 'ppo_checkpoint_replay_max', 0))
+  if int(getattr(config, 'ppo_checkpoint_replay_max', 0) or 0) > 0:
+    print('[ppo] ppo_checkpoint_replay_max ignored: replay is not written '
+          'to checkpoints',
+          flush=True)
   if ckpt_interval > 0 and checkpoint_dir is not None:
     os.makedirs(checkpoint_dir, exist_ok=True)
     keep_msg = ('keep all milestones'
                 if ckpt_keep_last <= 0
                 else f'keep last {ckpt_keep_last} milestones')
-    replay_msg = ('no replay in ckpt' if ckpt_replay_max <= 0
-                  else f'latest.pkl carries up to {ckpt_replay_max} '
-                       f'replay transitions')
     print(f'[ppo] checkpoints → {checkpoint_dir} '
-          f'(every {ckpt_interval} iters, {keep_msg}, {replay_msg})')
+          f'(every {ckpt_interval} iters, {keep_msg}, no replay in ckpt)')
   nf_bwd_ckpt_dir = None
   nf_bwd_ckpt_interval = 0
   if use_nf_bwd and checkpoint_dir is not None:
@@ -4397,19 +4738,33 @@ def run_ppo_training(
     # When set, reward / GAE / PPO consume these device arrays directly
     # instead of round-tripping the full (T, E, …) traj through NumPy.
     rollout_j = None
+    _bb_steps_j = None
+    _t_unroll_s = _t_insert_s = _t_rewgae_s = _t_ppo_s = float('nan')
     if bb_generate_unroll is not None:
       # BuilderBench: fused policy + env unroll via jax.lax.scan (GPU).
-      (vec_env._state, key, next_done, _), _steps_j = bb_generate_unroll(
+      _s0_in = s0_states_j if s0_states_j is not None else jnp.asarray(s0_states)
+      _nd_in = next_done_j if next_done_j is not None else jnp.asarray(next_done)
+      _t0 = time.time()
+      (vec_env._state, key, _nd_out, _s0_out), _steps_j = bb_generate_unroll(
           vec_env._state,
           ppo_params['policy'],
           ppo_params['value'],
           key,
-          jnp.asarray(next_done),
-          jnp.asarray(s0_states),
+          _nd_in,
+          _s0_in,
           iter_obs_mean_j,
           iter_obs_var_j,
       )
+      jax.block_until_ready(_steps_j['env_rew'])
+      _t_unroll_s = time.time() - _t0
+      if s0_states_j is not None:
+        s0_states_j = _s0_out
+        next_done_j = _nd_out
+      else:
+        s0_states = np.asarray(_s0_out, dtype=np.float32)
+        next_done = np.asarray(_nd_out, dtype=np.float32)
       # Keep the heavy rollout on device for reward → GAE → PPO.
+      # Replay flush (host) waits until those GPU jobs are queued.
       rollout_j = {
           'obs': _steps_j['obs'],
           'actions': _steps_j['actions'],
@@ -4418,61 +4773,36 @@ def run_ppo_training(
           'roll_dones': _steps_j['roll_dones'],
           'step_dones': _steps_j['step_dones'],
           'env_rew': _steps_j['env_rew'],
+          'success': _steps_j['success'],
       }
+      if 'very_hard_success' in _steps_j:
+        rollout_j['very_hard_success'] = _steps_j['very_hard_success']
       if use_dirac_target:
         rollout_j['s0_states'] = _steps_j['s0_states']
-        roll_s0_states[:] = np.asarray(_steps_j['s0_states'], dtype=np.float32)
-      # Host copies only for episode→replay flush + reward-normalizer state.
-      _flush_acts = np.asarray(_steps_j['actions'], dtype=np.float32)
-      _flush_env_rew = np.asarray(_steps_j['env_rew'], dtype=np.float32)
-      _flush_step_dones = np.asarray(
-          _steps_j['step_dones'], dtype=np.float32)
-      roll_acts[:] = _flush_acts
-      roll_env_rew[:] = _flush_env_rew
-      roll_step_dones[:] = _flush_step_dones
+      _bb_steps_j = _steps_j
+      if gpu_buf is not None:
+        _t0 = time.time()
+        tid_te, traj_id_j = gpu_replay_api.expand_traj_ids(
+            traj_id_j, _steps_j['step_dones'])
+        gpu_buf = gpu_replay_api.insert(
+            gpu_buf,
+            _steps_j['obs'][..., :obs_dim_cfg],
+            _steps_j['actions'],
+            _steps_j['terminal_obs'][..., :obs_dim_cfg],
+            tid_te)
+        jax.block_until_ready(gpu_buf.horizon)
+        _t_insert_s = time.time() - _t0
+        gpu_filled_t = _jxr.host_filled_after_insert(
+            gpu_filled_t, T, gpu_cap_T)
       if use_kde_dirac:
-        # KDE reward is NumPy-only; materialize obs for that path.
+        # KDE reward is NumPy-only; unroll still stays on device for GAE/PPO
+        # and the deferred replay flush.
         roll_obs[:] = np.asarray(_steps_j['obs'], dtype=np.float32)
         for _t in range(T):
           rep_rew_np = (np.zeros(E, dtype=np.float32) if kde_state is None
                         else reward_fn(kde_state, roll_obs[_t]).astype(np.float32))
           roll_rew_raw[_t] = rep_rew_np
-        rollout_j = None  # fall back to host rollout buffers below
-      obs = np.asarray(
-          vec_env.pack_obs_from_state(vec_env._state), dtype=np.float32)
-      _roll_success = (
-          np.asarray(_steps_j['success'], dtype=np.float32)
-          if _track_train_success else None)
-      _roll_very_hard = None
-      if 'very_hard_success' in _steps_j:
-        _roll_very_hard = np.asarray(
-            _steps_j['very_hard_success'], dtype=np.float32)
-      _term_all = np.asarray(_steps_j['terminal_obs'], dtype=np.float32)
-      _next_all = np.asarray(_steps_j['next_obs'], dtype=np.float32)
-      hard_goal_visit_count = _flush_rollout_episodes_to_replay(
-          actions=_flush_acts,
-          env_rew=_flush_env_rew,
-          dones=_flush_step_dones.astype(bool),
-          terminal_obs=_term_all,
-          next_obs=_next_all,
-          success=_roll_success,
-          ep_obs=ep_obs,
-          ep_act=ep_act,
-          ep_return=ep_return,
-          ep_len=ep_len,
-          ep_success_max=ep_success_max,
-          s0_states=s0_states,
-          obs_dim=int(config.obs_dim),
-          recent_returns=recent_returns,
-          recent_lengths=recent_lengths,
-          recent_success=recent_success,
-          use_crl_td3_switch=use_crl_td3_switch,
-          hard_goal_visit_count=hard_goal_visit_count,
-          replay=replay,
-          very_hard_success=_roll_very_hard,
-          ep_very_hard_success_max=ep_very_hard_success_max,
-          recent_very_hard_success=recent_very_hard_success,
-      )
+      obs_j = vec_env.pack_obs_from_state(vec_env._state)
       global_step += T * E
     else:
       for t in range(T):
@@ -4549,47 +4879,38 @@ def run_ppo_training(
         next_done = dones.astype(np.float32)
         global_step += E
 
+      obs_j = jnp.asarray(obs)
       # Sawyer MetaWorld envs use sparse 0/1 env reward as hard success.
       if use_external_reward and _roll_success is None:
         _roll_success = (
             (np.asarray(roll_env_rew, dtype=np.float32) >= 0.5)
             .astype(np.float32))
 
-    _switch_after_this_iteration = (
-        use_crl_td3_switch
-        and not reward_switched_to_td3
-        and hard_goal_visit_count >= _switch_goal_visits)
-
-    # Occasional raw-vs-normalized sanity print (2 early iters only).
-    if norm_obs and iteration in (1, 10) and np.all(np.isfinite(iter_obs_mean)):
-      if rollout_j is not None:
-        _raw = np.asarray(rollout_j['obs'][0, 0], dtype=np.float32)
-      else:
-        _raw = np.asarray(roll_obs[0, 0], dtype=np.float32)
-      _norm = np.asarray(_normalize_packed_obs(
-          jnp.asarray(_raw[None]), iter_obs_mean_j, iter_obs_var_j,
-          obs_dim=obs_dim_cfg, start_index=norm_si, end_index=norm_ei,
-          clip=obs_norm_clip, enabled=True,
-          goal_state_indices=_goal_state_indices)[0])
-      print(f'[ppo][obs_norm] iter={iteration} raw  '
-            f'state={np.array2string(_raw[:obs_dim_cfg], precision=3)} '
-            f'goal={np.array2string(_raw[obs_dim_cfg:], precision=3)}')
-      print(f'[ppo][obs_norm] iter={iteration} norm '
-            f'state={np.array2string(_norm[:obs_dim_cfg], precision=3)} '
-            f'goal={np.array2string(_norm[obs_dim_cfg:], precision=3)}')
+    if _bb_steps_j is None:
+      _switch_after_this_iteration = (
+          use_crl_td3_switch
+          and not reward_switched_to_td3
+          and hard_goal_visit_count >= _switch_goal_visits)
+    else:
+      _switch_after_this_iteration = False
 
     # =================================================================
-    # 1b. Batched reward computation (single GPU call over full rollout)
+    # 1b. Batched reward computation (stay on device through GAE / PPO)
     # =================================================================
+    _t_rewgae_0 = time.time()
     # kde_dirac rewards were already filled per-step above (CPU-only).
-    _rew_flat_j = None
     if sparse_reward_only:
       # Latched: drop denser/repr reward; PPO uses sparse hard-success only.
-      roll_rew_raw[:] = 0.0
+      rew_raw_j = jnp.zeros((T, E), dtype=jnp.float32)
     elif use_env_dense:
       # Opt-in BB baseline: PPO on CreativeCube tanh distance (env_rew).
-      roll_rew_raw[:] = np.asarray(roll_env_rew, dtype=np.float32)
-    elif not use_kde_dirac:
+      if rollout_j is not None:
+        rew_raw_j = jnp.asarray(rollout_j['env_rew'], dtype=jnp.float32)
+      else:
+        rew_raw_j = jnp.asarray(roll_env_rew, dtype=jnp.float32)
+    elif use_kde_dirac:
+      rew_raw_j = jnp.asarray(roll_rew_raw, dtype=jnp.float32)
+    else:
       if rollout_j is not None:
         _flat_obs_j = jnp.reshape(rollout_j['obs'], (T * E, -1))
         _flat_acts_j = jnp.reshape(rollout_j['actions'], (T * E, -1))
@@ -4667,8 +4988,343 @@ def run_ppo_training(
                 iter_obs_mean_j, iter_obs_var_j),
             _flat_obs_j, _flat_acts_j,
             chunk=(_PIXEL_REWARD_CHUNK if _bb_pixel else 0))
-      # ReturnNormalizer is stateful NumPy — one small (T·E,) D2H only.
-      roll_rew_raw[:] = np.asarray(_rew_flat_j, dtype=np.float32).reshape(T, E)
+      rew_raw_j = jnp.reshape(_rew_flat_j, (T, E))
+    rew_intr_j = rew_raw_j
+
+    # Hard / very-hard success external bonus (opt-in).
+    # Default: after return-norm so the fixed scale is not washed out.
+    # Optional: before return-norm (absorbed into running return std).
+    # When sparse_reward_only is latched, this IS the sole PPO reward.
+    # Logging always records both 2cm (hard) and 1cm (very_hard); this
+    # only selects which one the bonus uses.
+    ext_j = None
+    ext_success_j = None
+    if use_external_reward:
+      if external_reward_success == 'very_hard':
+        if rollout_j is not None and 'very_hard_success' in rollout_j:
+          ext_success_j = rollout_j['very_hard_success']
+        elif _roll_very_hard is not None:
+          ext_success_j = jnp.asarray(_roll_very_hard, dtype=jnp.float32)
+        else:
+          raise RuntimeError(
+              'ppo_external_reward_success=very_hard but the rollout has no '
+              'very_hard_success metric (BuilderBench 1cm)')
+      else:
+        if rollout_j is not None:
+          ext_success_j = rollout_j['success']
+        elif _roll_success is not None:
+          ext_success_j = jnp.asarray(_roll_success, dtype=jnp.float32)
+      if ext_success_j is not None:
+        ext_j = (
+            jnp.asarray(external_reward_scale, dtype=jnp.float32)
+            * (ext_success_j >= 0.5).astype(jnp.float32))
+        if external_reward_before_norm or sparse_reward_only:
+          rew_raw_j = rew_raw_j + ext_j
+
+    if return_norm_scan is not None and not sparse_reward_only:
+      if rollout_j is not None:
+        _step_dones_j = rollout_j['step_dones']
+      else:
+        _step_dones_j = jnp.asarray(roll_step_dones, dtype=jnp.float32)
+      (rn_mean_j, rn_var_j, rn_count_j, rn_returns_j, rew_j) = (
+          return_norm_scan(
+              rn_mean_j, rn_var_j, rn_count_j, rn_returns_j,
+              rew_raw_j, _step_dones_j))
+    else:
+      rew_j = rew_raw_j
+
+    if (use_external_reward and ext_j is not None
+            and not external_reward_before_norm
+            and not sparse_reward_only):
+      rew_j = rew_j + ext_j
+
+    # =================================================================
+    # 2. GAE advantages / returns
+    # =================================================================
+    next_val_j = value_only(
+        ppo_params['value'], obs_j,
+        iter_obs_mean_j, iter_obs_var_j)
+    if rollout_j is not None:
+      _gae_vals_j = rollout_j['values']
+      _gae_dones_j = rollout_j['roll_dones']
+    else:
+      _gae_vals_j = jnp.asarray(roll_vals)
+      _gae_dones_j = jnp.asarray(roll_dones)
+    adv_j, ret_j = gae_fn(
+        rew_j, _gae_vals_j, _gae_dones_j,
+        next_val_j, jnp.asarray(next_done))
+    jax.block_until_ready(adv_j)
+    _t_rewgae_s = time.time() - _t_rewgae_0
+
+    # =================================================================
+    # 3. PPO updates (epochs × minibatches over flat T·E batch)
+    # =================================================================
+    _t_ppo_0 = time.time()
+    if rollout_j is not None:
+      flat_obs_j = jnp.reshape(
+          rollout_j['obs'], (batch_per_iter,) + obs_shape)
+      flat_acts_j = jnp.reshape(
+          rollout_j['actions'], (batch_per_iter,) + act_shape)
+      flat_logp_j = jnp.reshape(rollout_j['logprobs'], (batch_per_iter,))
+      flat_vals_j = jnp.reshape(rollout_j['values'], (batch_per_iter,))
+    else:
+      flat_obs_j = jnp.asarray(
+          roll_obs.reshape((batch_per_iter,) + obs_shape))
+      flat_acts_j = jnp.asarray(
+          roll_acts.reshape((batch_per_iter,) + act_shape))
+      flat_logp_j = jnp.asarray(roll_logp.reshape(batch_per_iter))
+      flat_vals_j = jnp.asarray(roll_vals.reshape(batch_per_iter))
+    flat_adv_j = jnp.reshape(adv_j, (batch_per_iter,))
+    flat_ret_j = jnp.reshape(ret_j, (batch_per_iter,))
+
+    ppo_metrics_device: list = []
+    early_stop = False
+    _need_kl_sync = config.ppo_target_kl is not None
+    _target_kl = (
+        float(config.ppo_target_kl) if _need_kl_sync else None)
+    _n_mb = int(config.ppo_num_minibatches)
+    _es_epoch = -1
+    _es_mb_approx: list = []
+    _es_mb_analytic: list = []
+    _es_mb_beta: list = []
+    _rolled_back = False
+    _cd_now = _kl_es_cooldown
+    _es_this_iter = bool(_need_kl_sync) and (_cd_now <= 0)
+    if _need_kl_sync and _kl_es_cooldown > 0:
+      print(f'[ppo] target_kl cooldown after actor-reset: '
+            f'{_kl_es_cooldown} iters left (early-stop/rollback off)',
+            flush=True)
+    # Snapshot rollout-time policy params once per iteration for KL penalty.
+    # Scan path always takes a policy pytree (unused when the penalty is off).
+    _old_ppo_policy_params_j = ppo_params['policy']
+    _n_epochs = int(config.ppo_num_epochs)
+    ppo_scan_metrics = None
+    if ppo_scan is not None:
+      _ppo_data = {
+          'obs': flat_obs_j,
+          'actions': flat_acts_j,
+          'old_logprobs': flat_logp_j,
+          'advantages': flat_adv_j,
+          'returns': flat_ret_j,
+          'old_values': flat_vals_j,
+      }
+      key, k_scan = jax.random.split(key)
+      (ppo_params, ppo_opt_state, key, _, ppo_scan_metrics) = ppo_scan(
+          ppo_params, ppo_opt_state, _ppo_data, k_scan,
+          iter_obs_mean_j, iter_obs_var_j,
+          jnp.asarray(ppo_sgd_step, dtype=jnp.int32),
+          _old_ppo_policy_params_j,
+          jnp.asarray(
+              _kl_beta if _kl_penalty_on else 0.0, dtype=jnp.float32))
+      ppo_sgd_step += _n_epochs * _n_mb
+    else:
+      for epoch in range(_n_epochs):
+        perm = np_rng.permutation(batch_per_iter)
+        epoch_kl_max = 0.0
+        epoch_mb_approx: list = []
+        epoch_mb_analytic: list = []
+        epoch_mb_beta: list = []
+        for mb_i, start in enumerate(range(0, batch_per_iter, mb_size)):
+          mb = jnp.asarray(perm[start:start + mb_size])
+          batch = {
+              'obs':          flat_obs_j[mb],
+              'actions':      flat_acts_j[mb],
+              'old_logprobs': flat_logp_j[mb],
+              'advantages':   flat_adv_j[mb],
+              'returns':      flat_ret_j[mb],
+              'old_values':   flat_vals_j[mb],
+          }
+          key, k_mb = jax.random.split(key)
+          params_before = ppo_params
+          opt_before = ppo_opt_state
+          if ent_coef_schedule is not None and _kl_penalty_on:
+            ppo_params, ppo_opt_state, m = ppo_update(
+                ppo_params, ppo_opt_state, batch, k_mb,
+                iter_obs_mean_j, iter_obs_var_j,
+                jnp.asarray(ppo_sgd_step, dtype=jnp.int32),
+                _old_ppo_policy_params_j,
+                jnp.asarray(_kl_beta, dtype=jnp.float32))
+          elif ent_coef_schedule is not None:
+            ppo_params, ppo_opt_state, m = ppo_update(
+                ppo_params, ppo_opt_state, batch, k_mb,
+                iter_obs_mean_j, iter_obs_var_j,
+                jnp.asarray(ppo_sgd_step, dtype=jnp.int32))
+          elif _kl_penalty_on:
+            ppo_params, ppo_opt_state, m = ppo_update(
+                ppo_params, ppo_opt_state, batch, k_mb,
+                iter_obs_mean_j, iter_obs_var_j,
+                _old_ppo_policy_params_j,
+                jnp.asarray(_kl_beta, dtype=jnp.float32))
+          else:
+            ppo_params, ppo_opt_state, m = ppo_update(
+                ppo_params, ppo_opt_state, batch, k_mb,
+                iter_obs_mean_j, iter_obs_var_j)
+          # Host-read KL only when target_kl early-stop needs it. Otherwise
+          # leave metrics on device so later minibatches can queue.
+          if not _need_kl_sync:
+            ppo_sgd_step += 1
+            ppo_metrics_device.append(m)
+            continue
+          _mb_approx = float(m['approx_kl'])
+          _mb_analytic = (
+              float(m['analytic_kl']) if _kl_penalty_on else float('nan'))
+          _trip = _mb_approx > _target_kl
+          if _trip and (not _es_this_iter):
+            print(f'[ppo] target_kl SKIP (actor-reset cooldown) '
+                  f'iter={iteration} epoch={epoch}/{_n_epochs - 1} '
+                  f'mb={mb_i}/{_n_mb - 1} approx_kl={_mb_approx:.6g} '
+                  f'threshold={_target_kl:g}',
+                  flush=True)
+          elif _trip and _kl_rollback:
+            # Discard this minibatch's update and end the iteration.
+            ppo_params = params_before
+            ppo_opt_state = opt_before
+            early_stop = True
+            _rolled_back = True
+            _es_epoch = int(epoch)
+            epoch_mb_approx.append(_mb_approx)
+            if _kl_penalty_on:
+              epoch_mb_analytic.append(_mb_analytic)
+              epoch_mb_beta.append(_kl_beta)
+            _es_mb_approx = epoch_mb_approx
+            _es_mb_analytic = epoch_mb_analytic
+            _es_mb_beta = epoch_mb_beta
+            _an_s = (f'{_mb_analytic:.6g}' if _kl_penalty_on else 'n/a')
+            print(f'[ppo] target_kl ROLLBACK iter={iteration} '
+                  f'epoch={epoch}/{_n_epochs - 1} mb={mb_i}/{_n_mb - 1} '
+                  f'threshold={_target_kl:g} approx_kl={_mb_approx:.6g} '
+                  f'analytic_kl={_an_s}',
+                  flush=True)
+            print('[ppo]   discarded this minibatch update; '
+                  'stopping remaining epochs',
+                  flush=True)
+            if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic[:-1]:
+              _adapt_kl_beta(float(np.mean(epoch_mb_analytic[:-1])))
+            break
+          ppo_sgd_step += 1
+          ppo_metrics_device.append(m)
+          epoch_mb_approx.append(_mb_approx)
+          if _need_kl_sync:
+            epoch_kl_max = max(epoch_kl_max, _mb_approx)
+          if _kl_penalty_on:
+            epoch_mb_analytic.append(_mb_analytic)
+            if not _kl_adapt_epoch:
+              _adapt_kl_beta(_mb_analytic)
+            epoch_mb_beta.append(_kl_beta)
+          if _trip and _es_this_iter and (not _kl_rollback):
+            # Keep this minibatch update; stop remaining minibatches/epochs.
+            early_stop = True
+            _es_epoch = int(epoch)
+            _es_mb_approx = epoch_mb_approx
+            _es_mb_analytic = epoch_mb_analytic
+            _es_mb_beta = epoch_mb_beta
+            _approx_s = ', '.join(f'{x:.6g}' for x in _es_mb_approx)
+            print(f'[ppo] target_kl early-stop iter={iteration} '
+                  f'epoch={epoch}/{_n_epochs - 1} mb={mb_i}/{_n_mb - 1} '
+                  f'threshold={_target_kl:g} approx_kl={_mb_approx:.6g} '
+                  f'mb_approx_kl=[{_approx_s}]',
+                  flush=True)
+            if _kl_penalty_on:
+              _an_s = ', '.join(f'{x:.6g}' for x in _es_mb_analytic)
+              _b_s = ', '.join(f'{x:.6g}' for x in _es_mb_beta)
+              print(f'[ppo]   mb_analytic_kl=[{_an_s}]', flush=True)
+              print(f'[ppo]   mb_beta_after=[{_b_s}]', flush=True)
+            if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic:
+              _adapt_kl_beta(float(np.mean(epoch_mb_analytic)))
+            break
+        if _rolled_back or early_stop:
+          break
+        if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic:
+          _adapt_kl_beta(float(np.mean(epoch_mb_analytic)))
+
+    if ppo_scan_metrics is not None:
+      jax.block_until_ready(ppo_scan_metrics['pg_loss'])
+    elif ppo_metrics_device:
+      jax.block_until_ready(ppo_metrics_device[-1]['pg_loss'])
+    _t_ppo_s = time.time() - _t_ppo_0
+    if np.isfinite(_t_unroll_s):
+      print(
+          f'[ppo][time] iter={iteration} '
+          f'unroll={_t_unroll_s:.3f}s insert={_t_insert_s:.3f}s '
+          f'rew_gae={_t_rewgae_s:.3f}s ppo={_t_ppo_s:.3f}s',
+          flush=True)
+
+    if _kl_es_cooldown > 0:
+      _kl_es_cooldown -= 1
+
+    # Replay flush + logging copies. Unroll extras D2H here so scanned PPO
+    # can run on the GPU while the host stitches episodes.
+    if _bb_steps_j is not None:
+      _flush_env_rew = np.asarray(_bb_steps_j['env_rew'], dtype=np.float32)
+      _flush_step_dones = np.asarray(
+          _bb_steps_j['step_dones'], dtype=np.float32)
+      roll_env_rew[:] = _flush_env_rew
+      roll_step_dones[:] = _flush_step_dones
+      _roll_success = (
+          np.asarray(_bb_steps_j['success'], dtype=np.float32)
+          if _track_train_success else None)
+      _roll_very_hard = None
+      if 'very_hard_success' in _bb_steps_j:
+        _roll_very_hard = np.asarray(
+            _bb_steps_j['very_hard_success'], dtype=np.float32)
+      if gpu_buf is not None:
+        hard_goal_visit_count = _account_rollout_episodes(
+            env_rew=_flush_env_rew,
+            dones=_flush_step_dones.astype(bool),
+            success=_roll_success,
+            ep_return=ep_return,
+            ep_len=ep_len,
+            ep_success_max=ep_success_max,
+            recent_returns=recent_returns,
+            recent_lengths=recent_lengths,
+            recent_success=recent_success,
+            use_crl_td3_switch=use_crl_td3_switch,
+            hard_goal_visit_count=hard_goal_visit_count,
+            very_hard_success=_roll_very_hard,
+            ep_very_hard_success_max=ep_very_hard_success_max,
+            recent_very_hard_success=recent_very_hard_success,
+        )
+      else:
+        _flush_acts = np.asarray(_bb_steps_j['actions'], dtype=np.float32)
+        roll_acts[:] = _flush_acts
+        _term_all = np.asarray(_bb_steps_j['terminal_obs'], dtype=np.float32)
+        _next_all = np.asarray(_bb_steps_j['next_obs'], dtype=np.float32)
+        hard_goal_visit_count = _flush_rollout_episodes_to_replay(
+            actions=_flush_acts,
+            env_rew=_flush_env_rew,
+            dones=_flush_step_dones.astype(bool),
+            terminal_obs=_term_all,
+            next_obs=_next_all,
+            success=_roll_success,
+            ep_obs=ep_obs,
+            ep_act=ep_act,
+            ep_return=ep_return,
+            ep_len=ep_len,
+            ep_success_max=ep_success_max,
+            s0_states=s0_states,
+            obs_dim=int(config.obs_dim),
+            recent_returns=recent_returns,
+            recent_lengths=recent_lengths,
+            recent_success=recent_success,
+            use_crl_td3_switch=use_crl_td3_switch,
+            hard_goal_visit_count=hard_goal_visit_count,
+            replay=replay,
+            very_hard_success=_roll_very_hard,
+            ep_very_hard_success_max=ep_very_hard_success_max,
+            recent_very_hard_success=recent_very_hard_success,
+        )
+      _switch_after_this_iteration = (
+          use_crl_td3_switch
+          and not reward_switched_to_td3
+          and hard_goal_visit_count >= _switch_goal_visits)
+
+    roll_rew_raw[:] = np.asarray(rew_raw_j, dtype=np.float32)
+    roll_rew[:] = np.asarray(rew_j, dtype=np.float32)
+    _rew_intr_np = np.asarray(rew_intr_j, dtype=np.float32)
+    _ext = (np.asarray(ext_j, dtype=np.float32) if ext_j is not None else None)
+    _ext_success = (
+        np.asarray(ext_success_j, dtype=np.float32)
+        if ext_success_j is not None else None)
 
     # Raw repr r(s_T,a_T)-r(s_0,a_0) on completed episodes, before ext bonus.
     _succ_for_delta = _roll_success
@@ -4678,46 +5334,8 @@ def run_ppo_training(
           .astype(np.float32))
     (_rT_r0_succ, _rT_r0_fail, _rT_r0_n_succ, _rT_r0_n_fail,
      ep_repr_r0, ep_repr_r0_valid) = _completed_ep_repr_rT_minus_r0(
-         roll_rew_raw, roll_step_dones, _succ_for_delta,
+         _rew_intr_np, roll_step_dones, _succ_for_delta,
          ep_repr_r0, ep_repr_r0_valid, _ep_succ_at_start)
-
-    # Hard / very-hard success external bonus (opt-in).
-    # Default: after return-norm so the fixed scale is not washed out.
-    # Optional: before return-norm (absorbed into running return std).
-    # When sparse_reward_only is latched, this IS the sole PPO reward.
-    # Logging always records both 2cm (hard) and 1cm (very_hard); this
-    # only selects which one the bonus uses.
-    _ext = None
-    _ext_success = None
-    if use_external_reward:
-      if external_reward_success == 'very_hard':
-        _ext_success = _roll_very_hard
-        if _ext_success is None:
-          raise RuntimeError(
-              'ppo_external_reward_success=very_hard but the rollout has no '
-              'very_hard_success metric (BuilderBench 1cm)')
-      else:
-        _ext_success = _roll_success
-      if _ext_success is not None:
-        _ext = (
-            external_reward_scale
-            * (_ext_success >= 0.5).astype(np.float32))
-        if external_reward_before_norm or sparse_reward_only:
-          roll_rew_raw += _ext
-
-    # Apply reward normalisation (cheap NumPy loop; normalizer state is shared
-    # across the rollout, reset on episode boundaries via roll_step_dones).
-    # Skip when sparse-only: reward is already the fixed sparse scale.
-    if reward_normalizer is not None and not sparse_reward_only:
-      for _t in range(T):
-        roll_rew[_t] = reward_normalizer(roll_rew_raw[_t], roll_step_dones[_t])
-    else:
-      roll_rew[:] = roll_rew_raw
-
-    if (use_external_reward and _ext is not None
-            and not external_reward_before_norm
-            and not sparse_reward_only):
-      roll_rew += _ext
 
     # Latch after sustained high train success: sparse-only reward and/or
     # freeze representations. Sparse-after always uses 2cm train_success_mean.
@@ -4803,182 +5421,14 @@ def run_ppo_training(
             f'full_reward={_full:.4g}',
             flush=True)
 
-    # =================================================================
-    # 2. GAE advantages / returns
-    # =================================================================
-    next_val_j = value_only(
-        ppo_params['value'], jnp.asarray(obs),
-        iter_obs_mean_j, iter_obs_var_j)
-    if rollout_j is not None:
-      _gae_vals_j = rollout_j['values']
-      _gae_dones_j = rollout_j['roll_dones']
-    else:
-      _gae_vals_j = jnp.asarray(roll_vals)
-      _gae_dones_j = jnp.asarray(roll_dones)
-    adv_j, ret_j = gae_fn(
-        jnp.asarray(roll_rew), _gae_vals_j, _gae_dones_j,
-        next_val_j, jnp.asarray(next_done))
-
-    # =================================================================
-    # 3. PPO updates (epochs × minibatches over flat T·E batch)
-    # =================================================================
-    if rollout_j is not None:
-      flat_obs_j = jnp.reshape(
-          rollout_j['obs'], (batch_per_iter,) + obs_shape)
-      flat_acts_j = jnp.reshape(
-          rollout_j['actions'], (batch_per_iter,) + act_shape)
-      flat_logp_j = jnp.reshape(rollout_j['logprobs'], (batch_per_iter,))
-      flat_vals_j = jnp.reshape(rollout_j['values'], (batch_per_iter,))
-    else:
-      flat_obs_j = jnp.asarray(
-          roll_obs.reshape((batch_per_iter,) + obs_shape))
-      flat_acts_j = jnp.asarray(
-          roll_acts.reshape((batch_per_iter,) + act_shape))
-      flat_logp_j = jnp.asarray(roll_logp.reshape(batch_per_iter))
-      flat_vals_j = jnp.asarray(roll_vals.reshape(batch_per_iter))
-    flat_adv_j = jnp.reshape(adv_j, (batch_per_iter,))
-    flat_ret_j = jnp.reshape(ret_j, (batch_per_iter,))
-
-    ppo_metrics_device: list = []
-    early_stop = False
-    _need_kl_sync = config.ppo_target_kl is not None
-    _target_kl = (
-        float(config.ppo_target_kl) if _need_kl_sync else None)
-    _n_mb = int(config.ppo_num_minibatches)
-    _es_epoch = -1
-    _es_mb_approx: list = []
-    _es_mb_analytic: list = []
-    _es_mb_beta: list = []
-    _rolled_back = False
-    _cd_now = _kl_es_cooldown
-    _es_this_iter = bool(_need_kl_sync) and (_cd_now <= 0)
-    if _need_kl_sync and _kl_es_cooldown > 0:
-      print(f'[ppo] target_kl cooldown after actor-reset: '
-            f'{_kl_es_cooldown} iters left (early-stop/rollback off)',
-            flush=True)
-    # Snapshot rollout-time policy params once per iteration for KL penalty.
-    if _kl_penalty_on:
-      _old_ppo_policy_params_j = ppo_params['policy']
-    _n_epochs = int(config.ppo_num_epochs)
-    for epoch in range(_n_epochs):
-      perm = np_rng.permutation(batch_per_iter)
-      epoch_kl_max = 0.0
-      epoch_mb_approx: list = []
-      epoch_mb_analytic: list = []
-      epoch_mb_beta: list = []
-      for mb_i, start in enumerate(range(0, batch_per_iter, mb_size)):
-        mb = jnp.asarray(perm[start:start + mb_size])
-        batch = {
-            'obs':          flat_obs_j[mb],
-            'actions':      flat_acts_j[mb],
-            'old_logprobs': flat_logp_j[mb],
-            'advantages':   flat_adv_j[mb],
-            'returns':      flat_ret_j[mb],
-            'old_values':   flat_vals_j[mb],
-        }
-        key, k_mb = jax.random.split(key)
-        params_before = ppo_params
-        opt_before = ppo_opt_state
-        if ent_coef_schedule is not None and _kl_penalty_on:
-          ppo_params, ppo_opt_state, m = ppo_update(
-              ppo_params, ppo_opt_state, batch, k_mb,
-              iter_obs_mean_j, iter_obs_var_j,
-              jnp.asarray(ppo_sgd_step, dtype=jnp.int32),
-              _old_ppo_policy_params_j,
-              jnp.asarray(_kl_beta, dtype=jnp.float32))
-        elif ent_coef_schedule is not None:
-          ppo_params, ppo_opt_state, m = ppo_update(
-              ppo_params, ppo_opt_state, batch, k_mb,
-              iter_obs_mean_j, iter_obs_var_j,
-              jnp.asarray(ppo_sgd_step, dtype=jnp.int32))
-        elif _kl_penalty_on:
-          ppo_params, ppo_opt_state, m = ppo_update(
-              ppo_params, ppo_opt_state, batch, k_mb,
-              iter_obs_mean_j, iter_obs_var_j,
-              _old_ppo_policy_params_j,
-              jnp.asarray(_kl_beta, dtype=jnp.float32))
-        else:
-          ppo_params, ppo_opt_state, m = ppo_update(
-              ppo_params, ppo_opt_state, batch, k_mb,
-              iter_obs_mean_j, iter_obs_var_j)
-        _mb_approx = float(m['approx_kl'])
-        _mb_analytic = (
-            float(m['analytic_kl']) if _kl_penalty_on else float('nan'))
-        _trip = _need_kl_sync and _mb_approx > _target_kl
-        if _trip and (not _es_this_iter):
-          print(f'[ppo] target_kl SKIP (actor-reset cooldown) '
-                f'iter={iteration} epoch={epoch}/{_n_epochs - 1} '
-                f'mb={mb_i}/{_n_mb - 1} approx_kl={_mb_approx:.6g} '
-                f'threshold={_target_kl:g}',
-                flush=True)
-        elif _trip and _kl_rollback:
-          # Discard this minibatch's update and end the iteration.
-          ppo_params = params_before
-          ppo_opt_state = opt_before
-          early_stop = True
-          _rolled_back = True
-          _es_epoch = int(epoch)
-          epoch_mb_approx.append(_mb_approx)
-          if _kl_penalty_on:
-            epoch_mb_analytic.append(_mb_analytic)
-            epoch_mb_beta.append(_kl_beta)
-          _es_mb_approx = epoch_mb_approx
-          _es_mb_analytic = epoch_mb_analytic
-          _es_mb_beta = epoch_mb_beta
-          _an_s = (f'{_mb_analytic:.6g}' if _kl_penalty_on else 'n/a')
-          print(f'[ppo] target_kl ROLLBACK iter={iteration} '
-                f'epoch={epoch}/{_n_epochs - 1} mb={mb_i}/{_n_mb - 1} '
-                f'threshold={_target_kl:g} approx_kl={_mb_approx:.6g} '
-                f'analytic_kl={_an_s}',
-                flush=True)
-          print('[ppo]   discarded this minibatch update; '
-                'stopping remaining epochs',
-                flush=True)
-          if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic[:-1]:
-            _adapt_kl_beta(float(np.mean(epoch_mb_analytic[:-1])))
-          break
-        ppo_sgd_step += 1
-        ppo_metrics_device.append(m)
-        epoch_mb_approx.append(_mb_approx)
-        if _need_kl_sync:
-          epoch_kl_max = max(epoch_kl_max, _mb_approx)
-        if _kl_penalty_on:
-          epoch_mb_analytic.append(_mb_analytic)
-          if not _kl_adapt_epoch:
-            _adapt_kl_beta(_mb_analytic)
-          epoch_mb_beta.append(_kl_beta)
-        if _trip and _es_this_iter and (not _kl_rollback):
-          # Keep this minibatch update; stop remaining minibatches/epochs.
-          early_stop = True
-          _es_epoch = int(epoch)
-          _es_mb_approx = epoch_mb_approx
-          _es_mb_analytic = epoch_mb_analytic
-          _es_mb_beta = epoch_mb_beta
-          _approx_s = ', '.join(f'{x:.6g}' for x in _es_mb_approx)
-          print(f'[ppo] target_kl early-stop iter={iteration} '
-                f'epoch={epoch}/{_n_epochs - 1} mb={mb_i}/{_n_mb - 1} '
-                f'threshold={_target_kl:g} approx_kl={_mb_approx:.6g} '
-                f'mb_approx_kl=[{_approx_s}]',
-                flush=True)
-          if _kl_penalty_on:
-            _an_s = ', '.join(f'{x:.6g}' for x in _es_mb_analytic)
-            _b_s = ', '.join(f'{x:.6g}' for x in _es_mb_beta)
-            print(f'[ppo]   mb_analytic_kl=[{_an_s}]', flush=True)
-            print(f'[ppo]   mb_beta_after=[{_b_s}]', flush=True)
-          if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic:
-            _adapt_kl_beta(float(np.mean(epoch_mb_analytic)))
-          break
-      if _rolled_back or early_stop:
-        break
-      if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic:
-        _adapt_kl_beta(float(np.mean(epoch_mb_analytic)))
-
-    if _kl_es_cooldown > 0:
-      _kl_es_cooldown -= 1
-
-    # One host sync for all PPO metrics after the epoch loop.
+    # One host sync for all PPO metrics after the epoch loop / scan.
     ppo_metrics_agg: Dict[str, list] = {}
-    if ppo_metrics_device:
+    if ppo_scan_metrics is not None:
+      _stacked_np = {
+          k_: np.asarray(v) for k_, v in ppo_scan_metrics.items()}
+      for k_, arr in _stacked_np.items():
+        ppo_metrics_agg[k_] = [float(x) for x in arr.reshape(-1)]
+    elif ppo_metrics_device:
       _m_keys = list(ppo_metrics_device[0].keys())
       _stacked = {
           k_: jnp.stack([m[k_] for m in ppo_metrics_device])
@@ -4989,16 +5439,40 @@ def run_ppo_training(
 
     pg_vals = ppo_metrics_agg.get('pg_loss', [])
     mean_pg = float(np.mean(pg_vals)) if pg_vals else float('inf')
+    # No per-minibatch KL read when target_kl is off: adapt β once from the
+    # stacked metrics (same host sync as logging).
+    if _kl_penalty_on and not _need_kl_sync:
+      _an_vals = ppo_metrics_agg.get('analytic_kl') or []
+      if _an_vals:
+        _adapt_kl_beta(float(np.mean(_an_vals)))
     # Host mirrors used by logging (single sync).
     adv = np.asarray(adv_j)
     ret = np.asarray(ret_j)
     if rollout_j is not None:
       roll_vals[:] = np.asarray(rollout_j['values'], dtype=np.float32)
-      # Lazy materialize of obs only if later code needs the host buffer.
       roll_dones[:] = np.asarray(
           rollout_j['roll_dones'], dtype=np.float32)
       roll_logp[:] = np.asarray(
           rollout_j['logprobs'], dtype=np.float32)
+
+    # Occasional raw-vs-normalized sanity print (2 early iters only).
+    # After PPO so this D2H does not block reward / GAE / scan.
+    if norm_obs and iteration in (1, 10) and np.all(np.isfinite(iter_obs_mean)):
+      if rollout_j is not None:
+        _raw = np.asarray(rollout_j['obs'][0, 0], dtype=np.float32)
+      else:
+        _raw = np.asarray(roll_obs[0, 0], dtype=np.float32)
+      _norm = np.asarray(_normalize_packed_obs(
+          jnp.asarray(_raw[None]), iter_obs_mean_j, iter_obs_var_j,
+          obs_dim=obs_dim_cfg, start_index=norm_si, end_index=norm_ei,
+          clip=obs_norm_clip, enabled=True,
+          goal_state_indices=_goal_state_indices)[0])
+      print(f'[ppo][obs_norm] iter={iteration} raw  '
+            f'state={np.array2string(_raw[:obs_dim_cfg], precision=3)} '
+            f'goal={np.array2string(_raw[obs_dim_cfg:], precision=3)}')
+      print(f'[ppo][obs_norm] iter={iteration} norm '
+            f'state={np.array2string(_norm[:obs_dim_cfg], precision=3)} '
+            f'goal={np.array2string(_norm[obs_dim_cfg:], precision=3)}')
 
     # =================================================================
     # 4. CRL updates (off-policy, from replay)
@@ -5006,7 +5480,7 @@ def run_ppo_training(
     crl_metrics_agg: Dict[str, list] = {}
     nfb_metrics_agg: Dict[str, list] = {}
     hybrid_td3_metrics_agg: Dict[str, list] = {}
-    if replay.size >= int(config.ppo_min_replay_size):
+    if _n_replay_trans() >= int(config.ppo_min_replay_size):
       # Update goal normalisation stats from a fresh replay sample (NF only).
       if use_nf and not _nf_normalizer_reset_done:
         # First time NF activates: reset the return normalizer so the extreme
@@ -5015,44 +5489,57 @@ def run_ppo_training(
         if reward_normalizer is not None:
           reward_normalizer._rms = RunningMeanStd(shape=())
           reward_normalizer._returns = np.zeros(E, dtype=np.float64)
+          rn_mean_j = jnp.asarray(
+              reward_normalizer._rms.mean, dtype=jnp.float32)
+          rn_var_j = jnp.asarray(
+              reward_normalizer._rms.var, dtype=jnp.float32)
+          rn_count_j = jnp.asarray(
+              reward_normalizer._rms.count, dtype=jnp.float32)
+          rn_returns_j = jnp.asarray(
+              reward_normalizer._returns, dtype=jnp.float32)
         _nf_normalizer_reset_done = True
       if use_nf:
         _std_floor = float(getattr(config, 'nf_goal_std_min', 0.02))
         _mix_task = bool(getattr(config, 'nf_mix_task_goal_stats', False))
-        _n_sf = int(config.batch_size) if _mix_task else min(2048, replay.size)
-        _n_sf = min(_n_sf, int(replay.size))
-        _stat_batch = replay.sample(_n_sf, np_rng)
-        _goals = _stat_batch['obs'][:, int(config.obs_dim):]
+        _n_rep = _n_replay_trans()
+        _n_sf = int(config.batch_size) if _mix_task else min(2048, _n_rep)
+        _n_sf = max(1, min(_n_sf, int(_n_rep)))
+        if gpu_buf is not None:
+          key, k_stat = jax.random.split(key)
+          _stat_batch, _ = gpu_replay_api.sample(
+              gpu_buf, k_stat, int(_n_sf))
+          _goals = _stat_batch['obs'][:, int(config.obs_dim):]
+        else:
+          _stat_batch = replay.sample(_n_sf, np_rng)
+          _goals = jnp.asarray(
+              _stat_batch['obs'][:, int(config.obs_dim):], dtype=jnp.float32)
         # Optionally mix in the actual env goals from the current rollout so
         # that the running stats cover both hindsight goals AND reward goals.
         if bool(getattr(config, 'nf_mix_env_goal_stats', False)):
           if rollout_j is not None:
-            _env_goals = np.asarray(
-                rollout_j['obs'].reshape(-1, rollout_j['obs'].shape[-1])
-                [:, int(config.obs_dim):],
-                dtype=np.float32)
+            _og = rollout_j['obs']
+            _env_goals = _og.reshape(-1, _og.shape[-1])[:, int(config.obs_dim):]
           else:
-            _env_goals = roll_obs.reshape(
-                -1, roll_obs.shape[-1])[:, int(config.obs_dim):]
-          _goals = np.concatenate([_goals, _env_goals], axis=0)
+            _env_goals = jnp.asarray(
+                roll_obs.reshape(-1, roll_obs.shape[-1])[:, int(config.obs_dim):],
+                dtype=jnp.float32)
+          _goals = jnp.concatenate([_goals, _env_goals], axis=0)
         if _mix_task:
           if rollout_j is not None:
-            _g_task = np.asarray(
-                rollout_j['obs'].reshape(-1, rollout_j['obs'].shape[-1])
-                [0, int(config.obs_dim):],
-                dtype=np.float32)
+            _og = rollout_j['obs']
+            _g_task = _og.reshape(-1, _og.shape[-1])[0, int(config.obs_dim):]
           else:
-            _g_task = roll_obs.reshape(
-                -1, roll_obs.shape[-1])[0, int(config.obs_dim):].astype(
-                    np.float32)
+            _g_task = jnp.asarray(
+                roll_obs.reshape(-1, roll_obs.shape[-1])[0, int(config.obs_dim):],
+                dtype=jnp.float32)
           _n_task = int(config.batch_size)
-          _goals = np.concatenate(
-              [_goals, np.repeat(_g_task[None], _n_task, axis=0)], axis=0)
+          _goals = jnp.concatenate(
+              [_goals, jnp.repeat(_g_task[None], _n_task, axis=0)], axis=0)
           _nf_stat_log['nf/goal_stat_n_sf'] = float(_n_sf)
           _nf_stat_log['nf/goal_stat_n_task'] = float(_n_task)
-        nf_goal_mean = _goals.mean(axis=0).astype(np.float32)
-        nf_goal_std  = _goals.std(axis=0).astype(np.float32)
-        nf_goal_std  = np.maximum(nf_goal_std, _std_floor).astype(np.float32)
+        nf_goal_mean = np.asarray(jnp.mean(_goals, axis=0), dtype=np.float32)
+        nf_goal_std = np.asarray(
+            jnp.maximum(jnp.std(_goals, axis=0), _std_floor), dtype=np.float32)
         for _di, (_gm, _gs) in enumerate(zip(nf_goal_mean, nf_goal_std)):
           _nf_stat_log[f'nf/goal_mean_{_di}'] = float(_gm)
           _nf_stat_log[f'nf/goal_std_{_di}']  = float(_gs)
@@ -5061,10 +5548,10 @@ def run_ppo_training(
               _stat_batch['obs'][:, :int(config.obs_dim)],
               int(config.start_index), int(config.end_index),
               _goal_state_indices)
-          nf_bwd_s_mean = _s_goal.mean(axis=0).astype(np.float32)
-          nf_bwd_s_std = np.maximum(
-              _s_goal.std(axis=0).astype(np.float32), _std_floor
-          ).astype(np.float32)
+          nf_bwd_s_mean = np.asarray(jnp.mean(_s_goal, axis=0), dtype=np.float32)
+          nf_bwd_s_std = np.asarray(
+              jnp.maximum(jnp.std(_s_goal, axis=0), _std_floor),
+              dtype=np.float32)
           for _di, (_sm, _ss) in enumerate(zip(nf_bwd_s_mean, nf_bwd_s_std)):
             _nf_stat_log[f'nfb/s_mean_{_di}'] = float(_sm)
             _nf_stat_log[f'nfb/s_std_{_di}'] = float(_ss)
@@ -5076,15 +5563,7 @@ def run_ppo_training(
         pass
       elif use_crl_td3_switch:
         # TD3 learns from the beginning and continues after the reward switch.
-        _samples_td3 = [
-            (replay.sample_with_uniform_negatives(
-                int(config.batch_size), np_rng, goal_low, goal_high)
-             if uniform_sampling
-             else replay.sample(int(config.batch_size), np_rng))
-            for _ in range(_n_crl)]
-        _stacked_td3 = {
-            k_: jnp.asarray(np.stack([s[k_] for s in _samples_td3], axis=0))
-            for k_ in _samples_td3[0]}
+        _stacked_td3 = _offpolicy_stacked(_n_crl)
         (hybrid_td3_params, hybrid_td3_opt_state, hybrid_td3_params_reward,
          key, td3_policy_target, m) = hybrid_td3_scan_update(
             hybrid_td3_params, hybrid_td3_opt_state,
@@ -5097,15 +5576,7 @@ def run_ppo_training(
         # frozen CRL critic still supplied this iteration's already-computed
         # rewards; TD3 becomes active only on the next iteration.
         if not _switch_after_this_iteration and not reward_switched_to_td3:
-          _samples = [
-              (replay.sample_with_uniform_negatives(
-                  int(config.batch_size), np_rng, goal_low, goal_high)
-               if uniform_sampling
-               else replay.sample(int(config.batch_size), np_rng))
-              for _ in range(_n_crl)]
-          _stacked = {
-              k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
-              for k_ in _samples[0]}
+          _stacked = _offpolicy_stacked(_n_crl)
           (q_params, q_opt_state, q_params_reward,
            key, m) = crl_scan_update(
               q_params, q_opt_state, q_params_reward, _stacked, key,
@@ -5120,25 +5591,34 @@ def run_ppo_training(
                 (1 - _gr_lam_alpha) * _gr_lam + _gr_lam_alpha * _target,
                 _gr_lam_min, _gr_lam_max))
       elif use_nf:
-        # Pre-sample all NF batches → one H→D transfer → one scanned JIT.
-        _samples = [
-            (replay.sample_with_uniform_negatives(
-                int(config.batch_size), np_rng, goal_low, goal_high)
-             if uniform_sampling
-             else replay.sample(int(config.batch_size), np_rng))
-            for _ in range(_n_crl)]
-        _stacked = {
-            k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
-            for k_ in _samples[0]}
         _gmean_j, _gstd_j = _nf_apply_goal_stats()
+        _stacked = None
         if use_nf_td:
+          _stacked = _offpolicy_stacked(_n_crl)
           (q_params, q_opt_state, nf_td_target, q_params_reward,
            key, m) = nf_scan_td_update(
               q_params, q_opt_state, nf_td_target, q_params_reward,
               _stacked, key,
               _gmean_j, _gstd_j,
               ppo_params['policy'])
+        elif nf_scan_buf_update is not None:
+          _lam_j = jnp.array(_gr_lam, dtype=jnp.float32)
+          if _nf_tr_eta > 0.0:
+            _p_old = nf_time_ema if nf_time_ema is not None else q_params
+            (q_params, q_opt_state, q_params_reward, gpu_buf,
+             key, _gr_lam_j, m) = nf_scan_buf_update(
+                 q_params, q_opt_state, q_params_reward, gpu_buf, key,
+                 _gmean_j, _gstd_j, _lam_j, _p_old, ppo_params['policy'])
+            if nf_time_ema is not None:
+              nf_time_ema = _ema_tree(nf_time_ema, q_params, _nf_tr_tau)
+          else:
+            (q_params, q_opt_state, q_params_reward, gpu_buf,
+             key, _gr_lam_j, m) = nf_scan_buf_update(
+                 q_params, q_opt_state, q_params_reward, gpu_buf, key,
+                 _gmean_j, _gstd_j, _lam_j)
+          _gr_lam = float(_gr_lam_j)
         else:
+          _stacked = _offpolicy_stacked(_n_crl)
           _nf_scan_args = (
               q_params, q_opt_state, q_params_reward, _stacked, key,
               _gmean_j, _gstd_j,
@@ -5153,10 +5633,11 @@ def run_ppo_training(
           else:
             (q_params, q_opt_state, q_params_reward,
              key, _gr_lam_j, m) = nf_scan_update(*_nf_scan_args)
-          # Dual mode: λ updated inside scan; keep Python float for next iter.
           _gr_lam = float(_gr_lam_j)
         crl_metrics_agg = {k_: [float(v)] for k_, v in m.items()}
         if use_nf_bwd:
+          if _stacked is None:
+            _stacked = _offpolicy_stacked(_n_crl)
           _smean_j, _sstd_j = _nf_apply_bwd_s_stats()
           (nf_bwd_params, nf_bwd_opt_state,
            nf_bwd_key, m_bwd) = nf_bwd_scan_update(
@@ -5164,15 +5645,7 @@ def run_ppo_training(
               _smean_j, _sstd_j)
           nfb_metrics_agg = {k_: [float(v)] for k_, v in m_bwd.items()}
       elif use_td3:
-        _samples = [
-            (replay.sample_with_uniform_negatives(
-                int(config.batch_size), np_rng, goal_low, goal_high)
-             if uniform_sampling
-             else replay.sample(int(config.batch_size), np_rng))
-            for _ in range(_n_crl)]
-        _stacked = {
-            k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
-            for k_ in _samples[0]}
+        _stacked = _offpolicy_stacked(_n_crl)
         (q_params, q_opt_state, q_params_reward,
          key, td3_policy_target, m) = td3_scan_update(
             q_params, q_opt_state, q_params_reward, _stacked, key,
@@ -5191,31 +5664,43 @@ def run_ppo_training(
                 f'({_tdi_crl_warmup_iters} iters); switching critic to '
                 f'TD-InfoNCE (target Q reinit from online φ,ψ)',
                 flush=True)
-        _samples = []
-        for _ in range(_n_crl):
-          if uniform_sampling:
-            crl_batch_np = replay.sample_with_uniform_negatives(
-                int(config.batch_size), np_rng, goal_low, goal_high)
-          else:
-            crl_batch_np = replay.sample(int(config.batch_size), np_rng)
+        if gpu_buf is not None:
+          _stacked = _offpolicy_stacked(_n_crl)
           if not _tdi_in_crl_warmup:
-            # Column goals = rolled geometric future goals (s_j from sample()).
             _si = int(config.start_index)
             _ei = int(config.end_index)
-            if 'future_state' in crl_batch_np:
-              _fs = crl_batch_np['future_state']
+            if 'future_state' in _stacked:
+              _fut_g = _nfb.state_as_goal(
+                  _stacked['future_state'], _si, _ei, _goal_state_indices)
             else:
-              _fs = None
-            if _fs is not None:
-              _fut_g = (_fs[:, _si:] if _ei == -1 else _fs[:, _si:_ei])
+              _fut_g = _stacked['obs'][..., int(config.obs_dim):]
+            _stacked = dict(_stacked)
+            _stacked['random_goal'] = jnp.roll(_fut_g, -1, axis=1)
+        else:
+          _samples = []
+          for _ in range(_n_crl):
+            if uniform_sampling:
+              crl_batch_np = replay.sample_with_uniform_negatives(
+                  int(config.batch_size), np_rng, goal_low, goal_high)
             else:
-              _fut_g = crl_batch_np['obs'][:, int(config.obs_dim):]
-            crl_batch_np = dict(crl_batch_np)
-            crl_batch_np['random_goal'] = np.roll(_fut_g, -1, axis=0)
-          _samples.append(crl_batch_np)
-        _stacked = {
-            k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
-            for k_ in _samples[0]}
+              crl_batch_np = replay.sample(int(config.batch_size), np_rng)
+            if not _tdi_in_crl_warmup:
+              _si = int(config.start_index)
+              _ei = int(config.end_index)
+              if 'future_state' in crl_batch_np:
+                _fs = crl_batch_np['future_state']
+              else:
+                _fs = None
+              if _fs is not None:
+                _fut_g = (_fs[:, _si:] if _ei == -1 else _fs[:, _si:_ei])
+              else:
+                _fut_g = crl_batch_np['obs'][:, int(config.obs_dim):]
+              crl_batch_np = dict(crl_batch_np)
+              crl_batch_np['random_goal'] = np.roll(_fut_g, -1, axis=0)
+            _samples.append(crl_batch_np)
+          _stacked = {
+              k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
+              for k_ in _samples[0]}
         if _tdi_in_crl_warmup:
           (q_params, q_opt_state, q_params_reward,
            key, m) = td_infonce_crl_warmup_scan(
@@ -5235,28 +5720,30 @@ def run_ppo_training(
         crl_metrics_agg['crl_warmup_active'] = [
             1.0 if _tdi_in_crl_warmup else 0.0]
       elif use_fm:
-        _samples = [
-            (replay.sample_with_uniform_negatives(
-                int(config.batch_size), np_rng, goal_low, goal_high)
-             if uniform_sampling
-             else replay.sample(int(config.batch_size), np_rng))
-            for _ in range(_n_crl)]
-        _stacked = {
-            k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
-            for k_ in _samples[0]}
+        _stacked = _offpolicy_stacked(_n_crl)
         (q_params, q_opt_state, q_params_reward,
          key, m) = fm_scan_update(
             q_params, q_opt_state, q_params_reward, _stacked, key)
         crl_metrics_agg = {k_: [float(v)] for k_, v in m.items()}
       elif use_gaussian:
         # Gaussian still on the Python loop (unused for now).
-        for _ in range(_n_crl):
-          if uniform_sampling:
-            crl_batch_np = replay.sample_with_uniform_negatives(
-                int(config.batch_size), np_rng, goal_low, goal_high)
+        if gpu_buf is not None:
+          _stacked = _offpolicy_stacked(_n_crl)
+          _cpu_batches = None
+        else:
+          _stacked = None
+          _cpu_batches = [
+              (replay.sample_with_uniform_negatives(
+                  int(config.batch_size), np_rng, goal_low, goal_high)
+               if uniform_sampling
+               else replay.sample(int(config.batch_size), np_rng))
+              for _ in range(_n_crl)]
+        for _i in range(_n_crl):
+          if _stacked is not None:
+            crl_batch = {k_: v[_i] for k_, v in _stacked.items()}
           else:
-            crl_batch_np = replay.sample(int(config.batch_size), np_rng)
-          crl_batch = {k_: jnp.asarray(v) for k_, v in crl_batch_np.items()}
+            crl_batch = {
+                k_: jnp.asarray(v) for k_, v in _cpu_batches[_i].items()}
           key, k_crl = jax.random.split(key)
           q_params, q_opt_state, m = crl_update(
               q_params, q_opt_state, crl_batch, k_crl)
@@ -5270,15 +5757,7 @@ def run_ppo_training(
       else:
         # Standard CRL: pre-sample all batches → one H→D transfer → one JIT.
         # This eliminates _n_crl rounds of dispatch + host sync.
-        _samples = [
-            (replay.sample_with_uniform_negatives(
-                int(config.batch_size), np_rng, goal_low, goal_high)
-             if uniform_sampling
-             else replay.sample(int(config.batch_size), np_rng))
-            for _ in range(_n_crl)]
-        _stacked = {
-            k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
-            for k_ in _samples[0]}
+        _stacked = _offpolicy_stacked(_n_crl)
         (q_params, q_opt_state, q_params_reward,
          key, m) = crl_scan_update(
             q_params, q_opt_state, q_params_reward, _stacked, key,
@@ -5297,7 +5776,7 @@ def run_ppo_training(
     # =================================================================
     # 4b. KDE refit (kde_dirac mode only)
     # =================================================================
-    if use_kde_dirac and replay.size >= int(config.ppo_min_replay_size):
+    if use_kde_dirac and _n_replay_trans() >= int(config.ppo_min_replay_size):
       if iteration % kde_refit_interval == 0:
         kde_state = GaussianKDE.fit(
             replay, int(config.obs_dim),
@@ -5306,6 +5785,9 @@ def run_ppo_training(
     # =================================================================
     # 5. Logging
     # =================================================================
+    if reward_normalizer is not None and rn_mean_j is not None:
+      _sync_return_norm_host(
+          reward_normalizer, rn_mean_j, rn_var_j, rn_count_j, rn_returns_j)
     elapsed = time.time() - start_time
     # flow-dense reward: only log if this env actually emits it.
     _has_flow_dense = not np.all(np.isnan(roll_flow_dense_rew))
@@ -5315,7 +5797,7 @@ def run_ppo_training(
         'learner_steps':     iteration,
         'global_step':       global_step,
         'sps':               global_step / max(1e-6, elapsed),
-        'replay_size':       int(replay.size),
+        'replay_size':       int(_n_replay_trans()),
         'reward_repr_mean':      float(roll_rew.mean()),
         'reward_repr_raw_mean':  float(roll_rew_raw.mean()),
         'reward_repr_raw_std':   float(roll_rew_raw.std()),
@@ -5336,6 +5818,10 @@ def run_ppo_training(
         'ep_return_mean':    float(np.mean(recent_returns)) if recent_returns else float('nan'),
         'ep_length_mean':    float(np.mean(recent_lengths)) if recent_lengths else float('nan'),
         'ppo/mean_pg_loss':  mean_pg,
+        'time_unroll_s':     float(_t_unroll_s),
+        'time_insert_s':     float(_t_insert_s),
+        'time_rewgae_s':     float(_t_rewgae_s),
+        'time_ppo_s':        float(_t_ppo_s),
     }
     if reward_normalizer is not None:
       log['reward_return_norm_std'] = float(reward_normalizer.std)
@@ -5870,10 +6356,6 @@ def run_ppo_training(
       milestone_path = os.path.join(
           checkpoint_dir, f'ckpt_iter_{iteration:07d}.pkl')
       _save_checkpoint(milestone_path, **ckpt_kw)
-      _replay_state = replay.state_dict(ckpt_replay_max)
-      if _replay_state is not None:
-        ckpt_kw['extra_state'] = dict(
-            _checkpoint_extra, replay=_replay_state)
       _save_checkpoint(os.path.join(checkpoint_dir, 'latest.pkl'), **ckpt_kw)
       _prune_old_checkpoints(checkpoint_dir, ckpt_keep_last)
 

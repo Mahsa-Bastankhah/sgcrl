@@ -118,8 +118,8 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     cfg.episode_length = creative_cube_mj_episode_length(
         num_cubes, self._task_id)
     cfg.permute_start_boxes = self._permute_start_boxes
-    # Use JAX MJX backend (no warp-lang required). Set BUILDERBENCH_MJX_IMPL=warp
-    # if warp-lang is installed and you want the faster path.
+    # MJX backend. Jobs should set BUILDERBENCH_MJX_IMPL=warp (sgcrl_builderbench
+    # has warp-lang). Use jax only if Warp is unavailable.
     cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
     if env_id in _MJX_PARAMS:
       cfg.nconmax, cfg.njmax = _MJX_PARAMS[env_id]

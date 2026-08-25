@@ -1,5 +1,6 @@
-"""JAX rasterizer: BuilderBench compact state/goal xyz → 64×64 RGB.
+"""JAX rasterizer: BuilderBench compact state/goal xyz → H×H RGB.
 
+Default ``IMAGE_HW=64``. Override with ``ppo_bb_pixel_hw`` / ``bb_pixel_hw``.
 Used only when ``ppo_bb_pixel_obs`` is on. Env obs and replay stay compact
 vectors; networks call these helpers at apply time (inside jit).
 
@@ -73,19 +74,31 @@ def resolve_bb_pixel_layout(env_name: str) -> Tuple[int, Tuple[int, ...]]:
   return int(num_cubes), color_idx
 
 
-def pixel_network_kwargs(env_name: str, enabled: bool) -> dict:
+def resolve_pixel_hw(hw) -> int:
+  """Validate rasterizer H=W. CNN is three stride-2 convs, so ``hw >= 8``."""
+  h = int(hw)
+  if h < 8:
+    raise ValueError(f'bb_pixel_hw must be >= 8, got {hw!r}')
+  return h
+
+
+def pixel_network_kwargs(
+    env_name: str, enabled: bool, hw: int = IMAGE_HW,
+) -> dict:
   """Kwargs for ``make_networks`` / ``make_nf_density_networks``."""
   if not enabled:
     return dict(
         bb_pixel_obs=False,
         bb_num_cubes=0,
         bb_goal_color_indices=(),
+        bb_pixel_hw=int(IMAGE_HW),
     )
   num_cubes, color_idx = resolve_bb_pixel_layout(env_name)
   return dict(
       bb_pixel_obs=True,
       bb_num_cubes=num_cubes,
       bb_goal_color_indices=color_idx,
+      bb_pixel_hw=resolve_pixel_hw(hw),
   )
 
 
@@ -294,7 +307,7 @@ def rasterize_bb_goal(
 
 
 class BBPixelTorso(hk.Module):
-  """Small CNN: ``(B, 64, 64, 3)`` in ``[0, 1]`` → ``(B, 256)``."""
+  """Small CNN: ``(B, H, W, 3)`` in ``[0, 1]`` → ``(B, 256)``."""
 
   def __init__(self, embed_dim: int = PIXEL_EMBED_DIM, name: str = 'bb_pixel_torso'):
     super().__init__(name=name)
@@ -319,10 +332,12 @@ def encode_state_goal_images(
     num_cubes: int,
     goal_color_indices: Sequence[int],
     torso_name: str = 'bb_pixel_torso',
+    resolution: int = IMAGE_HW,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
   """Rasterize then shared CNN. Call from inside a Haiku transform."""
+  hw = resolve_pixel_hw(resolution)
   torso = BBPixelTorso(name=torso_name)
-  s_img = rasterize_bb_state(state, num_cubes)
+  s_img = rasterize_bb_state(state, num_cubes, resolution=hw)
   g_img = rasterize_bb_goal(
-      goal, goal_color_indices, num_cubes=num_cubes)
+      goal, goal_color_indices, resolution=hw, num_cubes=num_cubes)
   return torso(s_img), torso(g_img)

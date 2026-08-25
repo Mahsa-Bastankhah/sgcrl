@@ -206,7 +206,8 @@ def make_networks(
     state_only: bool = False,
     bb_pixel_obs: bool = False,
     bb_num_cubes: int = 0,
-    bb_goal_color_indices: Optional[Sequence[int]] = None):
+    bb_goal_color_indices: Optional[Sequence[int]] = None,
+    bb_pixel_hw: int = 64):
   """Creates networks used by the agent.
 
   Args:
@@ -221,10 +222,12 @@ def make_networks(
     state_only: If True, φ encodes state only (not concat[s,a]), so CRL
       learns / rewards with φ(s)·ψ(g) instead of φ(s,a)·ψ(g).  Action is
       still accepted by the critic apply API but ignored by the SA encoder.
-    bb_pixel_obs: If True, rasterize BuilderBench compact xyz to 64×64 and
-      run a CNN before the existing MLPs.  Replay / env obs stay vectors.
-      Incompatible with ``use_image_obs`` (that path expects flattened
-      images already in ``obs``).
+    bb_pixel_obs: If True, rasterize BuilderBench compact xyz to
+      ``bb_pixel_hw``×``bb_pixel_hw`` and run a CNN before the existing
+      MLPs.  Replay / env obs stay vectors.  Incompatible with
+      ``use_image_obs`` (that path expects flattened images already in
+      ``obs``).
+    bb_pixel_hw: Rasterizer H=W when ``bb_pixel_obs`` is True (default 64).
   """
 
   num_dimensions = np.prod(spec.actions.shape, dtype=int)
@@ -234,6 +237,7 @@ def make_networks(
   _state_only = bool(state_only)
   _bb_pixel = bool(bb_pixel_obs)
   _bb_num_cubes = int(bb_num_cubes)
+  _bb_pixel_hw = int(bb_pixel_hw)
   _bb_goal_colors = tuple(
       int(i) for i in (bb_goal_color_indices or ()))
   if _bb_pixel and use_image_obs:
@@ -243,6 +247,9 @@ def make_networks(
     if _bb_num_cubes < 1 or not _bb_goal_colors:
       raise ValueError(
           'bb_pixel_obs requires bb_num_cubes>=1 and bb_goal_color_indices')
+    if _bb_pixel_hw < 8:
+      raise ValueError(
+          f'bb_pixel_hw must be >= 8, got {_bb_pixel_hw}')
   if _cat_select is not None and _cat_select < 2:
     raise ValueError(
         f'categorical_select_classes must be >= 2, got {_cat_select}')
@@ -268,7 +275,7 @@ def make_networks(
     from envs.builderbench_raster import encode_state_goal_images
     return encode_state_goal_images(
         obs[:, :obs_dim], obs[:, obs_dim:],
-        _bb_num_cubes, _bb_goal_colors)
+        _bb_num_cubes, _bb_goal_colors, resolution=_bb_pixel_hw)
 
   def _repr_fn(obs, action, hidden=None):
     # The optional input hidden is the image representations. We include this

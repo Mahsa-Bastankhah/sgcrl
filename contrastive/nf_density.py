@@ -208,6 +208,7 @@ def make_nf_density_networks(
     bb_pixel_obs: bool = False,
     bb_num_cubes: int = 0,
     bb_goal_color_indices: Optional[Sequence[int]] = None,
+    bb_pixel_hw: int = 64,
 ) -> NFDensityNetworks:
     """Build SA encoder + optional goal encoder + conditional RealNVP flow.
 
@@ -225,6 +226,7 @@ def make_nf_density_networks(
 
     bb_pixel_obs: if True, rasterize compact BB xyz → CNN before the SA /
     goal MLPs.  Requires ``bb_num_cubes`` and ``bb_goal_color_indices``.
+    ``bb_pixel_hw`` is the rasterizer H=W (default 64).
     When ``goal_enc_size==0``, a goal encoder is created with size
     ``rep_size`` so the flow runs on CNN embeddings (not raw xyz).
     """
@@ -236,11 +238,15 @@ def make_nf_density_networks(
 
     _bb_pixel = bool(bb_pixel_obs)
     _bb_num_cubes = int(bb_num_cubes)
+    _bb_pixel_hw = int(bb_pixel_hw)
     _bb_goal_colors = tuple(int(i) for i in (bb_goal_color_indices or ()))
     if _bb_pixel:
       if _bb_num_cubes < 1 or not _bb_goal_colors:
         raise ValueError(
             'bb_pixel_obs requires bb_num_cubes>=1 and bb_goal_color_indices')
+      if _bb_pixel_hw < 8:
+        raise ValueError(
+            f'bb_pixel_hw must be >= 8, got {_bb_pixel_hw}')
       if int(goal_enc_size) <= 0:
         goal_enc_size = max(int(rep_size), 2)
 
@@ -266,7 +272,8 @@ def make_nf_density_networks(
             from envs.builderbench_raster import (
                 BBPixelTorso, rasterize_bb_state)
             state = BBPixelTorso(name='bb_pixel_torso')(
-                rasterize_bb_state(state, _bb_num_cubes))
+                rasterize_bb_state(
+                    state, _bb_num_cubes, resolution=_bb_pixel_hw))
         return _sa_encoder(state, action, rep_size,
                            sa_hidden=_sa_hidden, sa_num_layers=_sa_num_layers,
                            state_only=_state_only)
@@ -277,7 +284,8 @@ def make_nf_density_networks(
                 BBPixelTorso, rasterize_bb_goal)
             goal = BBPixelTorso(name='bb_pixel_torso')(
                 rasterize_bb_goal(
-                    goal, _bb_goal_colors, num_cubes=_bb_num_cubes))
+                    goal, _bb_goal_colors, resolution=_bb_pixel_hw,
+                    num_cubes=_bb_num_cubes))
         return _goal_encoder(goal, goal_enc_size)
 
     def _affine_st(i: int, cond_in: jnp.ndarray):
@@ -942,6 +950,91 @@ def make_scan_nf_update_fn(
         scan_step, (params, opt_state, params_ema, key, lam), batches)
     metrics = jax.tree_util.tree_map(jnp.mean, metrics)
     return params, opt_state, params_ema, key, lam, metrics
+
+  return multi_update
+
+
+def make_scan_nf_buffer_update_fn(
+    nf_networks: NFDensityNetworks,
+    optimizer: optax.GradientTransformation,
+    obs_dim: int,
+    sample_batch,
+    n_steps: int,
+    noise_std: float = 0.0,
+    repr_tau: float = 0.0,
+    mask_prob: float = 0.0,
+    s_pert_prob: float = 0.0,
+    s_pert_eps: float = 1e-2,
+    s_pert_lo: int = 0,
+    s_pert_hi: int = -1,
+    grad_reg_c: float = 100.0,
+    grad_reg_coef: float = 0.0,
+    lam_lr: float = 0.0,
+    task_goal_frac: float = 0.0,
+    task_goal: Optional[np.ndarray] = None,
+    time_reg_eta: float = 0.0,
+    policy_network_apply=None,
+    sample_fn=None,
+    policy_goal: Optional[np.ndarray] = None,
+):
+  """Like :func:`make_scan_nf_update_fn` but samples each step from a GPU buffer.
+
+  ``sample_batch(buf, key) -> (batch, buf)``.  ``n_steps`` is the scan length
+  (``ppo_crl_steps_per_iter``).
+  """
+  raw_update = make_nf_density_update_fn(
+      nf_networks, optimizer, obs_dim=obs_dim, noise_std=noise_std,
+      mask_prob=mask_prob,
+      s_pert_prob=s_pert_prob, s_pert_eps=s_pert_eps,
+      s_pert_lo=s_pert_lo, s_pert_hi=s_pert_hi,
+      grad_reg_c=grad_reg_c, grad_reg_coef=grad_reg_coef,
+      lam_lr=lam_lr,
+      task_goal_frac=task_goal_frac, task_goal=task_goal,
+      time_reg_eta=time_reg_eta,
+      policy_network_apply=policy_network_apply,
+      sample_fn=sample_fn,
+      policy_goal=policy_goal)
+  use_ema = 0.0 < float(repr_tau) < 1.0
+  _tau = float(repr_tau)
+  _init_lam_py = max(grad_reg_coef, 5e-4) if grad_reg_coef > 0.0 else 0.0
+  _do_time_reg = float(time_reg_eta) > 0.0
+  _n_steps = int(n_steps)
+
+  @jax.jit
+  def multi_update(
+      params, opt_state, params_ema, buf, key, goal_mean, goal_std,
+      lam_val=None, params_old=None, policy_params=None):
+    lam = (jnp.array(_init_lam_py, dtype=jnp.float32)
+           if lam_val is None else lam_val)
+    p_old = params if params_old is None else params_old
+    pol = params if policy_params is None else policy_params
+    if _do_time_reg:
+      p_old = jax.lax.stop_gradient(p_old)
+      pol = jax.lax.stop_gradient(pol)
+
+    def scan_step(carry, _):
+      p, opt, ema, buf, k, lam = carry
+      k, k_s, k_u = jax.random.split(k, 3)
+      batch, buf = sample_batch(buf, k_s)
+      if _do_time_reg:
+        p, opt, lam, m = raw_update(
+            p, opt, batch, k_u, goal_mean, goal_std, lam, p_old, pol)
+      else:
+        p, opt, lam, m = raw_update(
+            p, opt, batch, k_u, goal_mean, goal_std, lam)
+      if use_ema:
+        ema = jax.tree_util.tree_map(
+            lambda t, o: _tau * t + (1.0 - _tau) * o, ema, p)
+      else:
+        ema = p
+      return (p, opt, ema, buf, k, lam), m
+
+    (params, opt_state, params_ema, buf, key, lam), metrics = jax.lax.scan(
+        scan_step,
+        (params, opt_state, params_ema, buf, key, lam),
+        None, length=_n_steps)
+    metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+    return params, opt_state, params_ema, buf, key, lam, metrics
 
   return multi_update
 

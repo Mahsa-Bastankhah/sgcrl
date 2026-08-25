@@ -87,6 +87,7 @@ class _TrainCtx:
   crl_state_only: bool = False
   fixed_start_x: Optional[float] = None
   bb_pixel_obs: bool = False
+  bb_pixel_hw: int = 64
 
 
 def force_video_nopermute_norand(ctx: _TrainCtx,
@@ -278,6 +279,14 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     bb_pixel_obs = bool(flags.get(
         'ppo_bb_pixel_obs',
         resolved.get('ppo_bb_pixel_obs', False)))
+    _hw_flag = flags.get(
+        'ppo_bb_pixel_hw', resolved.get('ppo_bb_pixel_hw', 64))
+    try:
+      bb_pixel_hw = int(_hw_flag)
+    except (TypeError, ValueError):
+      bb_pixel_hw = 64
+    if bb_pixel_hw < 8:
+      bb_pixel_hw = int(resolved.get('ppo_bb_pixel_hw', 64))
   else:
     use_pd = False
     pd_duration = 5
@@ -296,6 +305,7 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
     categorical_select_waypoint = False
     crl_state_only = False
     bb_pixel_obs = False
+    bb_pixel_hw = 64
 
   if use_pd:
     macro_ep_len = mj_ep_len // pd_duration
@@ -326,6 +336,7 @@ def _load_train_ctx(env_name: str, checkpoint_path: str) -> _TrainCtx:
       crl_state_only=crl_state_only,
       fixed_start_x=fixed_start_x,
       bb_pixel_obs=bb_pixel_obs,
+      bb_pixel_hw=int(bb_pixel_hw),
   )
 
 
@@ -357,9 +368,11 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx):
   if ctx.crl_state_only:
     print('[bb_video] crl_state_only=True → φ(s)·ψ(g) networks', flush=True)
   from envs.builderbench_raster import pixel_network_kwargs as _bb_pix_kw
-  _bb_pixel_kw = _bb_pix_kw(env_name, bool(ctx.bb_pixel_obs))
+  _bb_pixel_kw = _bb_pix_kw(
+      env_name, bool(ctx.bb_pixel_obs), hw=int(ctx.bb_pixel_hw))
   if _bb_pixel_kw['bb_pixel_obs']:
-    print('[bb_video] ppo_bb_pixel_obs=True: CNN on rasterized xyz',
+    print('[bb_video] ppo_bb_pixel_obs=True: CNN on rasterized xyz '
+          f'(hw={_bb_pixel_kw["bb_pixel_hw"]})',
           flush=True)
   networks = contrastive.make_networks(
       spec=env_spec,

@@ -373,9 +373,12 @@ flags.DEFINE_boolean(
     'Skip the iteration-0 in-train video (random init policy).')
 flags.DEFINE_boolean(
     'ppo_bb_pixel_obs', False,
-    'BuilderBench only: rasterize compact cube xyz to 64x64, run a CNN, '
+    'BuilderBench only: rasterize compact cube xyz to H×H, run a CNN, '
     'then policy / value / NF MLPs. Env obs and replay stay vectors. '
     'Default off (no change to existing runs).')
+flags.DEFINE_integer(
+    'ppo_bb_pixel_hw', -1,
+    'Rasterizer H=W when ppo_bb_pixel_obs is on. <0 keeps config default (64).')
 flags.DEFINE_boolean(
     'ppo_norm_reward', True,
     'Normalize the repr reward by the running std of discounted returns. Set False to pass raw reward directly to PPO.')
@@ -1080,6 +1083,8 @@ def main(_):
   config.ppo_norm_reward = bool(FLAGS.ppo_norm_reward)
   config.ppo_norm_obs = bool(FLAGS.ppo_norm_obs)
   config.ppo_bb_pixel_obs = bool(FLAGS.ppo_bb_pixel_obs)
+  if FLAGS.ppo_bb_pixel_hw >= 0:
+    config.ppo_bb_pixel_hw = int(FLAGS.ppo_bb_pixel_hw)
   config.ppo_obs_norm_clip = float(FLAGS.ppo_obs_norm_clip)
   config.nf_goal_enc_size = int(FLAGS.nf_goal_enc_size)
   config.ppo_return_norm_window = int(FLAGS.ppo_return_norm_window)
@@ -1207,7 +1212,8 @@ def main(_):
         f'norm_reward={config.ppo_norm_reward}, '
         f'norm_obs={config.ppo_norm_obs}'
         f'{f"(clip={config.ppo_obs_norm_clip})" if config.ppo_norm_obs else ""}, '
-        f'bb_pixel_obs={config.ppo_bb_pixel_obs}, '
+        f'bb_pixel_obs={config.ppo_bb_pixel_obs}'
+        f'{f"(hw={config.ppo_bb_pixel_hw})" if config.ppo_bb_pixel_obs else ""}, '
         f'eval_interval={config.ppo_eval_interval}, '
         f'video_interval={config.ppo_video_interval}, '
         f'repr_norm={config.repr_norm}, '
@@ -1465,10 +1471,13 @@ def main(_):
     print('[ppo_contrastive] crl_state_only=True: φ encodes state only '
           '(r(s)=φ(s)·ψ(g); InfoNCE uses φ(s))')
   from envs.builderbench_raster import pixel_network_kwargs as _bb_pix_kw
-  _bb_pixel_kw = _bb_pix_kw(env_name, bool(config.ppo_bb_pixel_obs))
+  _bb_pixel_kw = _bb_pix_kw(
+      env_name, bool(config.ppo_bb_pixel_obs),
+      hw=int(getattr(config, 'ppo_bb_pixel_hw', 64)))
   if _bb_pixel_kw['bb_pixel_obs']:
     print('[ppo_contrastive] ppo_bb_pixel_obs=True: policy/value/CRL CNN '
-          f'on rasterized xyz (num_cubes={_bb_pixel_kw["bb_num_cubes"]})')
+          f'on rasterized xyz (num_cubes={_bb_pixel_kw["bb_num_cubes"]}, '
+          f'hw={_bb_pixel_kw["bb_pixel_hw"]})')
   network_factory = functools.partial(
       contrastive.make_networks,
       obs_dim=obs_dim,

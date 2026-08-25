@@ -1,17 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=c8t2_nfc_sm_catwp_c10
-#SBATCH --output=slurm/ppo_builderbench_creative8_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_entanneal_ep60_300m_crl10_%A_%a.log
-#SBATCH --error=slurm/ppo_builderbench_creative8_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_entanneal_ep60_300m_crl10_%A_%a.log
+#SBATCH --job-name=c5t2_nfcsm_extrew_warp2h
+#SBATCH --output=slurm/ppo_builderbench_creative5_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catselect_extrew1_minstd1e5_ent05_ep50_T50_warp_2h_%A_%a.log
+#SBATCH --error=slurm/ppo_builderbench_creative5_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catselect_extrew1_minstd1e5_ent05_ep50_T50_warp_2h_%A_%a.log
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=14:59:00
+#SBATCH --time=2:00:00
 #SBATCH --account=seas
 #SBATCH --array=0-0
 
-# c7t2 NF compact catwp: same as base ep60 but ppo_crl_steps_per_iter=10 (2 seeds). 24h.
+# 2h Warp smoke: c5t2 NF compact-small + extrew + fixed ent=0.05.
+# catselect, ep=50, T=50 (mj=250).
 unset LD_PRELOAD
 
 module purge
@@ -86,57 +87,58 @@ export PIP_CACHE_DIR=/n/fs/mislresearch/mb6458-tmp/pip-cache
 export TF_CPP_MIN_LOG_LEVEL=2
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
-ENV=${ENV:-builderbench_creative_8_task2}
+ENV=${ENV:-builderbench_creative_5_task2}
 SEED=${SEED:-${SLURM_ARRAY_TASK_ID:-0}}
-NUM_STEPS=${NUM_STEPS:-300000000}
+NUM_STEPS=${NUM_STEPS:-200000000}
 PPO_NUM_ENVS=${PPO_NUM_ENVS:-1024}
 MAX_REPLAY_SIZE=${MAX_REPLAY_SIZE:-10000000}
 ENT_COEF=0.05
-ENT_COEF_FINAL=0.0
 MIN_STD=1e-5
 DISCOUNT_FACTOR=0.99
 PPO_CLIP_COEF=0.2
 REWARD_TAU=${REWARD_TAU:-0.5}
 EXT_REW_SCALE=${EXT_REW_SCALE:-1}
-EP_LEN=${EP_LEN:-60}
+EP_LEN=${EP_LEN:-50}
+T=${T:-50}
 PD_DURATION=${PD_DURATION:-5}
 MJ_EP_LEN=$((EP_LEN * PD_DURATION))
 CRL_STEPS=${CRL_STEPS:-10}
 FIXED_START_X=${FIXED_START_X:-0.1}
 
-LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative8_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_entanneal_ep60_300m_crl10/}"
+LOG_DIR="${LOG_DIR:-logs/ppo_builderbench_creative5_task2_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catselect_extrew1_minstd1e5_ent05_ep50_T50_warp_2h/}"
 
 mkdir -p slurm "${LOG_DIR}"
 
 echo "SLURM_JOB_ID=${SLURM_JOB_ID}  SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID}"
 echo "env=${ENV} seed=${SEED} num_steps=${NUM_STEPS} repr_mode=nf reward_tau=${REWARD_TAU}"
 echo "log_dir=${LOG_DIR} num_envs=${PPO_NUM_ENVS}"
+echo "BUILDERBENCH_MJX_IMPL=${BUILDERBENCH_MJX_IMPL}"
 echo "max_replay_size=${MAX_REPLAY_SIZE}"
-echo "builderbench_use_pd=true pd_duration=${PD_DURATION} permute_start_boxes=false fixed_start_x=${FIXED_START_X:-0.1} goals=MID+offsets(task2)"
-echo "episode_length=${EP_LEN} (mj_episode_length=${MJ_EP_LEN}, rollout_length=${EP_LEN})"
+echo "builderbench_use_pd=true pd_duration=${PD_DURATION} permute_start_boxes=false fixed_start_x=${FIXED_START_X} goals=MID+offsets(task2)"
+echo "episode_length=${EP_LEN} (mj_episode_length=${MJ_EP_LEN}, rollout_length=${T})"
 echo "ppo_norm_obs=false"
 echo "ppo_use_external_reward=true ppo_external_reward_scale=${EXT_REW_SCALE} (AFTER return-norm)"
 echo "ppo_actor_min_std=${MIN_STD}"
-echo "ppo_anneal_lr=true ppo_anneal_ent_coef=true"
-echo "ppo_categorical_select=true ppo_categorical_select_waypoint=true (n-way select + n×3 waypoint heads)"
+echo "ppo_anneal_ent_coef=false  ent=${ENT_COEF} (fixed)"
+echo "ppo_categorical_select=true (hybrid Gaussian + categorical select; not catwp)"
 echo "ppo_crl_steps_per_iter=${CRL_STEPS}"
 echo "ppo_eval_interval=30 ppo_video_interval=400"
-echo "steps_per_iter=$((PPO_NUM_ENVS * EP_LEN))"
-echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * EP_LEN)))"
+echo "steps_per_iter=$((PPO_NUM_ENVS * T))"
+echo "num_iterations=$((NUM_STEPS / (PPO_NUM_ENVS * T)))"
 echo "nf_compact_small: sa3x192 r64 b6 w192"
 
 python -u -c "
 from envs.builderbench_utils import default_fixed_target_goal, num_creative_tasks, load_task_goal_offsets
 import numpy as np
 load_task_goal_offsets.cache_clear()
-print('creative-8 n_tasks=', num_creative_tasks(8))
-g = default_fixed_target_goal(8, 1)
+print('creative-5 n_tasks=', num_creative_tasks(5))
+g = default_fixed_target_goal(5, 1)
 print('hard_goal (flat)=', g.tolist())
 print('hard_goal (cubes)=')
 print(np.asarray(g).reshape(-1, 3))
 "
 nvidia-smi || true
-python -u -c "import sgcrl_jax_acme_compat; import jax; print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
+python -u -c "import os, sgcrl_jax_acme_compat, warp, jax; print('warp', warp.__version__); print('BUILDERBENCH_MJX_IMPL', os.environ.get('BUILDERBENCH_MJX_IMPL')); print('JAX backend:', jax.default_backend()); print('JAX devices:', jax.devices())"
 
 python -u ppo_contrastive.py \
   --env="${ENV}" \
@@ -145,8 +147,6 @@ python -u ppo_contrastive.py \
   --log_dir_path="${LOG_DIR}" \
   --ppo_num_envs="${PPO_NUM_ENVS}" \
   --ppo_ent_coef="${ENT_COEF}" \
-  --ppo_anneal_ent_coef=true \
-  --ppo_ent_coef_final="${ENT_COEF_FINAL}" \
   --ppo_actor_min_std="${MIN_STD}" \
   --ppo_discount="${DISCOUNT_FACTOR}" \
   --ppo_clip_coef="${PPO_CLIP_COEF}" \
@@ -155,9 +155,9 @@ python -u ppo_contrastive.py \
   --builderbench_use_pd=true \
   --builderbench_pd_duration="${PD_DURATION}" \
   --builderbench_permute_start_boxes=false \
-  --builderbench_fixed_start_x="${FIXED_START_X:-0.1}" \
+  --builderbench_fixed_start_x="${FIXED_START_X}" \
   --builderbench_mj_episode_length="${MJ_EP_LEN}" \
-  --ppo_rollout_length="${EP_LEN}" \
+  --ppo_rollout_length="${T}" \
   --ppo_crl_steps_per_iter="${CRL_STEPS}" \
   --ppo_skip_first_eval=true \
   --ppo_eval_interval=30 \
@@ -179,6 +179,7 @@ python -u ppo_contrastive.py \
   --nf_goal_enc_size=0 \
   --ppo_use_external_reward \
   --ppo_external_reward_scale="${EXT_REW_SCALE}" \
+  --ppo_categorical_select \
   --hidden_layer_sizes="256,256,256,256,256,256"
 PY_EXIT=$?
 pkill -P $$ 2>/dev/null || true

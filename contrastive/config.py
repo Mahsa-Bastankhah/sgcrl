@@ -529,9 +529,10 @@ class ContrastiveConfig:
 
 
   use_image_obs: bool = False
-  # BuilderBench only: rasterize compact xyz → 64×64, CNN, then existing
+  # BuilderBench only: rasterize compact xyz → H×H, CNN, then existing
   # policy / value / NF MLPs. Env obs and replay stay vectors. Default off.
   ppo_bb_pixel_obs: bool = False
+  ppo_bb_pixel_hw: int = 64
   random_goals: float = 0.5
   jit: bool = True
   add_mc_to_td: bool = False
