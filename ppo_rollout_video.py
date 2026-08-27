@@ -13,114 +13,44 @@ Examples:
       --env=sawyer_bin \
       --output=videos/sawyer_bin_0/
 
+  # ManiSkill envs render via SAPIEN automatically (no --camera needed).
+  python ppo_rollout_video.py \
+      --checkpoint=logs/ppo/ppo_maniskill_pushcube_0/checkpoints/latest.pkl \
+      --env=maniskill_pushcube \
+      --output=videos/pushcube_0.mp4
+
 Deterministic actions by default (policy.mode()); pass `--stochastic`
-to sample instead.  Frames are rendered offscreen via mujoco_py's
-`MjRenderContextOffscreen`; on a headless cluster make sure MUJOCO_GL is
-set (typically `egl` for GPU nodes, `osmesa` for CPU nodes).
+to sample instead.  For MuJoCo/metaworld envs, frames are rendered
+offscreen via mujoco_py's `MjRenderContextOffscreen`; on a headless
+cluster make sure MUJOCO_GL is set (typically `egl` for GPU nodes,
+`osmesa` for CPU nodes).  ManiSkill envs render via their own SAPIEN
+`.render()` (see `ppo_video_utils.get_render_fn`) -- no MUJOCO_GL needed.
 
 The `--rotate` flag applies an N*90-degree rotation to each rendered
-frame (default 180).  Mujoco_py's pixel convention plus whatever the
-metaworld scene camera yields means the raw image can come out upside-
-down or mirrored depending on the build; rotating in software is cheap
-and robust — easier than chasing the right camera matrix.
+MuJoCo/metaworld frame (default 180; ignored for ManiSkill envs).
+Mujoco_py's pixel convention plus whatever the metaworld scene camera
+yields means the raw image can come out upside-down or mirrored
+depending on the build; rotating in software is cheap and robust —
+easier than chasing the right camera matrix.
+
+`--hidden_layer_sizes` must match the checkpoint's training-time
+architecture exactly (else loaded params won't plug in). If omitted,
+it's read from the checkpoint's own stored `hidden_layer_sizes` field
+(present on checkpoints saved after this field was added); older
+checkpoints without it fall back to the `ContrastiveConfig` default
+with a printed warning.
 """
-import sgcrl_jax_acme_compat  # noqa: F401 — must precede acme/jax imports
+import sgcrl_jax_acme_compat  # noqa: F401 — must precede all acme/jax imports
 
 import argparse
 import glob
 import os
 import re
 
-import numpy as np
-import jax
-from acme import specs
-
 import contrastive
 from contrastive import ppo_learner
-from contrastive import utils as contrastive_utils
-import env_utils
 from ppo_contrastive import fixed_goal_dict
-
-# Metaworld/Sawyer cameras.  'corner' works for bin/box/peg; 'topview'
-# and 'behindGripper' exist too if you want a different angle.
-_DEFAULT_CAMERA = {
-    'sawyer_bin': 'corner',
-    'sawyer_box': 'corner',
-    'sawyer_peg': 'corner',
-}
-
-
-def _build_networks(env_name, seed):
-  """Build networks matching the PPO training setup.
-
-  The architectural hyperparameters (hidden layer sizes, repr_dim, twin_q,
-  actor_min_std) must match the training-time values exactly, or the
-  loaded params won't plug in cleanly.  We read them off a fresh
-  ContrastiveConfig so this file stays in sync with config.py defaults.
-  """
-  probe_env, obs_dim = contrastive_utils.make_environment(
-      env_name, start_index=0, end_index=-1, seed=seed,
-      fixed_start_end=fixed_goal_dict[env_name])
-  env_spec = specs.make_environment_spec(probe_env)
-  del probe_env
-
-  cfg = contrastive.ContrastiveConfig()
-  networks = contrastive.make_networks(
-      spec=env_spec,
-      obs_dim=obs_dim,
-      repr_dim=cfg.repr_dim,
-      repr_norm=cfg.repr_norm,
-      twin_q=cfg.twin_q,
-      use_image_obs=cfg.use_image_obs,
-      hidden_layer_sizes=cfg.hidden_layer_sizes,
-      actor_min_std=float(cfg.ppo_actor_min_std),
-  )
-  return networks, obs_dim
-
-
-def _get_render_fn(gym_env, width, height, camera_name, rotate_deg=180):
-  """Return a callable that produces one RGB frame per invocation.
-
-  Uses mujoco_py's `MjRenderContextOffscreen` explicitly so we don't
-  depend on whether the gym/metaworld wrapper exposes a `render` method
-  with the right signature (the metaworld commit we pin has an older
-  convention that differs from gym's).
-
-  `rotate_deg` is applied to the final frame as an N*90-degree rotation
-  (any multiple of 90 is accepted; other values are rounded to the
-  nearest multiple).  Useful because mujoco_py's raw buffer layout plus
-  the metaworld scene camera sometimes yields an inverted / mirrored
-  image depending on the build.
-  """
-  from mujoco_py import MjRenderContextOffscreen
-
-  sim = gym_env.sim
-  camera_id = sim.model.camera_name2id(camera_name)
-
-  # Build (or reuse) an offscreen context.  mujoco_py caches it on the sim.
-  ctx = None
-  for c in getattr(sim, 'render_contexts', []) or []:
-    if getattr(c, 'offscreen', False):
-      ctx = c
-      break
-  if ctx is None:
-    ctx = MjRenderContextOffscreen(sim, device_id=-1)
-
-  # Pre-compute the rotation count so the per-frame path is a single call.
-  k_rot = int(round((rotate_deg % 360) / 90)) % 4   # 0,1,2,3
-
-  def _render():
-    ctx.render(width, height, camera_id)
-    rgb = ctx.read_pixels(width, height, depth=False)
-    # mujoco_py's read_pixels returns rows in OpenGL order (bottom-up),
-    # so the baseline fix is a vertical flip.  Any additional user-
-    # requested rotation is applied on top of that.
-    frame = rgb[::-1]
-    if k_rot:
-      frame = np.rot90(frame, k=k_rot)
-    return np.ascontiguousarray(frame)
-
-  return _render
+import ppo_video_utils
 
 
 def _enumerate_checkpoints(path: str):
@@ -155,55 +85,6 @@ def _enumerate_checkpoints(path: str):
   return entries
 
 
-def _rollout_one(policy_params, gym_env, networks, render,
-                 max_steps: int, stochastic: bool, seed: int):
-  """Run one deterministic (or stochastic) rollout, return (frames, stats)."""
-  @jax.jit
-  def policy_mode(params, obs):
-    dist = networks.policy_network.apply(params, obs)
-    return networks.sample_eval(dist, jax.random.PRNGKey(0))
-
-  @jax.jit
-  def policy_sample(params, obs, rng):
-    dist = networks.policy_network.apply(params, obs)
-    return networks.sample(dist, rng)
-
-  obs = np.asarray(gym_env.reset(), dtype=np.float32)
-  frames = [render()]
-  total_reward = 0.0
-  success = False
-  rng = jax.random.PRNGKey(seed)
-  for t in range(max_steps):
-    if stochastic:
-      rng, k = jax.random.split(rng)
-      action_j = policy_sample(policy_params, obs[None], k)
-    else:
-      action_j = policy_mode(policy_params, obs[None])
-    action = np.asarray(action_j)[0].astype(np.float32)
-    obs_next, r, done, info = gym_env.step(action)
-    obs = np.asarray(obs_next, dtype=np.float32)
-    total_reward += float(r)
-    if float(r) > 0.0:
-      success = True
-    frames.append(render())
-    if done:
-      break
-  return frames, dict(total_reward=total_reward, success=success,
-                      length=len(frames))
-
-
-def _write_video(frames, path: str, fps: int):
-  import imageio.v2 as imageio
-  out_dir = os.path.dirname(os.path.abspath(path))
-  if out_dir:
-    os.makedirs(out_dir, exist_ok=True)
-  ext = os.path.splitext(path)[1].lower()
-  if ext == '.gif':
-    imageio.mimsave(path, frames, fps=fps)
-  else:
-    imageio.mimwrite(path, frames, fps=fps, codec='libx264', quality=8)
-
-
 def _resolve_output_path(output_arg: str, env: str, label: str,
                          multi: bool) -> str:
   """Translate the user's --output into a per-checkpoint filename.
@@ -226,6 +107,20 @@ def _resolve_output_path(output_arg: str, env: str, label: str,
   return f'{stem}_{label}{ext}'
 
 
+def _resolve_hidden_layer_sizes(args_value: str, first_ckpt: dict):
+  if args_value:
+    return tuple(int(x) for x in args_value.split(','))
+  stored = first_ckpt.get('hidden_layer_sizes')
+  if stored is not None:
+    return tuple(stored)
+  default = contrastive.ContrastiveConfig().hidden_layer_sizes
+  print('[rollout] WARNING: checkpoint has no hidden_layer_sizes field '
+        f'(pre-dates this feature); assuming default {default}. Pass '
+        '--hidden_layer_sizes explicitly if this run used a custom '
+        'architecture.')
+  return default
+
+
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument('--checkpoint', required=True,
@@ -240,15 +135,24 @@ def main():
   parser.add_argument('--height', type=int, default=480)
   parser.add_argument('--fps', type=int, default=30)
   parser.add_argument('--camera', default=None,
-                      help='Mujoco camera name; default depends on --env.')
+                      help='Mujoco camera name; default depends on --env. '
+                           'Ignored for ManiSkill envs.')
   parser.add_argument('--rotate', type=int, default=180,
                       help='Rotate each frame by N*90 degrees before writing. '
-                           'Default 180 (upright for metaworld sawyer scenes).')
+                           'Default 180 (upright for metaworld sawyer scenes). '
+                           'Ignored for ManiSkill envs.')
   parser.add_argument('--stochastic', action='store_true',
                       help='Sample from the policy instead of using mode().')
   parser.add_argument('--max_steps', type=int, default=-1,
                       help='Override rollout length; -1 = env default.')
   parser.add_argument('--seed', type=int, default=0)
+  parser.add_argument('--hidden_layer_sizes', default='',
+                      help='Comma-separated widths, e.g. '
+                           '"256,256,256,256,256,256". If empty (default), '
+                           'read from the checkpoint\'s stored '
+                           '`hidden_layer_sizes` field; falls back to the '
+                           'ContrastiveConfig default (256,256) with a '
+                           'warning for older checkpoints without it.')
   args = parser.parse_args()
 
   # ----- 1. Enumerate checkpoints ----------------------------------------
@@ -259,48 +163,67 @@ def main():
   print(f'[rollout] found {len(ckpt_entries)} checkpoint(s) under '
         f'{args.checkpoint}')
 
-  # ----- 2. Build networks + env + render ONCE and reuse -----------------
-  # The env, mujoco context, and jitted policy graph are all reusable
-  # across checkpoints — only the params change.  This avoids the
-  # multi-second mujoco_py startup per checkpoint.
-  print('[rollout] building networks and inferring spec...')
-  networks, _ = _build_networks(args.env, seed=args.seed)
+  first_ckpt = ppo_learner.load_checkpoint(ckpt_entries[0][1])
+  hidden_layer_sizes = _resolve_hidden_layer_sizes(
+      args.hidden_layer_sizes, first_ckpt)
+  print(f'[rollout] hidden_layer_sizes={hidden_layer_sizes}')
 
-  gym_env, _, env_max_steps = env_utils.load(
-      args.env, fixed_start_end=fixed_goal_dict[args.env], seed=args.seed)
+  # ----- 2. Build networks + env + render ONCE and reuse -----------------
+  # The env, render context, and jitted policy graph are all reusable
+  # across checkpoints — only the params change.
+  print('[rollout] building networks and inferring spec...')
+  render_mode = 'rgb_array' if args.env.startswith('maniskill_') else None
+  networks, _, gym_env, env_max_steps = ppo_video_utils.build_networks(
+      args.env, args.seed, hidden_layer_sizes,
+      fixed_start_end=fixed_goal_dict[args.env], render_mode=render_mode)
+
   max_steps = env_max_steps if args.max_steps < 0 else int(args.max_steps)
-  camera = args.camera or _DEFAULT_CAMERA.get(args.env, 'corner')
+  camera = args.camera
   print(f'[rollout] env={args.env}  max_steps={max_steps}  '
         f'camera={camera}  rotate={args.rotate}°')
 
-  render = _get_render_fn(gym_env, args.width, args.height, camera,
-                          rotate_deg=args.rotate)
+  render = ppo_video_utils.get_render_fn(
+      args.env, gym_env, args.width, args.height, camera,
+      rotate_deg=args.rotate)
 
   # ----- 3. Render one video per checkpoint ------------------------------
   multi = len(ckpt_entries) > 1
   for label, path in ckpt_entries:
     print(f'[rollout] === {label}  ({path}) ===')
-    ckpt = ppo_learner.load_checkpoint(path)
+    ckpt = first_ckpt if path == ckpt_entries[0][1] else (
+        ppo_learner.load_checkpoint(path))
     policy_params = ckpt['policy_params']
     print(f'[rollout]   iteration={ckpt.get("iteration")} '
           f'global_step={ckpt.get("global_step")}')
 
-    frames, stats = _rollout_one(
+    _obs_norm_state = ckpt.get('obs_normalizer_state')
+    obs_normalizer = (
+        ppo_learner.ObsNormalizer.from_state_dict(_obs_norm_state)
+        if _obs_norm_state is not None else None)
+    if obs_normalizer is None:
+      print('[rollout]   WARNING: checkpoint has no obs_normalizer_state '
+            '(older checkpoint, or trained with ppo_norm_obs=False) -- '
+            'feeding the policy raw observations.')
+
+    frames, stats = ppo_video_utils.rollout_and_render(
         policy_params=policy_params,
         gym_env=gym_env,
         networks=networks,
-        render=render,
+        render_fn=render,
         max_steps=max_steps,
         stochastic=args.stochastic,
         seed=args.seed,
+        obs_normalizer=obs_normalizer,
     )
     print(f'[rollout]   length={stats["length"]}  '
           f'total_reward={stats["total_reward"]:.3f}  '
           f'success={stats["success"]}')
 
     out_path = _resolve_output_path(args.output, args.env, label, multi)
-    _write_video(frames, out_path, args.fps)
+    ppo_video_utils.write_video(frames, out_path, args.fps)
     print(f'[rollout]   wrote {out_path}')
+
+  gym_env.close()
 
 
 if __name__ == '__main__':

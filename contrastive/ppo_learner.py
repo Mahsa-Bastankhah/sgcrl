@@ -32,6 +32,7 @@ from acme.jax import networks as networks_lib
 
 from contrastive import config as contrastive_config
 from contrastive import networks as contrastive_networks
+from contrastive import nf_density as _nf
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,12 @@ class PPOTrainingState(NamedTuple):
   q_params: networks_lib.Params
   q_optimizer_state: optax.OptState
   key: networks_lib.PRNGKey
+  # Trained running mean/std for observation normalization (None if
+  # `ppo_norm_obs=False`); see `ObsNormalizer`. Callers that render a
+  # rollout right after training (e.g. `ppo_contrastive.py`'s end-of-run
+  # video) need this to feed the policy observations on the same scale it
+  # was trained on.
+  obs_normalizer: Optional['ObsNormalizer'] = None
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +101,99 @@ class RunningMeanStd:
     self.mean = new_mean
     self.var = M2 / tot
     self.count = tot
+
+
+class ObsNormalizer:
+  """Online per-dimension observation normalizer (z-score via `RunningMeanStd`).
+
+  Observations are `concat([state(obs_dim,), goal(goal_dim,)])`. Goal
+  column j is the SAME feature slot as state column `start_index + j`
+  (that's what `obs_to_goal` slicing means -- the goal is always a literal
+  slice of some state), so goal columns are normalized by reusing the
+  corresponding STATE column's stats, not their own independently-fit
+  stats. This matters because the "goal" a rollout sees (an env-provided
+  heuristic, e.g. a chased target position) and the "goal" the CRL loss
+  trains on (a literal future-state slice, via HER) are two different
+  samples of conceptually the same feature -- sharing stats keeps both on
+  the same scale instead of letting them drift apart.
+
+  Running stats are updated ONLY from the state portion of observations:
+  the goal segment is a derived/heuristic quantity (not an independently
+  sampled state), so it shouldn't skew the estimate of the state's own
+  distribution.
+
+  Output is clipped to +/-`clip` after normalizing, matching CleanRL's
+  `NormalizeObservation` wrapper -- keeps stray high-variance dims from
+  producing huge inputs to the policy/value/CRL encoders early in
+  training, before the running stats have settled.
+  """
+
+  def __init__(self, obs_dim: int, start_index: int, end_index: int,
+               epsilon: float = 1e-4, clip: float = 10.0):
+    self.obs_dim = int(obs_dim)
+    self.start_index = int(start_index)
+    self.end_index = (self.obs_dim if int(end_index) == -1
+                      else int(end_index))
+    self._rms = RunningMeanStd(shape=(self.obs_dim,), epsilon=epsilon)
+    self._clip = float(clip)
+
+  def update(self, state: np.ndarray):
+    """Folds a batch of RAW state observations into the running stats.
+
+    Args:
+      state: (..., obs_dim) array -- the STATE portion only (not goal).
+    """
+    flat = np.asarray(state, dtype=np.float64).reshape(-1, self.obs_dim)
+    self._rms.update(flat)
+
+  def _mean_std(self):
+    return self._rms.mean, np.sqrt(self._rms.var) + 1e-8
+
+  def normalize_state(self, state: np.ndarray, clip=None) -> np.ndarray:
+    mean, std = self._mean_std()
+    out = (np.asarray(state, dtype=np.float64) - mean) / std
+    clip = self._clip if clip is None else float(clip)
+    return np.clip(out, -clip, clip).astype(np.float32)
+
+  def normalize_goal(self, goal: np.ndarray) -> np.ndarray:
+    mean, std = self._mean_std()
+    s, e = self.start_index, self.end_index
+    out = (np.asarray(goal, dtype=np.float64) - mean[s:e]) / std[s:e]
+    return np.clip(out, -self._clip, self._clip).astype(np.float32)
+
+  def __call__(self, obs: np.ndarray) -> np.ndarray:
+    """Normalizes a raw `concat([state, goal])` batch; same shape out."""
+    obs = np.asarray(obs, dtype=np.float64)
+    state = self.normalize_state(obs[..., :self.obs_dim])
+    goal = self.normalize_goal(obs[..., self.obs_dim:])
+    return np.concatenate([state, goal], axis=-1)
+
+  def state_dict(self) -> dict:
+    return {
+        'mean': self._rms.mean.copy(),
+        'var': self._rms.var.copy(),
+        'count': self._rms.count,
+        'obs_dim': self.obs_dim,
+        'start_index': self.start_index,
+        'end_index': self.end_index,
+    }
+
+  def load_state_dict(self, d: dict):
+    self._rms.mean = np.asarray(d['mean'], dtype=np.float64)
+    self._rms.var = np.asarray(d['var'], dtype=np.float64)
+    self._rms.count = float(d['count'])
+
+  @classmethod
+  def from_state_dict(cls, d: dict) -> 'ObsNormalizer':
+    """Reconstructs a normalizer from a `state_dict()`, no config needed.
+
+    Useful for `ppo_rollout_video.py`, which loads a checkpoint standalone
+    (no access to the `ContrastiveConfig` that produced it).
+    """
+    norm = cls(obs_dim=d['obs_dim'], start_index=d['start_index'],
+               end_index=d['end_index'])
+    norm.load_state_dict(d)
+    return norm
 
 
 class ReturnNormalizer:
@@ -519,9 +619,16 @@ def make_ppo_update_fn(
   return update
 
 
+def _ema_tree(target, online, tau: float):
+  """target <- tau*target + (1-tau)*online, leaf-wise over a pytree."""
+  return jax.tree_util.tree_map(
+      lambda t, o: tau * t + (1.0 - tau) * o, target, online)
+
+
 def make_crl_update_fn(
     networks: contrastive_networks.ContrastiveNetworks,
     q_optimizer: optax.GradientTransformation,
+    _return_raw: bool = False,
 ):
   """Returns a jitted CRL critic update over one replay batch.
 
@@ -532,6 +639,9 @@ def make_crl_update_fn(
   Args:
     networks: ContrastiveNetworks (``q_network`` only is used here).
     q_optimizer: Adam (or other) transform for Q / representation params.
+    _return_raw: if True, also return the un-jitted ``update`` function so
+      ``make_scan_crl_update_fn`` can call it once per ``jax.lax.scan`` step
+      (jitting the whole scan, not each individual step).
 
   Returns:
     ``update(q_params, q_optimizer_state, batch, key)``
@@ -642,7 +752,57 @@ def make_crl_update_fn(
     metrics['update_skipped_nonfinite'] = 1.0 - do_update.astype(jnp.float32)
     return new_q_params, new_opt_state, metrics
 
+  if _return_raw:
+    return jax.jit(update), update
   return jax.jit(update)
+
+
+def make_scan_crl_update_fn(
+    networks: contrastive_networks.ContrastiveNetworks,
+    q_optimizer: optax.GradientTransformation,
+    repr_tau: float = 0.0,
+):
+  """Scan-based CRL updater: runs N CRL steps in a single JIT call.
+
+  The caller pre-samples all N replay batches in NumPy, stacks them into
+  ``(N, B, dim)`` arrays, and transfers to GPU once; a single
+  ``jax.lax.scan`` call replaces N separate dispatch-and-sync rounds
+  through ``make_crl_update_fn``'s per-step ``update``.
+
+  When ``0 < repr_tau < 1``, the "slow" EMA copy of q_params used for the
+  PPO reward (see ``run_ppo_training``'s ``q_params_reward``) is also
+  updated inside the scan, eliminating N un-jitted ``_ema_tree`` calls
+  per iteration.
+
+  Returns:
+    ``multi_update(q_params, q_opt_state, q_params_reward, batches, key)``
+    → ``(new_q_params, new_q_opt_state, new_q_params_reward, new_key,
+         mean_metrics)``
+    where ``batches`` is a dict of ``(N, B, dim)`` JAX arrays.
+  """
+  _, raw_update = make_crl_update_fn(networks, q_optimizer, _return_raw=True)
+
+  use_ema = 0.0 < float(repr_tau) < 1.0
+  _tau = float(repr_tau)
+
+  @jax.jit
+  def multi_update(q_params, q_opt_state, q_params_reward, batches, key):
+    def scan_step(carry, batch):
+      q_p, q_opt, q_reward, k = carry
+      k, k_crl = jax.random.split(k)
+      q_p, q_opt, m = raw_update(q_p, q_opt, batch, k_crl)
+      if use_ema:
+        q_reward = _ema_tree(q_reward, q_p, _tau)
+      else:
+        q_reward = q_p
+      return (q_p, q_opt, q_reward, k), m
+
+    (q_params, q_opt_state, q_params_reward, key), metrics = jax.lax.scan(
+        scan_step, (q_params, q_opt_state, q_params_reward, key), batches)
+    metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+    return q_params, q_opt_state, q_params_reward, key, metrics
+
+  return multi_update
 
 
 # ---------------------------------------------------------------------------
@@ -722,8 +882,27 @@ class VecEnv:
 def _save_checkpoint(path: str,
                      policy_params, value_params, q_params,
                      ppo_opt_state, q_opt_state,
-                     iteration: int, global_step: int, key):
-  """Write a pickle checkpoint atomically (write to tmp → rename)."""
+                     iteration: int, global_step: int, key,
+                     hidden_layer_sizes=None,
+                     q_params_reward=None,
+                     obs_normalizer_state=None):
+  """Write a pickle checkpoint atomically (write to tmp → rename).
+
+  `hidden_layer_sizes` (if given) is stored so a later rollout/video
+  script can reconstruct the exact trained network architecture without
+  the caller having to remember and re-pass a custom override correctly.
+
+  `q_params_reward` (if given) is the EMA "slow" copy of q_params used for
+  the PPO reward when `ppo_crl_repr_tau` is enabled; stored separately so
+  resuming from a checkpoint doesn't reset the EMA back to the online
+  q_params.
+
+  `obs_normalizer_state` (if given) is `ObsNormalizer.state_dict()` --
+  stored so resuming doesn't reset the running mean/std back to zero, and
+  so `ppo_rollout_video.py` can reconstruct the exact same normalizer a
+  saved policy was trained against (its own `from_state_dict` carries the
+  obs_dim/start_index/end_index needed, no separate config required).
+  """
   import pickle as _pkl
   import os as _os
 
@@ -736,6 +915,10 @@ def _save_checkpoint(path: str,
       'iteration':           int(iteration),
       'global_step':         int(global_step),
       'key':                 key,
+      'hidden_layer_sizes':  (tuple(hidden_layer_sizes)
+                             if hidden_layer_sizes is not None else None),
+      'q_params_reward':     q_params_reward,
+      'obs_normalizer_state': obs_normalizer_state,
   }
   tmp_path = path + '.tmp'
   with open(tmp_path, 'wb') as fh:
@@ -817,6 +1000,8 @@ def run_ppo_training(
     total_steps: int,
     seed: int = 0,
     checkpoint_dir: Optional[str] = None,
+    video_fn: Optional[Callable] = None,
+    video_every_steps: int = 0,
 ):
   """Top-level PPO-on-φ·ψ training loop.
 
@@ -833,6 +1018,49 @@ def run_ppo_training(
   The CRL side is InfoNCE + logsumexp penalty on replay batches only.
   The PPO side follows CleanRL.
   """
+  # ---- vec env ------------------------------------------------------------
+  # Built BEFORE any other ManiSkill env in this process (see below): SAPIEN
+  # requires `physx.enable_gpu()` -- triggered by ManiSkill itself the
+  # moment a `num_envs > 1` env is constructed, auto sim_backend='physx_cuda'
+  # -- to be the FIRST PhysX-touching call ever made in the process, or it
+  # raises "GPU PhysX can only be enabled once before any other code
+  # involving PhysX". The `probe_env`/spec-building step right after this
+  # constructs a `num_envs=1` (CPU, sim_backend='physx_cpu') ManiSkill env;
+  # if that ran first, the native-vec GPU env below would fail to init.
+  _env_name = str(getattr(config, 'env_name', '') or '').lower()
+  _use_maniskill_native_vec = (
+      bool(getattr(config, 'ppo_maniskill_native_vec', False))
+      and _env_name in ('maniskill_pushcube', 'maniskill_pickcube',
+                        'maniskill_open_cabinet_drawer',
+                        'maniskill_close_cabinet_drawer',
+                        'maniskill_close_subtask_train',
+                        'maniskill_open_subtask_train'))
+  if _use_maniskill_native_vec:
+    import env_utils as _env_utils
+    # When ppo_crl_add_extrinsic_reward is on, use the narrow drawer-only
+    # success signal (matching the evaluator/ppo_rnd_learner.py) instead of
+    # the default 'success' key, so `roll_env_rew` below is exactly the 0/1
+    # bonus to add to the reps reward. No-op (default 'success', unused) for
+    # every other env_name or when the flag is off.
+    _success_key = 'success'
+    if bool(getattr(config, 'ppo_crl_add_extrinsic_reward', False)):
+      if _env_name == 'maniskill_close_subtask_train':
+        _success_key = 'drawer_closed'
+      elif _env_name == 'maniskill_open_subtask_train':
+        _success_key = 'drawer_open'
+    vec_env = _env_utils.ManiskillVecEnv(
+        _env_name, config.ppo_num_envs,
+        obs_dim=int(config.obs_dim),
+        start_index=int(config.start_index),
+        end_index=int(config.end_index),
+        success_key=_success_key)
+    print(f'[ppo] maniskill native vec env: {_env_name}, '
+          f'num_envs={config.ppo_num_envs} (single GPU-batched sim), '
+          f'success_key={_success_key!r}')
+  else:
+    vec_env = VecEnv(env_factory, config.ppo_num_envs, seed=seed * 31)
+  E = vec_env.num_envs
+
   # ---- build networks from env spec -------------------------------------
   from acme import specs as _specs
   import contrastive.utils as _cu
@@ -841,12 +1069,36 @@ def run_ppo_training(
   spec = _specs.make_environment_spec(probe_env)
   networks = network_factory(spec=spec)
   del probe_env
-
-  # ---- vec env ----------------------------------------------------------
-  vec_env = VecEnv(env_factory, config.ppo_num_envs, seed=seed * 31)
-  E = vec_env.num_envs
   obs_shape = vec_env.observation_shape
   act_shape = vec_env.action_shape
+
+  # ---- density estimator selection (φ·ψ contrastive vs. NF RealNVP) -----
+  repr_mode = (str(getattr(config, 'ppo_repr_mode', 'crl') or 'crl')).strip().lower()
+  if repr_mode not in ('crl', 'nf'):
+    raise ValueError(
+        f"Unknown config.ppo_repr_mode={repr_mode!r}; expected 'crl' or 'nf'")
+  use_nf = repr_mode == 'nf'
+  obs_dim_cfg = int(config.obs_dim)
+  goal_dim_cfg = int(np.prod(obs_shape)) - obs_dim_cfg
+  act_dim_cfg = int(np.prod(act_shape))
+
+  nf_density_nets = None
+  if use_nf:
+    nf_density_nets = _nf.make_nf_density_networks(
+        obs_dim=obs_dim_cfg, act_dim=act_dim_cfg, goal_dim=goal_dim_cfg,
+        rep_size=int(config.nf_rep_size),
+        num_blocks=int(config.nf_num_blocks),
+        channels=int(config.nf_coupling_width),
+        goal_enc_size=int(config.nf_goal_enc_size),
+        sa_hidden=int(config.nf_sa_hidden),
+        sa_num_layers=int(config.nf_sa_num_layers))
+    print(f'[ppo] repr_mode=nf (RealNVP)  obs_dim={obs_dim_cfg} '
+          f'act_dim={act_dim_cfg} goal_dim={goal_dim_cfg} '
+          f'rep_size={config.nf_rep_size} num_blocks={config.nf_num_blocks} '
+          f'coupling_width={config.nf_coupling_width} '
+          f'flow_dim={nf_density_nets.flow_dim} '
+          f'sa_encoder={config.nf_sa_num_layers}x{config.nf_sa_hidden}+swish')
+
   T = int(config.ppo_rollout_length)
   batch_per_iter = T * E
   mb_size = batch_per_iter // int(config.ppo_num_minibatches)
@@ -854,12 +1106,32 @@ def run_ppo_training(
       'batch_per_iter must divide evenly into ppo_num_minibatches')
   num_iterations = int(total_steps) // (T * E)
 
+  # ---- observation normalizer --------------------------------------------
+  # See `ObsNormalizer` docstring: normalizes state+goal per-column online,
+  # goal columns sharing stats with their corresponding state column.
+  norm_obs = bool(getattr(config, 'ppo_norm_obs', True))
+  obs_normalizer = (
+      ObsNormalizer(obs_dim=int(config.obs_dim),
+                    start_index=int(config.start_index),
+                    end_index=int(config.end_index))
+      if norm_obs else None)
+
+  def _obs_update(raw_state: np.ndarray):
+    """Folds raw STATE observations into the running stats (no-op if off)."""
+    if obs_normalizer is not None:
+      obs_normalizer.update(raw_state[..., :int(config.obs_dim)])
+
+  def _obs_norm(raw_obs: np.ndarray) -> np.ndarray:
+    """Normalizes a raw `concat([state, goal])` batch (identity if off)."""
+    return obs_normalizer(raw_obs) if obs_normalizer is not None else raw_obs
+
   # ---- init params ------------------------------------------------------
   key = jax.random.PRNGKey(seed)
   k_pol, k_val, k_q, key = jax.random.split(key, 4)
   policy_params = networks.policy_network.init(k_pol)
   value_params = networks.value_network.init(k_val)
-  q_params = networks.q_network.init(k_q)
+  q_params = (_nf.init_nf_params(nf_density_nets, k_q) if use_nf
+              else networks.q_network.init(k_q))
   ppo_params = {'policy': policy_params, 'value': value_params}
 
   # ---- optimizers -------------------------------------------------------
@@ -886,8 +1158,26 @@ def run_ppo_training(
         optax.adam(float(config.learning_rate), eps=1e-5))
   ppo_opt_state = ppo_optimizer.init(ppo_params)
 
-  q_optimizer = optax.adam(float(config.learning_rate))
+  if use_nf:
+    q_optimizer = _nf.make_nf_optimizers(
+        encoder_lr=float(config.nf_encoder_lr),
+        critic_lr=float(config.nf_critic_lr),
+        critic_weight_decay=float(config.nf_critic_weight_decay),
+        grad_clip=float(config.nf_grad_clip),
+        has_goal_encoder=(nf_density_nets.goal_encoder_net is not None))
+  else:
+    q_optimizer = optax.adam(float(config.learning_rate))
   q_opt_state = q_optimizer.init(q_params)
+
+  # ---- slow "reward" copy of q_params (see ppo_crl_repr_tau) -------------
+  # When enabled, `q_params_reward` is an EMA-averaged copy of q_params
+  # used only to compute the PPO reward; the CRL loss keeps training the
+  # live `q_params` every step regardless. 0 (default) disables this: the
+  # reward reads the live q_params directly (q_params_reward == q_params).
+  _repr_tau = (float(config.ppo_nf_reward_tau) if use_nf
+               else float(getattr(config, 'ppo_crl_repr_tau', 0.0)))
+  _use_repr_ema = 0.0 < _repr_tau < 1.0
+  q_params_reward = q_params
 
   # ---- resume from checkpoint if one exists -----------------------------
   start_iteration = 0
@@ -903,6 +1193,13 @@ def run_ppo_training(
       ppo_opt_state = _ckpt['ppo_optimizer_state']
       q_opt_state   = _ckpt['q_optimizer_state']
       ppo_params    = {'policy': policy_params, 'value': value_params}
+      q_params_reward = (_ckpt.get('q_params_reward', None)
+                        if _use_repr_ema else q_params)
+      if q_params_reward is None:
+        q_params_reward = q_params
+      _obs_norm_state = _ckpt.get('obs_normalizer_state', None)
+      if obs_normalizer is not None and _obs_norm_state is not None:
+        obs_normalizer.load_state_dict(_obs_norm_state)
       start_iteration = int(_ckpt['iteration']) + 1
       global_step     = int(_ckpt['global_step'])
       key             = _ckpt['key']
@@ -918,12 +1215,32 @@ def run_ppo_training(
         _csv_path = os.path.join(_run_dir, 'logs', _label, 'logs.csv')
         _truncate_csv_to_iteration(_csv_path, int(_ckpt['iteration']))
 
+  def _reward_q_params():
+    return q_params_reward if _use_repr_ema else q_params
+
   # ---- jitted helpers ---------------------------------------------------
-  reward_fn = make_reward_fn(networks)
   gae_fn = make_gae_fn(config)
   ppo_update = make_ppo_update_fn(networks, config, ppo_optimizer)
 
-  crl_update = make_crl_update_fn(networks, q_optimizer)
+  reward_fn = None
+  nf_reward_fn = None
+  crl_scan_update = None
+  nf_scan_update = None
+  if use_nf:
+    nf_reward_fn = _nf.make_nf_reward_fn(nf_density_nets, obs_dim=obs_dim_cfg)
+    nf_scan_update = _nf.make_scan_nf_update_fn(
+        nf_density_nets, q_optimizer, obs_dim=obs_dim_cfg,
+        noise_std=float(config.nf_noise_std), repr_tau=_repr_tau)
+    if _use_repr_ema:
+      print(f'[ppo] NF reward repr EMA: tau={_repr_tau} '
+            f'(reward uses a slow copy of NF params)')
+  else:
+    reward_fn = make_reward_fn(networks)
+    crl_scan_update = make_scan_crl_update_fn(
+        networks, q_optimizer, repr_tau=_repr_tau)
+    if _use_repr_ema:
+      print(f'[ppo] CRL reward repr EMA: tau={_repr_tau} '
+            f'(reward uses a slow copy of q_params)')
 
   @jax.jit
   def act_and_value(policy_p, value_p, obs, rng):
@@ -939,12 +1256,19 @@ def run_ppo_training(
 
   @jax.jit
   def greedy_action(policy_p, obs):
-    # Deterministic policy mean for evaluation.
+    # Deterministic policy mode (NormalTanhDistribution.mode(), no rng
+    # needed) -- used for eval rollouts so success_rate/success_rate_1000
+    # reflect the policy's actual behavior, not sampling noise.
     dist = networks.policy_network.apply(policy_p, obs)
-    return networks.sample(dist, jax.random.PRNGKey(0))  # sample still; we log both below
+    return networks.sample_eval(dist, None)
 
   # ---- uniform-sampling goal bounds (extracted once from env spec) ------
   uniform_sampling = bool(getattr(config, 'uniform_sampling', False))
+  if uniform_sampling and use_nf:
+    print('[ppo] WARNING: uniform_sampling has no effect under '
+          'ppo_repr_mode=nf (NF density loss ignores extra_goals); '
+          'disabling for this run.')
+    uniform_sampling = False
   goal_low = goal_high = None
   if uniform_sampling:
     _obs_min = np.asarray(spec.observations.minimum, dtype=np.float32)
@@ -963,6 +1287,12 @@ def run_ppo_training(
       end_index=int(config.end_index))
   np_rng = np.random.default_rng(seed + 12345)
 
+  # ---- NF goal-normalization running stats (only used when use_nf) ------
+  nf_goal_mean = np.zeros(goal_dim_cfg, dtype=np.float32) if use_nf else None
+  nf_goal_std = np.ones(goal_dim_cfg, dtype=np.float32) if use_nf else None
+  _nf_goal_std_min = float(getattr(config, 'nf_goal_std_min', 0.1))
+  _nf_normalizer_reset_done = False
+
   # ---- per-env episode buffers (for flushing complete trajectories) -----
   ep_obs: list = [[] for _ in range(E)]
   ep_act: list = [[] for _ in range(E)]
@@ -972,6 +1302,8 @@ def run_ppo_training(
   recent_lengths: list = []
 
   obs = vec_env.reset()
+  _obs_update(obs)
+  obs = _obs_norm(obs)
   next_done = np.zeros(E, dtype=np.float32)
   for i in range(E):
     ep_obs[i].append(obs[i].copy())
@@ -988,6 +1320,16 @@ def run_ppo_training(
   if _env == 'riverswim':
     eval_success_obs = _cu.RiverSwimGoalVisitSuccessObserver(
         obs_dim=int(config.obs_dim))
+  elif _env == 'maniskill_close_subtask_train':
+    # Drawer-closed only -- mshab's own info['success'] (== env reward,
+    # still logged separately below) also requires the arm back at rest
+    # and the robot static, which the CRL goal never trains for. See
+    # `contrastive.utils.DrawerClosedSuccessObserver`.
+    eval_success_obs = _cu.DrawerClosedSuccessObserver()
+  elif _env == 'maniskill_open_subtask_train':
+    # Drawer-open only, mirroring the close branch above -- see
+    # `contrastive.utils.DrawerOpenSuccessObserver`.
+    eval_success_obs = _cu.DrawerOpenSuccessObserver()
   else:
     eval_success_obs = _cu.SuccessObserver()
   eval_dist_obs = _cu.DistanceObserver(
@@ -1004,6 +1346,10 @@ def run_ppo_training(
   roll_env_rew = np.zeros((T, E), dtype=np.float32)        # gt reward (log only)
   roll_dones = np.zeros((T, E), dtype=np.float32)
   roll_vals = np.zeros((T, E), dtype=np.float32)
+  # Per-step env `dones` (post-step), used to reset the reward normalizer's
+  # running-return tracker at episode boundaries once reward is computed
+  # in a single batched call after the rollout (see step 1b below).
+  roll_step_dones = np.zeros((T, E), dtype=np.float32)
 
   # ---- reward normalizer (CleanRL NormalizeReward) ----------------------
   # Normalizes the reps-based reward by the running std of discounted
@@ -1030,6 +1376,16 @@ def run_ppo_training(
   # global_step, ppo_sgd_step, start_iteration set above (0 for fresh runs,
   # restored from checkpoint on resume).
 
+  # ---- periodic mid-training rollout video ------------------------------
+  # `video_fn` (if given) is called with (policy_params, obs_normalizer,
+  # global_step) every time `global_step` crosses a `video_every_steps`
+  # boundary. Resuming from a checkpoint already past one or more boundaries
+  # must not immediately re-trigger them, so the next boundary is computed
+  # from the restored `global_step`, not from 0.
+  next_video_step = (
+      ((global_step // video_every_steps) + 1) * video_every_steps
+      if (video_fn is not None and video_every_steps > 0) else None)
+
   for iteration in range(start_iteration, num_iterations):
     # =================================================================
     # 1. Rollout (on-policy, CleanRL convention)
@@ -1047,21 +1403,19 @@ def run_ppo_training(
       roll_logp[t] = np.asarray(logprob_j)
       roll_vals[t] = np.asarray(value_j)
 
-      # reps-based reward, computed BEFORE env step (frozen q_params).
-      rep_rew = reward_fn(q_params, jnp.asarray(obs), action_j)
-      rep_rew_np = np.asarray(rep_rew)
-      roll_rew_raw[t] = rep_rew_np
-
       next_obs, env_rew, dones, terminal_obs = vec_env.step(action)
+      # `terminal_obs` is always a genuine raw post-step state; `next_obs`
+      # rows where `dones` is True are ALSO a genuine raw state (the fresh
+      # auto-reset observation) -- both are worth folding into the running
+      # stats. Rows where `dones` is False have next_obs == terminal_obs,
+      # so only counting them once (via terminal_obs) avoids double-weighting.
+      _obs_update(terminal_obs)
+      if dones.any():
+        _obs_update(next_obs[dones])
+      terminal_obs = _obs_norm(terminal_obs)
+      next_obs = _obs_norm(next_obs)
       roll_env_rew[t] = env_rew
-
-      # Scale reps reward by the running std of discounted returns.
-      # Applied AFTER the env step so `dones` is available to reset the
-      # running-return tracker at episode boundaries.
-      if reward_normalizer is not None:
-        roll_rew[t] = reward_normalizer(rep_rew_np, dones)
-      else:
-        roll_rew[t] = rep_rew_np
+      roll_step_dones[t] = dones.astype(np.float32)
 
       # Episode flushing / per-env accounting.
       for i in range(E):
@@ -1091,6 +1445,40 @@ def run_ppo_training(
       obs = next_obs
       next_done = dones.astype(np.float32)
       global_step += E
+
+    # =================================================================
+    # 1b. Batched reward computation (single GPU call over the whole
+    # rollout, instead of T separate per-step calls). Equivalent to the
+    # per-step version: q_params (or its EMA "reward" copy, see
+    # ppo_crl_repr_tau) doesn't change during rollout collection, only
+    # between iterations, so computing it before vs. after the T-loop
+    # gives identical values.
+    # =================================================================
+    _flat_obs_j = jnp.asarray(roll_obs.reshape(batch_per_iter, -1))
+    _flat_acts_j = jnp.asarray(roll_acts.reshape(batch_per_iter, -1))
+    if use_nf:
+      _rew_flat = np.asarray(nf_reward_fn(
+          _reward_q_params(), _flat_obs_j, _flat_acts_j,
+          jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std)))
+    else:
+      _rew_flat = np.asarray(
+          reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
+    roll_rew_raw[:] = _rew_flat.reshape(T, E)
+    if bool(getattr(config, 'ppo_crl_add_extrinsic_reward', False)):
+      # Add the sparse extrinsic success reward (roll_env_rew, already the
+      # narrow drawer-only 0/1 flag -- see the success_key resolution above)
+      # on top of the reps reward, BEFORE normalization, so the combined
+      # signal is scaled by reward_normalizer exactly like the pure φ·ψ
+      # reward was before.
+      roll_rew_raw[:] += roll_env_rew
+
+    # Scale reps reward by the running std of discounted returns.  Reset
+    # at episode boundaries via the per-step `dones` recorded above.
+    if reward_normalizer is not None:
+      for _t in range(T):
+        roll_rew[_t] = reward_normalizer(roll_rew_raw[_t], roll_step_dones[_t])
+    else:
+      roll_rew[:] = roll_rew_raw
 
     # =================================================================
     # 2. GAE advantages / returns
@@ -1144,23 +1532,85 @@ def run_ppo_training(
     mean_pg = float(np.mean(pg_vals)) if pg_vals else float('inf')
 
     # =================================================================
-    # 4. CRL updates (off-policy, from replay)
+    # 4. Density-estimator updates (off-policy, from replay): CRL InfoNCE
+    #    or NF NLL, dispatched on config.ppo_repr_mode.
     # =================================================================
     crl_metrics_agg: Dict[str, list] = {}
-    if replay.size >= int(config.ppo_min_replay_size):
-      for _ in range(int(config.ppo_crl_steps_per_iter)):
+    _n_crl = int(config.ppo_crl_steps_per_iter)
+    if replay.size >= int(config.ppo_min_replay_size) and _n_crl > 0:
+      if use_nf:
+        if not _nf_normalizer_reset_done:
+          # First NF activation: reset the return normalizer so the
+          # untrained flow's wild initial log p_NF rewards don't
+          # permanently corrupt the running return-std PPO uses to scale
+          # advantages. CRL's cold start is comparatively much milder so
+          # it doesn't need this.
+          if reward_normalizer is not None:
+            reward_normalizer._rms = RunningMeanStd(shape=())
+            reward_normalizer._returns = np.zeros(E, dtype=np.float64)
+          _nf_normalizer_reset_done = True
+
+        # Refresh goal normalization stats from a fresh replay sample.
+        _mix_task = bool(getattr(config, 'nf_mix_task_goal_stats', False))
+        _stat_n = int(config.batch_size) if _mix_task else min(2048, replay.size)
+        _stat_n = min(_stat_n, int(replay.size))
+        _stat_batch = replay.sample(_stat_n, np_rng)
+        _goals = _stat_batch['obs'][:, obs_dim_cfg:]
+        if _mix_task:
+          # Mix in batch_size copies of the current rollout's actual env
+          # task goal so it's in-distribution for the normalizer, not just
+          # hindsight-relabeled goals -- otherwise r = log p_NF(g_task|s,a)
+          # can be wildly out-of-distribution (and explode) early on.
+          _g_task = roll_obs.reshape(-1, roll_obs.shape[-1])[
+              0, obs_dim_cfg:].astype(np.float32)
+          _n_task = int(config.batch_size)
+          _goals = np.concatenate(
+              [_goals, np.repeat(_g_task[None], _n_task, axis=0)], axis=0)
+        nf_goal_mean = _goals.mean(axis=0).astype(np.float32)
+        nf_goal_std = np.maximum(
+            _goals.std(axis=0), _nf_goal_std_min).astype(np.float32)
+
+        _samples = [replay.sample(int(config.batch_size), np_rng)
+                    for _ in range(_n_crl)]
+        _stacked = {
+            k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
+            for k_ in _samples[0]}
+        (q_params, q_opt_state, q_params_reward,
+         key, _nf_lam_unused, m) = nf_scan_update(
+            q_params, q_opt_state, q_params_reward, _stacked, key,
+            jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std))
+        crl_metrics_agg = {k_: [float(v)] for k_, v in m.items()}
+      else:
+        # Pre-sample all N batches in NumPy, stack to (N, B, dim), and run
+        # all N CRL steps in a single jax.lax.scan (one JIT dispatch instead
+        # of N), also updating the EMA "reward" copy of q_params inside the
+        # scan when ppo_crl_repr_tau is enabled.
         if uniform_sampling:
-          crl_batch_np = replay.sample_with_uniform_negatives(
-              int(config.batch_size), np_rng, goal_low, goal_high,
-              num_negatives=int(getattr(config, 'uniform_num_negatives', -1)))
+          # `goal_low`/`goal_high` are RAW env bounds (real physical units --
+          # correct support to sample from). `replay` already stores
+          # normalized obs (see `_obs_norm` above), so the resulting
+          # `extra_goals` must be normalized too before joining the batch,
+          # or these "negatives" would sit at a wildly different scale than
+          # the (already normalized) positives/other negatives.
+          _samples = []
+          for _ in range(_n_crl):
+            s = replay.sample_with_uniform_negatives(
+                int(config.batch_size), np_rng, goal_low, goal_high,
+                num_negatives=int(getattr(config, 'uniform_num_negatives', -1)))
+            if obs_normalizer is not None:
+              s['extra_goals'] = obs_normalizer.normalize_goal(s['extra_goals'])
+            _samples.append(s)
         else:
-          crl_batch_np = replay.sample(int(config.batch_size), np_rng)
-        crl_batch = {k_: jnp.asarray(v) for k_, v in crl_batch_np.items()}
-        key, k_crl = jax.random.split(key)
-        q_params, q_opt_state, m = crl_update(
-            q_params, q_opt_state, crl_batch, k_crl)
-        for k_, v in m.items():
-          crl_metrics_agg.setdefault(k_, []).append(float(v))
+          _samples = [
+              replay.sample(int(config.batch_size), np_rng)
+              for _ in range(_n_crl)]
+        _stacked = {
+            k_: jnp.asarray(np.stack([s[k_] for s in _samples], axis=0))
+            for k_ in _samples[0]}
+        (q_params, q_opt_state, q_params_reward,
+         key, m) = crl_scan_update(
+            q_params, q_opt_state, q_params_reward, _stacked, key)
+        crl_metrics_agg = {k_: [float(v)] for k_, v in m.items()}
 
     # =================================================================
     # 5. Logging
@@ -1190,13 +1640,17 @@ def run_ppo_training(
         # skips CRL for lack of replay data.
         'ep_return_mean':    float(np.mean(recent_returns)) if recent_returns else float('nan'),
         'ep_length_mean':    float(np.mean(recent_lengths)) if recent_lengths else float('nan'),
-        'crl/crl_loss':           float('nan'),
-        'crl/categorical_accuracy': float('nan'),
-        'crl/binary_accuracy':    float('nan'),
-        'crl/logits_pos':         float('nan'),
-        'crl/logits_neg':         float('nan'),
-        'crl/logsumexp':          float('nan'),
     }
+    if use_nf:
+      log['crl/density_loss'] = float('nan')
+      log['crl/log_p_mean'] = float('nan')
+    else:
+      log['crl/crl_loss'] = float('nan')
+      log['crl/categorical_accuracy'] = float('nan')
+      log['crl/binary_accuracy'] = float('nan')
+      log['crl/logits_pos'] = float('nan')
+      log['crl/logits_neg'] = float('nan')
+      log['crl/logsumexp'] = float('nan')
     for k_, vs in ppo_metrics_agg.items():
       log[f'ppo/{k_}'] = float(np.mean(vs))
     for k_, vs in crl_metrics_agg.items():
@@ -1228,10 +1682,16 @@ def run_ppo_training(
         eval_dist_obs.observe_first(env, ts)
         ret_e, n_e = 0.0, 0
         while not ts.last():
-          key, k_eval = jax.random.split(key)
-          a, _, _ = act_and_value(
-              ppo_params['policy'], ppo_params['value'],
-              jnp.asarray(ts.observation)[None], k_eval)
+          # Deterministic policy mode (not a stochastic training-time
+          # sample) so success_rate/success_rate_1000 reflect the policy's
+          # actual behavior, not sampling noise. Frozen normalization: uses
+          # the current running stats but does NOT update them from eval
+          # data (keeps eval deterministic/comparable across iterations,
+          # and `eval_dist_obs` below still reads raw meters/radians off
+          # `ts` directly, unaffected).
+          a = greedy_action(
+              ppo_params['policy'],
+              jnp.asarray(_obs_norm(ts.observation))[None])
           action = np.asarray(a)[0].astype(np.float32)
           action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
           action = np.clip(action, -1.0, 1.0)
@@ -1257,6 +1717,16 @@ def run_ppo_training(
       eval_logger.write(agg)
 
     # =================================================================
+    # 6b. Periodic mid-training rollout video (every `video_every_steps`
+    #     global steps). `video_fn` owns rendering + wandb logging; it
+    #     always writes to the same local path (caller's responsibility)
+    #     so disk usage doesn't grow with training length.
+    # =================================================================
+    if next_video_step is not None and global_step >= next_video_step:
+      video_fn(ppo_params['policy'], obs_normalizer, global_step, iteration)
+      next_video_step += video_every_steps
+
+    # =================================================================
     # 7. Checkpointing (every `ppo_checkpoint_interval` iterations,
     #    plus a rolling `latest.pkl` and FIFO pruning of older
     #    milestone files).
@@ -1274,7 +1744,11 @@ def run_ppo_training(
           q_opt_state=q_opt_state,
           iteration=iteration,
           global_step=global_step,
-          key=key)
+          key=key,
+          hidden_layer_sizes=config.hidden_layer_sizes,
+          q_params_reward=(q_params_reward if _use_repr_ema else None),
+          obs_normalizer_state=(obs_normalizer.state_dict()
+                                if obs_normalizer is not None else None))
 
   # ---- return final state in case the caller wants to checkpoint --------
   return PPOTrainingState(
@@ -1284,4 +1758,5 @@ def run_ppo_training(
       q_params=q_params,
       q_optimizer_state=q_opt_state,
       key=key,
+      obs_normalizer=obs_normalizer,
   )

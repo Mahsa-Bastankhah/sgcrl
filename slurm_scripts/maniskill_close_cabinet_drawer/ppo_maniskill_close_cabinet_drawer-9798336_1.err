@@ -1,0 +1,28 @@
+
+EnvironmentNameNotFound: Could not find conda environment: contrastive_rl
+You can list all discoverable environments with `conda info --envs`.
+
+
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+Traceback (most recent call last):
+  File "<string>", line 6, in <module>
+  File "/home/gliu2/miniconda3/lib/python3.12/site-packages/gymnasium/envs/registration.py", line 681, in make
+    env_spec = _find_spec(id)
+               ^^^^^^^^^^^^^^
+  File "/home/gliu2/miniconda3/lib/python3.12/site-packages/gymnasium/envs/registration.py", line 526, in _find_spec
+    _check_version_exists(ns, name, version)
+  File "/home/gliu2/miniconda3/lib/python3.12/site-packages/gymnasium/envs/registration.py", line 392, in _check_version_exists
+    _check_name_exists(ns, name)
+  File "/home/gliu2/miniconda3/lib/python3.12/site-packages/gymnasium/envs/registration.py", line 369, in _check_name_exists
+    raise error.NameNotFound(
+gymnasium.error.NameNotFound: Environment `CloseCabinetDrawer` doesn't exist.
+Traceback (most recent call last):
+  File "/home/gliu2/dist_matching/sgcrl/ppo_contrastive.py", line 21, in <module>
+    import sgcrl_jax_acme_compat  # noqa: F401 — must precede all acme/jax imports
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/gliu2/dist_matching/sgcrl/sgcrl_jax_acme_compat.py", line 18, in <module>
+    import jax
+ModuleNotFoundError: No module named 'jax'

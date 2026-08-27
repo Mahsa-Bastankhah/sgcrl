@@ -14,7 +14,7 @@
 
 conda init
 source activate base
-conda activate contrastive_rl
+conda activate /data/user_data/gliu2/conda_envs/contrastive_rl
 export LD_LIBRARY_PATH=/usr/local/cuda-11/lib64:/home/gliu2/miniconda/envs/contrastive_rl/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/gliu2/.mujoco/mujoco210/bin
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia

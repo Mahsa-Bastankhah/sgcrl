@@ -11,6 +11,38 @@ from acme.utils.loggers import filters
 from acme.utils.loggers import terminal
 
 
+class WandbLogger(base.Logger):
+  """Acme Logger that forwards write() calls to an already-open wandb run.
+
+  Keys are prefixed with `{label}/` (mirroring
+  scripts/csv_runs_to_wandb.py's `f"{prefix}/{k}"` convention) so the
+  'learner' and 'eval' loggers -- both of which currently emit a
+  'learner_steps' field -- never collide on the same run. The wandb step
+  is taken explicitly from data['learner_steps'] rather than relying on
+  wandb's implicit auto-increment, because 'learner' writes every PPO
+  iteration while 'eval' writes only every 10th; auto-increment would
+  desync the two loggers' step axes on one run.
+  """
+
+  def __init__(self, label: str, run: Any = None):
+    self._label = label
+    self._run = run
+
+  def write(self, data: Mapping[str, Any]) -> None:
+    if self._run is None:
+      return
+    step = data.get('learner_steps')
+    payload = {}
+    for k, v in data.items():
+      if isinstance(v, bool) or isinstance(v, (int, float)) or hasattr(v, 'item'):
+        payload[f'{self._label}/{k}'] = v
+    if payload:
+      self._run.log(payload, step=int(step) if step is not None else None)
+
+  def close(self) -> None:
+    pass  # run.finish() is owned by the training entrypoint, not this logger.
+
+
 def make_default_logger(
     label: str,
     save_data: bool = True,
@@ -21,6 +53,7 @@ def make_default_logger(
     print_fn: Optional[Callable[[str], None]] = None,
     serialize_fn: Optional[Callable[[Mapping[str, Any]], str]] = base.to_numpy,
     steps_key: str = 'steps',
+    wandb_run: Optional[Any] = None,
 ) -> base.Logger:
   """Makes a default Acme logger.
 
@@ -33,6 +66,8 @@ def make_default_logger(
     serialize_fn: An optional function to apply to the write inputs before
       passing them to the various loggers.
     steps_key: Ignored.
+    wandb_run: If given (an active `wandb.init()` return value), a
+      WandbLogger is added so every write() also logs to that run.
 
   Returns:
     A logger object that responds to logger.write(some_dict).
@@ -46,6 +81,9 @@ def make_default_logger(
 
   if save_data:
     loggers.append(csv.CSVLogger(label=label, directory_or_file=save_dir, add_uid=add_uid))
+
+  if wandb_run is not None:
+    loggers.append(WandbLogger(label=label, run=wandb_run))
 
   # Dispatch to all writers and filter Nones and by time.
   logger = aggregators.Dispatcher(loggers, serialize_fn)

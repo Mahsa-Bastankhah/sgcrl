@@ -142,6 +142,85 @@ class ContrastiveNetworks:
   q_goal_network_2: Optional[networks_lib.FeedForwardNetwork] = None
 
 
+@dataclasses.dataclass
+class RNDNetworks:
+  """Extra networks for the PPO+RND agent (`ppo_rnd.py` /
+  `contrastive/ppo_rnd_learner.py`), on top of the shared
+  `policy_network` produced by `make_networks(...)`.
+  """
+  int_value_network: networks_lib.FeedForwardNetwork
+  rnd_predictor_network: networks_lib.FeedForwardNetwork
+  rnd_target_network: networks_lib.FeedForwardNetwork
+
+
+def make_rnd_extra_networks(
+    spec,
+    obs_dim,
+    hidden_layer_sizes = (256, 256),
+    rnd_output_size = 256):
+  """Creates the intrinsic-value + RND predictor/target networks.
+
+  `int_value_network` takes the full obs = [state; goal] (same input as the
+  PPO extrinsic `value_network` from `make_networks`). `rnd_predictor_network`
+  / `rnd_target_network` take STATE-ONLY input (`obs[:, :obs_dim]`) -- the
+  per-episode goal slice is task metadata, not something whose novelty should
+  drive exploration (see `ppo_rnd_learner.py`).
+  """
+
+  def _int_value_fn(obs):
+    if _use_residual_mlp(hidden_layer_sizes):
+      h = _mlp_or_residual(
+          obs,
+          list(hidden_layer_sizes),
+          hidden_layer_sizes=hidden_layer_sizes,
+          name='int_value_mlp',
+          activation=jnp.tanh,
+          activate_final=True,
+          w_init=hk.initializers.Orthogonal(scale=np.sqrt(2.0)),
+      )
+      out = hk.Linear(1, w_init=hk.initializers.Orthogonal(scale=1.0))(h)
+      return jnp.squeeze(out, axis=-1)
+    net = hk.Sequential([
+        hk.nets.MLP(
+            list(hidden_layer_sizes),
+            w_init=hk.initializers.Orthogonal(scale=np.sqrt(2.0)),
+            activation=jnp.tanh,
+            activate_final=True),
+        hk.Linear(1, w_init=hk.initializers.Orthogonal(scale=1.0)),
+    ])
+    return jnp.squeeze(net(obs), axis=-1)
+
+  def _rnd_fn(net_name):
+    def _fn(state):
+      return _mlp_or_residual(
+          state,
+          list(hidden_layer_sizes) + [rnd_output_size],
+          hidden_layer_sizes=hidden_layer_sizes,
+          name=net_name,
+          activation=jax.nn.relu,
+          activate_final=False,
+          w_init=hk.initializers.VarianceScaling(1.0, 'fan_avg', 'uniform'),
+      )
+    return _fn
+
+  int_value = hk.without_apply_rng(hk.transform(_int_value_fn))
+  rnd_predictor = hk.without_apply_rng(hk.transform(_rnd_fn('rnd_predictor')))
+  rnd_target = hk.without_apply_rng(hk.transform(_rnd_fn('rnd_target')))
+
+  dummy_obs = utils.zeros_like(spec.observations)
+  dummy_obs = utils.add_batch_dim(dummy_obs)
+  dummy_state = dummy_obs[:, :obs_dim]
+
+  return RNDNetworks(
+      int_value_network=networks_lib.FeedForwardNetwork(
+          lambda key: int_value.init(key, dummy_obs), int_value.apply),
+      rnd_predictor_network=networks_lib.FeedForwardNetwork(
+          lambda key: rnd_predictor.init(key, dummy_state), rnd_predictor.apply),
+      rnd_target_network=networks_lib.FeedForwardNetwork(
+          lambda key: rnd_target.init(key, dummy_state), rnd_target.apply),
+  )
+
+
 def apply_policy_and_sample(
     networks,
     eval_mode = False):

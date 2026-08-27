@@ -62,6 +62,83 @@ class SuccessObserver(observers_base.EnvLoopObserver):
     }
 
 
+class DrawerClosedSuccessObserver(observers_base.EnvLoopObserver):
+  """Measures success purely by whether the drawer's joint closed.
+
+  Unlike `SuccessObserver` (which uses `timestep.reward`, i.e. mshab's own
+  `info['success']` -- articulation closed AND the arm back at its rest
+  pose AND the robot static AND under the cumulative-force limit), this
+  only checks the drawer joint itself, via the `drawer_closed` flag
+  `env_utils.ManiskillCloseSubtaskTrain.step()` puts in its info dict
+  (reachable here as `env.get_info()['drawer_closed']` -- `env` is the
+  acme `EnvironmentWrapper` stack built by `contrastive_utils
+  .make_environment`, whose `__getattr__` forwards `get_info` down to the
+  innermost `acme.wrappers.gym_wrapper.GymWrapper`). `reward`/env-reward
+  logging is untouched -- this only changes `success`/`success_1000`.
+  """
+
+  def __init__(self):
+    self._closed_flags = []
+    self._success = []
+
+  def observe_first(self, env, timestep
+                    ):
+    """Observes the initial state."""
+    if self._closed_flags:
+      success = any(self._closed_flags)
+      self._success.append(success)
+    self._closed_flags = []
+
+  def observe(self, env, timestep,
+              action):
+    """Records one environment step."""
+    info = env.get_info() or {}
+    self._closed_flags.append(bool(info.get('drawer_closed', False)))
+
+  def get_metrics(self):
+    """Returns metrics collected for the current episode."""
+    return {
+        'success': float(any(self._closed_flags)),
+        'success_1000': np.mean(self._success[-1000:]),
+    }
+
+
+class DrawerOpenSuccessObserver(observers_base.EnvLoopObserver):
+  """Measures success purely by whether the drawer's joint opened.
+
+  Sibling of `DrawerClosedSuccessObserver`, mirrored exactly (see that
+  class's docstring for the full rationale) but reading the `drawer_open`
+  info flag `env_utils.ManiskillOpenSubtaskTrain.step()`/
+  `env_utils.ManiskillVecEnv.step()` (with `success_key='drawer_open'`) put
+  in the info dict instead of `drawer_closed`.
+  """
+
+  def __init__(self):
+    self._open_flags = []
+    self._success = []
+
+  def observe_first(self, env, timestep
+                    ):
+    """Observes the initial state."""
+    if self._open_flags:
+      success = any(self._open_flags)
+      self._success.append(success)
+    self._open_flags = []
+
+  def observe(self, env, timestep,
+              action):
+    """Records one environment step."""
+    info = env.get_info() or {}
+    self._open_flags.append(bool(info.get('drawer_open', False)))
+
+  def get_metrics(self):
+    """Returns metrics collected for the current episode."""
+    return {
+        'success': float(any(self._open_flags)),
+        'success_1000': np.mean(self._success[-1000:]),
+    }
+
+
 class RiverSwimGoalVisitSuccessObserver(observers_base.EnvLoopObserver):
   """Eval success for RiverSwim: agent reached the goal cell at least once.
 
@@ -285,7 +362,8 @@ class ObservationFilterWrapper(base.EnvironmentWrapper):
 
 
 def make_environment(env_name, start_index, end_index,
-                     seed, fixed_start_end = None):
+                     seed, fixed_start_end = None, render_mode = None,
+                     **env_kwargs):
   """Creates the environment.
 
   Args:
@@ -294,6 +372,10 @@ def make_environment(env_name, start_index, end_index,
     end_index: final index of the observation to use in the goal. The goal
       is then obs[start_index:goal_index].
     seed: random seed.
+    render_mode: forwarded to env_utils.load (ManiSkill envs only; e.g.
+      'rgb_array' to enable rendering for video rollouts).
+    **env_kwargs: extra env-specific kwargs forwarded to env_utils.load
+      (e.g. randomize_gripper_init for sawyer_bin).
   Returns:
     env: the environment
     obs_dim: integer specifying the size of the observations, before
@@ -301,7 +383,7 @@ def make_environment(env_name, start_index, end_index,
   """
   np.random.seed(seed)
   gym_env, obs_dim, max_episode_steps = env_utils.load(
-      env_name, fixed_start_end, seed)
+      env_name, fixed_start_end, seed, render_mode=render_mode, **env_kwargs)
   goal_indices = obs_dim + obs_to_goal_1d(np.arange(obs_dim), start_index,
                                           end_index)
   indices = np.concatenate([

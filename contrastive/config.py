@@ -195,7 +195,99 @@ class ContrastiveConfig:
   # Number of uniform negative goals to add per CRL batch.  -1 means
   # batch_size // 2 (the default when uniform_sampling is True).
   uniform_num_negatives: int = -1
+  # When 0 < tau < 1, a separate EMA-averaged "slow" copy of q_params
+  # (ema <- tau*ema + (1-tau)*online after each CRL step) is used only to
+  # compute the PPO reward, while the "fast"/online q_params keeps training
+  # on the CRL loss every step. This is target-network-style stabilization
+  # for PPO on top of a non-stationary learned reward. 0 (default) disables
+  # this: reward reads the live q_params directly.
+  ppo_crl_repr_tau: float = 0.0
+  # If True, add the sparse extrinsic success reward (1 if the goal has
+  # been reached, else 0) on top of the φ·ψ representation reward before
+  # GAE. Only has an effect for maniskill_close_subtask_train /
+  # maniskill_open_subtask_train (uses success_key='drawer_closed'/
+  # 'drawer_open' instead of the default 'success' for the extra reward
+  # term -- see ManiskillVecEnv). False (default) leaves the reward purely
+  # representation-based, unchanged from prior behavior.
+  ppo_crl_add_extrinsic_reward: bool = False
+  # If True (maniskill_* env_names only), collect PPO rollouts from a
+  # single ManiSkill env simulating all ppo_num_envs copies at once on the
+  # GPU (PhysX GPU backend), instead of ppo_num_envs independent single-env
+  # SAPIEN scenes stepped one at a time in a Python loop. Pure wall-clock
+  # throughput optimization -- same rollouts, same learning dynamics.
+  # Requires a CUDA GPU; ManiSkill raises at construction time otherwise.
+  ppo_maniskill_native_vec: bool = False
+  # Normalize observations (state + goal) per-dimension using an online
+  # running mean/std (Welford, see `ppo_learner.ObsNormalizer`), so raw
+  # feature dims with very different natural scales -- e.g. position in
+  # meters vs. a [0, 1] boolean grasp flag -- don't dominate/vanish in the
+  # policy/value/CRL encoders purely due to magnitude. Goal columns reuse
+  # the SAME per-column stats as their corresponding state column (goal
+  # column j <-> state column start_index+j), so HER-relabeled training
+  # goals (literal future-state slices) and env-provided rollout goals
+  # (e.g. ManiskillOpenCabinetDrawer's chased handle_target_pos) stay on a
+  # consistent scale instead of drifting apart under independently-fit
+  # statistics. Mirrors `ppo_norm_reward`'s always-on-by-default precedent.
+  ppo_norm_obs: bool = True
 
+  # -------------------------------------------------------------------------
+  # Density estimator selector for the PPO shaped reward + off-policy
+  # critic/density update (standalone PPO only, reward_shaping_mode='ppo').
+  #   'crl' (default) — φ(s,a)·ψ(g) contrastive representations (InfoNCE);
+  #                     100% unchanged behavior from before this field existed.
+  #   'nf'            — conditional RealNVP density log p_NF(g|s,a), ported
+  #                     from contrastive/nf_density.py (origin/new-builderbench).
+  # -------------------------------------------------------------------------
+  ppo_repr_mode: str = 'crl'
+
+  # NF-specific options (only read when ppo_repr_mode == 'nf'). Minimal
+  # subset of contrastive/nf_density.py's knobs; nf_density.py supports
+  # other features (TD-NF, gradient regularizer, coupling-scale tanh,
+  # reward-mode variants, mask_prob, s-perturbation, goal encoder)
+  # intentionally not exposed here -- they keep nf_density.py's function
+  # defaults (effectively off) since we never pass overrides.
+  nf_rep_size: int = 256
+  nf_num_blocks: int = 12
+  nf_coupling_width: int = 512
+  nf_sa_hidden: int = 1024
+  nf_sa_num_layers: int = 4
+  nf_goal_enc_size: int = 0
+  nf_encoder_lr: float = 3e-4
+  nf_critic_lr: float = 1e-4
+  nf_critic_weight_decay: float = 1e-6
+  nf_grad_clip: float = 1.0
+  nf_noise_std: float = 0.05
+  nf_goal_std_min: float = 0.1
+  # If True, the goal-normalization stats (nf_goal_mean/nf_goal_std) are
+  # computed from batch_size replay hindsight goals PLUS batch_size copies
+  # of the current rollout's actual env task goal, so the task goal is
+  # in-distribution for the normalizer instead of relying solely on
+  # hindsight-relabeled goals. Stabilizes r = log p_NF(g_task|s,a) early in
+  # training, when the task goal can otherwise be far out-of-distribution
+  # relative to the replay's hindsight goals and blow up the flow's density.
+  nf_mix_task_goal_stats: bool = False
+  # EMA decay tau for NF params used in the PPO reward r = log p_NF(g|s,a).
+  # Mirrors ppo_crl_repr_tau (CRL-only); the two are never both active.
+  ppo_nf_reward_tau: float = 0.0
+
+  # -------------------------------------------------------------------------
+  # PPO+RND agent (`ppo_rnd.py` / `contrastive/ppo_rnd_learner.py`). Separate
+  # standalone entrypoint from `ppo_contrastive.py` -- no CRL critic/replay;
+  # reward is sparse extrinsic (evaluator success) + RND intrinsic. Reuses
+  # the `ppo_*` fields above (num_envs, rollout_length, clip_coef, ent_coef,
+  # actor_min_std, discount, gae_lambda, anneal_lr, max_grad_norm, norm_obs,
+  # checkpoint_interval, maniskill_native_vec) and `hidden_layer_sizes`.
+  # -------------------------------------------------------------------------
+  # Weight on the (normalized) intrinsic advantage in the combined PPO
+  # advantage: advantages = rnd_ext_coef*ext_adv + rnd_int_coef*int_adv.
+  rnd_int_coef: float = 1.0
+  rnd_ext_coef: float = 1.0
+  # Discount used for the intrinsic-reward GAE/return stream only; the
+  # extrinsic stream uses `ppo_discount` (falls back to `discount`), same as
+  # the CRL agent.
+  rnd_int_discount: float = 0.99
+  # Output width of the RND predictor/target networks' final layer.
+  rnd_output_size: int = 256
 
   use_image_obs: bool = False
   random_goals: float = 0.5
