@@ -1,103 +1,182 @@
 #!/bin/bash
 
 # ==============================================================================
-# SECTION 1: USER CONFIGURATION
+# SECTION 1: USER CONFIGURATION (EXPERIMENT DEFINITION)
 # ==============================================================================
 
 # 1. Define where the temp file lives
-#    We use the script's own directory to keep things contained
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 TASK_FILE="$SCRIPT_DIR/mila_tasks.tmp"
 rm -f "$TASK_FILE" # Clear old runs
 
-# 2. Get Project Root (So we can find train.py)
-#    Assumes this script is in <root>/tamia/scratch_tamia.sh
+# 2. Get Project Root
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-# 3. YOUR EXPERIMENT LOOPS
-#    Append every command you want to run to $TASK_FILE
+# 3. EXPERIMENT LOOPS
 echo "Generating tasks..."
+
+WANDB_PROJECT="dist-matching"
+WANDB_ENTITY="doina-precup"
 
 for seed in 0 1; do
 
-for arch in contrastive; do
+  # --------------------------------------------------------------------------
+  # 1. ManiSkill In-Room Push Drawer (CloseCabinetDrawer) - PPO + CRL
+  # --------------------------------------------------------------------------
+  echo "python ppo_contrastive.py \
+      --env=maniskill_close_cabinet_drawer \
+      --seed=${seed} \
+      --num_steps=600000000 \
+      --log_dir_path=maniskill_close_cabinet_drawer/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_crl_steps_per_iter=128 \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=0.01 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --ppo_crl_repr_tau=0.5 \
+      --ppo_num_envs=512 \
+      --maniskill_native_vec \
+      --uniform_sampling \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_close_cabinet_drawer_crl \
+      --render_video" >> "$TASK_FILE"
 
+  # --------------------------------------------------------------------------
+  # 2. ManiSkill In-Room Push Drawer (CloseCabinetDrawer) - PPO + RND
+  # --------------------------------------------------------------------------
+  echo "python ppo_rnd.py \
+      --env=maniskill_close_cabinet_drawer \
+      --seed=${seed} \
+      --num_steps=600000000 \
+      --log_dir_path=maniskill_close_cabinet_drawer_rnd/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=0.01 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --rnd_int_coef=1.0 \
+      --rnd_ext_coef=1.0 \
+      --rnd_int_discount=0.99 \
+      --ppo_num_envs=512 \
+      --maniskill_native_vec \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_close_cabinet_drawer_rnd \
+      --render_video" >> "$TASK_FILE"
 
-exp_name='creative-5-task2_stable_crl_eval_sg'
-echo "python stable_crl.py --env_id creative-5-task2 --use_pd --pd_duration 5 --architecture ${ach} --repetition_factor 12 --entropy_cost 0.01 --seed=${seed} --exp_name=${exp_name} --eval_single_goal True" >> "$TASK_FILE"
+  # --------------------------------------------------------------------------
+  # 3. ManiSkill-HAB Adjacent-Room Spawn -> Close Drawer - PPO + CRL
+  # --------------------------------------------------------------------------
+  echo "python ppo_contrastive.py \
+      --env=maniskill_close_subtask_train \
+      --seed=${seed} \
+      --num_steps=70000000 \
+      --log_dir_path=maniskill_close_subtask_train/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_crl_steps_per_iter=256 \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=0.01 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --ppo_crl_repr_tau=0.5 \
+      --ppo_num_envs=64 \
+      --ppo_checkpoint_interval=20 \
+      --maniskill_native_vec \
+      --uniform_sampling \
+      --ppo_crl_add_extrinsic_reward \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_close_subtask_crl \
+      --render_video \
+      --video_every_steps=20000000" >> "$TASK_FILE"
 
-# exp_name='creative-5-task1_stable_crl_eval_sg'
-# echo "python stable_crl.py --env_id creative-5-task1 --use_pd --pd_duration 5 --architecture ${ach} --repetition_factor 12 --entropy_cost 0.01 --seed=${seed} --exp_name=${exp_name} --eval_single_goal True" >> "$TASK_FILE"
-#
-#
-# exp_name='creative-7-task2_stable_crl_eval_sg'
-# echo "python stable_crl.py --env_id creative-7-task2 --use_pd --pd_duration 5 --architecture ${ach} --repetition_factor 12 --entropy_cost 0.01 --seed=${seed} --exp_name=${exp_name} --eval_single_goal True" >> "$TASK_FILE"
-#
-#
-# exp_name='creative-8-task2_stable_crl_eval_sg'
-# echo "python stable_crl.py --env_id creative-8-task2 --use_pd --pd_duration 5 --architecture ${ach} --repetition_factor 12 --entropy_cost 0.01 --seed=${seed} --exp_name=${exp_name} --eval_single_goal True" >> "$TASK_FILE"
+  # --------------------------------------------------------------------------
+  # 4. ManiSkill-HAB Adjacent-Room Spawn -> Close Drawer - PPO + RND
+  # --------------------------------------------------------------------------
+  echo "python ppo_rnd.py \
+      --env=maniskill_close_subtask_train \
+      --seed=${seed} \
+      --num_steps=70000000 \
+      --log_dir_path=maniskill_close_subtask_train_rnd/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=0.01 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --rnd_int_coef=1.0 \
+      --rnd_ext_coef=1.0 \
+      --rnd_int_discount=0.99 \
+      --ppo_num_envs=64 \
+      --ppo_checkpoint_interval=20 \
+      --maniskill_native_vec \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_close_subtask_rnd \
+      --render_video \
+      --video_every_steps=20000000" >> "$TASK_FILE"
 
-exp_name='creative-5-task2_sgcrl'
-echo "python stable_crl.py --env_id creative-5-task2 --use_pd --pd_duration 5 --architecture ${ach} --seed=${seed} --exp_name=${exp_name} --single_goal" >> "$TASK_FILE"
+  # --------------------------------------------------------------------------
+  # 5. ManiSkill-HAB Adjacent-Room Spawn -> Open Drawer - PPO + CRL
+  # --------------------------------------------------------------------------
+  echo "python ppo_contrastive.py \
+      --env=maniskill_open_subtask_train \
+      --seed=${seed} \
+      --num_steps=70000000 \
+      --log_dir_path=maniskill_open_subtask_train/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_crl_steps_per_iter=256 \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=1e-5 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --ppo_crl_repr_tau=0.5 \
+      --ppo_num_envs=64 \
+      --ppo_checkpoint_interval=20 \
+      --maniskill_native_vec \
+      --uniform_sampling \
+      --ppo_crl_add_extrinsic_reward \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_open_subtask_crl \
+      --render_video \
+      --video_every_steps=20000000" >> "$TASK_FILE"
 
-exp_name='creative-4-task1_sgcrl'
-echo "python stable_crl.py --env_id creative-5-task2 --use_pd --pd_duration 5 --architecture ${ach} --seed=${seed} --exp_name=${exp_name} --single_goal" >> "$TASK_FILE"
-
-# exp_name='creative-5-task1_sgcrl'
-# echo "python stable_crl.py --env_id creative-5-task1 --use_pd --pd_duration 5 --architecture ${ach} --seed=${seed} --exp_name=${exp_name} --single_goal" >> "$TASK_FILE"
-#
-#
-# exp_name='creative-7-task2_sgcrl'
-# echo "python stable_crl.py --env_id creative-7-task2 --use_pd --pd_duration 5 --architecture ${ach} --seed=${seed} --exp_name=${exp_name} --single_goal" >> "$TASK_FILE"
-#
-#
-# exp_name='creative-8-task2_sgcrl'
-# echo "python stable_crl.py --env_id creative-8-task2 --use_pd --pd_duration 5 --architecture ${ach} --seed=${seed} --exp_name=${exp_name} --single_goal" >> "$TASK_FILE"
+  # --------------------------------------------------------------------------
+  # 6. ManiSkill-HAB Adjacent-Room Spawn -> Open Drawer - PPO + RND
+  # --------------------------------------------------------------------------
+  echo "python ppo_rnd.py \
+      --env=maniskill_open_subtask_train \
+      --seed=${seed} \
+      --num_steps=70000000 \
+      --log_dir_path=maniskill_open_subtask_train_rnd/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=1e-5 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --rnd_int_coef=1.0 \
+      --rnd_ext_coef=1.0 \
+      --rnd_int_discount=0.99 \
+      --ppo_num_envs=64 \
+      --ppo_checkpoint_interval=20 \
+      --maniskill_native_vec \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_open_subtask_rnd \
+      --render_video \
+      --video_every_steps=20000000" >> "$TASK_FILE"
 
 done
-done
 
-
-# for seed in 0 1 ; do
-#   exp_name="creative-8-task2_cat_sel_sgcrl_fair_s${seed}"
-#   echo "python stable_crl.py --seed=${seed} --single_goal --categorical_select --env_id creative-8-task2 --use_pd --pd_duration 5 --architecture default --no-permute_start_boxes --entropy_cost 0.05 --entropy_cost_final 0.0 --num_timesteps 300000000 --exp_name=${exp_name}" >> "$TASK_FILE"
-# done
-#
-# Comparison runs matching NF-default baseline setup:
-# 1. --no-permute_start_boxes (fixed start lane per cube ID)
-# 2. --entropy_cost 0.05 --entropy_cost_final 0.0 (entropy annealing 0.05 -> 0.0)
-# 3. --num_timesteps 300000000 (300M steps)
-
-# for seed in 0 1 ; do
-#   exp_name="creative-8-task2_cat_sel_sgcrl_fair_s${seed}"
-#   echo "python stable_crl.py --seed=${seed} --single_goal --categorical_select --env_id creative-8-task2 --use_pd --pd_duration 5 --architecture default --no-permute_start_boxes --entropy_cost 0.05 --entropy_cost_final 0.0 --num_timesteps 300000000 --exp_name=${exp_name}" >> "$TASK_FILE"
-# done
-#
-# for seed in 0 1 2; do
-#   exp_name="creative-7-task2_cat_sel_sgcrl_fair_s${seed}"
-#   echo "python stable_crl.py --seed=${seed} --single_goal --categorical_select --env_id creative-7-task2 --use_pd --pd_duration 5 --architecture default --no-permute_start_boxes --entropy_cost 0.05 --entropy_cost_final 0.0 --num_timesteps 300000000 --exp_name=${exp_name}" >> "$TASK_FILE"
-# done
-
-# for seed in 1; do
-# exp_name='creative-8-task2_cat_sel_sgcrl'
-# echo "python stable_crl.py --seed=${seed} --single_goal --categorical_select --env_id creative-8-task2 --use_pd --pd_duration 5 --architecture default --exp_name=${exp_name}" >> "$TASK_FILE"
-# # exp_name='creative-7-task2_cat_sel_sgcrl'
-# # echo "python stable_crl.py --seed=${seed} --single_goal --categorical_select --env_id creative-7-task2 --use_pd --pd_duration 5 --architecture default --exp_name=${exp_name}" >> "$TASK_FILE"
-# done
-
-
-
-
-
-
-#
 # ==============================================================================
-# SECTION 2: THE BACKEND (DO NOT TOUCH)
+# SECTION 2: THE BACKEND (SLURM BATCH GENERATION & SUBMISSION)
 # ==============================================================================
 
 # --- CONFIGURATION FOR BATCHING ---
 GPUS_PER_NODE=1
-TASKS_PER_GPU=1  # <--- Change this to run more/fewer tasks per GPU
+TASKS_PER_GPU=1
 CHUNK_SIZE=$(( GPUS_PER_NODE * TASKS_PER_GPU ))
 SERIAL=true
 
@@ -122,48 +201,36 @@ for (( i=0; i<NUM_TASKS; i+=CHUNK_SIZE )); do
     # -- 1. Start writing the SLURM script --
     cat <<EOT > "$SLURM_SCRIPT"
 #!/bin/bash
-#SBATCH --job-name=rebrac_mila_${JOB_ID}
+#SBATCH --job-name=maniskill_mila_${JOB_ID}
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:l40s:${GPUS_PER_NODE}
+#SBATCH --gres=gpu:${GPUS_PER_NODE}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --mem=128G
 
-source /home/mila/m/mohammad-sami-nur.islam/sgcrl/builderbench/.venv/bin/activate
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export WANDB_DIR=\$SLURM_TMPDIR/wandb
-export WANDB_CACHE_DIR=\$SLURM_TMPDIR/.cache/wandb
-export WANDB_CONFIG_DIR=\$SLURM_TMPDIR/.config/wandb
-export WANDB_DATA_DIR=\$SLURM_TMPDIR/.data/wandb
+source "$PROJECT_ROOT/mainskill_env/bin/activate"
 
-export MUJOCO_GL=egl
+export XLA_PYTHON_CLIENT_MEM_FRACTION=.4
+export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+export WANDB_ENTITY=${WANDB_ENTITY}
+export WANDB_PROJECT=${WANDB_PROJECT}
+export MS_ASSET_DIR=/network/scratch/m/mohammad-sami-nur.islam/maniskill_data
+export MSHAB_TASK=set_table
+export MSHAB_SPLIT=train
+export MSHAB_OBJ=kitchen_counter
 
 echo "Starting Batch $JOB_ID..."
 
 EOT
 
     # -- 2. Inject commands using a Loop --
-    # Iterate over each GPU
     for (( gpu=0; gpu<GPUS_PER_NODE; gpu++ )); do
-        # Iterate over the "slots" on that GPU
         for (( slot=0; slot<TASKS_PER_GPU; slot++ )); do
-            
-            # Calculate the global index of the task we want
-            # offset = (gpu * TASKS_PER_GPU) + slot
             offset=$(( (gpu * TASKS_PER_GPU) + slot ))
             task_index=$(( i + offset ))
-
-            # Retrieve the task command
             cmd="${TASKS[$task_index]}"
 
-            # Only add if the command is not empty (handles partial last batches)
-            # if [ -n "$cmd" ]; then
-            #     echo "CUDA_VISIBLE_DEVICES=$gpu $cmd &" >> "$SLURM_SCRIPT"
-            # fi
-            # if [ -n "$cmd" ]; then
-            #     echo "(cd $PROJECT_ROOT && CUDA_VISIBLE_DEVICES=$gpu $cmd) &" >> "$SLURM_SCRIPT"
-            # fi
             if [ -n "$cmd" ]; then
                 if [ "$SERIAL" = true ]; then
                     echo "(cd $PROJECT_ROOT && CUDA_VISIBLE_DEVICES=$gpu $cmd)" >> "$SLURM_SCRIPT"
@@ -175,7 +242,6 @@ EOT
     done
 
     # -- 3. Finish script --
-    # echo "wait" >> "$SLURM_SCRIPT"
     if [ "$SERIAL" = false ] && [ "$TASKS_PER_GPU" -gt 1 ]; then
         echo "wait" >> "$SLURM_SCRIPT"
     fi
@@ -183,9 +249,6 @@ EOT
     # -- 4. Submit --
     echo "Submitting Batch $JOB_ID (Tasks starting at $i)..."
     sbatch "$SLURM_SCRIPT"
-    
-    # Optional: Delete the script after submission
-    # rm "$SLURM_SCRIPT" 
 done
 
 echo "All jobs submitted."
