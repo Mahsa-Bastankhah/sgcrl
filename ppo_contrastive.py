@@ -1680,6 +1680,12 @@ def main(_):
       wandb_run_name = f'{parent_name}--{folder_name}' if parent_name else folder_name
       wandb_group = FLAGS.wandb_group or FLAGS.exp_name or parent_name
       wandb_run_id = f'{parent_name}_{folder_name}_{int(time.time())}'.replace('/', '_')
+      if len(wandb_run_id) > 120:
+        import hashlib
+        id_hash = hashlib.md5(wandb_run_id.encode()).hexdigest()[:8]
+        wandb_run_id = f"{wandb_run_id[:100]}_{id_hash}"
+      if len(wandb_run_name) > 128:
+        wandb_run_name = wandb_run_name[:128]
       wandb.init(
           project=FLAGS.wandb_project,
           entity=FLAGS.wandb_entity or None,

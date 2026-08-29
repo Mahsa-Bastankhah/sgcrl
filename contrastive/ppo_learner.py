@@ -2841,6 +2841,7 @@ def run_ppo_training(
     _fm_time_embed = bool(getattr(config, 'fm_time_embedding', False))
     _fm_embed_dim = int(getattr(config, 'fm_time_embed_dim', 32))
     _fm_ode_solver = str(getattr(config, 'fm_ode_solver', 'euler') or 'euler').strip().lower()
+    _fm_reward_clip = float(getattr(config, 'fm_reward_clip', 0.0))
     fm_density_nets = _fm.make_fm_density_networks(
         obs_dim=obs_dim_cfg,
         act_dim=act_dim_cfg,
