@@ -360,8 +360,9 @@ NUM_TASKS=${#TASKS[@]}
 
 echo "Found $NUM_TASKS tasks. Splitting into batches of $CHUNK_SIZE..."
 
-# Create logs directory if it doesn't exist
-mkdir -p "$PROJECT_ROOT/slurm_logs"
+# Create scratch slurm logs directory
+SCRATCH_LOG_DIR="/network/scratch/m/mohammad-sami-nur.islam/slurm_logs/slurm_logs_dist_matching_maniskill"
+mkdir -p "$SCRATCH_LOG_DIR"
 
 for (( i=0; i<NUM_TASKS; i+=CHUNK_SIZE )); do
     JOB_ID=$((i / CHUNK_SIZE))
@@ -377,6 +378,7 @@ for (( i=0; i<NUM_TASKS; i+=CHUNK_SIZE )); do
 #SBATCH --cpus-per-task=12
 #SBATCH --time=48:00:00
 #SBATCH --mem=128G
+#SBATCH --output=${SCRATCH_LOG_DIR}/slurm-%j.out
 
 source "$PROJECT_ROOT/mainskill_env/bin/activate"
 
