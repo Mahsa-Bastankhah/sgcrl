@@ -31,6 +31,16 @@ from ppo_env_defaults import fixed_goal_dict, PPO_ENV_DEFAULTS
 
 FLAGS = flags.FLAGS
 
+SCRATCH_LOG_ROOT = '/network/scratch/m/mohammad-sami-nur.islam/sgcrl_logs'
+
+
+def _resolve_log_dir(log_dir_path: str) -> str:
+  """Resolves relative log paths to SCRATCH_LOG_ROOT."""
+  if os.path.isabs(log_dir_path):
+    return log_dir_path
+  return os.path.join(SCRATCH_LOG_ROOT, log_dir_path)
+
+
 flags.DEFINE_string('log_dir_path', 'logs/ppo_rnd/', 'Where to log metrics')
 flags.DEFINE_integer('seed', 0, 'Random seed')
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
@@ -167,7 +177,7 @@ def main(_):
       alg_name='ppo_rnd',
       reward_shaping_mode='ppo',
       max_number_of_steps=FLAGS.num_steps,
-      log_dir=FLAGS.log_dir_path,
+      log_dir=_resolve_log_dir(FLAGS.log_dir_path),
       add_uid=FLAGS.add_uid,
       fix_goals=not FLAGS.sample_goals,
   )
@@ -304,6 +314,8 @@ def main(_):
   # ---- Optional live wandb logging ---------------------------------------
   wandb_run = None
   if FLAGS.wandb_project:
+    if not os.environ.get('WANDB_DIR'):
+      os.environ['WANDB_DIR'] = '/network/scratch/m/mohammad-sami-nur.islam/wandb_cache'
     import wandb
     wandb_run_id_path = os.path.join(run_dir, 'wandb_run_id.txt')
     wandb_run_id = None

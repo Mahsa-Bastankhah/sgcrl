@@ -62,10 +62,17 @@ def main():
                       help='Empty auto-generates from the checkpoint path.')
   args = parser.parse_args()
 
-  ckpt = ppo_learner.load_checkpoint(args.checkpoint)
+  checkpoint_path = args.checkpoint
+  scratch_log_root = '/network/scratch/m/mohammad-sami-nur.islam/sgcrl_logs'
+  if not os.path.exists(checkpoint_path) and not os.path.isabs(checkpoint_path):
+    scratch_candidate = os.path.join(scratch_log_root, checkpoint_path)
+    if os.path.exists(scratch_candidate):
+      checkpoint_path = scratch_candidate
+
+  ckpt = ppo_learner.load_checkpoint(checkpoint_path)
   iteration = ckpt.get('iteration')
   global_step = ckpt.get('global_step')
-  print(f'[render] loaded {args.checkpoint} '
+  print(f'[render] loaded {checkpoint_path} '
         f'(iteration={iteration}, global_step={global_step})')
 
   if args.hidden_layer_sizes:
