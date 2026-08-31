@@ -20,51 +20,51 @@ WANDB_ENTITY="doina-precup"
 
 for seed in 0 1; do
 
-  # --------------------------------------------------------------------------
-  # 1. ManiSkill In-Room Push Drawer (CloseCabinetDrawer) - PPO + CRL
-  # --------------------------------------------------------------------------
-  echo "python ppo_contrastive.py \
-      --env=maniskill_close_cabinet_drawer \
-      --seed=${seed} \
-      --num_steps=600000000 \
-      --log_dir_path=maniskill_close_cabinet_drawer/ \
-      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-      --ppo_crl_steps_per_iter=128 \
-      --ppo_ent_coef=0.05 \
-      --ppo_actor_min_std=0.01 \
-      --ppo_discount=0.99 \
-      --ppo_clip_coef=0.2 \
-      --ppo_crl_repr_tau=0.5 \
-      --ppo_num_envs=512 \
-      --maniskill_native_vec \
-      --uniform_sampling \
-      --wandb_project=${WANDB_PROJECT} \
-      --wandb_entity=${WANDB_ENTITY} \
-      --wandb_group=ppo_close_cabinet_drawer_crl \
-      --render_video" >> "$TASK_FILE"
-
-  # --------------------------------------------------------------------------
-  # 2. ManiSkill In-Room Push Drawer (CloseCabinetDrawer) - PPO + RND
-  # --------------------------------------------------------------------------
-  echo "python ppo_rnd.py \
-      --env=maniskill_close_cabinet_drawer \
-      --seed=${seed} \
-      --num_steps=600000000 \
-      --log_dir_path=maniskill_close_cabinet_drawer_rnd/ \
-      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-      --ppo_ent_coef=0.05 \
-      --ppo_actor_min_std=0.01 \
-      --ppo_discount=0.99 \
-      --ppo_clip_coef=0.2 \
-      --rnd_int_coef=1.0 \
-      --rnd_ext_coef=1.0 \
-      --rnd_int_discount=0.99 \
-      --ppo_num_envs=512 \
-      --maniskill_native_vec \
-      --wandb_project=${WANDB_PROJECT} \
-      --wandb_entity=${WANDB_ENTITY} \
-      --wandb_group=ppo_close_cabinet_drawer_rnd \
-      --render_video" >> "$TASK_FILE"
+  # # --------------------------------------------------------------------------
+  # # 1. ManiSkill In-Room Push Drawer (CloseCabinetDrawer) - PPO + CRL
+  # # --------------------------------------------------------------------------
+  # echo "python ppo_contrastive.py \
+  #     --env=maniskill_close_cabinet_drawer \
+  #     --seed=${seed} \
+  #     --num_steps=600000000 \
+  #     --log_dir_path=maniskill_close_cabinet_drawer/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_crl_steps_per_iter=128 \
+  #     --ppo_ent_coef=0.05 \
+  #     --ppo_actor_min_std=0.01 \
+  #     --ppo_discount=0.99 \
+  #     --ppo_clip_coef=0.2 \
+  #     --ppo_crl_repr_tau=0.5 \
+  #     --ppo_num_envs=512 \
+  #     --maniskill_native_vec \
+  #     --uniform_sampling \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=ppo_close_cabinet_drawer_crl \
+  #     --render_video" >> "$TASK_FILE"
+  #
+  # # --------------------------------------------------------------------------
+  # # 2. ManiSkill In-Room Push Drawer (CloseCabinetDrawer) - PPO + RND
+  # # --------------------------------------------------------------------------
+  # echo "python ppo_rnd.py \
+  #     --env=maniskill_close_cabinet_drawer \
+  #     --seed=${seed} \
+  #     --num_steps=600000000 \
+  #     --log_dir_path=maniskill_close_cabinet_drawer_rnd/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_ent_coef=0.05 \
+  #     --ppo_actor_min_std=0.01 \
+  #     --ppo_discount=0.99 \
+  #     --ppo_clip_coef=0.2 \
+  #     --rnd_int_coef=1.0 \
+  #     --rnd_ext_coef=1.0 \
+  #     --rnd_int_discount=0.99 \
+  #     --ppo_num_envs=512 \
+  #     --maniskill_native_vec \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=ppo_close_cabinet_drawer_rnd \
+  #     --render_video" >> "$TASK_FILE"
 
   # --------------------------------------------------------------------------
   # 3. ManiSkill-HAB Adjacent-Room Spawn -> Close Drawer - PPO + CRL
@@ -211,6 +211,9 @@ for (( i=0; i<NUM_TASKS; i+=CHUNK_SIZE )); do
 
 source "$PROJECT_ROOT/mainskill_env/bin/activate"
 
+export PATH="$PROJECT_ROOT/mainskill_env/bin:$PATH"
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/lib/nvidia:$LD_LIBRARY_PATH
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.4
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
 export WANDB_ENTITY=${WANDB_ENTITY}
