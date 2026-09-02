@@ -204,6 +204,13 @@ class ContrastiveConfig:
   # If True, a minibatch with approx_kl > ppo_target_kl rolls back that
   # update and ends the iteration immediately (does not finish the epoch).
   ppo_kl_early_stop_rollback: bool = False
+  # After this many consecutive iters with train_success_1000 strictly
+  # above the thresh, latch and skip all later PPO policy/value updates
+  # (NF/CRL still train). Off until the latch. No KL penalty.
+  ppo_kl_rollback_after_success: bool = False
+  ppo_kl_rollback_after_success_thresh: float = 0.8
+  ppo_kl_rollback_after_success_iters: int = 4
+  ppo_kl_rollback_kl: float = 0.05
   # After an actor reset, skip target-KL early-stop / rollback for this many
   # subsequent iterations (0 = no cooldown).
   ppo_target_kl_reset_cooldown: int = 0
@@ -278,6 +285,15 @@ class ContrastiveConfig:
   # Fraction of the NF batch whose ∇_s log p regularizer uses the env task
   # goal instead of replay g.  0 = off (replay g only).  NLL is never mixed.
   ppo_nf_grad_reg_task_g_frac: float = 0.0
+  # Dual ∇_s regularizer on the PPO value net.  Off unless explicitly set.
+  # Same Lagrangian as NF: L += λ · E[‖∇_s V‖], then
+  #   λ ← clip(λ + lam_lr · (E[‖∇_s V‖] − c), λ_min, 1).
+  # ∇_s is w.r.t. the state slice of packed obs (goal held fixed).
+  ppo_value_grad_reg: bool = False
+  ppo_value_grad_reg_c: float = 100.0
+  # <0 → init λ from max(ppo_crl_grad_reg_coef, 5e-4).
+  ppo_value_grad_reg_lam: float = -1.0
+  ppo_value_grad_reg_lam_lr: float = 1e-6
   # NF time-reg: η E[(log p_θ(g|s,a) − log p_old(g|s',a'))²] with
   # a' ∼ π(·|s', g_task) (stopgrad).  0 = off.  p_old is stopgrad.
   # target='iter': p_old = θ at the start of this PPO iter (before the
@@ -485,6 +501,7 @@ class ContrastiveConfig:
   # If True, NF μ/σ is computed from batch_size replay s_f plus batch_size
   # copies of the current env task goal (obs[:, obs_dim:]), so g_task is not OOD.
   nf_mix_task_goal_stats: bool = False
+  nf_mix_task_goal_frac: float = 0.5
   # If True, NF learns p(g|s) / reward r(s) instead of p(g|s,a) / r(s,a).
   # Encoder input is state only; action is ignored at train and reward time.
   nf_state_only: bool = False
@@ -512,6 +529,8 @@ class ContrastiveConfig:
   # Comma-separated PPO iterations at which to force an actor reinit
   # (in addition to the short-episode guard). Empty = schedule disabled.
   ppo_actor_reset_iters: str = ''
+  # If >0, last-layer actor reset when ep_length_mean < this. 0 = 0.8 * horizon.
+  ppo_actor_reset_ep_len: float = 0.0
   ppo_eval_interval: int = 30  # run eval every N PPO iterations (0 = disabled)
   ppo_eval_episodes: int = 5  # number of eval episodes per eval round
   # In-train BuilderBench video (deterministic policy + live obs_rms).

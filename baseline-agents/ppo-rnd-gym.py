@@ -54,6 +54,7 @@ FIXED_START_END = {
     "sawyer_drawer_open": np.array([0.0, 0.54, 0.09], dtype=np.float32),
     "sawyer_button_press": np.array([0.0, 0.8, 0.115], dtype=np.float32),
     "sawyer_peg": np.array([-0.3, 0.6, 0.0], dtype=np.float32),
+    "sawyer_bin": np.array([0.12, 0.7, 0.02], dtype=np.float32),
 }
 
 

@@ -12,6 +12,7 @@
 #SBATCH --array=0-0
 
 # PPO + NF compact-small on AllegroKukaThrow (300M, 4h).
+# The first 300M run finished in 3h05 with a 4h cap.
 # Same recipe as the 30min smoke (ent 0.05->0.01, NF reward only).
 #   sbatch jobs/job_ppo_allegro_kuka_throw_e1024_nf_compact_small_sa3x192_r64_b6_w192_tau05_minstd1e5_entanneal_ep300_300m_crl10_ent05to001.slurm
 

@@ -1049,8 +1049,9 @@ def make_reward_fn(
       products are replaced by Gaussian KDE log-densities fitted on replay
       buffer states.  Requires a ``GaussianKDE`` object to be maintained
       externally and passed as the first argument of the returned function.
-    * ``'env_dense'``: not handled here — rollout copies BuilderBench
-      ``env_rew`` (tanh cube–goal distance). Default remains φ·ψ.
+    * ``'env_dense'``: not handled here — rollout copies env dense reward
+      (BuilderBench tanh cube–goal, or NVIDIA Allegro ``rew_buf``). Default
+      remains φ·ψ.
 
   Optional ``config.ppo_crl_hit_bonus`` adds an indicator on top of φ·ψ:
   ``'sf'`` → scale·1{‖obs_to_goal(s)−g‖<tol}; ``'goal'`` →
@@ -2286,6 +2287,14 @@ class IsaacGymVecEnv:
           fixed_target_xyz=tuple(kw.get('fixed_target_xyz', (0.5, -0.3, 0.4))),
           pipeline=str(kw.get('pipeline', 'gpu')),
           headless=True,
+          randomize_init=bool(kw.get('randomize_init', True)),
+          randomize_object_xyz=bool(kw.get('randomize_object_xyz', False)),
+          randomize_object_shape=bool(kw.get('randomize_object_shape', True)),
+          palm_goal=bool(kw.get('palm_goal', False)),
+          palm_goal_xyz=kw.get('palm_goal_xyz'),
+          table_push=bool(kw.get('table_push', False)),
+          table_push_xyz=kw.get('table_push_xyz'),
+          table_spawn=bool(kw.get('table_spawn', False)),
       )
       self.used_prebuilt = False
     self._num_envs = int(self._env.num_envs)
@@ -2651,11 +2660,29 @@ def run_ppo_training(
             'fixed_target_xyz': _ig_kw.get(
                 'isaacgym_fixed_target_xyz', (0.5, -0.3, 0.4)),
             'pipeline': str(_ig_kw.get('isaacgym_pipeline', 'gpu')),
+            'randomize_init': bool(_ig_kw.get('isaacgym_randomize_init', True)),
+            'randomize_object_xyz': bool(
+                _ig_kw.get('isaacgym_randomize_object_xyz', False)),
+            'randomize_object_shape': bool(
+                _ig_kw.get('isaacgym_randomize_object_shape', True)),
+            'palm_goal': bool(_ig_kw.get('isaacgym_palm_goal', False)),
+            'palm_goal_xyz': _ig_kw.get('isaacgym_palm_goal_xyz'),
+            'table_push': bool(_ig_kw.get('isaacgym_table_push', False)),
+            'table_push_xyz': _ig_kw.get('isaacgym_table_push_xyz'),
+            'table_spawn': bool(_ig_kw.get('isaacgym_table_spawn', False)),
         },
     )
     print(f'[ppo] using native-batched Isaac Gym vec env '
           f'(AllegroKukaThrow, E={config.ppo_num_envs}, '
           f'pipeline={_ig_kw.get("isaacgym_pipeline", "gpu")}, '
+          f'randomize_init={bool(_ig_kw.get("isaacgym_randomize_init", True))}, '
+          f'randomize_object_xyz='
+          f'{bool(_ig_kw.get("isaacgym_randomize_object_xyz", False))}, '
+          f'randomize_object_shape='
+          f'{bool(_ig_kw.get("isaacgym_randomize_object_shape", True))}, '
+          f'palm_goal={bool(_ig_kw.get("isaacgym_palm_goal", False))}, '
+          f'table_push={bool(_ig_kw.get("isaacgym_table_push", False))}, '
+          f'table_spawn={bool(_ig_kw.get("isaacgym_table_spawn", False))}, '
           f'prebuilt={getattr(vec_env, "used_prebuilt", False)})')
 
   # ---- build networks from env spec -------------------------------------
@@ -3254,14 +3281,19 @@ def run_ppo_training(
   use_kde_dirac    = reward_mode == 'kde_dirac'
   use_env_dense    = reward_mode == 'env_dense'
   if use_env_dense:
-    if not _use_jax_bb_vec:
+    if not (_use_jax_bb_vec or _use_isaacgym):
       raise ValueError(
-          "ppo_reward_mode='env_dense' is a BuilderBench baseline "
-          '(CreativeCube tanh cube–goal distance); other envs unsupported')
+          "ppo_reward_mode='env_dense' is BuilderBench tanh cube–goal "
+          'or NVIDIA AllegroKuka rew_buf; other envs unsupported')
     reward_fn = None
-    print('[ppo] reward mode: env_dense (BuilderBench tanh cube-goal '
-          'distance env_rew; φ·ψ unused; opt-in baseline only)',
-          flush=True)
+    if _use_isaacgym:
+      print('[ppo] reward mode: env_dense (NVIDIA AllegroKuka rew_buf; '
+            'repr unused; opt-in sanity baseline)',
+            flush=True)
+    else:
+      print('[ppo] reward mode: env_dense (BuilderBench tanh cube-goal '
+            'distance env_rew; φ·ψ unused; opt-in baseline only)',
+            flush=True)
   else:
     reward_fn = make_reward_fn(networks, config)
     print('[ppo] init: reward_fn ready', flush=True)
@@ -3934,6 +3966,25 @@ def run_ppo_training(
       print('[ppo] BuilderBench: periodic eval disabled; '
             'logging train_success_mean / train_success_1000 from rollouts')
 
+  # Isaac Gym: one PhysX sim per process. Eval must reuse the training
+  # vec env (a second AllegroKukaThrowVecEnv after JAX segfaults).
+  ig_eval_action = None
+  if _use_isaacgym:
+    _ig_eval_iv = int(getattr(config, 'ppo_eval_interval', 30))
+    if _ig_eval_iv > 0:
+      @jax.jit
+      def ig_eval_action(policy_p, obs, obs_mean, obs_var):
+        network_obs = _normalize_packed_obs(
+            obs, obs_mean, obs_var, obs_dim=obs_dim_cfg, start_index=norm_si,
+            end_index=norm_ei, clip=obs_norm_clip, enabled=norm_obs,
+            goal_state_indices=_goal_state_indices)
+        dist = networks.policy_network.apply(policy_p, network_obs)
+        return dist.mode()
+
+      print('[ppo] Allegro eval: deterministic mode() on the training '
+            f'vec env (E={E}, ep_len={T}, every {_ig_eval_iv} iters)',
+            flush=True)
+
   # Optional in-train deterministic video (BuilderBench only).
   bb_video_env = None
   bb_video_mocap = None
@@ -4064,14 +4115,16 @@ def run_ppo_training(
         f'(1cm), got {external_reward_success!r}')
   if use_external_reward:
     _sawyer_extrew = str(_env_name).startswith('sawyer_')
-    if not (_use_jax_bb_vec or _sawyer_extrew):
+    if not (_use_jax_bb_vec or _sawyer_extrew or _use_isaacgym):
       raise ValueError(
-          'ppo_use_external_reward requires BuilderBench (metrics["success"]) '
-          'or a Sawyer MetaWorld env (sparse env reward as hard success)')
-    if _sawyer_extrew and external_reward_success == 'very_hard':
+          'ppo_use_external_reward requires BuilderBench (metrics["success"]), '
+          'a Sawyer MetaWorld env (sparse env reward), or AllegroKukaThrow '
+          '(env.success(): object within success_tolerance of the goal)')
+    if ((_sawyer_extrew or _use_isaacgym)
+            and external_reward_success == 'very_hard'):
       raise ValueError(
           'ppo_external_reward_success=very_hard is BuilderBench-only '
-          '(1cm all-cubes); Sawyer has no very-hard metric')
+          '(1cm all-cubes); Sawyer / Allegro have no very-hard metric')
     _when = (
         'BEFORE reward normalisation'
         if external_reward_before_norm else
@@ -4081,6 +4134,8 @@ def run_ppo_training(
           'metrics["very_hard_success"] (1cm)'
           if external_reward_success == 'very_hard' else
           'metrics["success"] (2cm)')
+    elif _use_isaacgym:
+      _src = 'AllegroKukaThrow env.success() (object at goal, not env_rew)'
     else:
       _src = 'env_reward>=0.5 (Sawyer sparse success)'
     print('[ppo] external success bonus enabled: '
@@ -4168,10 +4223,12 @@ def run_ppo_training(
     print('[ppo] logging train_success_mean / train_success_1000 from '
           'AllegroKukaThrow object-at-target (not dense env reward)',
           flush=True)
-  # Nominal PD/MJ episode length (BuilderBench). Used to detect collapse via
-  # short episodes (e.g. repeated OOB early terminations) and reinit the actor.
+  # Nominal episode length. Used to detect collapse via short episodes
+  # (e.g. repeated OOB / table-drop early terminations) and reinit the actor.
+  # Same rule as BuilderBench: mean of recent lengths < 80% of horizon.
   _nominal_ep_len = (
-      int(vec_env.episode_length) if _use_jax_bb_vec else 0)
+      int(vec_env.episode_length)
+      if (_use_jax_bb_vec or _use_isaacgym) else 0)
   _actor_reset_ep_frac = 0.8
   _force_reset_iters: set = set()
   _raw_force = str(getattr(config, 'ppo_actor_reset_iters', '') or '').strip()
@@ -4180,11 +4237,20 @@ def run_ppo_training(
       _tok = _tok.strip()
       if _tok:
         _force_reset_iters.add(int(_tok))
+  _raw_reset_len = float(getattr(config, 'ppo_actor_reset_ep_len', 0) or 0)
+  _actor_reset_thresh = (
+      _raw_reset_len if _raw_reset_len > 0
+      else _actor_reset_ep_frac * float(_nominal_ep_len))
   if _nominal_ep_len > 0:
-    print(f'[ppo] actor-reset guard: reinit policy HEAD (last layer; keep '
-          f'policy_mlp trunk) if ep_length_mean < '
-          f'{_actor_reset_ep_frac:.0%} of nominal ({_nominal_ep_len}) '
-          f'= {_actor_reset_ep_frac * _nominal_ep_len:.1f}')
+    if _raw_reset_len > 0:
+      print(f'[ppo] actor-reset guard: reinit policy HEAD (last layer; keep '
+            f'policy_mlp trunk) if ep_length_mean < {_actor_reset_thresh:.1f} '
+            f'(absolute; nominal={_nominal_ep_len})')
+    else:
+      print(f'[ppo] actor-reset guard: reinit policy HEAD (last layer; keep '
+            f'policy_mlp trunk) if ep_length_mean < '
+            f'{_actor_reset_ep_frac:.0%} of nominal ({_nominal_ep_len}) '
+            f'= {_actor_reset_thresh:.1f}')
   if _force_reset_iters:
     print(f'[ppo] actor-reset schedule: force FULL policy reinit at iters '
           f'{sorted(_force_reset_iters)}')
@@ -4212,9 +4278,14 @@ def run_ppo_training(
             '(logged nf/goal_mean_*, nf/goal_std_* still from replay)',
             flush=True)
     if bool(getattr(config, 'nf_mix_task_goal_stats', False)):
-      print('[ppo] NF goal stats: mix batch_size replay s_f + '
-            f'batch_size copies of env task goal '
-            f'(batch_size={int(config.batch_size)})', flush=True)
+      _mix_frac = float(getattr(config, 'nf_mix_task_goal_frac', 0.5))
+      _bs = int(config.batch_size)
+      _n_tot = 2 * _bs
+      _n_task0 = int(round(_mix_frac * _n_tot))
+      print('[ppo] NF goal stats: mix '
+            f'{_n_tot - _n_task0} replay s_f + {_n_task0} copies of env '
+            f'task goal (frac={_mix_frac:.2f}, batch_size={_bs})',
+            flush=True)
 
   obs = vec_env.reset()
   next_done = np.zeros(E, dtype=np.float32)
@@ -4511,6 +4582,9 @@ def run_ppo_training(
       )
       global_step += T * E
     else:
+      _isaac_success = None
+      if _use_isaacgym and use_external_reward:
+        _isaac_success = np.zeros((T, E), dtype=np.float32)
       for t in range(T):
         roll_obs[t] = obs
         roll_dones[t] = next_done
@@ -4539,9 +4613,12 @@ def run_ppo_training(
         # Store step-level dones for the post-rollout reward normalizer loop.
         roll_step_dones[t] = dones.astype(np.float32)
         _step_success = None
-        if _track_train_success and _use_isaacgym:
-          _step_success = np.asarray(
-              getattr(vec_env, 'last_success', None), dtype=np.float32)
+        if _use_isaacgym and (_track_train_success or use_external_reward):
+          _raw_succ = getattr(vec_env, 'last_success', None)
+          if _raw_succ is not None:
+            _step_success = np.asarray(_raw_succ, dtype=np.float32)
+            if _isaac_success is not None:
+              _isaac_success[t] = _step_success
 
         # Episode flushing / per-env accounting.
         for i in range(E):
@@ -4593,11 +4670,15 @@ def run_ppo_training(
         next_done = dones.astype(np.float32)
         global_step += E
 
-      # Sawyer MetaWorld envs use sparse 0/1 env reward as hard success.
+      # Allegro: per-step env.success() (object at goal). Sawyer: sparse 0/1
+      # env reward. Do not use Allegro env_rew here — that is NVIDIA dense.
       if use_external_reward and _roll_success is None:
-        _roll_success = (
-            (np.asarray(roll_env_rew, dtype=np.float32) >= 0.5)
-            .astype(np.float32))
+        if _isaac_success is not None:
+          _roll_success = _isaac_success
+        else:
+          _roll_success = (
+              (np.asarray(roll_env_rew, dtype=np.float32) >= 0.5)
+              .astype(np.float32))
 
     _switch_after_this_iteration = (
         use_crl_td3_switch
@@ -4631,7 +4712,7 @@ def run_ppo_training(
       # Latched: drop denser/repr reward; PPO uses sparse hard-success only.
       roll_rew_raw[:] = 0.0
     elif use_env_dense:
-      # Opt-in BB baseline: PPO on CreativeCube tanh distance (env_rew).
+      # Opt-in: PPO on env dense reward (BB tanh cube–goal or Allegro rew_buf).
       roll_rew_raw[:] = np.asarray(roll_env_rew, dtype=np.float32)
     elif not use_kde_dirac:
       if rollout_j is not None:
@@ -5038,10 +5119,22 @@ def run_ppo_training(
       if use_nf:
         _std_floor = float(getattr(config, 'nf_goal_std_min', 0.02))
         _mix_task = bool(getattr(config, 'nf_mix_task_goal_stats', False))
-        _n_sf = int(config.batch_size) if _mix_task else min(2048, replay.size)
-        _n_sf = min(_n_sf, int(replay.size))
-        _stat_batch = replay.sample(_n_sf, np_rng)
-        _goals = _stat_batch['obs'][:, int(config.obs_dim):]
+        _n_task = 0
+        if _mix_task:
+          _mix_frac = min(
+              max(float(getattr(config, 'nf_mix_task_goal_frac', 0.5)),
+                  0.0), 1.0)
+          _n_total = 2 * int(config.batch_size)
+          _n_task = int(round(_mix_frac * _n_total))
+          _n_sf = _n_total - _n_task
+        else:
+          _n_sf = min(2048, replay.size)
+        _n_sf = min(max(int(_n_sf), 0), int(replay.size))
+        if _n_sf > 0:
+          _stat_batch = replay.sample(_n_sf, np_rng)
+          _goals = _stat_batch['obs'][:, int(config.obs_dim):]
+        else:
+          _goals = np.zeros((0, goal_dim_cfg), dtype=np.float32)
         # Optionally mix in the actual env goals from the current rollout so
         # that the running stats cover both hindsight goals AND reward goals.
         if bool(getattr(config, 'nf_mix_env_goal_stats', False)):
@@ -5054,7 +5147,7 @@ def run_ppo_training(
             _env_goals = roll_obs.reshape(
                 -1, roll_obs.shape[-1])[:, int(config.obs_dim):]
           _goals = np.concatenate([_goals, _env_goals], axis=0)
-        if _mix_task:
+        if _mix_task and _n_task > 0:
           if rollout_j is not None:
             _g_task = np.asarray(
                 rollout_j['obs'].reshape(-1, rollout_j['obs'].shape[-1])
@@ -5064,11 +5157,11 @@ def run_ppo_training(
             _g_task = roll_obs.reshape(
                 -1, roll_obs.shape[-1])[0, int(config.obs_dim):].astype(
                     np.float32)
-          _n_task = int(config.batch_size)
           _goals = np.concatenate(
               [_goals, np.repeat(_g_task[None], _n_task, axis=0)], axis=0)
           _nf_stat_log['nf/goal_stat_n_sf'] = float(_n_sf)
           _nf_stat_log['nf/goal_stat_n_task'] = float(_n_task)
+          _nf_stat_log['nf/goal_stat_mix_frac'] = float(_mix_frac)
         nf_goal_mean = _goals.mean(axis=0).astype(np.float32)
         nf_goal_std  = _goals.std(axis=0).astype(np.float32)
         nf_goal_std  = np.maximum(nf_goal_std, _std_floor).astype(np.float32)
@@ -5353,6 +5446,26 @@ def run_ppo_training(
         log['train_very_hard_success_1000'] = (
             float(np.mean(recent_very_hard_success[-1000:]))
             if recent_very_hard_success else float('nan'))
+    if _use_isaacgym:
+      # Object xyz is always the last 3 dims of state. Packed goal object
+      # is last 3 of goal (palm-goal is [palm, object_in_bucket]).
+      if rollout_j is not None and 'obs' in rollout_j:
+        _pack_obs = np.asarray(rollout_j['obs'], dtype=np.float32)
+      else:
+        _pack_obs = np.asarray(roll_obs, dtype=np.float32)
+      _od = int(config.obs_dim)
+      _obj_xyz = _pack_obs[..., _od - 3:_od]
+      _gdim = int(_pack_obs.shape[-1]) - _od
+      if _gdim >= 6:
+        _g_obj = _pack_obs[..., _od + 3:_od + 6]
+      else:
+        _g_obj = _pack_obs[..., _od:_od + 3]
+      _obj_dist = np.linalg.norm(_obj_xyz - _g_obj, axis=-1)
+      log['object_x_mean'] = float(_obj_xyz[..., 0].mean())
+      log['object_y_mean'] = float(_obj_xyz[..., 1].mean())
+      log['object_z_mean'] = float(_obj_xyz[..., 2].mean())
+      log['object_goal_dist_mean'] = float(_obj_dist.mean())
+      log['object_z_frac_below_01'] = float((_obj_xyz[..., 2] < 0.1).mean())
     if use_crl_td3_switch:
       log['reward_source_td3'] = float(_reward_uses_td3_this_iter)
       log['reward_td3_weight'] = float(_reward_td3_weight)
@@ -5562,10 +5675,10 @@ def run_ppo_training(
                 else float('nan'))
     _short_ep = (
         _nominal_ep_len > 0 and recent_lengths
-        and _ep_mean < _actor_reset_ep_frac * float(_nominal_ep_len))
+        and _ep_mean < _actor_reset_thresh)
     _forced = int(iteration) in _force_reset_iters
     if _short_ep or _forced:
-      _thresh = _actor_reset_ep_frac * float(_nominal_ep_len)
+      _thresh = _actor_reset_thresh
       key, k_pol = jax.random.split(key)
       with _haiku_init_device(_use_isaacgym):
         _fresh_policy = networks.policy_network.init(k_pol)
@@ -5636,6 +5749,62 @@ def run_ppo_training(
         )
         ep_metrics_list = _smooth_bb_eval_metrics(
             ep_metrics_list, eval_success_obs, eval_dist_obs)
+      elif _use_isaacgym and ig_eval_action is not None:
+        # Reset the live vec env, run one deterministic episode per env,
+        # then rebuild training episode buffers so the next rollout matches
+        # PhysX state.
+        obs = vec_env.reset()
+        any_succ = np.zeros(E, dtype=np.float32)
+        _rs0 = getattr(vec_env, 'last_success', None)
+        if _rs0 is not None:
+          any_succ = np.maximum(
+              any_succ, np.asarray(_rs0, dtype=np.float32).reshape(-1))
+        ep_ret = np.zeros(E, dtype=np.float32)
+        ep_n = np.zeros(E, dtype=np.int32)
+        still = np.ones(E, dtype=bool)
+        for _t in range(int(T)):
+          a = np.asarray(
+              ig_eval_action(
+                  ppo_params['policy'], jnp.asarray(obs),
+                  iter_obs_mean_j, iter_obs_var_j))
+          a = np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=-1.0)
+          a = np.clip(a, -1.0, 1.0)
+          next_obs, env_rew, dones, _, _ = vec_env.step(a)
+          _rs = getattr(vec_env, 'last_success', None)
+          if _rs is not None:
+            any_succ = np.maximum(
+                any_succ, np.asarray(_rs, dtype=np.float32).reshape(-1))
+          _still_f = still.astype(np.float32)
+          ep_ret += np.asarray(env_rew, dtype=np.float32) * _still_f
+          ep_n += still.astype(np.int32)
+          still &= ~np.asarray(dones, dtype=bool)
+          obs = next_obs
+          if not bool(still.any()):
+            break
+        succ_bit = (any_succ >= 0.5)
+        for i in range(E):
+          eval_success_obs._success.append(bool(succ_bit[i]))
+        succ_1000 = float(np.mean(eval_success_obs._success[-1000:]))
+        ep_metrics_list = [
+            {
+                'episode_return': float(ep_ret[i]),
+                'episode_length': int(ep_n[i]),
+                'success': float(succ_bit[i]),
+                'success_1000': succ_1000,
+            }
+            for i in range(E)
+        ]
+        _n_eval = int(E)
+        next_done = np.zeros(E, dtype=np.float32)
+        for i in range(E):
+          ep_obs[i] = [obs[i].copy()]
+          ep_act[i] = []
+          ep_return[i] = 0.0
+          ep_flow_dense_return[i] = 0.0
+          ep_has_flow_dense[i] = False
+          ep_len[i] = 0
+          ep_success_max[i] = 0.0
+          s0_states[i] = obs[i, :int(config.obs_dim)].copy()
       else:
         ep_metrics_list = []
         for e_i in range(_n_eval):

@@ -1362,6 +1362,7 @@ def make_ppo_update_fn(
 
   Combined loss (CleanRL-style):
       L  =  pg_loss  -  ent_coef * entropy  +  vf_coef * v_loss
+           [+ λ · E[‖∇_s V‖] if ppo_value_grad_reg]
 
   * pg_loss:   clipped surrogate,  max(-adv*ratio, -adv*clip(ratio))
   * v_loss:    clipped MSE (optional) against `returns`
@@ -1374,8 +1375,10 @@ def make_ppo_update_fn(
       `ent_coef` is the static `config.ppo_ent_coef` and `update()` keeps its
       original 4-argument signature.
 
-  Returns a function `update(params, opt_state, batch, key[, step])` that
-  does one SGD step and returns (new_params, new_opt_state, metrics_dict).
+  Returns a function `update(..., vgr_lam)` that does one SGD step and
+  returns (new_params, new_opt_state, metrics_dict). Dual λ for
+  value-grad-reg is carried as `vgr_lam` and written back to
+  `metrics['value_grad_reg_lam']`.
   """
   clip_coef = float(config.ppo_clip_coef)
   vf_coef = float(config.ppo_vf_coef)
@@ -1390,8 +1393,20 @@ def make_ppo_update_fn(
   gidx = getattr(config, 'goal_state_indices', None)
   det_select = bool(getattr(config, 'ppo_deterministic_select_dim', False))
   _kl_pen = float(getattr(config, 'ppo_kl_penalty_coef', 0.0)) > 0
+  _vgr = bool(getattr(config, 'ppo_value_grad_reg', False)) and obs_dim > 0
+  _vgr_c = float(getattr(config, 'ppo_value_grad_reg_c', 100.0))
+  _vgr_lam_lr = float(getattr(config, 'ppo_value_grad_reg_lam_lr', 1e-6))
+  _vgr_dual = _vgr and _vgr_lam_lr > 0.0
+  _vgr_lam_min = 1e-8
+  _vgr_lam_max = 1.0
+  if _vgr:
+    print(
+        f'[ppo] value dual-gradreg: c={_vgr_c} lam_lr={_vgr_lam_lr}'
+        f'{" (dual)" if _vgr_dual else " (fixed λ)"}',
+        flush=True)
 
-  def _ppo_loss_core(params, batch, key, obs_mean, obs_var, ent_coef):
+  def _ppo_loss_core(params, batch, key, obs_mean, obs_var, ent_coef,
+                     lam_val):
     """Shared PPO loss computation. Returns (total, dist, network_obs, metrics)."""
     network_obs = _normalize_packed_obs(
         batch['obs'], obs_mean, obs_var, obs_dim=obs_dim, start_index=si,
@@ -1438,6 +1453,35 @@ def make_ppo_update_fn(
     # ---- combined loss ----
     total = pg_loss - ent_coef * entropy_mean + vf_coef * v_loss
 
+    zero = jnp.array(0.0, dtype=total.dtype)
+    vgr_gnorm_mean = zero
+    vgr_gnorm_max = zero
+    vgr_frac_above = zero
+    vgr_raw = zero
+    vgr_pen = zero
+    vgr_lam_m = zero
+    if _vgr:
+      def _one_v(s, g):
+        packed = jnp.concatenate([s, g], axis=-1)
+        return jnp.reshape(
+            networks.value_network.apply(params['value'], packed[None]), ())
+
+      def _v_gnorm(s, g):
+        gs = jax.grad(_one_v, argnums=0)(s, g)
+        return optax.safe_norm(gs, 1e-8)
+
+      s_sl = network_obs[:, :obs_dim]
+      g_sl = network_obs[:, obs_dim:]
+      v_gnorms = jax.vmap(_v_gnorm)(s_sl, g_sl)
+      vgr_gnorm_mean = jnp.mean(v_gnorms)
+      vgr_gnorm_max = jnp.max(v_gnorms)
+      vgr_frac_above = jnp.mean(
+          (v_gnorms > _vgr_c).astype(total.dtype))
+      vgr_raw = jnp.mean(jnp.maximum(v_gnorms - _vgr_c, 0.0))
+      vgr_lam_m = lam_val.astype(total.dtype)
+      vgr_pen = vgr_lam_m * vgr_gnorm_mean
+      total = total + vgr_pen
+
     # ---- diagnostics ----
     approx_kl = jnp.mean((ratio - 1.0) - logratio)  # http://joschu.net/blog/kl-approx.html
     old_approx_kl = jnp.mean(-logratio)
@@ -1462,18 +1506,39 @@ def make_ppo_update_fn(
         'policy_scale_min': jnp.min(policy_scale),
         'ent_coef': jnp.asarray(ent_coef, dtype=jnp.float32),
     }
+    if _vgr:
+      metrics.update({
+          'value_grad_reg': vgr_pen,
+          'value_grad_reg_raw': vgr_raw,
+          'value_grad_reg_lam': vgr_lam_m,
+          'value_grad_s_norm_mean': vgr_gnorm_mean,
+          'value_grad_s_norm_max': vgr_gnorm_max,
+          'value_grad_s_frac_above_c': vgr_frac_above,
+      })
     return total, dist, network_obs, metrics
+
+  def _dual_vgr_lam(lam_val, metrics):
+    metrics = dict(metrics)
+    if _vgr_dual:
+      gnorm_sg = jax.lax.stop_gradient(metrics['value_grad_s_norm_mean'])
+      lam_new = jnp.clip(
+          lam_val + _vgr_lam_lr * (gnorm_sg - _vgr_c),
+          _vgr_lam_min, _vgr_lam_max)
+      metrics['value_grad_reg_lam'] = lam_new
+    else:
+      metrics['value_grad_reg_lam'] = lam_val
+    return metrics
 
   if _kl_pen:
     # PPO-penalty path: loss includes β·KL(π_rollout ‖ π_now).
     # old_policy_params_j: rollout-time policy params (stop-gradiented inside).
     # kl_beta_j: current β scalar; adapted per minibatch by the host loop.
     def ppo_loss_kl(params, batch, key, obs_mean, obs_var,
-                    old_policy_params_j, kl_beta_j, step=None):
+                    old_policy_params_j, kl_beta_j, vgr_lam, step=None):
       ent_coef = (ent_coef_schedule(step) if ent_coef_schedule is not None
                   else ent_coef_const)
       total, dist, network_obs, metrics = _ppo_loss_core(
-          params, batch, key, obs_mean, obs_var, ent_coef)
+          params, batch, key, obs_mean, obs_var, ent_coef, vgr_lam)
       dist_old = _policy_dist_maybe_det_select(
           networks.policy_network.apply(
               jax.lax.stop_gradient(old_policy_params_j), network_obs),
@@ -1491,51 +1556,52 @@ def make_ppo_update_fn(
     if ent_coef_schedule is not None:
       @jax.jit
       def update(params, opt_state, batch, key, obs_mean, obs_var, step,
-                 old_policy_params_j, kl_beta_j):
+                 old_policy_params_j, kl_beta_j, vgr_lam):
         (_, metrics), grads = grad_fn(
             params, batch, key, obs_mean, obs_var,
-            old_policy_params_j, kl_beta_j, step)
+            old_policy_params_j, kl_beta_j, vgr_lam, step)
         updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, _dual_vgr_lam(vgr_lam, metrics)
     else:
       @jax.jit
       def update(params, opt_state, batch, key, obs_mean, obs_var,
-                 old_policy_params_j, kl_beta_j):
+                 old_policy_params_j, kl_beta_j, vgr_lam):
         (_, metrics), grads = grad_fn(
             params, batch, key, obs_mean, obs_var,
-            old_policy_params_j, kl_beta_j)
+            old_policy_params_j, kl_beta_j, vgr_lam)
         updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, _dual_vgr_lam(vgr_lam, metrics)
 
   else:
-    # Default path (no KL penalty): zero overhead, unchanged behaviour.
-    def ppo_loss(params, batch, key, obs_mean, obs_var, step=None):
+    # Default path (no KL penalty): zero overhead when value-grad-reg is off.
+    def ppo_loss(params, batch, key, obs_mean, obs_var, vgr_lam, step=None):
       ent_coef = (ent_coef_schedule(step) if ent_coef_schedule is not None
                   else ent_coef_const)
       total, _, _, metrics = _ppo_loss_core(
-          params, batch, key, obs_mean, obs_var, ent_coef)
+          params, batch, key, obs_mean, obs_var, ent_coef, vgr_lam)
       return total, metrics
 
     grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
 
     if ent_coef_schedule is not None:
       @jax.jit
-      def update(params, opt_state, batch, key, obs_mean, obs_var, step):
+      def update(params, opt_state, batch, key, obs_mean, obs_var, step,
+                 vgr_lam):
         (_, metrics), grads = grad_fn(
-            params, batch, key, obs_mean, obs_var, step)
+            params, batch, key, obs_mean, obs_var, vgr_lam, step)
         updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, _dual_vgr_lam(vgr_lam, metrics)
     else:
       @jax.jit
-      def update(params, opt_state, batch, key, obs_mean, obs_var):
+      def update(params, opt_state, batch, key, obs_mean, obs_var, vgr_lam):
         (_, metrics), grads = grad_fn(
-            params, batch, key, obs_mean, obs_var)
+            params, batch, key, obs_mean, obs_var, vgr_lam)
         updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, _dual_vgr_lam(vgr_lam, metrics)
 
   return update
 
@@ -1549,6 +1615,7 @@ def make_scanned_ppo_fn(
     batch_n: int,
     use_ent_schedule: bool,
     use_kl_penalty: bool,
+    use_value_grad_reg: bool = False,
 ):
   """One JIT: shuffle each epoch, ``lax.scan`` over minibatches and epochs.
 
@@ -1561,26 +1628,26 @@ def make_scanned_ppo_fn(
   batch_n = int(batch_n)
 
   def _call_update(params, opt_state, batch, key, obs_mean, obs_var, step,
-                   old_policy, kl_beta):
+                   old_policy, kl_beta, vgr_lam):
     if use_ent_schedule and use_kl_penalty:
       return ppo_update(
           params, opt_state, batch, key, obs_mean, obs_var, step,
-          old_policy, kl_beta)
+          old_policy, kl_beta, vgr_lam)
     if use_ent_schedule:
       return ppo_update(
-          params, opt_state, batch, key, obs_mean, obs_var, step)
+          params, opt_state, batch, key, obs_mean, obs_var, step, vgr_lam)
     if use_kl_penalty:
       return ppo_update(
           params, opt_state, batch, key, obs_mean, obs_var,
-          old_policy, kl_beta)
+          old_policy, kl_beta, vgr_lam)
     return ppo_update(
-        params, opt_state, batch, key, obs_mean, obs_var)
+        params, opt_state, batch, key, obs_mean, obs_var, vgr_lam)
 
   @jax.jit
   def scan_ppo(params, opt_state, data, key, obs_mean, obs_var, sgd_step,
-               old_policy, kl_beta):
+               old_policy, kl_beta, vgr_lam):
     def epoch_body(carry, _):
-      params, opt_state, key, sgd_step = carry
+      params, opt_state, key, sgd_step, vgr_lam = carry
       key, k_perm, k_mb = jax.random.split(key, 3)
       perm = jax.random.permutation(k_perm, batch_n)
       shuffled = jax.tree_util.tree_map(lambda x: x[perm], data)
@@ -1591,23 +1658,26 @@ def make_scanned_ppo_fn(
       minibatches = jax.tree_util.tree_map(_mb_ax, shuffled)
 
       def mb_body(mb_carry, batch):
-        params, opt_state, key, sgd_step = mb_carry
+        params, opt_state, key, sgd_step, vgr_lam = mb_carry
         key, k_up = jax.random.split(key)
         params, opt_state, metrics = _call_update(
             params, opt_state, batch, k_up, obs_mean, obs_var, sgd_step,
-            old_policy, kl_beta)
-        return (params, opt_state, key, sgd_step + 1), metrics
+            old_policy, kl_beta, vgr_lam)
+        if use_value_grad_reg:
+          vgr_lam = metrics['value_grad_reg_lam']
+        return (params, opt_state, key, sgd_step + 1, vgr_lam), metrics
 
-      (params, opt_state, key, sgd_step), metrics = jax.lax.scan(
-          mb_body, (params, opt_state, k_mb, sgd_step), minibatches,
+      (params, opt_state, key, sgd_step, vgr_lam), metrics = jax.lax.scan(
+          mb_body, (params, opt_state, k_mb, sgd_step, vgr_lam), minibatches,
           length=n_mb)
-      return (params, opt_state, key, sgd_step), metrics
+      return (params, opt_state, key, sgd_step, vgr_lam), metrics
 
-    (params, opt_state, key, sgd_step), metrics = jax.lax.scan(
-        epoch_body, (params, opt_state, key, sgd_step), None, length=n_epochs)
+    (params, opt_state, key, sgd_step, vgr_lam), metrics = jax.lax.scan(
+        epoch_body, (params, opt_state, key, sgd_step, vgr_lam), None,
+        length=n_epochs)
     metrics = jax.tree_util.tree_map(
         lambda x: jnp.reshape(x, (n_epochs * n_mb,) + x.shape[2:]), metrics)
-    return params, opt_state, key, sgd_step, metrics
+    return params, opt_state, key, sgd_step, vgr_lam, metrics
 
   return scan_ppo
 
@@ -3221,6 +3291,9 @@ def run_ppo_training(
   repr_frozen = False
   freeze_repr_streak = 0
   freeze_repr_switch_iteration = -1
+  kl_rb_armed = False
+  kl_rb_streak = 0
+  kl_rb_switch_iteration = -1
   if checkpoint_dir is not None:
     _latest = os.path.join(checkpoint_dir, 'latest.pkl')
     if os.path.exists(_latest):
@@ -3314,6 +3387,15 @@ def run_ppo_training(
             print(f'[ppo] resumed frozen-repr '
                   f'(switched at iter={freeze_repr_switch_iteration}, '
                   f'streak={freeze_repr_streak})')
+      if bool(getattr(config, 'ppo_kl_rollback_after_success', False)):
+        kl_rb_armed = bool(_extra.get('kl_rb_armed', False))
+        kl_rb_streak = int(_extra.get('kl_rb_streak', 0))
+        kl_rb_switch_iteration = int(
+            _extra.get('kl_rb_switch_iteration', -1))
+        if kl_rb_armed:
+          print(f'[ppo] resumed KL-iter-rollback latch '
+                f'(latched at iter={kl_rb_switch_iteration}, '
+                f'streak={kl_rb_streak})', flush=True)
       print(f'[ppo] resumed from checkpoint: '
             f'start_iteration={start_iteration}, global_step={global_step}')
       # Truncate CSV logs to remove any entries written after the checkpoint
@@ -3424,6 +3506,9 @@ def run_ppo_training(
         use_ent_schedule=(ent_coef_schedule is not None),
         use_kl_penalty=bool(
             float(getattr(config, 'ppo_kl_penalty_coef', 0.0)) > 0),
+        use_value_grad_reg=(
+            bool(getattr(config, 'ppo_value_grad_reg', False))
+            and int(config.obs_dim) > 0),
     )
     print('[ppo] PPO updates: jax.lax.scan epochs×minibatches '
           f'({int(config.ppo_num_epochs)}×{int(config.ppo_num_minibatches)})',
@@ -4649,6 +4734,21 @@ def run_ppo_training(
     _nf_lam_lr_log = float(getattr(config, 'ppo_nf_grad_reg_lam_lr', -1.0))
     _nf_lam_mode = 'fixed' if _nf_lam_lr_log == 0.0 else 'dual (inside scan)'
     print(f'[ppo] NF grad-reg λ init={_gr_lam}  mode={_nf_lam_mode}')
+  _vgr_do = bool(getattr(config, 'ppo_value_grad_reg', False)) and obs_dim_cfg > 0
+  _vgr_lam_cfg = float(getattr(config, 'ppo_value_grad_reg_lam', -1.0))
+  if _vgr_do:
+    if _vgr_lam_cfg >= 0.0:
+      _vgr_lam_init = float(_vgr_lam_cfg)
+    else:
+      _vgr_lam_init = float(max(_gr_coef_cfg, 5e-4))
+    print(
+        f'[ppo] value grad-reg λ init={_vgr_lam_init}  '
+        f'c={float(getattr(config, "ppo_value_grad_reg_c", 100.0))}  '
+        f'lam_lr={float(getattr(config, "ppo_value_grad_reg_lam_lr", 1e-6))}',
+        flush=True)
+  else:
+    _vgr_lam_init = 0.0
+  _vgr_lam_j = jnp.asarray(_vgr_lam_init, dtype=jnp.float32)
   # Skip logging keys for features that are off. λ / ∇_s diagnostics stay
   # even when the regularizer is not in the loss.
   _hit_on = bool((getattr(config, 'ppo_crl_hit_bonus', '') or '').strip())
@@ -4679,6 +4779,16 @@ def run_ppo_training(
   _kl_beta_min = float(getattr(config, 'ppo_kl_penalty_beta_min', 0.0))
   _kl_adapt_epoch = bool(getattr(config, 'ppo_kl_penalty_adapt_epoch', False))
   _kl_rollback = bool(getattr(config, 'ppo_kl_early_stop_rollback', False))
+  _kl_rb_after = bool(getattr(config, 'ppo_kl_rollback_after_success', False))
+  _kl_rb_succ_thresh = float(
+      getattr(config, 'ppo_kl_rollback_after_success_thresh', 0.8))
+  _kl_rb_succ_iters = int(
+      getattr(config, 'ppo_kl_rollback_after_success_iters', 10))
+  _kl_rb_kl = float(getattr(config, 'ppo_kl_rollback_kl', 0.05))
+  if _kl_rb_after and _kl_rb_succ_iters < 1:
+    raise ValueError(
+        f'ppo_kl_rollback_after_success_iters must be >= 1, got '
+        f'{_kl_rb_succ_iters}')
   _kl_es_cooldown_iters = int(getattr(config, 'ppo_target_kl_reset_cooldown', 0))
   _kl_es_cooldown = 0
   _last_kl_beta = _kl_beta
@@ -4702,6 +4812,13 @@ def run_ppo_training(
           f'adapt={"epoch" if _kl_adapt_epoch else "minibatch"}, '
           f'rollback={_kl_rollback}, '
           f'reset_cooldown={_kl_es_cooldown_iters}',
+          flush=True)
+  if _kl_rb_after:
+    print(f'[ppo] policy-train latch: off until train_success_1000 > '
+          f'{_kl_rb_succ_thresh:g} for {_kl_rb_succ_iters} consecutive '
+          f'iters; then skip all later PPO policy/value updates '
+          f'(NF/CRL still train). latched={kl_rb_armed} '
+          f'streak={kl_rb_streak}',
           flush=True)
 
   for iteration in range(start_iteration, num_iterations):
@@ -5079,16 +5196,21 @@ def run_ppo_training(
 
     ppo_metrics_device: list = []
     early_stop = False
-    _need_kl_sync = config.ppo_target_kl is not None
-    _target_kl = (
-        float(config.ppo_target_kl) if _need_kl_sync else None)
     _n_mb = int(config.ppo_num_minibatches)
     _es_epoch = -1
     _es_mb_approx: list = []
     _es_mb_analytic: list = []
     _es_mb_beta: list = []
     _rolled_back = False
+    _kl_cancel_approx = float('nan')
+    _kl_cancel_epoch = -1
+    _kl_cancel_mb = -1
     _cd_now = _kl_es_cooldown
+    _skip_ppo = bool(_kl_rb_after and kl_rb_armed)
+    _kl_full_iter_rb = False
+    _need_kl_sync = config.ppo_target_kl is not None
+    _target_kl = (
+        float(config.ppo_target_kl) if _need_kl_sync else None)
     _es_this_iter = bool(_need_kl_sync) and (_cd_now <= 0)
     if _need_kl_sync and _kl_es_cooldown > 0:
       print(f'[ppo] target_kl cooldown after actor-reset: '
@@ -5099,7 +5221,13 @@ def run_ppo_training(
     _old_ppo_policy_params_j = ppo_params['policy']
     _n_epochs = int(config.ppo_num_epochs)
     ppo_scan_metrics = None
-    if ppo_scan is not None:
+    _use_scan_this_iter = (
+        (ppo_scan is not None) and (not _skip_ppo) and (not _kl_full_iter_rb))
+    if _skip_ppo:
+      print(f'[ppo] policy-train SKIP iter={iteration} '
+            f'(train latch armed at iter={kl_rb_switch_iteration})',
+            flush=True)
+    elif _use_scan_this_iter:
       _ppo_data = {
           'obs': flat_obs_j,
           'actions': flat_acts_j,
@@ -5109,15 +5237,21 @@ def run_ppo_training(
           'old_values': flat_vals_j,
       }
       key, k_scan = jax.random.split(key)
-      (ppo_params, ppo_opt_state, key, _, ppo_scan_metrics) = ppo_scan(
+      (ppo_params, ppo_opt_state, key, _, _vgr_lam_j,
+       ppo_scan_metrics) = ppo_scan(
           ppo_params, ppo_opt_state, _ppo_data, k_scan,
           iter_obs_mean_j, iter_obs_var_j,
           jnp.asarray(ppo_sgd_step, dtype=jnp.int32),
           _old_ppo_policy_params_j,
           jnp.asarray(
-              _kl_beta if _kl_penalty_on else 0.0, dtype=jnp.float32))
+              _kl_beta if _kl_penalty_on else 0.0, dtype=jnp.float32),
+          _vgr_lam_j)
       ppo_sgd_step += _n_epochs * _n_mb
     else:
+      params_iter_start = ppo_params
+      opt_iter_start = ppo_opt_state
+      sgd_iter_start = int(ppo_sgd_step)
+      vgr_lam_iter_start = _vgr_lam_j
       for epoch in range(_n_epochs):
         perm = np_rng.permutation(batch_per_iter)
         epoch_kl_max = 0.0
@@ -5137,28 +5271,34 @@ def run_ppo_training(
           key, k_mb = jax.random.split(key)
           params_before = ppo_params
           opt_before = ppo_opt_state
+          vgr_lam_before = _vgr_lam_j
           if ent_coef_schedule is not None and _kl_penalty_on:
             ppo_params, ppo_opt_state, m = ppo_update(
                 ppo_params, ppo_opt_state, batch, k_mb,
                 iter_obs_mean_j, iter_obs_var_j,
                 jnp.asarray(ppo_sgd_step, dtype=jnp.int32),
                 _old_ppo_policy_params_j,
-                jnp.asarray(_kl_beta, dtype=jnp.float32))
+                jnp.asarray(_kl_beta, dtype=jnp.float32),
+                _vgr_lam_j)
           elif ent_coef_schedule is not None:
             ppo_params, ppo_opt_state, m = ppo_update(
                 ppo_params, ppo_opt_state, batch, k_mb,
                 iter_obs_mean_j, iter_obs_var_j,
-                jnp.asarray(ppo_sgd_step, dtype=jnp.int32))
+                jnp.asarray(ppo_sgd_step, dtype=jnp.int32),
+                _vgr_lam_j)
           elif _kl_penalty_on:
             ppo_params, ppo_opt_state, m = ppo_update(
                 ppo_params, ppo_opt_state, batch, k_mb,
                 iter_obs_mean_j, iter_obs_var_j,
                 _old_ppo_policy_params_j,
-                jnp.asarray(_kl_beta, dtype=jnp.float32))
+                jnp.asarray(_kl_beta, dtype=jnp.float32),
+                _vgr_lam_j)
           else:
             ppo_params, ppo_opt_state, m = ppo_update(
                 ppo_params, ppo_opt_state, batch, k_mb,
-                iter_obs_mean_j, iter_obs_var_j)
+                iter_obs_mean_j, iter_obs_var_j, _vgr_lam_j)
+          if _vgr_do:
+            _vgr_lam_j = m['value_grad_reg_lam']
           # Host-read KL only when target_kl early-stop needs it. Otherwise
           # leave metrics on device so later minibatches can queue.
           if not _need_kl_sync:
@@ -5175,13 +5315,24 @@ def run_ppo_training(
                   f'mb={mb_i}/{_n_mb - 1} approx_kl={_mb_approx:.6g} '
                   f'threshold={_target_kl:g}',
                   flush=True)
-          elif _trip and _kl_rollback:
-            # Discard this minibatch's update and end the iteration.
-            ppo_params = params_before
-            ppo_opt_state = opt_before
+          elif _trip and (_kl_full_iter_rb or _kl_rollback):
+            if _kl_full_iter_rb:
+              # Discard every PPO step from this iter (not just this mb).
+              ppo_params = params_iter_start
+              ppo_opt_state = opt_iter_start
+              ppo_sgd_step = sgd_iter_start
+              _vgr_lam_j = vgr_lam_iter_start
+              ppo_metrics_device.clear()
+            else:
+              ppo_params = params_before
+              ppo_opt_state = opt_before
+              _vgr_lam_j = vgr_lam_before
             early_stop = True
             _rolled_back = True
             _es_epoch = int(epoch)
+            _kl_cancel_approx = float(_mb_approx)
+            _kl_cancel_epoch = int(epoch)
+            _kl_cancel_mb = int(mb_i)
             epoch_mb_approx.append(_mb_approx)
             if _kl_penalty_on:
               epoch_mb_analytic.append(_mb_analytic)
@@ -5190,14 +5341,25 @@ def run_ppo_training(
             _es_mb_analytic = epoch_mb_analytic
             _es_mb_beta = epoch_mb_beta
             _an_s = (f'{_mb_analytic:.6g}' if _kl_penalty_on else 'n/a')
-            print(f'[ppo] target_kl ROLLBACK iter={iteration} '
-                  f'epoch={epoch}/{_n_epochs - 1} mb={mb_i}/{_n_mb - 1} '
-                  f'threshold={_target_kl:g} approx_kl={_mb_approx:.6g} '
-                  f'analytic_kl={_an_s}',
-                  flush=True)
-            print('[ppo]   discarded this minibatch update; '
-                  'stopping remaining epochs',
-                  flush=True)
+            if _kl_full_iter_rb:
+              print(f'[ppo] kl-iter-CANCEL iter={iteration} '
+                    f'epoch={epoch}/{_n_epochs - 1} mb={mb_i}/{_n_mb - 1} '
+                    f'threshold={_target_kl:g} approx_kl={_mb_approx:.6g} '
+                    f'train_success_1000_latch=1',
+                    flush=True)
+              print('[ppo]   reverted ALL PPO updates this iter '
+                    '(policy+value+Adam); skipping remaining epochs; '
+                    'next env iter',
+                    flush=True)
+            else:
+              print(f'[ppo] target_kl ROLLBACK iter={iteration} '
+                    f'epoch={epoch}/{_n_epochs - 1} mb={mb_i}/{_n_mb - 1} '
+                    f'threshold={_target_kl:g} approx_kl={_mb_approx:.6g} '
+                    f'analytic_kl={_an_s}',
+                    flush=True)
+              print('[ppo]   discarded this minibatch update; '
+                    'stopping remaining epochs',
+                    flush=True)
             if _kl_penalty_on and _kl_adapt_epoch and epoch_mb_analytic[:-1]:
               _adapt_kl_beta(float(np.mean(epoch_mb_analytic[:-1])))
             break
@@ -5832,6 +5994,20 @@ def run_ppo_training(
       log['train_success_1000'] = (
           float(np.mean(recent_success[-1000:]))
           if recent_success else float('nan'))
+      if _kl_rb_after and not kl_rb_armed:
+        _tr = float(log['train_success_1000'])
+        if np.isfinite(_tr) and _tr > _kl_rb_succ_thresh:
+          kl_rb_streak += 1
+        else:
+          kl_rb_streak = 0
+        if kl_rb_streak >= _kl_rb_succ_iters:
+          kl_rb_armed = True
+          kl_rb_switch_iteration = int(iteration)
+          print(f'[ppo] policy-train latch: LATCHED at iter={iteration} '
+                f'(streak={kl_rb_streak}, train_success_1000={_tr:.4f} > '
+                f'{_kl_rb_succ_thresh:g}); later PPO policy/value updates '
+                f'are skipped',
+                flush=True)
       if _use_jax_bb_vec:
         log['train_very_hard_success_mean'] = (
             float(np.mean(recent_very_hard_success[-100:]))
@@ -5955,6 +6131,12 @@ def run_ppo_training(
     # PPO update metrics (always present).
     for k_, vs in ppo_metrics_agg.items():
       log[f'ppo/{k_}'] = float(np.mean(vs))
+    if _vgr_do:
+      for _vk in (
+          'value_grad_reg', 'value_grad_reg_raw', 'value_grad_reg_lam',
+          'value_grad_s_norm_mean', 'value_grad_s_norm_max',
+          'value_grad_s_frac_above_c'):
+        log.setdefault(f'ppo/{_vk}', float('nan'))
     if ppo_metrics_agg.get('approx_kl'):
       log['ppo/approx_kl_max'] = float(np.max(ppo_metrics_agg['approx_kl']))
     if _need_kl_sync:
@@ -5976,6 +6158,15 @@ def run_ppo_training(
       log['ppo/kl_beta'] = _last_kl_beta
     log['ppo/kl_rollback'] = float(_rolled_back)
     log['ppo/target_kl_cooldown'] = float(_cd_now)
+    if _kl_rb_after:
+      log['ppo/kl_rollback_latched'] = float(kl_rb_armed)
+      log['ppo/kl_rb_streak'] = int(kl_rb_streak)
+      log['ppo/kl_rb_switch_iteration'] = int(kl_rb_switch_iteration)
+      log['ppo/policy_update_skipped'] = float(_skip_ppo)
+      log['ppo/kl_iter_cancelled'] = float(_rolled_back and _kl_full_iter_rb)
+      log['ppo/kl_cancel_approx_kl'] = float(_kl_cancel_approx)
+      log['ppo/kl_cancel_epoch'] = int(_kl_cancel_epoch)
+      log['ppo/kl_cancel_mb'] = int(_kl_cancel_mb)
     _ent_vs = ppo_metrics_agg.get('entropy_loss', [])
     _pg_vs = ppo_metrics_agg.get('pg_loss', [])
     if _ent_vs and _pg_vs:
@@ -6191,7 +6382,6 @@ def run_ppo_training(
             f'success={agg.get("success", float("nan")):.3f} '
             f'very_hard={agg.get("very_hard_success", float("nan")):.3f}',
             flush=True)
-
     # =================================================================
     # 6b. Periodic deterministic video (same frozen obs_rms as eval)
     # =================================================================
@@ -6323,6 +6513,12 @@ def run_ppo_training(
             'repr_frozen': bool(repr_frozen),
             'freeze_repr_streak': int(freeze_repr_streak),
             'freeze_repr_switch_iteration': int(freeze_repr_switch_iteration),
+        })
+      if _kl_rb_after:
+        _checkpoint_extra.update({
+            'kl_rb_armed': bool(kl_rb_armed),
+            'kl_rb_streak': int(kl_rb_streak),
+            'kl_rb_switch_iteration': int(kl_rb_switch_iteration),
         })
       if use_td_infonce:
         _checkpoint_extra['td_infonce_target_q'] = td_infonce_target_q

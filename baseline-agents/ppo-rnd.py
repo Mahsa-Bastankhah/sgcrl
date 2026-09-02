@@ -1,19 +1,36 @@
 import os
+import sys
+from pathlib import Path
 
 xla_flags = os.environ.get("XLA_FLAGS", "")
 xla_flags += " --xla_gpu_triton_gemm_any=True"
 os.environ["XLA_FLAGS"] = xla_flags
 os.environ["MUJOCO_GL"] = "egl"
 
+# Allegro / Isaac Gym: create GPU PhysX BEFORE JAX takes the CUDA context.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from envs.isaacgym_physx_bootstrap import (  # noqa: E402
+    maybe_create_from_argv as _ig_boot,
+    take_prebuilt_env as _ig_take,
+)
+_ig_boot()
+
+# TFP 0.25 still reads jax.interpreters.xla.pytype_aval_mappings; JAX 0.10
+# removed it. Must run after PhysX bootstrap and before import distrax.
+import sgcrl_jax_acme_compat  # noqa: F401,E402
+
+import pickle
 import time
 import tyro
 import numpy as np
 import functools
 import pprint
 import re
-import mediapy
-import wandb
-import wandb_osh
+wandb = None
+wandb_osh = None
+TriggerWandbSyncHook = None
 
 import jax
 import flax
@@ -22,18 +39,69 @@ import distrax
 import flax.linen as nn
 import jax.numpy as jnp
 
-from pathlib import Path
 from flax.training.train_state import TrainState
 from dataclasses import dataclass, field
 from typing import Any, Sequence, NamedTuple
-from wandb_osh.hooks import TriggerWandbSyncHook
-
 import utils.running_statistics as running_statistics
-from utils.wrapper import wrap_env, PDWrapper
-from utils.evaluation import Evaluator
-from utils.networks import MLP, save_params
-from builderbench.env_utils import make_env
-from utils.jax import count_parameters
+
+
+def count_parameters(params):
+    return sum(
+        int(np.prod(np.asarray(p.shape)))
+        for p in jax.tree_util.tree_leaves(params))
+
+
+def save_params(path: str, params: Any):
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(pickle.dumps(params))
+
+
+class MLP(nn.Module):
+    """Local copy of builderbench.utils.networks.MLP (no etils)."""
+
+    layer_sizes: Sequence[int]
+    activation: Any = nn.relu
+    kernel_init: Any = nn.initializers.lecun_uniform()
+    bias_init: Any = nn.initializers.zeros
+    final_kernet_init: Any = nn.initializers.lecun_uniform()
+    final_bias_init: Any = nn.initializers.zeros
+    activate_final: bool = False
+    bias: bool = True
+    layer_norm: bool = False
+
+    def get_penultimate(self, data: jnp.ndarray):
+        return self(data, return_penultimate=True)
+
+    @nn.compact
+    def __call__(self, data: jnp.ndarray, return_penultimate: bool = False):
+        hidden = data
+        for i, hidden_size in enumerate(self.layer_sizes[:-1]):
+            hidden = nn.Dense(
+                hidden_size,
+                name=f'hidden_{i}',
+                kernel_init=self.kernel_init,
+                bias_init=self.bias_init,
+                use_bias=self.bias,
+            )(hidden)
+            hidden = self.activation(hidden)
+            if self.layer_norm:
+                hidden = nn.LayerNorm()(hidden)
+        if return_penultimate:
+            return hidden
+        final_layer_index = len(self.layer_sizes) - 1
+        hidden = nn.Dense(
+            self.layer_sizes[-1],
+            name=f'hidden_{final_layer_index}',
+            kernel_init=self.final_kernet_init,
+            bias_init=self.final_bias_init,
+            use_bias=self.bias,
+        )(hidden)
+        if self.activate_final:
+            hidden = self.activation(hidden)
+            if self.layer_norm:
+                hidden = nn.LayerNorm()(hidden)
+        return hidden
 
 class HardSuccessRewardWrapper:
     """Expose only BuilderBench's binary hard-success reward."""
@@ -48,6 +116,42 @@ class HardSuccessRewardWrapper:
     def step(self, state, action):
         state = self.env.step(state, action)
         return state.replace(reward=state.metrics["success"])
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+
+class FixedGoalWrapper:
+    """Pin target_goal (and mocaps) on every reset so train and eval match."""
+
+    def __init__(self, env, fixed_goal):
+        from envs.builderbench_utils import set_task_mocap_pos
+        self.env = env
+        self._fixed_goal = jnp.asarray(fixed_goal, dtype=jnp.float32).reshape(-1)
+        self._set_task_mocap_pos = set_task_mocap_pos
+        inner = env
+        while hasattr(inner, 'env') and not hasattr(inner, '_task_mocap_targets'):
+            inner = inner.env
+        self._mocap_targets = inner._task_mocap_targets
+        self._n_task_cubes = int(self._fixed_goal.size // 3)
+
+    def _apply(self, state):
+        fixed_pos = self._fixed_goal.reshape(self._n_task_cubes, 3)
+        info = dict(state.info)
+        info['target_goal'] = jnp.broadcast_to(
+            self._fixed_goal, state.info['target_goal'].shape)
+        if 'target_mocap_pos' in info:
+            info['target_mocap_pos'] = jnp.broadcast_to(
+                fixed_pos, state.info['target_mocap_pos'].shape)
+        mocap_pos = self._set_task_mocap_pos(
+            state.data.mocap_pos, self._mocap_targets, fixed_pos)
+        return state.replace(data=state.data.replace(mocap_pos=mocap_pos), info=info)
+
+    def reset(self, rng):
+        return self._apply(self.env.reset(rng))
+
+    def step(self, state, action):
+        return self._apply(self.env.step(state, action))
 
     def __getattr__(self, name):
         return getattr(self.env, name)
@@ -80,9 +184,24 @@ class Args:
     env_early_termination: bool = True
     env_episode_length: int = None
     permutation_invariant_reward: bool = True   # invariance to the order of cubes in any structure
+    # Init randomization (matches NF / CRL jobs: fixed x, no lane permutation, fixed goal).
+    permute_start_boxes: bool = False  # False = keep task-file lane order (no shuffle)
+    fixed_start_x: float = 0.1        # cube init x fixed; <0 keeps [0.05,0.1] range
+    fix_goal: bool = True             # fix target_goal to sampling-midpoint + task offsets
     # PD waypoint control (matches builderbench ppo_pd / sgcrl CRL jobs).
     use_pd: bool = False
     pd_duration: int = 5
+
+    # Allegro / Isaac Gym (ignored for BuilderBench env_id). Bootstrap reads
+    # the same --isaacgym-* argv before JAX import; keep names aligned.
+    isaacgym_table_push: bool = False
+    isaacgym_table_push_xyz: str = '0.20,-0.15,0.555'
+    isaacgym_randomize_init: bool = False
+    isaacgym_randomize_object_xyz: bool = True
+    isaacgym_randomize_object_shape: bool = False
+    isaacgym_episode_length: int = 300
+    isaacgym_pipeline: str = 'gpu'
+    isaacgym_palm_goal: bool = False
 
     # algorithm
     num_timesteps: int = 50000000
@@ -101,10 +220,11 @@ class Args:
     int_discount: float = 0.99
     int_loss_cost: float = 1.0
     ext_loss_cost: float = 2.0
-    entropy_cost: float = 2e-2
+    entropy_cost: float = 0.05
+    entropy_cost_final: float = 0.01   # linearly annealed to this by end of training
     reward_scaling: float = 1.0
     gae_lambda: float = 0.95
-    clipping_epsilon: float = 0.3
+    clipping_epsilon: float = 0.2
     normalize_advantage: bool = True
 
     diagnostic: bool = False
@@ -146,8 +266,11 @@ class ResidualMLP(nn.Module):
     use_layer_norm: bool = True
     activate_final: bool = False
 
-    @nn.compact
     def get_penultimate(self, data):
+        return self(data, return_penultimate=True)
+
+    @nn.compact
+    def __call__(self, data, return_penultimate=False):
         hidden = data
         skip = None
         for i, hidden_size in enumerate(self.layer_sizes[:-1]):
@@ -159,11 +282,8 @@ class ResidualMLP(nn.Module):
                 if skip is not None and skip.shape[-1] == hidden.shape[-1]:
                     hidden = skip + hidden
                 skip = hidden
-        return hidden
-
-    @nn.compact
-    def __call__(self, data):
-        hidden = self.get_penultimate(data)
+        if return_penultimate:
+            return hidden
         final_index = len(self.layer_sizes) - 1
         hidden = nn.Dense(
             self.layer_sizes[-1], name=f"linear_{final_index}")(hidden)
@@ -435,8 +555,121 @@ def make_inference_fn(ppo_networks):
         return policy
     return make_policy
 
+
+def is_allegro_env(env_id: str) -> bool:
+    return str(env_id).startswith('allegro_kuka')
+
+
+def _parse_xyz(text: str):
+    xyz = tuple(float(x.strip()) for x in str(text).split(',') if x.strip())
+    if len(xyz) != 3:
+        raise ValueError(f'expected 3 floats, got {text!r}')
+    return xyz
+
+
+def _torch_to_np(tensor):
+    return np.asarray(tensor.detach().cpu().numpy(), dtype=np.float32)
+
+
+def _allegro_obs_goal(packed: np.ndarray, obs_dim: int):
+    packed = np.asarray(packed, dtype=np.float32)
+    return packed[:, :obs_dim], packed[:, obs_dim:]
+
+
+def allegro_generate_unroll(
+    env,
+    packed_obs,
+    policy,
+    key,
+    unroll_length: int,
+    obs_dim: int,
+):
+    """Host-side Isaac Gym collect; policy is JAX."""
+    import torch
+
+    device = env.device
+    act_low = -1.0
+    act_high = 1.0
+    obs_t, act_t, rew_t, disc_t, next_t = [], [], [], [], []
+    logp_t, raw_t, trunc_t, succ_t = [], [], [], []
+    packed = np.asarray(packed_obs, dtype=np.float32)
+    for _ in range(unroll_length):
+        key, k_step = jax.random.split(key)
+        state, goal = _allegro_obs_goal(packed, obs_dim)
+        actions, extras = policy(
+            jnp.asarray(state), jnp.asarray(goal), k_step)
+        actions_np = np.clip(
+            np.asarray(actions, dtype=np.float32), act_low, act_high)
+        act_torch = torch.from_numpy(actions_np).to(device)
+        next_obs_t, _, done_t = env.step(act_torch)
+        success_t = env.success()
+        next_np = _torch_to_np(next_obs_t)
+        done_np = _torch_to_np(done_t).reshape(-1)
+        succ_np = _torch_to_np(success_t).reshape(-1)
+        obs_t.append(packed)
+        act_t.append(actions_np)
+        rew_t.append(succ_np)
+        disc_t.append(1.0 - done_np)
+        next_t.append(next_np)
+        logp_t.append(np.asarray(extras['log_prob'], dtype=np.float32))
+        raw_t.append(np.asarray(extras['raw_action'], dtype=np.float32))
+        trunc_t.append(done_np)
+        succ_t.append(succ_np)
+        packed = next_np
+    stacked = lambda xs: jnp.asarray(np.stack(xs, axis=0))
+    transition = Transition(
+        observation=stacked(obs_t),
+        action=stacked(act_t),
+        reward=stacked(rew_t),
+        discount=stacked(disc_t),
+        next_observation=stacked(next_t),
+        extras={
+            'policy_extras': {
+                'log_prob': stacked(logp_t),
+                'raw_action': stacked(raw_t),
+            },
+            'state_extras': {
+                'truncation': stacked(trunc_t),
+            },
+        },
+    )
+    metrics = {'success': stacked(succ_t)}
+    return packed, transition, metrics, key
+
+
+def allegro_run_eval(env, policy, key, episode_length: int, obs_dim: int):
+    """Deterministic episode on the train sim (one PhysX instance per process)."""
+    import torch
+
+    packed = _torch_to_np(env.reset())
+    ep_success = np.zeros((env.num_envs,), dtype=np.float32)
+    step_success = []
+    for _ in range(int(episode_length)):
+        key, k_step = jax.random.split(key)
+        state, goal = _allegro_obs_goal(packed, obs_dim)
+        actions, _ = policy(jnp.asarray(state), jnp.asarray(goal), k_step)
+        actions_np = np.clip(np.asarray(actions, dtype=np.float32), -1.0, 1.0)
+        next_obs_t, _, _ = env.step(
+            torch.from_numpy(actions_np).to(env.device))
+        succ = _torch_to_np(env.success()).reshape(-1)
+        ep_success = np.maximum(ep_success, succ)
+        step_success.append(succ)
+        packed = _torch_to_np(next_obs_t)
+    packed = _torch_to_np(env.reset())
+    return packed, key, {
+        'eval/episode_success': float(ep_success.mean()),
+        'eval/success_mean': float(np.mean(step_success)),
+        'eval/num_envs': int(env.num_envs),
+    }
+
+
 def main(args: Args):
     categorical_select_classes(args)
+    use_allegro = is_allegro_env(args.env_id)
+    if use_allegro and args.use_pd:
+        raise ValueError('Allegro Isaac Gym does not support --use-pd')
+    if use_allegro and args.categorical_select:
+        raise ValueError('Allegro Isaac Gym does not support --categorical-select')
 
     args.num_training_step = args.num_timesteps // ( args.num_envs * args.rollout_length )
     args.num_training_steps_per_eval = args.num_training_step // args.num_eval_steps
@@ -452,6 +685,17 @@ def main(args: Args):
     
     # Initialize wandb if tracking is enabled
     if args.track:
+        global wandb, wandb_osh, TriggerWandbSyncHook
+        import wandb as _wandb
+        wandb = _wandb
+        try:
+            import wandb_osh as _wandb_osh
+            from wandb_osh.hooks import TriggerWandbSyncHook as _Trigger
+            wandb_osh = _wandb_osh
+            TriggerWandbSyncHook = _Trigger
+        except ImportError:
+            wandb_osh = None
+            TriggerWandbSyncHook = None
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
@@ -464,6 +708,8 @@ def main(args: Args):
         )
 
         if args.wandb_mode == 'offline':
+            if wandb_osh is None or TriggerWandbSyncHook is None:
+                raise ImportError('offline wandb sync requires wandb_osh')
             wandb_osh.set_log_level("ERROR")
             trigger_sync = TriggerWandbSyncHook()
         
@@ -471,46 +717,101 @@ def main(args: Args):
     local_key, key_env, key_eval, key_policy, key_value, key_rnd = jax.random.split(key, 6)
 
     # Initialize environment
-    env_class, default_config = make_env(args)
-    # BuilderBench defaults to MJX warp; prefer jax unless warp is available.
-    default_config.impl = os.environ.get("BUILDERBENCH_MJX_IMPL", "jax")
-    print(f"MJX impl={default_config.impl}")
-    def _make_controlled_env():
-      base = env_class(config=default_config)
-      if args.use_pd:
-        return PDWrapper(base, duration=args.pd_duration)
-      return base
-
-    if args.use_pd:
-      assert default_config.episode_length % args.pd_duration == 0, (
-          "Environment episode length must be divisible by pd_duration")
-      episode_length = default_config.episode_length // args.pd_duration
-      print(f"Control mode: PD waypoint controls (pd_duration={args.pd_duration}) "
-            f"macro_ep_len={episode_length}")
+    allegro_env = None
+    allegro_packed = None
+    evaluator = None
+    reset_fn = None
+    env_state = None
+    log_data_metric_keys = ()
+    if use_allegro:
+        allegro_env = _ig_take()
+        if allegro_env is None:
+            raise RuntimeError(
+                'Allegro PhysX sim was not created before JAX. '
+                'Pass --env-id=allegro_kuka_throw (or *_slide) so '
+                'isaacgym_physx_bootstrap can run at import time.')
+        args.num_envs = int(allegro_env.num_envs)
+        args.num_reset_steps = 0
+        episode_length = int(getattr(
+            allegro_env, 'max_episode_steps', args.isaacgym_episode_length))
+        obs_size = int(allegro_env.obs_dim)
+        goal_size = int(allegro_env.goal_dim)
+        action_size = int(allegro_env.action_dim)
+        allegro_packed = _torch_to_np(allegro_env.reset())
+        push_xyz = _parse_xyz(args.isaacgym_table_push_xyz)
+        print(
+            f'[ppo_rnd] allegro env_id={args.env_id} E={args.num_envs} '
+            f'ep_len={episode_length} obs={obs_size} goal={goal_size} '
+            f'act={action_size} table_push={bool(allegro_env.table_push)} '
+            f'table_push_xyz={push_xyz} '
+            f'randomize_init={bool(args.isaacgym_randomize_init)} '
+            f'randomize_object_xyz={bool(allegro_env.randomize_object_xyz)} '
+            f'randomize_object_shape={bool(allegro_env.randomize_object_shape)} '
+            f'reward=env.success() (object within 7.5cm of goal)',
+            flush=True)
     else:
-      episode_length = default_config.episode_length
-      print("Control mode: raw controls")
-    env = wrap_env(HardSuccessRewardWrapper(_make_controlled_env()), episode_length)
-    eval_env = wrap_env(
-        HardSuccessRewardWrapper(_make_controlled_env()), episode_length)
+        from builderbench.env_utils import make_env
+        from utils.evaluation import Evaluator
+        from utils.wrapper import wrap_env, PDWrapper
+
+        env_class, default_config = make_env(args)
+        # BuilderBench defaults to MJX warp; prefer jax unless warp is available.
+        default_config.impl = os.environ.get("BUILDERBENCH_MJX_IMPL", "jax")
+        default_config.permute_start_boxes = args.permute_start_boxes
+        print(f"MJX impl={default_config.impl}")
+        print(f"permute_start_boxes={args.permute_start_boxes} "
+              f"fixed_start_x={args.fixed_start_x} fix_goal={args.fix_goal}")
+        _fixed_goal = None
+        if args.fix_goal:
+            import re as _re
+            from envs.builderbench_utils import default_fixed_target_goal
+            _nc = int(_re.search(r"creative-(\d+)", args.env_id).group(1))
+            _ti = int(_re.search(r"task(\d+)", args.env_id).group(1)) - 1
+            _fixed_goal = jnp.asarray(
+                default_fixed_target_goal(_nc, _ti), dtype=jnp.float32)
+            print(f"fix_goal=True  fixed_goal={_fixed_goal.tolist()}")
+            print("eval uses the same fixed target_goal as train")
+        def _make_controlled_env():
+          from envs.builderbench_utils import apply_fixed_start_x
+          base = env_class(config=default_config)
+          apply_fixed_start_x(base, args.fixed_start_x if args.fixed_start_x >= 0 else None)
+          if args.use_pd:
+            base = PDWrapper(base, duration=args.pd_duration)
+          if _fixed_goal is not None:
+            base = FixedGoalWrapper(base, _fixed_goal)
+          return base
+
+        if args.use_pd:
+          assert default_config.episode_length % args.pd_duration == 0, (
+              "Environment episode length must be divisible by pd_duration")
+          episode_length = default_config.episode_length // args.pd_duration
+          print(f"Control mode: PD waypoint controls (pd_duration={args.pd_duration}) "
+                f"macro_ep_len={episode_length}")
+        else:
+          episode_length = default_config.episode_length
+          print("Control mode: raw controls")
+        env = wrap_env(HardSuccessRewardWrapper(_make_controlled_env()), episode_length)
+        eval_env = wrap_env(
+            HardSuccessRewardWrapper(_make_controlled_env()), episode_length)
+
+        reset_fn = jax.jit(env.reset)
+        key_envs = jax.random.split(key_env, args.num_envs)
+        env_state = reset_fn(key_envs)
+        obs_size = env.observation_size
+        action_size = env.action_size
+        goal_size = env.goal_size
+
+        log_data_metric_keys = []
+        for k in ("obj_reached_once", "obj_lifted", "obj_moved",
+                  "success", "easy_success", "very_hard_success"):
+            if k in env_state.metrics.keys():
+                log_data_metric_keys.append(k)
+        log_data_metric_keys = tuple(log_data_metric_keys)
 
     # Initialize checkpoint folder
     if args.save_checkpoint:
         save_path = Path(args.wandb_dir) / f"checkpoints/{args.exp_name}/"
         os.makedirs(save_path, exist_ok=True)
-
-    reset_fn = jax.jit(env.reset)
-    key_envs = jax.random.split(key_env, args.num_envs)
-    env_state = reset_fn(key_envs)
-    obs_size = env.observation_size
-    action_size = env.action_size
-    goal_size = env.goal_size
-
-    log_data_metric_keys = []
-    for k in ("obj_reached_once", "obj_lifted", "obj_moved"):
-        if k in env_state.metrics.keys():
-            log_data_metric_keys.append(k)
-    log_data_metric_keys = tuple(log_data_metric_keys)
 
     # Initialize PPO networks
     ppo_network = make_ppo_networks(args, action_size)
@@ -531,14 +832,16 @@ def main(args: Args):
 
     print(f'\nNumber of parameters in actor critic network are: {count_parameters(training_state.params)}\n')
 
-    # Initialize evaluators
-    evaluator = Evaluator(
-        eval_env,
-        functools.partial(make_policy, deterministic=True),
-        num_eval_envs=args.num_eval_envs,
-        episode_length=episode_length,
-        key=key_eval,
-    )
+    # Initialize evaluators (BuilderBench only; Allegro eval uses the train sim).
+    evaluator = None
+    if not use_allegro:
+        evaluator = Evaluator(
+            eval_env,
+            functools.partial(make_policy, deterministic=True),
+            num_eval_envs=args.num_eval_envs,
+            episode_length=episode_length,
+            key=key_eval,
+        )
 
     def generate_unroll(
         env,
@@ -605,7 +908,7 @@ def main(args: Args):
         )
         int_reward_normalizer_params = running_statistics.update(
             training_state.int_reward_normalizer_params,
-            jnp.sum( int_rewards * ( args.int_discount ** jnp.arange(args.rollout_length)[:, None] ), axis=-1),
+            jnp.sum( int_rewards * ( args.int_discount ** jnp.arange(args.rollout_length)[:, None] ), axis=0),
         )
 
         training_state = training_state.replace(
@@ -615,6 +918,44 @@ def main(args: Args):
         )
 
         return training_state, env_state, data, data_metrics
+
+    @jax.jit
+    def attach_rnd_rewards(training_state, data):
+        int_prediction, int_target = ppo_network.rnd_network.apply(
+            training_state.params['rnd'], data.next_observation,
+            training_state.normalizer_params)
+        int_rewards = jnp.sum((int_prediction - int_target) ** 2, axis=-1) / 2
+        data.extras['policy_extras']['int_reward'] = int_rewards
+        normalizer_params = running_statistics.update(
+            training_state.normalizer_params,
+            data.observation,
+        )
+        int_reward_normalizer_params = running_statistics.update(
+            training_state.int_reward_normalizer_params,
+            jnp.sum(
+                int_rewards * (
+                    args.int_discount ** jnp.arange(args.rollout_length)[:, None]
+                ),
+                axis=0,
+            ),
+        )
+        training_state = training_state.replace(
+            normalizer_params=normalizer_params,
+            int_reward_normalizer_params=int_reward_normalizer_params,
+            env_steps=training_state.env_steps + args.rollout_length * args.num_envs,
+        )
+        return training_state, data
+
+    def allegro_data_collect_step(training_state, packed, key_generate_rollout):
+        policy = jax.jit(make_policy({
+            'policy': training_state.params['policy'],
+            'normalizer': training_state.normalizer_params,
+        }))
+        packed, data, data_metrics, key_generate_rollout = allegro_generate_unroll(
+            allegro_env, packed, policy, key_generate_rollout,
+            args.rollout_length, obs_size)
+        training_state, data = attach_rnd_rewards(training_state, data)
+        return training_state, packed, data, data_metrics
     
     def compute_gae(
         truncation: jnp.ndarray,
@@ -667,6 +1008,7 @@ def main(args: Args):
         init_normalizer_params,
         data,
         rng,
+        entropy_cost,
     ):
         bijector = distrax.Tanh()  
         policy_apply = ppo_network.policy_network.apply
@@ -694,8 +1036,8 @@ def main(args: Args):
         surrogate_loss2 = (jnp.clip(rho_s, 1 - args.clipping_epsilon, 1 + args.clipping_epsilon) * advantages)
         policy_loss = -jnp.mean(jnp.minimum(surrogate_loss1, surrogate_loss2))
 
-        # Forwad loss
-        predict_next_state_feature, target_next_state_feature = rnd_apply(params['rnd'], data.next_observation)
+        # Forward loss — use same normalized+clipped obs as bonus computation
+        predict_next_state_feature, target_next_state_feature = rnd_apply(params['rnd'], data.next_observation, normalizer_params)
         forward_loss = jnp.mean( (predict_next_state_feature-target_next_state_feature)**2 )
 
         # Value function loss
@@ -715,7 +1057,7 @@ def main(args: Args):
             entropy = policy_dist.entropy() + bijector.forward_log_det_jacobian(
                 policy_dist.sample(seed=rng))
             entropy = jnp.mean(jnp.sum(entropy, axis=-1))
-        entropy_loss = args.entropy_cost * -entropy
+        entropy_loss = entropy_cost * -entropy
 
         total_loss = policy_loss + v_loss + int_v_loss + entropy_loss + forward_loss
         return total_loss, {
@@ -728,7 +1070,7 @@ def main(args: Args):
         }
     
     @jax.jit
-    def learn_step(training_state, data, key_sgd):
+    def learn_step(training_state, data, key_sgd, entropy_cost):
 
         def _learn_step(carry, unused_t):
             
@@ -736,7 +1078,7 @@ def main(args: Args):
                 training_state, key = carry
                 key, key_loss = jax.random.split(key)
                 
-                (_, metrics), grads = jax.value_and_grad(compute_ppo_loss, has_aux=True)(training_state.params, training_state.normalizer_params, training_state.int_reward_normalizer_params, data, key_loss)
+                (_, metrics), grads = jax.value_and_grad(compute_ppo_loss, has_aux=True)(training_state.params, training_state.normalizer_params, training_state.int_reward_normalizer_params, data, key_loss, entropy_cost)
                 training_state = training_state.apply_gradients(grads=grads)
                 
                 return (training_state, key), metrics
@@ -888,7 +1230,7 @@ def main(args: Args):
             policy_feature_ranks = {f"policy_{k}": v for k, v in policy_feature_ranks.items()}
             value_feature_ranks = {f"value_{k}": v for k, v in value_feature_ranks.items()}
 
-            return carry, policy_feature_ranks | value_feature_ranks
+            return carry, {**policy_feature_ranks, **value_feature_ranks}
         
         (_), metrics = jax.lax.scan(
                 _extra_log_step,
@@ -908,21 +1250,32 @@ def main(args: Args):
         key_sgd, key_generate_unroll, key = jax.random.split(key, 3)
 
         data_collect_start = time.time()
-        training_state, env_state, training_data, data_metrics = data_collect_step(training_state, env_state, key_generate_unroll)
+        if use_allegro:
+            training_state, allegro_packed, training_data, data_metrics = (
+                allegro_data_collect_step(
+                    training_state, allegro_packed, key_generate_unroll))
+        else:
+            training_state, env_state, training_data, data_metrics = (
+                data_collect_step(
+                    training_state, env_state, key_generate_unroll))
         data_collect_step_time += time.time() - data_collect_start
         
         learn_step_start = time.time()
-        training_state, training_metrics = learn_step(training_state, training_data, key_sgd)
+        frac = (ts - 1) / max(1, args.num_training_step - 1)
+        current_entropy_cost = jnp.float32(
+            args.entropy_cost + (args.entropy_cost_final - args.entropy_cost) * frac)
+        training_state, training_metrics = learn_step(training_state, training_data, key_sgd, current_entropy_cost)
         learn_step_time += time.time() - learn_step_start
 
         if metrics is None:
-            metrics = data_metrics | training_metrics
+            metrics = {**data_metrics, **training_metrics}
         else:
             metrics = jax.tree_util.tree_map(
-                lambda x, y: x + y, metrics, (data_metrics | training_metrics)
+                lambda x, y: x + y, metrics, {**data_metrics, **training_metrics}
             )
 
-        if args.num_reset_steps > 0 and ts % args.num_training_steps_per_real_reset == 0:
+        if (not use_allegro and args.num_reset_steps > 0
+                and ts % args.num_training_steps_per_real_reset == 0):
             key_env, key = jax.random.split(key, 2)
             key_envs = jax.random.split(key_env, args.num_envs)
             env_state = reset_fn(key_envs)
@@ -957,6 +1310,7 @@ def main(args: Args):
                 'training/data_collection_time_fraction' : data_collect_step_time / training_step_time,
                 'training/learning_time_fraction' : learn_step_time / training_step_time,
                 'training/env_steps': training_state.env_steps,
+                'training/entropy_cost': float(current_entropy_cost),
                 'normalizer/count' : training_state.normalizer_params.count,
                 'normalizer/mean' : jnp.mean( training_state.normalizer_params.mean ),
                 'normalizer/summer_variance' : jnp.mean( training_state.normalizer_params.summed_variance ),
@@ -969,10 +1323,23 @@ def main(args: Args):
                 **{f'diagnostic/{name}': value for name, value in extra_metrics.items()},
             }
 
-            metrics = evaluator.run_evaluation(
-                policy_params={'policy':training_state.params['policy'], 'normalizer':training_state.normalizer_params},
-                training_metrics=metrics,
-            )
+            if use_allegro:
+                key_eval, key = jax.random.split(key, 2)
+                eval_policy = make_policy(
+                    {
+                        'policy': training_state.params['policy'],
+                        'normalizer': training_state.normalizer_params,
+                    },
+                    deterministic=True,
+                )
+                allegro_packed, key_eval, eval_metrics = allegro_run_eval(
+                    allegro_env, eval_policy, key_eval, episode_length, obs_size)
+                metrics.update(eval_metrics)
+            else:
+                metrics = evaluator.run_evaluation(
+                    policy_params={'policy':training_state.params['policy'], 'normalizer':training_state.normalizer_params},
+                    training_metrics=metrics,
+                )
 
             print(f'\nEvaluation step {es}:\n')
             pprint.pprint(metrics)

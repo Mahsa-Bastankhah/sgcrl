@@ -108,6 +108,21 @@ flags.DEFINE_bool(
     'ppo_kl_early_stop_rollback', False,
     'If True and ppo_target_kl>0, a minibatch with approx_kl above the '
     'threshold rolls back that update and ends the iteration immediately.')
+flags.DEFINE_bool(
+    'ppo_kl_rollback_after_success', False,
+    'If True: after N consecutive evals with success above the thresh, '
+    'skip all later PPO policy/value updates. NF/CRL still train. '
+    'Does not enable a KL penalty or ppo_target_kl early-stop.')
+flags.DEFINE_float(
+    'ppo_kl_rollback_after_success_thresh', -1.0,
+    'Eval success must be strictly above this for the latch streak. '
+    '<=0 keeps config default (0.9).')
+flags.DEFINE_integer(
+    'ppo_kl_rollback_after_success_iters', -1,
+    'Consecutive high-success evals required to latch. <0 keeps default (3).')
+flags.DEFINE_float(
+    'ppo_kl_rollback_kl', -1.0,
+    'Unused when the eval latch skips PPO. <=0 keeps config default.')
 flags.DEFINE_integer(
     'ppo_target_kl_reset_cooldown', -1,
     'After an actor reset, skip target-KL early-stop/rollback for this many '
@@ -355,6 +370,10 @@ flags.DEFINE_string(
     'ppo_actor_reset_iters', '',
     'Comma-separated PPO iterations at which to force an actor reinit '
     '(in addition to the short-episode guard). Empty disables the schedule.')
+flags.DEFINE_float(
+    'ppo_actor_reset_ep_len', 0.0,
+    'If >0, reinit the policy last layer when ep_length_mean is below this '
+    'absolute length. 0 = default 80% of episode horizon. Set 1 to disable.')
 flags.DEFINE_integer(
     'ppo_eval_interval', -1,
     'Run eval every N PPO iterations. <0 keeps config/env default (30). 0 disables eval.')
@@ -390,6 +409,10 @@ flags.DEFINE_boolean(
     'nf_mix_task_goal_stats', False,
     'NF mode: compute goal μ/σ from batch_size replay s_f plus batch_size '
     'copies of the env task goal (obs[:, obs_dim:]) so g_task is in-distribution.')
+flags.DEFINE_float(
+    'nf_mix_task_goal_frac', 0.5,
+    'When --nf_mix_task_goal_stats is on, fraction of the NF goal-stat batch '
+    'that is the env task goal (rest is replay s_f).')
 flags.DEFINE_boolean(
     'nf_state_only', False,
     'NF mode: if True, learn log p_NF(g|s) and use reward r(s)=log p_NF(g|s) '
@@ -563,6 +586,22 @@ flags.DEFINE_float(
     'ppo_nf_grad_reg_task_g_frac', 0.0,
     'NF: fraction of the batch whose ∇_s log p regularizer uses the env '
     'task goal instead of replay g. 0 = off. NLL is never mixed.')
+flags.DEFINE_boolean(
+    'ppo_value_grad_reg', False,
+    'PPO: add λ·E[‖∇_s V‖] to the PPO loss and dual-ascent λ '
+    '(never on unless this flag is set). ∇_s is the state slice.')
+flags.DEFINE_float(
+    'ppo_value_grad_reg_c', -1.0,
+    'PPO value dual-gradreg threshold c on ‖∇_s V‖. '
+    '<0 keeps config default (100).')
+flags.DEFINE_float(
+    'ppo_value_grad_reg_lam', -1.0,
+    'PPO value dual-gradreg init λ. '
+    '<0 → init from max(ppo_crl_grad_reg_coef, 5e-4).')
+flags.DEFINE_float(
+    'ppo_value_grad_reg_lam_lr', -1.0,
+    'PPO value dual-gradreg λ step size. '
+    '<0 keeps config default (1e-6). 0 → λ fixed.')
 flags.DEFINE_float(
     'ppo_nf_time_reg_eta', 0.0,
     'NF: coefficient η on E[(log p_θ(g|s,a) − log p_old(g|s\',a\'))²] '
@@ -655,6 +694,36 @@ flags.DEFINE_list(
     'Isaac Gym (allegro_kuka_throw): fixed bucket/goal world-frame xyz '
     '(3 comma-separated floats). The object absolute position is the NF goal; '
     'this target is a constant of the env and never appears in the obs.')
+flags.DEFINE_bool(
+    'isaacgym_randomize_init', True,
+    'NVIDIA reset randomization of object pose / joints / forces. Off freezes '
+    'those (see --isaacgym_randomize_object_xyz for xyz-only).')
+flags.DEFINE_bool(
+    'isaacgym_randomize_object_xyz', False,
+    'With frozen init, keep NVIDIA object xy/z reset noise '
+    '(±0.1 m xy, ±0.02 m z). Ignored when randomize_init is on (xyz already '
+    'uses NVIDIA defaults).')
+flags.DEFINE_bool(
+    'isaacgym_randomize_object_shape', True,
+    'Mix object dimensions on reset. Off keeps a single default cube.')
+flags.DEFINE_bool(
+    'isaacgym_palm_goal', False,
+    '6-D palm+object goal packing. Off = 49+3 throw packing.')
+flags.DEFINE_list(
+    'isaacgym_palm_goal_xyz', ['0.17', '0.08', '0.57'],
+    'Commanded palm xyz when --isaacgym_palm_goal is on.')
+flags.DEFINE_bool(
+    'isaacgym_table_push', False,
+    'On-desk slide: object goal on the table (default or '
+    '--isaacgym_table_push_xyz). Parks the throw bucket off the desk.')
+flags.DEFINE_list(
+    'isaacgym_table_push_xyz', ['0.20', '-0.15', '0.555'],
+    'Object goal xyz when --isaacgym_table_push is on.')
+flags.DEFINE_bool(
+    'isaacgym_table_spawn', False,
+    'On-desk cube spawn: ±3 cm xy, no z noise, yaw-only quat, zero joint/'
+    'force noise, hardcoded hover ~8 cm above table center. Default off. '
+    'Does not flip --isaacgym_randomize_init.')
 flags.DEFINE_string(
     'hidden_layer_sizes', '',
     'Comma-separated hidden layer widths, e.g. "256,256,256,256,256,256". '
@@ -958,6 +1027,16 @@ def main(_):
     config.ppo_kl_penalty_beta_min = float(FLAGS.ppo_kl_penalty_beta_min)
   config.ppo_kl_penalty_adapt_epoch = bool(FLAGS.ppo_kl_penalty_adapt_epoch)
   config.ppo_kl_early_stop_rollback = bool(FLAGS.ppo_kl_early_stop_rollback)
+  config.ppo_kl_rollback_after_success = bool(
+      FLAGS.ppo_kl_rollback_after_success)
+  if FLAGS.ppo_kl_rollback_after_success_thresh > 0.0:
+    config.ppo_kl_rollback_after_success_thresh = float(
+        FLAGS.ppo_kl_rollback_after_success_thresh)
+  if FLAGS.ppo_kl_rollback_after_success_iters >= 0:
+    config.ppo_kl_rollback_after_success_iters = int(
+        FLAGS.ppo_kl_rollback_after_success_iters)
+  if FLAGS.ppo_kl_rollback_kl > 0.0:
+    config.ppo_kl_rollback_kl = float(FLAGS.ppo_kl_rollback_kl)
   if FLAGS.ppo_target_kl_reset_cooldown >= 0:
     config.ppo_target_kl_reset_cooldown = int(FLAGS.ppo_target_kl_reset_cooldown)
   if FLAGS.ppo_actor_min_std > 0.0:
@@ -1055,6 +1134,7 @@ def main(_):
   config.nf_scale_tanh_c = float(FLAGS.nf_scale_tanh_c)
   config.nf_mix_env_goal_stats = bool(FLAGS.nf_mix_env_goal_stats)
   config.nf_mix_task_goal_stats = bool(FLAGS.nf_mix_task_goal_stats)
+  config.nf_mix_task_goal_frac = float(FLAGS.nf_mix_task_goal_frac)
   config.nf_state_only = bool(FLAGS.nf_state_only)
   config.nf_train_backward = bool(FLAGS.nf_train_backward)
   if FLAGS.nf_backward_checkpoint_interval >= 0:
@@ -1071,6 +1151,7 @@ def main(_):
       config.ppo_crl_steps_per_iter = 0
   if str(FLAGS.ppo_actor_reset_iters or '').strip():
     config.ppo_actor_reset_iters = str(FLAGS.ppo_actor_reset_iters).strip()
+  config.ppo_actor_reset_ep_len = float(FLAGS.ppo_actor_reset_ep_len)
   if FLAGS.ppo_eval_interval >= 0:
     config.ppo_eval_interval = int(FLAGS.ppo_eval_interval)
   if FLAGS.ppo_eval_episodes >= 0:
@@ -1153,6 +1234,22 @@ def main(_):
     raise ValueError(
         'ppo_nf_grad_reg_task_g_frac must be in [0, 1], '
         f'got {config.ppo_nf_grad_reg_task_g_frac}')
+  config.ppo_value_grad_reg = bool(FLAGS.ppo_value_grad_reg)
+  if FLAGS.ppo_value_grad_reg_c >= 0.0:
+    config.ppo_value_grad_reg_c = float(FLAGS.ppo_value_grad_reg_c)
+  if FLAGS.ppo_value_grad_reg_lam >= 0.0:
+    config.ppo_value_grad_reg_lam = float(FLAGS.ppo_value_grad_reg_lam)
+  if FLAGS.ppo_value_grad_reg_lam_lr >= 0.0:
+    config.ppo_value_grad_reg_lam_lr = float(FLAGS.ppo_value_grad_reg_lam_lr)
+  if config.ppo_value_grad_reg:
+    if config.ppo_value_grad_reg_c < 0.0:
+      raise ValueError(
+          'ppo_value_grad_reg_c must be >= 0 when '
+          f'ppo_value_grad_reg is on, got {config.ppo_value_grad_reg_c}')
+    if config.ppo_value_grad_reg_lam_lr < 0.0:
+      raise ValueError(
+          'ppo_value_grad_reg_lam_lr must be >= 0 when '
+          f'ppo_value_grad_reg is on, got {config.ppo_value_grad_reg_lam_lr}')
   config.ppo_nf_time_reg_eta = float(FLAGS.ppo_nf_time_reg_eta)
   if config.ppo_nf_time_reg_eta < 0.0:
     raise ValueError(
@@ -1198,6 +1295,13 @@ def main(_):
         f'kl_penalty_beta_min={config.ppo_kl_penalty_beta_min}, '
         f'kl_penalty_adapt_epoch={config.ppo_kl_penalty_adapt_epoch}, '
         f'kl_early_stop_rollback={config.ppo_kl_early_stop_rollback}, '
+        f'kl_rollback_after_success='
+        f'{config.ppo_kl_rollback_after_success}, '
+        f'kl_rollback_after_success_thresh='
+        f'{config.ppo_kl_rollback_after_success_thresh}, '
+        f'kl_rollback_after_success_iters='
+        f'{config.ppo_kl_rollback_after_success_iters}, '
+        f'kl_rollback_kl={config.ppo_kl_rollback_kl}, '
         f'target_kl_reset_cooldown={config.ppo_target_kl_reset_cooldown}, '
         f'actor_min_std={config.ppo_actor_min_std}, '
         f'deterministic_select_dim={config.ppo_deterministic_select_dim}, '
@@ -1240,6 +1344,10 @@ def main(_):
         f'ppo_nf_grad_reg_lam={config.ppo_nf_grad_reg_lam}  '
         f'ppo_nf_grad_reg_lam_lr={config.ppo_nf_grad_reg_lam_lr}  '
         f'ppo_nf_grad_reg_task_g_frac={config.ppo_nf_grad_reg_task_g_frac}  '
+        f'ppo_value_grad_reg={config.ppo_value_grad_reg}  '
+        f'ppo_value_grad_reg_c={config.ppo_value_grad_reg_c}  '
+        f'ppo_value_grad_reg_lam={config.ppo_value_grad_reg_lam}  '
+        f'ppo_value_grad_reg_lam_lr={config.ppo_value_grad_reg_lam_lr}  '
         f'ppo_nf_time_reg_eta={config.ppo_nf_time_reg_eta}  '
         f'ppo_nf_time_reg_target={config.ppo_nf_time_reg_target!r}  '
         f'ppo_nf_time_reg_ema_tau={config.ppo_nf_time_reg_ema_tau}  '
@@ -1403,20 +1511,21 @@ def main(_):
     # sim.  Use the known compact packed layout from the wrapper:
     #   state (49) = joint pos (23) + joint vel (23) + object xyz (3)
     #   goal  (3)  = fixed target xyz
-    from envs.allegro_kuka_throw_env import STATE_DIM as _IG_STATE_DIM
-    from envs.allegro_kuka_throw_env import GOAL_DIM as _IG_GOAL_DIM
-    obs_dim = int(_IG_STATE_DIM)
+    from envs.allegro_kuka_throw_env import GOAL_DIM as _IG_GOAL_THROW
+    from envs.allegro_kuka_throw_env import GOAL_DIM_PALM as _IG_GOAL_PALM
+    from envs.allegro_kuka_throw_env import STATE_DIM as _IG_STATE_THROW
+    from envs.allegro_kuka_throw_env import STATE_DIM_PALM as _IG_STATE_PALM
+    _palm = bool(FLAGS.isaacgym_palm_goal)
+    obs_dim = int(_IG_STATE_PALM if _palm else _IG_STATE_THROW)
     config.obs_dim = obs_dim
-    config.goal_dim = int(_IG_GOAL_DIM)
+    config.goal_dim = int(_IG_GOAL_PALM if _palm else _IG_GOAL_THROW)
     config.max_episode_steps = int(FLAGS.isaacgym_episode_length)
-    # The hindsight goal is a projection of the state: object xyz occupies the
-    # LAST GOAL_DIM entries of the state (state[46:49] for the 49-D layout).
-    # start/end_index make _obs_to_goal(state) return that 3-D slice, matching
-    # the appended commanded goal (obs[obs_dim:], the fixed target xyz).
-    config.start_index = int(_IG_STATE_DIM - _IG_GOAL_DIM)
-    config.end_index = int(_IG_STATE_DIM)
-    print(f'[ppo_contrastive] isaacgym: obs_dim={obs_dim} '
-          f'goal_dim={config.goal_dim} '
+    # Hindsight goal is the last goal_dim entries of state (object xyz, or
+    # palm+object when palm_goal is on).
+    config.start_index = int(obs_dim - config.goal_dim)
+    config.end_index = int(obs_dim)
+    print(f'[ppo_contrastive] isaacgym: palm_goal={_palm} '
+          f'obs_dim={obs_dim} goal_dim={config.goal_dim} '
           f'goal_slice=state[{config.start_index}:{config.end_index}] '
           f'max_episode_steps={config.max_episode_steps}')
   else:
@@ -1538,6 +1647,18 @@ def main(_):
         'isaacgym_fixed_target_xyz': tuple(
             float(v) for v in FLAGS.isaacgym_fixed_target_xyz),
         'isaacgym_pipeline': str(FLAGS.isaacgym_pipeline).strip().lower(),
+        'isaacgym_randomize_init': bool(FLAGS.isaacgym_randomize_init),
+        'isaacgym_randomize_object_xyz': bool(
+            FLAGS.isaacgym_randomize_object_xyz),
+        'isaacgym_randomize_object_shape': bool(
+            FLAGS.isaacgym_randomize_object_shape),
+        'isaacgym_palm_goal': bool(FLAGS.isaacgym_palm_goal),
+        'isaacgym_palm_goal_xyz': tuple(
+            float(v) for v in FLAGS.isaacgym_palm_goal_xyz),
+        'isaacgym_table_push': bool(FLAGS.isaacgym_table_push),
+        'isaacgym_table_push_xyz': tuple(
+            float(v) for v in FLAGS.isaacgym_table_push_xyz),
+        'isaacgym_table_spawn': bool(FLAGS.isaacgym_table_spawn),
     }
     ppo_learner_isaacgym.run_ppo_training(
         config=config,

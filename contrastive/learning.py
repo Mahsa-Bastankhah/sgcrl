@@ -13,7 +13,6 @@ from contrastive import networks as contrastive_networks
 import jax
 import jax.numpy as jnp
 import optax
-import reverb
 from jax.experimental.host_callback import id_print
 from jax import debug
 from jax.scipy.special import logsumexp

@@ -27,24 +27,42 @@ FIGS = os.path.join(
 TRAIN_OUT = os.path.join(FIGS, 'c7t2_c8t2_live_ablations_train_success.png')
 EVAL_OUT = os.path.join(FIGS, 'c7t2_c8t2_live_ablations_eval_success.png')
 
-# Currently RUNNING, plus 3748244 cancelled this morning (~09:29).
-# Pending 3751949 / 3751950 (c7 timereg warp 4h) have no logs yet.
+# Recent c7/c8 training jobs (last ~2 days). Skip SPS probes and
+# 2h timereg probes that never left 0. Pending 3751949/3751950: no logs.
 # (log_dir_name, legend, color, linestyle)
 C7_RUNS = (
     (
         'ppo_builderbench_creative7_task2_e1024_pd_nf_compact_small'
         '_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1'
+        '_minstd1e5_ent05_ep70_200m_crl10_dualgradreg_c100_lamlr1e6_s1',
+        'compact-small · ep=70 T=70 · ent=0.05 · λlr=1e-6\n'
+        'peaked then collapsed  ·  3748350',
+        C[0],
+        '-',
+    ),
+    (
+        'ppo_builderbench_creative7_task2_e1024_pd_nf_compact_small'
+        '_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1'
+        '_minstd1e5_ent05_ep90_200m_crl10_dualgradreg_c100_lamlr1e6_s1',
+        'compact-small · ep=90 T=90 · ent=0.05 · λlr=1e-6\n'
+        'never learned  ·  3748351',
+        C[1],
+        '--',
+    ),
+    (
+        'ppo_builderbench_creative7_task2_e1024_pd_nf_compact_small'
+        '_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1'
         '_minstd1e5_ent05_ep70_200m_crl10_dualgradreg_c100_lamlr1e2_tkl005_s1',
-        'NF compact-small · catwp · dualgradreg\n'
-        r'ep70 · ent=0.05 · $\lambda$lr=1e-2 · tKL=0.05 · RUNNING 3749899',
+        'compact-small · ep=70 T=70 · ent=0.05 · λlr=1e-2 · tKL=0.05\n'
+        'RUNNING 3749899',
         C[2],
         '-',
     ),
     (
         'mpo_crl_builderbench_creative7_task2_e1024_pd_fast_succ',
-        'MPO-CRL  ·  T=90  ·  RUNNING 3749778',
-        C[0],
-        '--',
+        'MPO-CRL  ·  ep=90 T=90  ·  cancelled 12:32  ·  3749778',
+        C[4],
+        ':',
     ),
 )
 C8_RUNS = (
@@ -53,8 +71,8 @@ C8_RUNS = (
         '_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catwp_extrew1'
         '_minstd1e5_ent005_to001_ep100_300m_crl10_dualgradreg_c100'
         '_lamlr1e6_36h',
-        'NF compact · catwp · dualgradreg c=100\n'
-        'T=100 · ent 0.05→0.01 · cancelled 09:29  ·  3748244',
+        'ep=100 T=100 · ent 0.05→0.01 · cancelled 09:29\n'
+        'held lock  ·  3748244',
         C[1],
         '-',
     ),
@@ -62,8 +80,8 @@ C8_RUNS = (
         'ppo_builderbench_creative8_task2_e1024_pd_nf_compact'
         '_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catwp_extrew1'
         '_minstd1e5_ent05_ep100_300m_crl10_dualgradreg_c100_lamlr1e6_36h',
-        'NF compact · catwp · dualgradreg c=100\n'
-        'T=100 · ent=0.05 fixed  ·  RUNNING 3748245',
+        'ep=100 T=100 · ent=0.05 fixed · cancelled 12:32\n'
+        'peaked then dropped  ·  3748245',
         C[0],
         '-',
     ),
@@ -72,10 +90,20 @@ C8_RUNS = (
         '_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catwp_extrew1'
         '_minstd1e5_ent005_to001_ep100_T50_300m_crl10_dualgradreg_c100'
         '_lamlr1e6_36h',
-        'NF compact · catwp · dualgradreg c=100\n'
-        'T=50 · ent 0.05→0.01  ·  RUNNING 3748347',
+        'ep=100 T=50 · ent 0.05→0.01 · cancelled 10:48\n'
+        'peaked then collapsed  ·  3748347',
         C[2],
         '--',
+    ),
+    (
+        'ppo_builderbench_creative8_task2_e1024_pd_nf_compact'
+        '_sa3x256_r64_b6_w256_tau05_nopermute_fixedx01_catwp_extrew1'
+        '_minstd1e5_ent005_to001_ep60_300m_crl10_dualgradreg_c100'
+        '_lamlr1e6_tkl005',
+        'ep=60 T=60 · tKL=0.05 · timeout\n'
+        'never learned  ·  3748425',
+        C[3],
+        '-.',
     ),
 )
 PANELS = (
@@ -130,9 +158,9 @@ def _style(ax, *, title: str, ylabel: str) -> None:
 
 def _legend_below(ax, *, fontsize: float):
   return ax.legend(
-      loc='upper center', bbox_to_anchor=(0.5, -0.22),
+      loc='upper center', bbox_to_anchor=(0.5, -0.20),
       fontsize=fontsize, framealpha=0.95, handlelength=2.8,
-      labelspacing=0.75, borderpad=0.5, fancybox=False,
+      labelspacing=0.65, borderpad=0.45, fancybox=False,
       edgecolor='#333333',
   )
 
@@ -143,20 +171,20 @@ def _make_figure(kind: str, out_path: str) -> None:
     ylabel = 'Train Success (last 1000)'
     sup = (
         'Hard train success (last 1000)  ·  '
-        'currently running / cancelled this morning'
+        'recent c7t2 / c8t2  ·  3749899 still running'
     )
-    legend_fs = (7.2, 6.8)
+    legend_fs = (6.6, 6.6)
   else:
     ylabel = f'Eval Success (roll mean w={w})'
     sup = (
         f'Hard eval success (rolling mean, window={w})  ·  '
-        'currently running / cancelled this morning'
+        'recent c7t2 / c8t2  ·  3749899 still running'
     )
-    legend_fs = (7.2, 6.8)
+    legend_fs = (6.6, 6.6)
 
-  fig, axes = plt.subplots(1, 2, figsize=(14.8, 5.8), sharey=True)
+  fig, axes = plt.subplots(1, 2, figsize=(14.8, 6.4), sharey=True)
   fig.subplots_adjust(
-      left=0.06, right=0.995, top=0.84, bottom=0.40, wspace=0.12)
+      left=0.06, right=0.995, top=0.84, bottom=0.46, wspace=0.12)
 
   legs = []
   for ax, (tag, runs), fs in zip(axes, PANELS, legend_fs):

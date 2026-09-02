@@ -101,11 +101,48 @@ def force_video_nopermute_norand(ctx: _TrainCtx,
 
 def _episode_success_from_states(states) -> float:
   """Max per-step success over the episode (1.0 if any step succeeded)."""
+  succ = _step_success_series(states)
+  if succ is None:
+    return float('nan')
+  return float(np.max(succ))
+
+
+def _step_success_series(states) -> Optional[np.ndarray]:
   if hasattr(states, 'metrics') and states.metrics is not None:
     succ = states.metrics.get('success')
     if succ is not None:
-      return float(np.max(np.asarray(succ)))
-  return float('nan')
+      arr = np.asarray(succ, dtype=np.float32)
+      if arr.ndim >= 2:
+        arr = arr[:, 0]
+      return arr
+  return None
+
+
+def _overlay_success_banner(frame: np.ndarray, on: bool) -> np.ndarray:
+  """Paint a top bar: green + SUCCESS=1 when the step succeeded."""
+  img = np.asarray(frame)
+  if img.dtype != np.uint8:
+    mx = float(np.max(img)) if img.size else 1.0
+    img = (np.clip(img, 0, 1) * 255).astype(np.uint8) if mx <= 1.0 else img.astype(np.uint8)
+  out = np.ascontiguousarray(img.copy())
+  bar_h = max(32, int(out.shape[0] * 0.08))
+  color = (34, 139, 34) if on else (55, 55, 55)
+  out[:bar_h] = color
+  try:
+    from PIL import Image, ImageDraw, ImageFont
+    pil = Image.fromarray(out)
+    draw = ImageDraw.Draw(pil)
+    label = 'SUCCESS = 1' if on else 'success = 0'
+    try:
+      font = ImageFont.truetype(
+          '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf', 22)
+    except OSError:
+      font = ImageFont.load_default()
+    draw.text((12, 6), label, fill=(255, 255, 255), font=font)
+    out = np.asarray(pil)
+  except Exception:
+    pass
+  return out
 
 
 def _get_video(
@@ -133,16 +170,24 @@ def _get_video(
       num_cubes=num_cubes,
   )
   mocap_key = 'target_mocap'
+  step_succ = _step_success_series(video_env_states)
   video_images = []
+  n_on = 0
   for i in range(episode_length):
     if i % 2 == 0:
-      video_images.append(video_env.render_from_info(
+      frame = video_env.render_from_info(
           np.asarray(video_env_states.data.qpos[i][0]),
           np.asarray(video_env_states.data.qvel[i][0]),
           np.asarray(video_env_states.info[f'{mocap_key}_pos'][i][0]),
           np.asarray(video_env_states.info[f'{mocap_key}_quat'][i][0]),
-      ))
-  return video_images, _episode_success_from_states(video_env_states)
+      )
+      on = bool(step_succ is not None and float(step_succ[i]) >= 0.5)
+      n_on += int(on)
+      video_images.append(_overlay_success_banner(frame, on))
+  ep_succ = _episode_success_from_states(video_env_states)
+  print(f'[bb_video]   overlay frames_on={n_on}/{len(video_images)} '
+        f'ep_success={ep_succ:.3f}', flush=True)
+  return video_images, ep_succ
 
 
 def _maybe_fix_target(

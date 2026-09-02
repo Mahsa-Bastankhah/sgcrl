@@ -32,22 +32,28 @@ fi
 CKPT="${CKPT:-}"
 OUT="${OUT:-videos/allegro_kuka_throw_ckpt.mp4}"
 SEED="${SEED:-0}"
+EPISODES="${EPISODES:-2}"
+DET_FLAG=""
+if [ "${DETERMINISTIC:-1}" = "1" ]; then
+  DET_FLAG="--deterministic"
+fi
 if [ -z "${CKPT}" ] || [ ! -f "${CKPT}" ]; then
   echo "CKPT missing or not a file: ${CKPT}"
   exit 1
 fi
 mkdir -p slurm "$(dirname "${OUT}")"
 
-echo "SLURM_JOB_ID=${SLURM_JOB_ID}  ckpt=${CKPT}  out=${OUT}"
+echo "SLURM_JOB_ID=${SLURM_JOB_ID}  ckpt=${CKPT}  out=${OUT}  episodes=${EPISODES}  det=${DETERMINISTIC:-1}"
 nvidia-smi || true
 
 python -u scripts/allegro_kuka_throw_ckpt_video.py \
   --checkpoint="${CKPT}" \
   --output="${OUT}" \
-  --num-steps=300 \
+  --episodes="${EPISODES}" \
   --fps=30 \
   --seed="${SEED}" \
-  --pipeline=gpu
+  --pipeline=gpu \
+  ${DET_FLAG}
 PY_EXIT=$?
 ls -lh "${OUT}" || true
 exit $PY_EXIT
