@@ -115,34 +115,30 @@ def make_sac_crl_update_fn(
   def critic_loss_fn(q_params, batch):
     obs = batch['obs']
     actions = batch['action']
-    logits, phi_sa, psi_g = networks.q_network.apply(q_params, obs, actions)
-
-    if 'extra_goals' in batch:
-      # Uniform negative goals: (B, num_negatives, goal_dim)
-      extra_goals = batch['extra_goals']
-      B, K, G_dim = extra_goals.shape
-      flat_extra = extra_goals.reshape(B * K, G_dim)
-      dummy_state = jnp.zeros((B * K, config.obs_dim), dtype=flat_extra.dtype)
-      dummy_obs = jnp.concatenate([dummy_state, flat_extra], axis=1)
-      dummy_act = jnp.zeros((B * K,) + actions.shape[1:], dtype=actions.dtype)
-      _, _, extra_psi = networks.q_network.apply(q_params, dummy_obs, dummy_act)
-      extra_psi = extra_psi.reshape(B, K, -1)
-
-      if len(logits.shape) == 3:
-        # twin_q
-        extra_logits1 = jnp.einsum('ik,ijk->ij', phi_sa[:, :, 0], extra_psi)
-        extra_logits2 = jnp.einsum('ik,ijk->ij', phi_sa[:, :, 1], extra_psi)
-        extra_logits = jnp.stack([extra_logits1, extra_logits2], axis=-1)
-        full_logits = jnp.concatenate([logits, extra_logits], axis=1)
+    extra_goals = batch.get('extra_goals', None)
+    if extra_goals is not None:
+      if extra_goals.ndim == 3:
+        extra_goals = extra_goals.reshape(-1, extra_goals.shape[-1])
+      K = extra_goals.shape[0]
+      obs_dim_inf = obs.shape[1] - extra_goals.shape[1]
+      act_dim = actions.shape[1]
+      obs_extra = jnp.concatenate([jnp.zeros((K, obs_dim_inf)), extra_goals], axis=1)
+      action_extra = jnp.zeros((K, act_dim))
+      obs_fwd = jnp.concatenate([obs, obs_extra], axis=0)
+      action_fwd = jnp.concatenate([actions, action_extra], axis=0)
+      logits_full, phi_sa, psi_g = networks.q_network.apply(q_params, obs_fwd, action_fwd)
+      if logits_full.ndim == 3:
+        full_logits = logits_full[:batch_size, :, :]
       else:
-        extra_logits = jnp.einsum('ik,ijk->ij', phi_sa, extra_psi)
-        full_logits = jnp.concatenate([logits, extra_logits], axis=1)
+        full_logits = logits_full[:batch_size, :]
+      labels = jnp.concatenate([I, jnp.zeros((batch_size, K))], axis=1)
     else:
-      full_logits = logits
+      full_logits, phi_sa, psi_g = networks.q_network.apply(q_params, obs, actions)
+      labels = I
 
     def _loss_single(_l):
       return (
-          optax.softmax_cross_entropy(logits=_l, labels=I)
+          optax.softmax_cross_entropy(logits=_l, labels=labels)
           + 0.01 * jax.nn.logsumexp(_l, axis=1) ** 2
       )
 

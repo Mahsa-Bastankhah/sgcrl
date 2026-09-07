@@ -43,6 +43,149 @@ for seed in 0 1; do
   #     --wandb_group=ppo_close_cabinet_drawer_crl \
   #     --render_video" >> "$TASK_FILE"
   #
+  # --------------------------------------------------------------------------
+  # 20. SAMI_CREATED_COMMANDS: ManiSkill Standard In-Room Open Drawer (OpenCabinetDrawer-v1) - PPO + CRL
+  # --------------------------------------------------------------------------
+  # echo "python ppo_contrastive.py \
+  #     --env=maniskill_open_cabinet_drawer \
+  #     --seed=${seed} \
+  #     --num_steps=600000000 \
+  #     --log_dir_path=maniskill_open_cabinet_drawer_crl/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_crl_steps_per_iter=128 \
+  #     --ppo_ent_coef=0.05 \
+  #     --ppo_actor_min_std=0.01 \
+  #     --ppo_discount=0.99 \
+  #     --ppo_clip_coef=0.2 \
+  #     --ppo_crl_repr_tau=0.5 \
+  #     --ppo_num_envs=512 \
+  #     --maniskill_native_vec \
+  #     --uniform_sampling \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=ppo_open_cabinet_drawer_crl \
+  #     --render_video \
+  #     --video_every_steps=5000000" >> "$TASK_FILE"
+  #
+  # --------------------------------------------------------------------------
+  # 21. SAMI_CREATED_COMMANDS: ManiSkill Standard In-Room Open Drawer (OpenCabinetDrawer-v1) - SAC + CRL (Acme)
+  # --------------------------------------------------------------------------
+  # echo "python sac_contrastive.py \
+  #     --env=maniskill_open_cabinet_drawer \
+  #     --seed=${seed} \
+  #     --num_steps=600000000 \
+  #     --log_dir_path=maniskill_open_cabinet_drawer_sac/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_crl_steps_per_iter=128 \
+  #     --actor_learning_rate=3e-4 \
+  #     --learning_rate=3e-4 \
+  #     --discount=0.99 \
+  #     --batch_size=256 \
+  #     --ppo_num_envs=512 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --uniform_sampling \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=sac_crl_open_cabinet_drawer \
+  #     --render_video \
+  #     --video_every_steps=5000000" >> "$TASK_FILE"
+  #
+  # --------------------------------------------------------------------------
+  # 22. SAMI_CREATED_COMMANDS: ManiSkill Standard In-Room Close Drawer (CloseCabinetDrawer-v1) - SAC + CRL (Acme)
+  # --------------------------------------------------------------------------
+  # echo "python sac_contrastive.py \
+  #     --env=maniskill_close_cabinet_drawer \
+  #     --seed=${seed} \
+  #     --num_steps=600000000 \
+  #     --log_dir_path=maniskill_close_cabinet_drawer_sac/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_crl_steps_per_iter=128 \
+  #     --actor_learning_rate=3e-4 \
+  #     --learning_rate=3e-4 \
+  #     --discount=0.99 \
+  #     --batch_size=256 \
+  #     --ppo_num_envs=512 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --uniform_sampling \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=sac_crl_close_cabinet_drawer \
+  #     --render_video \
+  #     --video_every_steps=5000000" >> "$TASK_FILE"
+  #
+  # --------------------------------------------------------------------------
+  # 23. SAMI_CREATED_COMMANDS: ManiSkill Standard In-Room Open Drawer (OpenCabinetDrawer-v1) - PPO + NF
+  # --------------------------------------------------------------------------
+  # echo "python ppo_contrastive.py \
+  #     --env=maniskill_open_cabinet_drawer \
+  #     --seed=${seed} \
+  #     --num_steps=600000000 \
+  #     --log_dir_path=ppo_maniskill_open_cabinet_drawer_nf_mixtask_1M/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_repr_mode=nf \
+  #     --nf_rep_size=64 \
+  #     --nf_num_blocks=6 \
+  #     --nf_coupling_width=192 \
+  #     --nf_sa_hidden=192 \
+  #     --nf_sa_num_layers=3 \
+  #     --nf_grad_clip=1.0 \
+  #     --nf_noise_std=0.05 \
+  #     --nf_goal_std_min=0.02 \
+  #     --nf_goal_enc_size=0 \
+  #     --nf_mix_task_goal_stats \
+  #     --ppo_crl_steps_per_iter=10 \
+  #     --ppo_ent_coef=0.05 \
+  #     --ppo_actor_min_std=0.01 \
+  #     --ppo_discount=0.99 \
+  #     --ppo_clip_coef=0.2 \
+  #     --ppo_nf_reward_tau=0.5 \
+  #     --ppo_num_envs=512 \
+  #     --maniskill_native_vec \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=ppo_nf_goal_fast_mixtask \
+  #     --render_video \
+  #     --video_every_steps=5000000" >> "$TASK_FILE"
+  #
+  # --------------------------------------------------------------------------
+  # 24. SAMI_CREATED_COMMANDS: ManiSkill-HAB Open Subtask (OpenSubtaskTrain-v0) - PPO + NF
+  # --------------------------------------------------------------------------
+  echo "python ppo_contrastive.py \
+      --env=maniskill_open_subtask_train \
+      --seed=${seed} \
+      --num_steps=70000000 \
+      --log_dir_path=maniskill_open_subtask_train_nf/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_repr_mode=nf \
+      --nf_rep_size=64 \
+      --nf_num_blocks=6 \
+      --nf_coupling_width=192 \
+      --nf_sa_hidden=192 \
+      --nf_sa_num_layers=3 \
+      --nf_grad_clip=1.0 \
+      --nf_noise_std=0.05 \
+      --nf_goal_std_min=0.02 \
+      --nf_goal_enc_size=0 \
+      --nf_mix_task_goal_stats \
+      --ppo_crl_steps_per_iter=10 \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=1e-5 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --ppo_nf_reward_tau=0.5 \
+      --ppo_num_envs=64 \
+      --ppo_checkpoint_interval=20 \
+      --maniskill_native_vec \
+      --ppo_crl_add_extrinsic_reward \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_open_subtask_nf \
+      --render_video \
+      --video_every_steps=5000000" >> "$TASK_FILE"
+  #
+  #
   # # --------------------------------------------------------------------------
   # # 2. ManiSkill In-Room Push Drawer (CloseCabinetDrawer) - PPO + RND
   # # --------------------------------------------------------------------------
@@ -168,174 +311,354 @@ for seed in 0 1; do
   #     --render_video \
   #     --video_every_steps=20000000" >> "$TASK_FILE"
 
-  # --------------------------------------------------------------------------
-  # 7. ManiSkill-HAB Close Drawer - SAC + CRL (Implementation 1: Haiku/Acme)
-  # --------------------------------------------------------------------------
-  echo "python sac_contrastive.py \
-      --env=maniskill_close_subtask_train \
-      --seed=${seed} \
-      --num_steps=70000000 \
-      --log_dir_path=maniskill_close_subtask_train_sac/ \
-      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-      --ppo_crl_steps_per_iter=256 \
-      --actor_learning_rate=3e-4 \
-      --learning_rate=3e-4 \
-      --discount=0.99 \
-      --batch_size=256 \
-      --ppo_num_envs=64 \
-      --ppo_checkpoint_interval=20 \
-      --maniskill_native_vec \
-      --uniform_sampling \
-      --wandb_project=${WANDB_PROJECT} \
-      --wandb_entity=${WANDB_ENTITY} \
-      --wandb_group=sac_crl_close_subtask \
-      --render_video \
-      --video_every_steps=20000000" >> "$TASK_FILE"
-
-  # --------------------------------------------------------------------------
-  # 8. ManiSkill-HAB Close Drawer - SAC + CRL (Implementation 2: Flax/Tyro)
-  # --------------------------------------------------------------------------
-  echo "python stable_crl_maniskill.py \
-      --env-id maniskill_close_subtask_train \
-      --seed ${seed} \
-      --num-timesteps 70000000 \
-      --contrastive-hidden-sizes 256 256 256 256 256 256 \
-      --crl-steps-per-iter 16 \
-      --actor-learning-rate 3e-4 \
-      --critic-learning-rate 3e-4 \
-      --discount 0.99 \
-      --batch-size 256 \
-      --num-envs 64 \
-      --rollout-length 64 \
-      --min-replay-size 1000 \
-      --max-replay-size 10000 \
-      --track \
-      --wandb-project-name ${WANDB_PROJECT} \
-      --wandb-entity ${WANDB_ENTITY} \
-      --wandb-group stable_flax_close_subtask \
-      --render-video \
-      --video-every-steps 20000000" >> "$TASK_FILE"
-
-  # --------------------------------------------------------------------------
-  # 9. ManiSkill-HAB Open Drawer - SAC + CRL (Implementation 1: Haiku/Acme)
-  # --------------------------------------------------------------------------
-  echo "python sac_contrastive.py \
-      --env=maniskill_open_subtask_train \
-      --seed=${seed} \
-      --num_steps=70000000 \
-      --log_dir_path=maniskill_open_subtask_train_sac/ \
-      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-      --ppo_crl_steps_per_iter=256 \
-      --actor_learning_rate=3e-4 \
-      --learning_rate=3e-4 \
-      --discount=0.99 \
-      --batch_size=256 \
-      --ppo_num_envs=64 \
-      --ppo_checkpoint_interval=20 \
-      --maniskill_native_vec \
-      --uniform_sampling \
-      --wandb_project=${WANDB_PROJECT} \
-      --wandb_entity=${WANDB_ENTITY} \
-      --wandb_group=sac_crl_open_subtask \
-      --render_video \
-      --video_every_steps=20000000" >> "$TASK_FILE"
-
-  # --------------------------------------------------------------------------
-  # 10. ManiSkill-HAB Open Drawer - SAC + CRL (Implementation 2: Flax/Tyro)
-  # --------------------------------------------------------------------------
-  echo "python stable_crl_maniskill.py \
-      --env-id maniskill_open_subtask_train \
-      --seed ${seed} \
-      --num-timesteps 70000000 \
-      --contrastive-hidden-sizes 256 256 256 256 256 256 \
-      --crl-steps-per-iter 16 \
-      --actor-learning-rate 3e-4 \
-      --critic-learning-rate 3e-4 \
-      --discount 0.99 \
-      --batch-size 256 \
-      --num-envs 64 \
-      --rollout-length 64 \
-      --min-replay-size 1000 \
-      --max-replay-size 10000 \
-      --track \
-      --wandb-project-name ${WANDB_PROJECT} \
-      --wandb-entity ${WANDB_ENTITY} \
-      --wandb-group stable_flax_open_subtask \
-      --render-video \
-      --video-every-steps 20000000" >> "$TASK_FILE"
-
-  # --------------------------------------------------------------------------
-  # 11. ManiSkill PushCube (Simpler Task) - SAC + CRL (Implementation 1: Haiku/Acme)
-  # --------------------------------------------------------------------------
-  echo "python sac_contrastive.py \
-      --env=maniskill_pushcube \
-      --seed=${seed} \
-      --num_steps=10000000 \
-      --log_dir_path=maniskill_pushcube_sac/ \
-      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-      --ppo_crl_steps_per_iter=64 \
-      --actor_learning_rate=3e-4 \
-      --learning_rate=3e-4 \
-      --discount=0.99 \
-      --batch_size=256 \
-      --ppo_num_envs=64 \
-      --ppo_checkpoint_interval=20 \
-      --maniskill_native_vec \
-      --uniform_sampling \
-      --wandb_project=${WANDB_PROJECT} \
-      --wandb_entity=${WANDB_ENTITY} \
-      --wandb_group=sac_crl_pushcube \
-      --render_video \
-      --video_every_steps=2000000" >> "$TASK_FILE"
-
-  # --------------------------------------------------------------------------
-  # 12. ManiSkill PushCube (Simpler Task) - SAC + CRL (Implementation 2: Flax/Tyro)
-  # --------------------------------------------------------------------------
-  echo "python stable_crl_maniskill.py \
-      --env-id maniskill_pushcube \
-      --seed ${seed} \
-      --num-timesteps 10000000 \
-      --contrastive-hidden-sizes 256 256 256 256 256 256 \
-      --crl-steps-per-iter 16 \
-      --actor-learning-rate 3e-4 \
-      --critic-learning-rate 3e-4 \
-      --discount 0.99 \
-      --batch-size 256 \
-      --num-envs 64 \
-      --rollout-length 64 \
-      --min-replay-size 1000 \
-      --max-replay-size 10000 \
-      --track \
-      --wandb-project-name ${WANDB_PROJECT} \
-      --wandb-entity ${WANDB_ENTITY} \
-      --wandb-group stable_flax_pushcube \
-      --render-video \
-      --video-every-steps 2000000" >> "$TASK_FILE"
+  # # --------------------------------------------------------------------------
+  # # 7. ManiSkill-HAB Close Drawer - SAC + CRL (Implementation 1: Haiku/Acme)
+  # # --------------------------------------------------------------------------
+  # echo "python sac_contrastive.py \
+  #     --env=maniskill_close_subtask_train \
+  #     --seed=${seed} \
+  #     --num_steps=70000000 \
+  #     --log_dir_path=maniskill_close_subtask_train_sac/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_crl_steps_per_iter=256 \
+  #     --actor_learning_rate=3e-4 \
+  #     --learning_rate=3e-4 \
+  #     --discount=0.99 \
+  #     --batch_size=256 \
+  #     --ppo_num_envs=64 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --uniform_sampling \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=sac_crl_close_subtask \
+  #     --render_video \
+  #     --video_every_steps=20000000" >> "$TASK_FILE"
+  #
+  # # --------------------------------------------------------------------------
+  # # 8. ManiSkill-HAB Close Drawer - SAC + CRL (Implementation 2: Flax/Tyro)
+  # # --------------------------------------------------------------------------
+  # echo "python stable_crl_maniskill.py \
+  #     --env-id maniskill_close_subtask_train \
+  #     --seed ${seed} \
+  #     --num-timesteps 70000000 \
+  #     --contrastive-hidden-sizes 256 256 256 256 256 256 \
+  #     --crl-steps-per-iter 16 \
+  #     --actor-learning-rate 3e-4 \
+  #     --critic-learning-rate 3e-4 \
+  #     --discount 0.99 \
+  #     --batch-size 256 \
+  #     --num-envs 64 \
+  #     --rollout-length 64 \
+  #     --min-replay-size 1000 \
+  #     --max-replay-size 10000 \
+  #     --track \
+  #     --wandb-project-name ${WANDB_PROJECT} \
+  #     --wandb-entity ${WANDB_ENTITY} \
+  #     --wandb-group stable_flax_close_subtask \
+  #     --render-video \
+  #     --video-every-steps 20000000" >> "$TASK_FILE"
+  #
+  # # --------------------------------------------------------------------------
+  # # 9. ManiSkill-HAB Open Drawer - SAC + CRL (Implementation 1: Haiku/Acme)
+  # # --------------------------------------------------------------------------
+  # echo "python sac_contrastive.py \
+  #     --env=maniskill_open_subtask_train \
+  #     --seed=${seed} \
+  #     --num_steps=70000000 \
+  #     --log_dir_path=maniskill_open_subtask_train_sac/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_crl_steps_per_iter=256 \
+  #     --actor_learning_rate=3e-4 \
+  #     --learning_rate=3e-4 \
+  #     --discount=0.99 \
+  #     --batch_size=256 \
+  #     --ppo_num_envs=64 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --uniform_sampling \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=sac_crl_open_subtask \
+  #     --render_video \
+  #     --video_every_steps=20000000" >> "$TASK_FILE"
+  #
+  # # --------------------------------------------------------------------------
+  # # 10. ManiSkill-HAB Open Drawer - SAC + CRL (Implementation 2: Flax/Tyro)
+  # # --------------------------------------------------------------------------
+  # echo "python stable_crl_maniskill.py \
+  #     --env-id maniskill_open_subtask_train \
+  #     --seed ${seed} \
+  #     --num-timesteps 70000000 \
+  #     --contrastive-hidden-sizes 256 256 256 256 256 256 \
+  #     --crl-steps-per-iter 16 \
+  #     --actor-learning-rate 3e-4 \
+  #     --critic-learning-rate 3e-4 \
+  #     --discount 0.99 \
+  #     --batch-size 256 \
+  #     --num-envs 64 \
+  #     --rollout-length 64 \
+  #     --min-replay-size 1000 \
+  #     --max-replay-size 10000 \
+  #     --track \
+  #     --wandb-project-name ${WANDB_PROJECT} \
+  #     --wandb-entity ${WANDB_ENTITY} \
+  #     --wandb-group stable_flax_open_subtask \
+  #     --render-video \
+  #     --video-every-steps 20000000" >> "$TASK_FILE"
+  #
+  # # --------------------------------------------------------------------------
+  # # 11. ManiSkill PushCube (Simpler Task) - SAC + CRL (Implementation 1: Haiku/Acme)
+  # # --------------------------------------------------------------------------
+  # echo "python sac_contrastive.py \
+  #     --env=maniskill_pushcube \
+  #     --seed=${seed} \
+  #     --num_steps=10000000 \
+  #     --log_dir_path=maniskill_pushcube_sac/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_crl_steps_per_iter=64 \
+  #     --actor_learning_rate=3e-4 \
+  #     --learning_rate=3e-4 \
+  #     --discount=0.99 \
+  #     --batch_size=256 \
+  #     --ppo_num_envs=64 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --uniform_sampling \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=sac_crl_pushcube \
+  #     --render_video \
+  #     --video_every_steps=2000000" >> "$TASK_FILE"
+  #
+  # # --------------------------------------------------------------------------
+  # # 12. ManiSkill PushCube (Simpler Task) - SAC + CRL (Implementation 2: Flax/Tyro)
+  # # --------------------------------------------------------------------------
+  # echo "python stable_crl_maniskill.py \
+  #     --env-id maniskill_pushcube \
+  #     --seed ${seed} \
+  #     --num-timesteps 10000000 \
+  #     --contrastive-hidden-sizes 256 256 256 256 256 256 \
+  #     --crl-steps-per-iter 16 \
+  #     --actor-learning-rate 3e-4 \
+  #     --critic-learning-rate 3e-4 \
+  #     --discount 0.99 \
+  #     --batch-size 256 \
+  #     --num-envs 64 \
+  #     --rollout-length 64 \
+  #     --min-replay-size 1000 \
+  #     --max-replay-size 10000 \
+  #     --track \
+  #     --wandb-project-name ${WANDB_PROJECT} \
+  #     --wandb-entity ${WANDB_ENTITY} \
+  #     --wandb-group stable_flax_pushcube \
+  #     --render-video \
+  #     --video-every-steps 2000000" >> "$TASK_FILE"
 
   # --------------------------------------------------------------------------
   # 13. ManiSkill PushCube (Simpler Task) - PPO + CRL Baseline
   # --------------------------------------------------------------------------
-  echo "python ppo_contrastive.py \
-      --env=maniskill_pushcube \
-      --seed=${seed} \
-      --num_steps=10000000 \
-      --log_dir_path=maniskill_pushcube_ppo/ \
-      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-      --ppo_crl_steps_per_iter=64 \
-      --ppo_ent_coef=0.05 \
-      --ppo_actor_min_std=0.01 \
-      --ppo_discount=0.99 \
-      --ppo_clip_coef=0.2 \
-      --ppo_crl_repr_tau=0.5 \
-      --ppo_num_envs=64 \
-      --ppo_checkpoint_interval=20 \
-      --maniskill_native_vec \
-      --uniform_sampling \
-      --wandb_project=${WANDB_PROJECT} \
-      --wandb_entity=${WANDB_ENTITY} \
-      --wandb_group=ppo_pushcube_crl \
-      --render_video \
-      --video_every_steps=2000000" >> "$TASK_FILE"
+  # echo "python ppo_contrastive.py \
+  #     --env=maniskill_pushcube \
+  #     --seed=${seed} \
+  #     --num_steps=10000000 \
+  #     --log_dir_path=maniskill_pushcube_ppo/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_crl_steps_per_iter=64 \
+  #     --ppo_ent_coef=0.05 \
+  #     --ppo_actor_min_std=0.01 \
+  #     --ppo_discount=0.99 \
+  #     --ppo_clip_coef=0.2 \
+  #     --ppo_crl_repr_tau=0.5 \
+  #     --ppo_num_envs=64 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --uniform_sampling \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=ppo_pushcube_crl \
+  #     --render_video \
+  #     --video_every_steps=2000000" >> "$TASK_FILE"
+
+  # # --------------------------------------------------------------------------
+  # # 14. SAMI_CREATED_COMMANDS: ManiSkill-HAB Open Drawer - PPO + NF
+  # # --------------------------------------------------------------------------
+  # echo "python ppo_contrastive.py \
+  #     --env=maniskill_open_subtask_train \
+  #     --seed=${seed} \
+  #     --num_steps=70000000 \
+  #     --log_dir_path=maniskill_open_subtask_train_nf/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_repr_mode=nf \
+  #     --nf_rep_size=64 \
+  #     --nf_num_blocks=6 \
+  #     --nf_coupling_width=192 \
+  #     --nf_sa_hidden=192 \
+  #     --nf_sa_num_layers=3 \
+  #     --nf_grad_clip=1.0 \
+  #     --nf_noise_std=0.05 \
+  #     --nf_goal_std_min=0.02 \
+  #     --nf_goal_enc_size=0 \
+  #     --nf_mix_task_goal_stats \
+  #     --ppo_crl_steps_per_iter=10 \
+  #     --ppo_ent_coef=0.05 \
+  #     --ppo_actor_min_std=1e-5 \
+  #     --ppo_discount=0.99 \
+  #     --ppo_clip_coef=0.2 \
+  #     --ppo_nf_reward_tau=0.5 \
+  #     --ppo_num_envs=64 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --ppo_crl_add_extrinsic_reward \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=ppo_open_subtask_nf_mixtask \
+  #     --render_video \
+  #     --video_every_steps=20000000" >> "$TASK_FILE"
+
+  # # --------------------------------------------------------------------------
+  # # 15. SAMI_CREATED_COMMANDS: ManiSkill-HAB Far Spawn -> Close Drawer - PPO + CRL
+  # # --------------------------------------------------------------------------
+  # echo "MSHAB_SPAWN_DATA_NAME=spawn_data_far.pt python ppo_contrastive.py \
+  #     --env=maniskill_close_subtask_train \
+  #     --seed=${seed} \
+  #     --num_steps=70000000 \
+  #     --log_dir_path=maniskill_close_subtask_far_crl/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_crl_steps_per_iter=256 \
+  #     --ppo_ent_coef=0.05 \
+  #     --ppo_actor_min_std=0.01 \
+  #     --ppo_discount=0.99 \
+  #     --ppo_clip_coef=0.2 \
+  #     --ppo_crl_repr_tau=0.5 \
+  #     --ppo_num_envs=64 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --uniform_sampling \
+  #     --ppo_crl_add_extrinsic_reward \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=ppo_close_subtask_far_crl \
+  #     --render_video \
+  #     --video_every_steps=5000000" >> "$TASK_FILE"
+  #
+  # # --------------------------------------------------------------------------
+  # # 16. SAMI_CREATED_COMMANDS: ManiSkill-HAB Far Spawn -> Close Drawer - PPO + RND
+  # # --------------------------------------------------------------------------
+  # echo "MSHAB_SPAWN_DATA_NAME=spawn_data_far.pt python ppo_rnd.py \
+  #     --env=maniskill_close_subtask_train \
+  #     --seed=${seed} \
+  #     --num_steps=70000000 \
+  #     --log_dir_path=maniskill_close_subtask_far_rnd/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_ent_coef=0.05 \
+  #     --ppo_actor_min_std=0.01 \
+  #     --ppo_discount=0.99 \
+  #     --ppo_clip_coef=0.2 \
+  #     --rnd_int_coef=1.0 \
+  #     --rnd_ext_coef=1.0 \
+  #     --rnd_int_discount=0.99 \
+  #     --ppo_num_envs=64 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=ppo_close_subtask_far_rnd \
+  #     --render_video \
+  #     --video_every_steps=5000000" >> "$TASK_FILE"
+  #
+  # # --------------------------------------------------------------------------
+  # # 17. SAMI_CREATED_COMMANDS: ManiSkill-HAB Far Spawn -> Close Drawer - PPO + NF
+  # # --------------------------------------------------------------------------
+  # echo "MSHAB_SPAWN_DATA_NAME=spawn_data_far.pt python ppo_contrastive.py \
+  #     --env=maniskill_close_subtask_train \
+  #     --seed=${seed} \
+  #     --num_steps=70000000 \
+  #     --log_dir_path=maniskill_close_subtask_far_nf/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_repr_mode=nf \
+  #     --nf_rep_size=64 \
+  #     --nf_num_blocks=6 \
+  #     --nf_coupling_width=192 \
+  #     --nf_sa_hidden=192 \
+  #     --nf_sa_num_layers=3 \
+  #     --nf_grad_clip=1.0 \
+  #     --nf_noise_std=0.05 \
+  #     --nf_goal_std_min=0.02 \
+  #     --nf_goal_enc_size=0 \
+  #     --nf_mix_task_goal_stats \
+  #     --ppo_crl_steps_per_iter=10 \
+  #     --ppo_ent_coef=0.05 \
+  #     --ppo_actor_min_std=0.01 \
+  #     --ppo_discount=0.99 \
+  #     --ppo_clip_coef=0.2 \
+  #     --ppo_nf_reward_tau=0.5 \
+  #     --ppo_num_envs=64 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --ppo_crl_add_extrinsic_reward \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=ppo_close_subtask_far_nf \
+  #     --render_video \
+  #     --video_every_steps=5000000" >> "$TASK_FILE"
+  #
+  # # --------------------------------------------------------------------------
+  # # 18. SAMI_CREATED_COMMANDS: ManiSkill-HAB Far Spawn -> Close Drawer - SAC + CRL (Haiku/Acme)
+  # # --------------------------------------------------------------------------
+  # echo "MSHAB_SPAWN_DATA_NAME=spawn_data_far.pt python sac_contrastive.py \
+  #     --env=maniskill_close_subtask_train \
+  #     --seed=${seed} \
+  #     --num_steps=70000000 \
+  #     --log_dir_path=maniskill_close_subtask_far_crl_sac/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_crl_steps_per_iter=256 \
+  #     --actor_learning_rate=3e-4 \
+  #     --learning_rate=3e-4 \
+  #     --discount=0.99 \
+  #     --batch_size=256 \
+  #     --ppo_num_envs=64 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --uniform_sampling \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=sac_crl_close_subtask_far \
+  #     --render_video \
+  #     --video_every_steps=5000000" >> "$TASK_FILE"
+  #
+  # # --------------------------------------------------------------------------
+  # # 19. SAMI_CREATED_COMMANDS: ManiSkill-HAB Nearby Spawn -> Close Drawer - PPO + NF
+  # # --------------------------------------------------------------------------
+  # echo "MSHAB_SPAWN_DATA_NAME=spawn_data.pt python ppo_contrastive.py \
+  #     --env=maniskill_close_subtask_train \
+  #     --seed=${seed} \
+  #     --num_steps=70000000 \
+  #     --log_dir_path=maniskill_close_subtask_nearby_nf/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_repr_mode=nf \
+  #     --nf_rep_size=64 \
+  #     --nf_num_blocks=6 \
+  #     --nf_coupling_width=192 \
+  #     --nf_sa_hidden=192 \
+  #     --nf_sa_num_layers=3 \
+  #     --nf_grad_clip=1.0 \
+  #     --nf_noise_std=0.05 \
+  #     --nf_goal_std_min=0.02 \
+  #     --nf_goal_enc_size=0 \
+  #     --nf_mix_task_goal_stats \
+  #     --ppo_crl_steps_per_iter=10 \
+  #     --ppo_ent_coef=0.05 \
+  #     --ppo_actor_min_std=0.01 \
+  #     --ppo_discount=0.99 \
+  #     --ppo_clip_coef=0.2 \
+  #     --ppo_nf_reward_tau=0.5 \
+  #     --ppo_num_envs=64 \
+  #     --ppo_checkpoint_interval=20 \
+  #     --maniskill_native_vec \
+  #     --ppo_crl_add_extrinsic_reward \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
 
 done
 
@@ -371,12 +694,12 @@ for (( i=0; i<NUM_TASKS; i+=CHUNK_SIZE )); do
     # -- 1. Start writing the SLURM script --
     cat <<EOT > "$SLURM_SCRIPT"
 #!/bin/bash
-#SBATCH --job-name=maniskill_mila_${JOB_ID}
+#SBATCH --job-name=maniskill_2_mila_${JOB_ID}
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:${GPUS_PER_NODE}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
-#SBATCH --time=48:00:00
+#SBATCH --time=16:00:00
 #SBATCH --mem=128G
 #SBATCH --output=${SCRATCH_LOG_DIR}/slurm-%j.out
 

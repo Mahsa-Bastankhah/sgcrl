@@ -43,6 +43,7 @@ def _resolve_log_dir(log_dir_path: str) -> str:
 
 
 flags.DEFINE_string('log_dir_path', 'logs/ppo/', 'Where to log metrics')
+flags.DEFINE_string('exp_name', None, 'Optional explicit experiment name.')
 flags.DEFINE_integer('seed', 0, 'Random seed')
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
 flags.DEFINE_string('env', 'point_FourRooms', 'Environment type')

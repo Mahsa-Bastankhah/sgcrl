@@ -86,9 +86,25 @@ def _require_maniskill(env_name: str):
 # each cabinet fully open and requires closing it back down.
 if _MANISKILL_IMPORT_ERROR is None:
 
+  try:
+    from mani_skill.utils.assets import data as _ms_asset_data
+    from mani_skill.utils.registration import REGISTERED_ENVS as _MS_REGISTERED_ENVS
+    _drawer_uids = [
+        f'partnet_mobility/{k}' for k in [
+            '1000', '1004', '1005', '1013', '1016', '1021', '1024', '1027',
+            '1032', '1033', '1035', '1038', '1040', '1044', '1045', '1052',
+            '1054', '1056', '1061', '1063', '1066', '1067', '1076', '1079', '1082'
+        ]
+    ]
+    _ms_asset_data.DATA_GROUPS['partnet_mobility_cabinet_drawer'] = set(_drawer_uids)
+    if 'OpenCabinetDrawer-v1' in _MS_REGISTERED_ENVS:
+      _MS_REGISTERED_ENVS['OpenCabinetDrawer-v1'].asset_download_ids = ['partnet_mobility_cabinet_drawer']
+  except Exception:
+    pass
+
   @_ms_register_env(
       'CloseCabinetDrawer-v1',
-      asset_download_ids=['partnet_mobility_cabinet'],
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
       max_episode_steps=100,
   )
   class _MsCloseCabinetDrawerEnv(_MsOpenCabinetDrawerEnv):
@@ -228,8 +244,10 @@ def _mshab_close_subtask_paths():
   obj = os.environ.get('MSHAB_OBJ', 'kitchen_counter')
   task_plan_fp = os.path.join(
       rearrange_dir, 'task_plans', task, 'close', split, f'{obj}.json')
-  spawn_data_fp = os.path.join(
-      rearrange_dir, 'spawn_data', task, 'close', split, 'spawn_data.pt')
+  spawn_filename = os.environ.get('MSHAB_SPAWN_DATA_NAME', 'spawn_data.pt')
+  spawn_data_fp = os.environ.get(
+      'MSHAB_SPAWN_DATA_FP',
+      os.path.join(rearrange_dir, 'spawn_data', task, 'close', split, spawn_filename))
   return task_plan_fp, spawn_data_fp
 
 
@@ -260,8 +278,10 @@ def _mshab_open_subtask_paths():
   obj = os.environ.get('MSHAB_OBJ', 'kitchen_counter')
   task_plan_fp = os.path.join(
       rearrange_dir, 'task_plans', task, 'open', split, f'{obj}.json')
-  spawn_data_fp = os.path.join(
-      rearrange_dir, 'spawn_data', task, 'open', split, 'spawn_data.pt')
+  spawn_filename = os.environ.get('MSHAB_SPAWN_DATA_NAME', 'spawn_data.pt')
+  spawn_data_fp = os.environ.get(
+      'MSHAB_SPAWN_DATA_FP',
+      os.path.join(rearrange_dir, 'spawn_data', task, 'open', split, spawn_filename))
   return task_plan_fp, spawn_data_fp
 
 

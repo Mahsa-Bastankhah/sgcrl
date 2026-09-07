@@ -38,6 +38,7 @@ def _resolve_log_dir(log_dir_path: str) -> str:
 
 
 flags.DEFINE_string('log_dir_path', 'logs/sac_crl/', 'Where to log metrics')
+flags.DEFINE_string('exp_name', None, 'Optional explicit experiment name.')
 flags.DEFINE_integer('seed', 0, 'Random seed')
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
 flags.DEFINE_string('env', 'maniskill_close_subtask_train', 'Environment type')
@@ -76,6 +77,7 @@ flags.DEFINE_bool(
 flags.DEFINE_string(
     'hidden_layer_sizes', '256,256,256,256,256,256',
     'Comma-separated MLP widths for policy & critic networks.')
+flags.DEFINE_bool('track', True, 'Whether to enable WandB tracking.')
 flags.DEFINE_string(
     'wandb_project', '',
     'WandB project to log to. Empty string disables wandb.')
