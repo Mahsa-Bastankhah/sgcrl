@@ -1028,15 +1028,11 @@ def run_ppo_training(
   # constructs a `num_envs=1` (CPU, sim_backend='physx_cpu') ManiSkill env;
   # if that ran first, the native-vec GPU env below would fail to init.
   _env_name = str(getattr(config, 'env_name', '') or '').lower()
+  import env_utils as _env_utils
   _use_maniskill_native_vec = (
       bool(getattr(config, 'ppo_maniskill_native_vec', False))
-      and _env_name in ('maniskill_pushcube', 'maniskill_pickcube',
-                        'maniskill_open_cabinet_drawer',
-                        'maniskill_close_cabinet_drawer',
-                        'maniskill_close_subtask_train',
-                        'maniskill_open_subtask_train'))
+      and _env_utils.maniskill_vec_supported(_env_name))
   if _use_maniskill_native_vec:
-    import env_utils as _env_utils
     # When ppo_crl_add_extrinsic_reward is on, use the narrow drawer-only
     # success signal (matching the evaluator/ppo_rnd_learner.py) instead of
     # the default 'success' key, so `roll_env_rew` below is exactly the 0/1

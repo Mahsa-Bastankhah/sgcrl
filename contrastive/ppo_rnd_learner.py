@@ -247,15 +247,11 @@ def run_ppo_rnd_training(
   # Same GPU-PhysX-first-touch ordering constraint as `ppo_learner
   # .run_ppo_training` -- see that function's matching comment.
   _env_name = str(getattr(config, 'env_name', '') or '').lower()
+  import env_utils as _env_utils
   _use_maniskill_native_vec = (
       bool(getattr(config, 'ppo_maniskill_native_vec', False))
-      and _env_name in ('maniskill_pushcube', 'maniskill_pickcube',
-                        'maniskill_open_cabinet_drawer',
-                        'maniskill_close_cabinet_drawer',
-                        'maniskill_close_subtask_train',
-                        'maniskill_open_subtask_train'))
+      and _env_utils.maniskill_vec_supported(_env_name))
   if _use_maniskill_native_vec:
-    import env_utils as _env_utils
     if _env_name == 'maniskill_close_subtask_train':
       _success_key = 'drawer_closed'
     elif _env_name == 'maniskill_open_subtask_train':

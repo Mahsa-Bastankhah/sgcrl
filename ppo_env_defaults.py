@@ -47,11 +47,23 @@ fixed_goal_dict = {
     # OpenCabinetDrawer-v1 randomizes the cabinet model, robot start pose,
     # and which drawer to open every reset; same reasoning as above.
     'maniskill_open_cabinet_drawer': None,
+    'maniskill_open_cabinet_drawer_chicane': None,
+    'maniskill_open_cabinet_drawer_chicane_med': None,
+    'maniskill_open_cabinet_drawer_chicane_wide': None,
+    'maniskill_open_cabinet_drawer_mini_hab': None,
+    'maniskill_open_cabinet_drawer_l_corridor': None,
+    'maniskill_open_cabinet_drawer_three_room': None,
     # CloseCabinetDrawer-v1 (this repo's own close-direction sibling of
     # OpenCabinetDrawer-v1, registered in env_utils.py): same per-episode
     # randomization as open, just starting each drawer open instead of
     # closed; same reasoning as above.
     'maniskill_close_cabinet_drawer': None,
+    'maniskill_close_cabinet_drawer_chicane': None,
+    'maniskill_close_cabinet_drawer_chicane_med': None,
+    'maniskill_close_cabinet_drawer_chicane_wide': None,
+    'maniskill_close_cabinet_drawer_mini_hab': None,
+    'maniskill_close_cabinet_drawer_l_corridor': None,
+    'maniskill_close_cabinet_drawer_three_room': None,
     # CloseSubtaskTrain-v0 randomizes the scene/spawn/articulation instance
     # every reset (sampled from its premade task-plan/spawn-data assets);
     # same reasoning as above.
@@ -109,12 +121,36 @@ PPO_ENV_DEFAULTS = {
     # per-step goal vector emitted by the wrapper.
     'maniskill_open_cabinet_drawer': dict(
         rollout_length=256, crl_steps_per_iter=128, end_index=6),
+    'maniskill_open_cabinet_drawer_chicane': dict(
+        rollout_length=256, crl_steps_per_iter=128, end_index=6),
+    'maniskill_open_cabinet_drawer_chicane_med': dict(
+        rollout_length=512, crl_steps_per_iter=256, end_index=6),
+    'maniskill_open_cabinet_drawer_chicane_wide': dict(
+        rollout_length=512, crl_steps_per_iter=256, end_index=6),
+    'maniskill_open_cabinet_drawer_mini_hab': dict(
+        rollout_length=256, crl_steps_per_iter=128, end_index=6),
+    'maniskill_open_cabinet_drawer_l_corridor': dict(
+        rollout_length=512, crl_steps_per_iter=256, end_index=6),
+    'maniskill_open_cabinet_drawer_three_room': dict(
+        rollout_length=512, crl_steps_per_iter=256, end_index=6),
     # CloseCabinetDrawer-v1: sibling of maniskill_open_cabinet_drawer with
     # the goal reversed (drawer starts open, success means closing it) --
     # same 100-step episodes, same STATE_DIM=10/GOAL_DIM=6 asymmetric split
     # (see ManiskillCloseCabinetDrawer's docstring), so identical defaults.
     'maniskill_close_cabinet_drawer': dict(
         rollout_length=256, crl_steps_per_iter=128, end_index=6),
+    'maniskill_close_cabinet_drawer_chicane': dict(
+        rollout_length=256, crl_steps_per_iter=128, end_index=6),
+    'maniskill_close_cabinet_drawer_chicane_med': dict(
+        rollout_length=512, crl_steps_per_iter=256, end_index=6),
+    'maniskill_close_cabinet_drawer_chicane_wide': dict(
+        rollout_length=512, crl_steps_per_iter=256, end_index=6),
+    'maniskill_close_cabinet_drawer_mini_hab': dict(
+        rollout_length=256, crl_steps_per_iter=128, end_index=6),
+    'maniskill_close_cabinet_drawer_l_corridor': dict(
+        rollout_length=512, crl_steps_per_iter=256, end_index=6),
+    'maniskill_close_cabinet_drawer_three_room': dict(
+        rollout_length=512, crl_steps_per_iter=256, end_index=6),
     # CloseSubtaskTrain-v0 has 400-step episodes (spawn now requires
     # navigating to an adjacent room before manipulating the drawer, up from
     # the earlier 200-step/~3m-same-room-only version) -- T and CRL steps

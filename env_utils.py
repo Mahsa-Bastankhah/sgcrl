@@ -51,18 +51,26 @@ try:
   import gymnasium as _gymnasium
   import mani_skill.envs  # noqa: F401  registers 'PushCube-v1' etc.
   import torch as _torch
+  import sapien as _sapien
   from mani_skill.envs.tasks.mobile_manipulation.open_cabinet_drawer import (
       OpenCabinetDrawerEnv as _MsOpenCabinetDrawerEnv)
   from mani_skill.utils.registration import register_env as _ms_register_env
   from mani_skill.utils.structs.pose import Pose as _MsPose
+  from mani_skill.utils.building import actors as _ms_actors
+  from mani_skill.sensors.camera import CameraConfig as _MsCameraConfig
+  from mani_skill.utils import sapien_utils as _ms_sapien_utils
 except Exception as _e:  # noqa: BLE001  cast a wide net, same rationale as
   # metaworld above: hosts without ManiSkill/torch/sapien installed should
   # still be able to run point/sawyer/riverswim workflows.
   _gymnasium = None
   _torch = None
+  _sapien = None
   _MsOpenCabinetDrawerEnv = None
   _ms_register_env = None
   _MsPose = None
+  _ms_actors = None
+  _MsCameraConfig = None
+  _ms_sapien_utils = None
   _MANISKILL_IMPORT_ERROR = _e
 
 
@@ -186,6 +194,399 @@ if _MANISKILL_IMPORT_ERROR is None:
       max_reward = 5.0
       return self.compute_dense_reward(
           obs=obs, action=action, info=info) / max_reward
+
+  @_ms_register_env(
+      'OpenCabinetDrawerChicane-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=200,
+  )
+  class _MsOpenCabinetDrawerChicaneEnv(_MsOpenCabinetDrawerEnv):
+    """Open cabinet drawer with a chicane obstacle barrier layout."""
+
+    @property
+    def _default_human_render_camera_configs(self):
+      pose = _ms_sapien_utils.look_at(eye=[-4.5, -3.5, 4.5], target=[-1.0, 0.0, 0.5])
+      return [_MsCameraConfig("render_camera", pose=pose, width=800, height=800, fov=0.9, near=0.01, far=100)]
+
+    def _load_scene(self, options: dict):
+      super()._load_scene(options)
+      wall_h = 0.5
+      self.obstacle_wall = _ms_actors.build_box(
+          self.scene,
+          half_sizes=[0.08, 0.60, wall_h],
+          color=[0.85, 0.25, 0.2, 1.0],  # Brick red barrier
+          name="obstacle_wall",
+          body_type="static",
+          add_collision=True,
+          initial_pose=_sapien.Pose(p=[-1.5, -0.3, wall_h])
+      )
+      self.obstacle_pillar = _ms_actors.build_cylinder(
+          self.scene,
+          radius=0.18,
+          half_length=wall_h,
+          color=[0.2, 0.5, 0.85, 1.0],  # Blue pillar
+          name="obstacle_pillar",
+          body_type="static",
+          add_collision=True,
+          initial_pose=_sapien.Pose(p=[-2.3, 0.7, wall_h])
+      )
+
+    def _initialize_episode(self, env_idx: _torch.Tensor, options: dict):
+      super()._initialize_episode(env_idx, options)
+      with _torch.device(self.device):
+        b = len(env_idx)
+        dist = _torch.empty((b,), device=self.device).uniform_(2.8, 3.2)
+        theta = _torch.empty((b,), device=self.device).uniform_(0.95 * _torch.pi, 1.05 * _torch.pi)
+        xy = _torch.zeros((b, 2), device=self.device)
+        xy[:, 0] += _torch.cos(theta) * dist
+        xy[:, 1] += _torch.sin(theta) * dist
+        qpos = self.agent.robot.qpos.clone()
+        qpos[:, :2] = xy
+        ori = (theta - _torch.pi)
+        qpos[:, 2] = ori
+        self.agent.robot.set_qpos(qpos)
+
+  @_ms_register_env(
+      'OpenCabinetDrawerChicaneMed-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=400,
+  )
+  class _MsOpenCabinetDrawerChicaneMedEnv(_MsOpenCabinetDrawerChicaneEnv):
+    """Open cabinet drawer with chicane obstacles and cabinet pushed back +0.6m (x=+0.6m)."""
+
+    @property
+    def _default_human_render_camera_configs(self):
+      pose = _ms_sapien_utils.look_at(eye=[-4.8, -3.8, 4.8], target=[-0.6, 0.0, 0.5])
+      return [_MsCameraConfig("render_camera", pose=pose, width=800, height=800, fov=0.9, near=0.01, far=100)]
+
+    def _initialize_episode(self, env_idx: _torch.Tensor, options: dict):
+      super()._initialize_episode(env_idx, options)
+      with _torch.device(self.device):
+        b = len(env_idx)
+        cab_pos = _torch.zeros((b, 3), device=self.device)
+        cab_pos[:, 0] = 0.6
+        cab_pos[:, 1] = 0.0
+        cab_pos[:, 2] = self.cabinet_zs[env_idx]
+        self.cabinet.set_pose(_MsPose.create_from_pq(p=cab_pos))
+        self.handle_link_goal.set_pose(_MsPose.create_from_pq(p=self.handle_link_positions(env_idx)))
+
+  @_ms_register_env(
+      'OpenCabinetDrawerChicaneWide-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=400,
+  )
+  class _MsOpenCabinetDrawerChicaneWideEnv(_MsOpenCabinetDrawerChicaneEnv):
+    """Open cabinet drawer with chicane obstacles and cabinet pushed back +1.0m (x=+1.0m)."""
+
+    @property
+    def _default_human_render_camera_configs(self):
+      pose = _ms_sapien_utils.look_at(eye=[-4.8, -3.8, 4.8], target=[-0.6, 0.0, 0.5])
+      return [_MsCameraConfig("render_camera", pose=pose, width=800, height=800, fov=0.9, near=0.01, far=100)]
+
+    def _initialize_episode(self, env_idx: _torch.Tensor, options: dict):
+      super()._initialize_episode(env_idx, options)
+      with _torch.device(self.device):
+        b = len(env_idx)
+        cab_pos = _torch.zeros((b, 3), device=self.device)
+        cab_pos[:, 0] = 1.0
+        cab_pos[:, 1] = 0.0
+        cab_pos[:, 2] = self.cabinet_zs[env_idx]
+        self.cabinet.set_pose(_MsPose.create_from_pq(p=cab_pos))
+        self.handle_link_goal.set_pose(_MsPose.create_from_pq(p=self.handle_link_positions(env_idx)))
+
+  @_ms_register_env(
+      'OpenCabinetDrawerMiniHab-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=200,
+  )
+  class _MsOpenCabinetDrawerMiniHabEnv(_MsOpenCabinetDrawerEnv):
+    """Open cabinet drawer with a 2-room suite and distractor table."""
+
+    @property
+    def _default_human_render_camera_configs(self):
+      pose = _ms_sapien_utils.look_at(eye=[-4.8, -4.5, 5.0], target=[-0.2, 0.0, 0.5])
+      return [_MsCameraConfig("render_camera", pose=pose, width=800, height=800, fov=0.9, near=0.01, far=100)]
+
+    def _load_scene(self, options: dict):
+      super()._load_scene(options)
+      wall_h = 0.5
+      wall_t = 0.08
+      wall_color = [0.88, 0.86, 0.82, 1.0]
+      partition_color = [0.35, 0.55, 0.75, 1.0]
+      furniture_color = [0.65, 0.45, 0.25, 1.0]
+
+      self.wall_north = _ms_actors.build_box(
+          self.scene, half_sizes=[2.8, wall_t, wall_h], color=wall_color,
+          name="wall_north", body_type="static", add_collision=True,
+          initial_pose=_sapien.Pose(p=[-0.2, 2.5, wall_h])
+      )
+      self.wall_south = _ms_actors.build_box(
+          self.scene, half_sizes=[2.8, wall_t, wall_h], color=wall_color,
+          name="wall_south", body_type="static", add_collision=True,
+          initial_pose=_sapien.Pose(p=[-0.2, -2.5, wall_h])
+      )
+      self.wall_west = _ms_actors.build_box(
+          self.scene, half_sizes=[wall_t, 2.5, wall_h], color=wall_color,
+          name="wall_west", body_type="static", add_collision=True,
+          initial_pose=_sapien.Pose(p=[-3.0, 0.0, wall_h])
+      )
+      self.wall_east = _ms_actors.build_box(
+          self.scene, half_sizes=[wall_t, 2.5, wall_h], color=wall_color,
+          name="wall_east", body_type="static", add_collision=True,
+          initial_pose=_sapien.Pose(p=[2.6, 0.0, wall_h])
+      )
+
+      # Partition with doorway
+      self.partition_south = _ms_actors.build_box(
+          self.scene, half_sizes=[wall_t, 1.15, wall_h], color=partition_color,
+          name="partition_south", body_type="static", add_collision=True,
+          initial_pose=_sapien.Pose(p=[-0.3, -1.35, wall_h])
+      )
+      self.partition_north = _ms_actors.build_box(
+          self.scene, half_sizes=[wall_t, 0.80, wall_h], color=partition_color,
+          name="partition_north", body_type="static", add_collision=True,
+          initial_pose=_sapien.Pose(p=[-0.3, 1.70, wall_h])
+      )
+
+      # Distractor table in Room 2
+      self.distractor_table = _ms_actors.build_box(
+          self.scene, half_sizes=[0.45, 0.60, 0.40], color=furniture_color,
+          name="distractor_table", body_type="static", add_collision=True,
+          initial_pose=_sapien.Pose(p=[1.4, 1.5, 0.40])
+      )
+
+    def _initialize_episode(self, env_idx: _torch.Tensor, options: dict):
+      super()._initialize_episode(env_idx, options)
+      with _torch.device(self.device):
+        b = len(env_idx)
+        cabinet_xy = _torch.zeros((b, 3), device=self.device)
+        cabinet_xy[:, 0] = 1.5
+        cabinet_xy[:, 1] = -1.4
+        cabinet_xy[:, 2] = self.cabinet_zs[env_idx]
+        self.cabinet.set_pose(_MsPose.create_from_pq(p=cabinet_xy))
+
+        robot_xy = _torch.zeros((b, 2), device=self.device)
+        robot_xy[:, 0] = _torch.empty((b,), device=self.device).uniform_(-2.1, -1.7)
+        robot_xy[:, 1] = _torch.empty((b,), device=self.device).uniform_(-1.6, -1.2)
+
+        qpos = self.agent.robot.qpos.clone()
+        qpos[:, :2] = robot_xy
+        qpos[:, 2] = 0.5 * _torch.pi
+        self.agent.robot.set_qpos(qpos)
+        self.handle_link_goal.set_pose(
+            _MsPose.create_from_pq(p=self.handle_link_positions(env_idx))
+        )
+
+  @_ms_register_env(
+      'OpenCabinetDrawerLCorridor-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=400,
+  )
+  class _MsOpenCabinetDrawerLCorridorEnv(_MsOpenCabinetDrawerEnv):
+    """Open cabinet drawer with an L-shaped corridor layout."""
+
+    @property
+    def _default_human_render_camera_configs(self):
+      pose = _ms_sapien_utils.look_at(eye=[-4.2, -4.2, 5.5], target=[-0.2, 0.2, 0.5])
+      return [_MsCameraConfig("render_camera", pose=pose, width=800, height=800, fov=0.9, near=0.01, far=100)]
+
+    def _load_scene(self, options: dict):
+      super()._load_scene(options)
+      wall_h = 0.5
+      wall_t = 0.08
+      c_wall = [0.88, 0.86, 0.82, 1.0]
+      c_part = [0.85, 0.40, 0.30, 1.0]
+
+      self.w_n = _ms_actors.build_box(self.scene, half_sizes=[2.7, wall_t, wall_h], color=c_wall, name="w_n", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[-0.5, 2.5, wall_h]))
+      self.w_s = _ms_actors.build_box(self.scene, half_sizes=[2.7, wall_t, wall_h], color=c_wall, name="w_s", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[-0.5, -2.5, wall_h]))
+      self.w_w = _ms_actors.build_box(self.scene, half_sizes=[wall_t, 2.5, wall_h], color=c_wall, name="w_w", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[-3.2, 0.0, wall_h]))
+      self.w_e = _ms_actors.build_box(self.scene, half_sizes=[wall_t, 2.5, wall_h], color=c_wall, name="w_e", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[2.2, 0.0, wall_h]))
+
+      self.p1 = _ms_actors.build_box(self.scene, half_sizes=[wall_t, 1.65, wall_h], color=c_part, name="p1", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[-1.8, -0.85, wall_h]))
+      self.p2 = _ms_actors.build_box(self.scene, half_sizes=[1.0, wall_t, wall_h], color=c_part, name="p2", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[0.4, 0.0, wall_h]))
+
+    def _initialize_episode(self, env_idx: _torch.Tensor, options: dict):
+      super()._initialize_episode(env_idx, options)
+      with _torch.device(self.device):
+        b = len(env_idx)
+        cabinet_xy = _torch.zeros((b, 3), device=self.device)
+        cabinet_xy[:, 0] = 1.4
+        cabinet_xy[:, 1] = -1.6
+        cabinet_xy[:, 2] = self.cabinet_zs[env_idx]
+        self.cabinet.set_pose(_MsPose.create_from_pq(p=cabinet_xy))
+
+        robot_xy = _torch.zeros((b, 2), device=self.device)
+        robot_xy[:, 0] = _torch.empty((b,), device=self.device).uniform_(-2.6, -2.4)
+        robot_xy[:, 1] = _torch.empty((b,), device=self.device).uniform_(-2.0, -1.6)
+
+        qpos = self.agent.robot.qpos.clone()
+        qpos[:, :2] = robot_xy
+        qpos[:, 2] = 0.5 * _torch.pi
+        self.agent.robot.set_qpos(qpos)
+        self.handle_link_goal.set_pose(_MsPose.create_from_pq(p=self.handle_link_positions(env_idx)))
+
+  @_ms_register_env(
+      'OpenCabinetDrawerThreeRoom-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=300,
+  )
+  class _MsOpenCabinetDrawerThreeRoomEnv(_MsOpenCabinetDrawerEnv):
+    """Open cabinet drawer with a 3-room S-curved layout."""
+
+    @property
+    def _default_human_render_camera_configs(self):
+      pose = _ms_sapien_utils.look_at(eye=[-5.2, -5.0, 5.8], target=[-0.2, 0.0, 0.5])
+      return [_MsCameraConfig("render_camera", pose=pose, width=800, height=800, fov=0.92, near=0.01, far=100)]
+
+    def _load_scene(self, options: dict):
+      super()._load_scene(options)
+      wall_h = 0.5
+      wall_t = 0.08
+      c_wall = [0.88, 0.86, 0.82, 1.0]
+      c_part = [0.45, 0.65, 0.55, 1.0]
+
+      self.w_n = _ms_actors.build_box(self.scene, half_sizes=[3.0, wall_t, wall_h], color=c_wall, name="w_n", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[-0.2, 2.6, wall_h]))
+      self.w_s = _ms_actors.build_box(self.scene, half_sizes=[3.0, wall_t, wall_h], color=c_wall, name="w_s", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[-0.2, -2.6, wall_h]))
+      self.w_w = _ms_actors.build_box(self.scene, half_sizes=[wall_t, 2.6, wall_h], color=c_wall, name="w_w", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[-3.2, 0.0, wall_h]))
+      self.w_e = _ms_actors.build_box(self.scene, half_sizes=[wall_t, 2.6, wall_h], color=c_wall, name="w_e", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[2.8, 0.0, wall_h]))
+
+      # Doorway 1 at North (Y in [1.2, 2.6])
+      self.d1 = _ms_actors.build_box(self.scene, half_sizes=[wall_t, 1.85, wall_h], color=c_part, name="d1", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[-1.2, -0.75, wall_h]))
+      # Doorway 2 at South (Y in [-2.6, -1.2])
+      self.d2 = _ms_actors.build_box(self.scene, half_sizes=[wall_t, 1.85, wall_h], color=c_part, name="d2", body_type="static", add_collision=True, initial_pose=_sapien.Pose(p=[0.9, 0.75, wall_h]))
+
+    def _initialize_episode(self, env_idx: _torch.Tensor, options: dict):
+      super()._initialize_episode(env_idx, options)
+      with _torch.device(self.device):
+        b = len(env_idx)
+        cabinet_xy = _torch.zeros((b, 3), device=self.device)
+        cabinet_xy[:, 0] = 1.8
+        cabinet_xy[:, 1] = 1.6
+        cabinet_xy[:, 2] = self.cabinet_zs[env_idx]
+        # Rotated yaw by +pi/2: [cos(pi/4), 0, 0, sin(pi/4)]
+        q_rot = _torch.tensor([[0.70710678, 0.0, 0.0, 0.70710678]], device=self.device).repeat(b, 1)
+        self.cabinet.set_pose(_MsPose.create_from_pq(p=cabinet_xy, q=q_rot))
+
+        robot_xy = _torch.zeros((b, 2), device=self.device)
+        robot_xy[:, 0] = _torch.empty((b,), device=self.device).uniform_(-2.5, -2.1)
+        robot_xy[:, 1] = _torch.empty((b,), device=self.device).uniform_(-1.8, -1.2)
+
+        qpos = self.agent.robot.qpos.clone()
+        qpos[:, :2] = robot_xy
+        qpos[:, 2] = 0.5 * _torch.pi
+        self.agent.robot.set_qpos(qpos)
+        self.handle_link_goal.set_pose(_MsPose.create_from_pq(p=self.handle_link_positions(env_idx)))
+
+  class _MsCloseCabinetDrawerMixin:
+    """Mixin for Close variants of custom OpenCabinetDrawer layouts."""
+    max_close_frac = 0.25
+
+    def _after_reconfigure(self, options):
+      super()._after_reconfigure(options)
+      target_qlimits = self.handle_link.joint.limits
+      qmin, qmax = target_qlimits[..., 0], target_qlimits[..., 1]
+      self.target_qpos = qmin + (qmax - qmin) * self.max_close_frac
+
+    def _initialize_episode(self, env_idx, options):
+      super()._initialize_episode(env_idx, options)
+      with _torch.device(self.device):
+        qlimits = self.cabinet.get_qlimits()
+        self.cabinet.set_qpos(qlimits[env_idx, :, 1])
+        self.cabinet.set_qvel(self.cabinet.qpos[env_idx] * 0)
+        if self.gpu_sim_enabled:
+          self.scene._gpu_apply_all()
+          self.scene.px.gpu_update_articulation_kinematics()
+          self.scene.px.step()
+          self.scene._gpu_fetch_all()
+        self.handle_link_goal.set_pose(
+            _MsPose.create_from_pq(p=self.handle_link_positions(env_idx)))
+
+    def evaluate(self):
+      closed_enough = self.handle_link.joint.qpos <= self.target_qpos
+      handle_link_pos = self.handle_link_positions()
+      link_is_static = (
+          _torch.linalg.norm(self.handle_link.angular_velocity, axis=1) <= 1
+      ) & (_torch.linalg.norm(self.handle_link.linear_velocity, axis=1) <= 0.1)
+      return {
+          'success': closed_enough & link_is_static,
+          'handle_link_pos': handle_link_pos,
+          'closed_enough': closed_enough,
+      }
+
+    def compute_dense_reward(self, obs, action, info):
+      tcp_to_handle_dist = _torch.linalg.norm(
+          self.agent.tcp.pose.p - info['handle_link_pos'], axis=1)
+      reaching_reward = 1 - _torch.tanh(5 * tcp_to_handle_dist)
+      qmax = self.handle_link.joint.limits[..., 1]
+      amount_to_close_left = _torch.div(
+          self.handle_link.joint.qpos - self.target_qpos,
+          qmax - self.target_qpos)
+      close_reward = 2 * (1 - amount_to_close_left)
+      reaching_reward[
+          amount_to_close_left < 0.999] = 2
+      close_reward[info['closed_enough']] = 3
+      reward = reaching_reward + close_reward
+      reward[info['success']] = 5.0
+      return reward
+
+    def compute_normalized_dense_reward(self, obs, action, info):
+      max_reward = 5.0
+      return self.compute_dense_reward(
+          obs=obs, action=action, info=info) / max_reward
+
+  @_ms_register_env(
+      'CloseCabinetDrawerChicane-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=200,
+  )
+  class _MsCloseCabinetDrawerChicaneEnv(_MsCloseCabinetDrawerMixin, _MsOpenCabinetDrawerChicaneEnv):
+    """Close cabinet drawer with a chicane obstacle barrier layout."""
+    pass
+
+  @_ms_register_env(
+      'CloseCabinetDrawerChicaneMed-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=400,
+  )
+  class _MsCloseCabinetDrawerChicaneMedEnv(_MsCloseCabinetDrawerMixin, _MsOpenCabinetDrawerChicaneMedEnv):
+    """Close cabinet drawer with chicane obstacles and cabinet pushed back +0.6m (x=+0.6m)."""
+    pass
+
+  @_ms_register_env(
+      'CloseCabinetDrawerChicaneWide-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=400,
+  )
+  class _MsCloseCabinetDrawerChicaneWideEnv(_MsCloseCabinetDrawerMixin, _MsOpenCabinetDrawerChicaneWideEnv):
+    """Close cabinet drawer with chicane obstacles and cabinet pushed back +1.0m (x=+1.0m)."""
+    pass
+
+  @_ms_register_env(
+      'CloseCabinetDrawerMiniHab-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=200,
+  )
+  class _MsCloseCabinetDrawerMiniHabEnv(_MsCloseCabinetDrawerMixin, _MsOpenCabinetDrawerMiniHabEnv):
+    """Close cabinet drawer with a 2-room suite and distractor table."""
+    pass
+
+  @_ms_register_env(
+      'CloseCabinetDrawerLCorridor-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=400,
+  )
+  class _MsCloseCabinetDrawerLCorridorEnv(_MsCloseCabinetDrawerMixin, _MsOpenCabinetDrawerLCorridorEnv):
+    """Close cabinet drawer with an L-shaped corridor layout."""
+    pass
+
+  @_ms_register_env(
+      'CloseCabinetDrawerThreeRoom-v1',
+      asset_download_ids=['partnet_mobility_cabinet_drawer'],
+      max_episode_steps=300,
+  )
+  class _MsCloseCabinetDrawerThreeRoomEnv(_MsCloseCabinetDrawerMixin, _MsOpenCabinetDrawerThreeRoomEnv):
+    """Close cabinet drawer with a 3-room S-curved layout."""
+    pass
 
 
 # mshab (ManiSkill-HAB, https://github.com/arth-shukla/mshab) is a separate
@@ -906,6 +1307,84 @@ class ManiskillOpenCabinetDrawer(gym.Env):
     return np.concatenate([state, goal]).astype(np.float32)
 
 
+class _BaseManiskillOpenCabinetCustom(ManiskillOpenCabinetDrawer):
+  """Base class for custom OpenCabinetDrawer layouts with wider spatial bounds."""
+
+  def __init__(self, task_id: str, fixed_start_end=None, render_mode=None):
+    gym.Env.__init__(self)
+    _require_maniskill(task_id)
+    del fixed_start_end
+    self._env = _gymnasium.make(
+        task_id,
+        obs_mode='state_dict',
+        control_mode='pd_ee_delta_pos',
+        render_mode=render_mode,
+        num_envs=1)
+    pos_bound = 5.0  # meters; larger margin for extended multi-room floorplans
+    pos_low = np.full(3, -pos_bound, dtype=np.float32)
+    pos_high = np.full(3, pos_bound, dtype=np.float32)
+    qpos_low = np.zeros(1, dtype=np.float32)
+    qpos_high = np.full(1, 0.6, dtype=np.float32)
+    grip_low = np.zeros(1, dtype=np.float32)
+    grip_high = np.full(1, 0.10, dtype=np.float32)
+    grasp_low = np.zeros(1, dtype=np.float32)
+    grasp_high = np.ones(1, dtype=np.float32)
+    heading_low = np.full(2, -1.0, dtype=np.float32)
+    heading_high = np.full(2, 1.0, dtype=np.float32)
+    base_xy_low = pos_low[:2]
+    base_xy_high = pos_high[:2]
+    state_low = np.concatenate(
+        [pos_low, qpos_low, grip_low, grasp_low, heading_low, base_xy_low])
+    state_high = np.concatenate(
+        [pos_high, qpos_high, grip_high, grasp_high, heading_high,
+         base_xy_high])
+    goal_low = np.concatenate([pos_low, qpos_low, grip_low, grasp_low])
+    goal_high = np.concatenate([pos_high, qpos_high, grip_high, grasp_high])
+    self.observation_space = gym.spaces.Box(
+        low=np.concatenate([state_low, goal_low]),
+        high=np.concatenate([state_high, goal_high]),
+        dtype=np.float32)
+    action_dim = int(self._env.action_space.shape[-1])
+    self.action_space = gym.spaces.Box(
+        low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32)
+
+
+class ManiskillOpenCabinetDrawerChicane(_BaseManiskillOpenCabinetCustom):
+  """gym (old-API) wrapper around ``OpenCabinetDrawerChicane-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('OpenCabinetDrawerChicane-v1', fixed_start_end, render_mode)
+
+
+class ManiskillOpenCabinetDrawerChicaneMed(_BaseManiskillOpenCabinetCustom):
+  """gym (old-API) wrapper around ``OpenCabinetDrawerChicaneMed-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('OpenCabinetDrawerChicaneMed-v1', fixed_start_end, render_mode)
+
+
+class ManiskillOpenCabinetDrawerChicaneWide(_BaseManiskillOpenCabinetCustom):
+  """gym (old-API) wrapper around ``OpenCabinetDrawerChicaneWide-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('OpenCabinetDrawerChicaneWide-v1', fixed_start_end, render_mode)
+
+
+class ManiskillOpenCabinetDrawerMiniHab(_BaseManiskillOpenCabinetCustom):
+  """gym (old-API) wrapper around ``OpenCabinetDrawerMiniHab-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('OpenCabinetDrawerMiniHab-v1', fixed_start_end, render_mode)
+
+
+class ManiskillOpenCabinetDrawerLCorridor(_BaseManiskillOpenCabinetCustom):
+  """gym (old-API) wrapper around ``OpenCabinetDrawerLCorridor-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('OpenCabinetDrawerLCorridor-v1', fixed_start_end, render_mode)
+
+
+class ManiskillOpenCabinetDrawerThreeRoom(_BaseManiskillOpenCabinetCustom):
+  """gym (old-API) wrapper around ``OpenCabinetDrawerThreeRoom-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('OpenCabinetDrawerThreeRoom-v1', fixed_start_end, render_mode)
+
+
 class ManiskillCloseCabinetDrawer(gym.Env):
   """gym (old-API) wrapper around this module's ``CloseCabinetDrawer-v1``.
 
@@ -1005,6 +1484,84 @@ class ManiskillCloseCabinetDrawer(gym.Env):
         handle_target_pos, drawer_target_qpos, self._GRIPPER_TARGET,
         self._GRASP_TARGET]).astype(np.float32)
     return np.concatenate([state, goal]).astype(np.float32)
+
+
+class _BaseManiskillCloseCabinetCustom(ManiskillCloseCabinetDrawer):
+  """Base class for custom CloseCabinetDrawer layouts with wider spatial bounds."""
+
+  def __init__(self, task_id: str, fixed_start_end=None, render_mode=None):
+    gym.Env.__init__(self)
+    _require_maniskill(task_id)
+    del fixed_start_end
+    self._env = _gymnasium.make(
+        task_id,
+        obs_mode='state_dict',
+        control_mode='pd_ee_delta_pos',
+        render_mode=render_mode,
+        num_envs=1)
+    pos_bound = 5.0  # meters; larger margin for extended multi-room floorplans
+    pos_low = np.full(3, -pos_bound, dtype=np.float32)
+    pos_high = np.full(3, pos_bound, dtype=np.float32)
+    qpos_low = np.zeros(1, dtype=np.float32)
+    qpos_high = np.full(1, 0.6, dtype=np.float32)
+    grip_low = np.zeros(1, dtype=np.float32)
+    grip_high = np.full(1, 0.10, dtype=np.float32)
+    grasp_low = np.zeros(1, dtype=np.float32)
+    grasp_high = np.ones(1, dtype=np.float32)
+    heading_low = np.full(2, -1.0, dtype=np.float32)
+    heading_high = np.full(2, 1.0, dtype=np.float32)
+    base_xy_low = pos_low[:2]
+    base_xy_high = pos_high[:2]
+    state_low = np.concatenate(
+        [pos_low, qpos_low, grip_low, grasp_low, heading_low, base_xy_low])
+    state_high = np.concatenate(
+        [pos_high, qpos_high, grip_high, grasp_high, heading_high,
+         base_xy_high])
+    goal_low = np.concatenate([pos_low, qpos_low, grip_low, grasp_low])
+    goal_high = np.concatenate([pos_high, qpos_high, grip_high, grasp_high])
+    self.observation_space = gym.spaces.Box(
+        low=np.concatenate([state_low, goal_low]),
+        high=np.concatenate([state_high, goal_high]),
+        dtype=np.float32)
+    action_dim = int(self._env.action_space.shape[-1])
+    self.action_space = gym.spaces.Box(
+        low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32)
+
+
+class ManiskillCloseCabinetDrawerChicane(_BaseManiskillCloseCabinetCustom):
+  """gym (old-API) wrapper around ``CloseCabinetDrawerChicane-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('CloseCabinetDrawerChicane-v1', fixed_start_end, render_mode)
+
+
+class ManiskillCloseCabinetDrawerChicaneMed(_BaseManiskillCloseCabinetCustom):
+  """gym (old-API) wrapper around ``CloseCabinetDrawerChicaneMed-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('CloseCabinetDrawerChicaneMed-v1', fixed_start_end, render_mode)
+
+
+class ManiskillCloseCabinetDrawerChicaneWide(_BaseManiskillCloseCabinetCustom):
+  """gym (old-API) wrapper around ``CloseCabinetDrawerChicaneWide-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('CloseCabinetDrawerChicaneWide-v1', fixed_start_end, render_mode)
+
+
+class ManiskillCloseCabinetDrawerMiniHab(_BaseManiskillCloseCabinetCustom):
+  """gym (old-API) wrapper around ``CloseCabinetDrawerMiniHab-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('CloseCabinetDrawerMiniHab-v1', fixed_start_end, render_mode)
+
+
+class ManiskillCloseCabinetDrawerLCorridor(_BaseManiskillCloseCabinetCustom):
+  """gym (old-API) wrapper around ``CloseCabinetDrawerLCorridor-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('CloseCabinetDrawerLCorridor-v1', fixed_start_end, render_mode)
+
+
+class ManiskillCloseCabinetDrawerThreeRoom(_BaseManiskillCloseCabinetCustom):
+  """gym (old-API) wrapper around ``CloseCabinetDrawerThreeRoom-v1``."""
+  def __init__(self, fixed_start_end=None, render_mode=None):
+    super().__init__('CloseCabinetDrawerThreeRoom-v1', fixed_start_end, render_mode)
 
 
 # Meters to pull the close-subtask "closed handle" goal position out from
@@ -2057,7 +2614,19 @@ _MANISKILL_TASK_IDS = {
     'maniskill_pushcube': 'PushCube-v1',
     'maniskill_pickcube': 'PickCube-v1',
     'maniskill_open_cabinet_drawer': 'OpenCabinetDrawer-v1',
+    'maniskill_open_cabinet_drawer_chicane': 'OpenCabinetDrawerChicane-v1',
+    'maniskill_open_cabinet_drawer_chicane_med': 'OpenCabinetDrawerChicaneMed-v1',
+    'maniskill_open_cabinet_drawer_chicane_wide': 'OpenCabinetDrawerChicaneWide-v1',
+    'maniskill_open_cabinet_drawer_mini_hab': 'OpenCabinetDrawerMiniHab-v1',
+    'maniskill_open_cabinet_drawer_l_corridor': 'OpenCabinetDrawerLCorridor-v1',
+    'maniskill_open_cabinet_drawer_three_room': 'OpenCabinetDrawerThreeRoom-v1',
     'maniskill_close_cabinet_drawer': 'CloseCabinetDrawer-v1',
+    'maniskill_close_cabinet_drawer_chicane': 'CloseCabinetDrawerChicane-v1',
+    'maniskill_close_cabinet_drawer_chicane_med': 'CloseCabinetDrawerChicaneMed-v1',
+    'maniskill_close_cabinet_drawer_chicane_wide': 'CloseCabinetDrawerChicaneWide-v1',
+    'maniskill_close_cabinet_drawer_mini_hab': 'CloseCabinetDrawerMiniHab-v1',
+    'maniskill_close_cabinet_drawer_l_corridor': 'CloseCabinetDrawerLCorridor-v1',
+    'maniskill_close_cabinet_drawer_three_room': 'CloseCabinetDrawerThreeRoom-v1',
     'maniskill_close_subtask_train': 'CloseSubtaskTrain-v0',
     'maniskill_open_subtask_train': 'OpenSubtaskTrain-v0',
 }
@@ -2075,10 +2644,19 @@ _MANISKILL_MAX_EPISODE_STEPS = {
     'maniskill_pushcube': 50,
     'maniskill_pickcube': 50,
     'maniskill_open_cabinet_drawer': 100,
-    # CloseCabinetDrawer-v1's own @register_env(..., max_episode_steps=100)
-    # (registered above in this file) -- same episode length as open, same
-    # underlying task/asset.
+    'maniskill_open_cabinet_drawer_chicane': 200,
+    'maniskill_open_cabinet_drawer_chicane_med': 400,
+    'maniskill_open_cabinet_drawer_chicane_wide': 400,
+    'maniskill_open_cabinet_drawer_mini_hab': 200,
+    'maniskill_open_cabinet_drawer_l_corridor': 400,
+    'maniskill_open_cabinet_drawer_three_room': 300,
     'maniskill_close_cabinet_drawer': 100,
+    'maniskill_close_cabinet_drawer_chicane': 200,
+    'maniskill_close_cabinet_drawer_chicane_med': 400,
+    'maniskill_close_cabinet_drawer_chicane_wide': 400,
+    'maniskill_close_cabinet_drawer_mini_hab': 200,
+    'maniskill_close_cabinet_drawer_l_corridor': 400,
+    'maniskill_close_cabinet_drawer_three_room': 300,
     'maniskill_close_subtask_train': 600,
     # Same 600 override as close (see that entry's comment) -- the
     # adjacent-room navigation distance is identical (same scenes, same
@@ -2097,7 +2675,19 @@ _MANISKILL_STATE_DIM = {
     'maniskill_pushcube': ManiskillPushCube.STATE_DIM,
     'maniskill_pickcube': ManiskillPickCube.STATE_DIM,
     'maniskill_open_cabinet_drawer': ManiskillOpenCabinetDrawer.STATE_DIM,
+    'maniskill_open_cabinet_drawer_chicane': ManiskillOpenCabinetDrawerChicane.STATE_DIM,
+    'maniskill_open_cabinet_drawer_chicane_med': ManiskillOpenCabinetDrawerChicaneMed.STATE_DIM,
+    'maniskill_open_cabinet_drawer_chicane_wide': ManiskillOpenCabinetDrawerChicaneWide.STATE_DIM,
+    'maniskill_open_cabinet_drawer_mini_hab': ManiskillOpenCabinetDrawerMiniHab.STATE_DIM,
+    'maniskill_open_cabinet_drawer_l_corridor': ManiskillOpenCabinetDrawerLCorridor.STATE_DIM,
+    'maniskill_open_cabinet_drawer_three_room': ManiskillOpenCabinetDrawerThreeRoom.STATE_DIM,
     'maniskill_close_cabinet_drawer': ManiskillCloseCabinetDrawer.STATE_DIM,
+    'maniskill_close_cabinet_drawer_chicane': ManiskillCloseCabinetDrawerChicane.STATE_DIM,
+    'maniskill_close_cabinet_drawer_chicane_med': ManiskillCloseCabinetDrawerChicaneMed.STATE_DIM,
+    'maniskill_close_cabinet_drawer_chicane_wide': ManiskillCloseCabinetDrawerChicaneWide.STATE_DIM,
+    'maniskill_close_cabinet_drawer_mini_hab': ManiskillCloseCabinetDrawerMiniHab.STATE_DIM,
+    'maniskill_close_cabinet_drawer_l_corridor': ManiskillCloseCabinetDrawerLCorridor.STATE_DIM,
+    'maniskill_close_cabinet_drawer_three_room': ManiskillCloseCabinetDrawerThreeRoom.STATE_DIM,
     'maniskill_close_subtask_train': ManiskillCloseSubtaskTrain.STATE_DIM,
     'maniskill_open_subtask_train': ManiskillOpenSubtaskTrain.STATE_DIM,
 }
@@ -2286,12 +2876,24 @@ class ManiskillVecEnv:
       return _pushcube_obs_batched(obs_dict)
     elif self._env_name == 'maniskill_pickcube':
       return _pickcube_obs_batched(obs_dict)
-    elif self._env_name == 'maniskill_open_cabinet_drawer':
+    elif self._env_name in ('maniskill_open_cabinet_drawer',
+                             'maniskill_open_cabinet_drawer_chicane',
+                             'maniskill_open_cabinet_drawer_chicane_med',
+                             'maniskill_open_cabinet_drawer_chicane_wide',
+                             'maniskill_open_cabinet_drawer_mini_hab',
+                             'maniskill_open_cabinet_drawer_l_corridor',
+                             'maniskill_open_cabinet_drawer_three_room'):
       return _open_cabinet_drawer_obs_batched(
           obs_dict, self._env.unwrapped.target_qpos,
           self._env.unwrapped.agent.is_grasping(
               self._env.unwrapped.handle_link))
-    elif self._env_name == 'maniskill_close_cabinet_drawer':
+    elif self._env_name in ('maniskill_close_cabinet_drawer',
+                             'maniskill_close_cabinet_drawer_chicane',
+                             'maniskill_close_cabinet_drawer_chicane_med',
+                             'maniskill_close_cabinet_drawer_chicane_wide',
+                             'maniskill_close_cabinet_drawer_mini_hab',
+                             'maniskill_close_cabinet_drawer_l_corridor',
+                             'maniskill_close_cabinet_drawer_three_room'):
       return _close_cabinet_drawer_obs_batched(
           obs_dict, self._env.unwrapped.target_qpos,
           self._env.unwrapped.agent.is_grasping(
@@ -2524,9 +3126,69 @@ def load(env_name, fixed_start_end=None, seed=None, render_mode=None,
     max_episode_steps = 100  # OpenCabinetDrawerEnv's own @register_env(..., max_episode_steps=100)
     kwargs['fixed_start_end'] = fixed_start_end
     kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_open_cabinet_drawer_chicane':
+    CLASS = ManiskillOpenCabinetDrawerChicane
+    max_episode_steps = 200
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_open_cabinet_drawer_chicane_med':
+    CLASS = ManiskillOpenCabinetDrawerChicaneMed
+    max_episode_steps = 400
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_open_cabinet_drawer_chicane_wide':
+    CLASS = ManiskillOpenCabinetDrawerChicaneWide
+    max_episode_steps = 400
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_open_cabinet_drawer_mini_hab':
+    CLASS = ManiskillOpenCabinetDrawerMiniHab
+    max_episode_steps = 200
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_open_cabinet_drawer_l_corridor':
+    CLASS = ManiskillOpenCabinetDrawerLCorridor
+    max_episode_steps = 400
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_open_cabinet_drawer_three_room':
+    CLASS = ManiskillOpenCabinetDrawerThreeRoom
+    max_episode_steps = 300
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
   elif env_name == 'maniskill_close_cabinet_drawer':
     CLASS = ManiskillCloseCabinetDrawer
     max_episode_steps = 100  # CloseCabinetDrawerEnv's own @register_env(..., max_episode_steps=100)
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_close_cabinet_drawer_chicane':
+    CLASS = ManiskillCloseCabinetDrawerChicane
+    max_episode_steps = 200
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_close_cabinet_drawer_chicane_med':
+    CLASS = ManiskillCloseCabinetDrawerChicaneMed
+    max_episode_steps = 400
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_close_cabinet_drawer_chicane_wide':
+    CLASS = ManiskillCloseCabinetDrawerChicaneWide
+    max_episode_steps = 400
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_close_cabinet_drawer_mini_hab':
+    CLASS = ManiskillCloseCabinetDrawerMiniHab
+    max_episode_steps = 200
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_close_cabinet_drawer_l_corridor':
+    CLASS = ManiskillCloseCabinetDrawerLCorridor
+    max_episode_steps = 400
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+  elif env_name == 'maniskill_close_cabinet_drawer_three_room':
+    CLASS = ManiskillCloseCabinetDrawerThreeRoom
+    max_episode_steps = 300
     kwargs['fixed_start_end'] = fixed_start_end
     kwargs['render_mode'] = render_mode
   elif env_name == 'maniskill_close_subtask_train':
