@@ -30,7 +30,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from acme.jax import networks as networks_lib
+try:
+    from acme.jax import networks as networks_lib
+except ImportError:
+    from typing import Callable, Any
+    class _FeedForwardNetwork(NamedTuple):
+        init: Callable[..., Any]
+        apply: Callable[..., Any]
+    class _networks_lib:
+        FeedForwardNetwork = _FeedForwardNetwork
+    networks_lib = _networks_lib()
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +412,56 @@ def nf_forward(nf_networks: NFDensityNetworks, params, state, action, goal):
     g = _encode_goal(nf_networks, params, goal)
     return nf_networks.flow_net.apply(
         params['nf_flow'], g, y, return_forward=True)
+
+
+def compute_pairwise_log_prob(
+    nf_networks: NFDensityNetworks, params: dict, state: jnp.ndarray,
+    action: jnp.ndarray, goal: jnp.ndarray
+) -> jnp.ndarray:
+    """Compute B x B matrix M[i, j] = log p_NF(goal_j | state_i, action_i).
+
+    state: (B, obs_dim)
+    action: (B, act_dim)
+    goal: (B, goal_dim) - must already be normalized.
+    Returns:
+        M: (B, B) where row i contains log p_NF(goal_j | state_i, action_i) for all j.
+    """
+    y = nf_networks.sa_encoder_net.apply(params['sa_encoder'], state, action)
+    g = _encode_goal(nf_networks, params, goal)
+
+    def _logp_for_anchor(y_single):
+        y_bcast = jnp.broadcast_to(y_single[None, :], (g.shape[0], y_single.shape[-1]))
+        return nf_networks.flow_net.apply(params['nf_flow'], g, y_bcast)
+
+    return jax.vmap(_logp_for_anchor)(y)
+
+
+def compute_categorical_metrics(pairwise_logp: jnp.ndarray) -> dict:
+    """Compute categorical accuracy and diagnostics from B x B matrix M."""
+    b_size = pairwise_logp.shape[0]
+    diag_indices = jnp.arange(b_size)
+    preds = jnp.argmax(pairwise_logp, axis=1)
+    correct = (preds == diag_indices)
+    cat_acc = jnp.mean(correct.astype(jnp.float32))
+
+    top5_preds = jnp.argsort(pairwise_logp, axis=1)[:, -5:]
+    top5_correct = jnp.any(top5_preds == diag_indices[:, None], axis=1)
+    top5_acc = jnp.mean(top5_correct.astype(jnp.float32))
+
+    eye = jnp.eye(b_size, dtype=pairwise_logp.dtype)
+    pos_logp = jnp.sum(pairwise_logp * eye) / b_size
+    neg_logp = jnp.sum(pairwise_logp * (1.0 - eye)) / jnp.maximum(b_size * (b_size - 1), 1)
+    margin = pos_logp - neg_logp
+    implicit_infonce = -jnp.mean(jnp.diag(pairwise_logp) - jax.nn.logsumexp(pairwise_logp, axis=1))
+
+    return {
+        'categorical_accuracy': cat_acc,
+        'top_5_accuracy': top5_acc,
+        'pos_logp': pos_logp,
+        'neg_logp': neg_logp,
+        'margin': margin,
+        'implicit_infonce': implicit_infonce,
+    }
 
 
 def _l2_ball_perturb(x, key, prob, eps):

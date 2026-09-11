@@ -84,6 +84,24 @@ def _require_maniskill(env_name: str):
     ) from _MANISKILL_IMPORT_ERROR
 
 
+_OGBENCH_IMPORT_ERROR = None
+try:
+  import ogbench as _ogbench
+except Exception as _e:  # noqa: BLE001
+  _ogbench = None
+  _OGBENCH_IMPORT_ERROR = _e
+
+
+def _require_ogbench(env_name: str):
+  if _OGBENCH_IMPORT_ERROR is not None:
+    raise RuntimeError(
+        f'Cannot build {env_name}: ogbench failed to import at '
+        f'env_utils load time.  Original error:\n    '
+        f'{type(_OGBENCH_IMPORT_ERROR).__name__}: '
+        f'{_OGBENCH_IMPORT_ERROR}'
+    ) from _OGBENCH_IMPORT_ERROR
+
+
 # ManiSkill3 ships OpenCabinetDrawer-v1 (and OpenCabinetDoor-v1) but no
 # "close" counterpart: OpenCabinetDrawerEnv._initialize_episode
 # unconditionally resets every cabinet to fully closed (the lower qlimit),

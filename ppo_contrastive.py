@@ -166,6 +166,18 @@ flags.DEFINE_float(
     '(mirrors --ppo_crl_repr_tau, CRL-only) to compute the PPO reward, '
     'while the online NF params keep training on the NLL loss. '
     '<=0 or >=1 (default) disables this: reward reads live NF params.')
+flags.DEFINE_string(
+    'nf_restore_checkpoint', '',
+    'Path to pre-trained NF checkpoint (.pkl). If set, initializes NF weights '
+    'and goal normalization stats from this file.')
+flags.DEFINE_bool(
+    'nf_freeze', False,
+    'If True and ppo_repr_mode is nf, freeze pre-trained NF weights and keep '
+    'normalization stats unchanged during PPO training.')
+flags.DEFINE_float(
+    'ppo_extrinsic_reward_scale', 1.0,
+    'Multiplier on extrinsic reward (roll_env_rew) when '
+    'ppo_crl_add_extrinsic_reward is True.')
 flags.DEFINE_bool(
     'maniskill_native_vec', False,
     'ManiSkill env_names only: collect PPO rollouts from one native '
@@ -334,6 +346,43 @@ def main(_):
   config.nf_mix_task_goal_stats = bool(FLAGS.nf_mix_task_goal_stats)
   if 0.0 < FLAGS.ppo_nf_reward_tau < 1.0:
     config.ppo_nf_reward_tau = float(FLAGS.ppo_nf_reward_tau)
+  config.nf_restore_checkpoint = str(FLAGS.nf_restore_checkpoint).strip()
+  config.nf_freeze = bool(FLAGS.nf_freeze)
+  config.ppo_extrinsic_reward_scale = float(FLAGS.ppo_extrinsic_reward_scale)
+  if config.nf_restore_checkpoint:
+    import pickle
+    with open(config.nf_restore_checkpoint, 'rb') as f:
+      _ckpt_meta = pickle.load(f)
+    if 'config' in _ckpt_meta and isinstance(_ckpt_meta['config'], dict):
+      _cfg = _ckpt_meta['config']
+      for k_src in ('nf_rep_size', 'rep_size'):
+        if k_src in _cfg:
+          config.nf_rep_size = int(_cfg[k_src])
+      for k_src in ('nf_num_blocks', 'num_blocks'):
+        if k_src in _cfg:
+          config.nf_num_blocks = int(_cfg[k_src])
+      for k_src in ('nf_coupling_width', 'coupling_width'):
+        if k_src in _cfg:
+          config.nf_coupling_width = int(_cfg[k_src])
+      for k_src in ('nf_sa_hidden', 'sa_hidden'):
+        if k_src in _cfg:
+          config.nf_sa_hidden = int(_cfg[k_src])
+      for k_src in ('nf_sa_num_layers', 'sa_num_layers'):
+        if k_src in _cfg:
+          config.nf_sa_num_layers = int(_cfg[k_src])
+      for k_src in ('nf_goal_enc_size', 'goal_enc_size'):
+        if k_src in _cfg:
+          config.nf_goal_enc_size = int(_cfg[k_src])
+    if 'params' in _ckpt_meta and 'nf_flow' in _ckpt_meta['params']:
+      _plu_keys = [k for k in _ckpt_meta['params']['nf_flow'].keys() if 'plu_' in k]
+      if _plu_keys:
+        config.nf_num_blocks = len(_plu_keys)
+    print(
+        f'[ppo_contrastive] Loaded NF architecture config from checkpoint: '
+        f'rep_size={config.nf_rep_size}, num_blocks={config.nf_num_blocks}, '
+        f'coupling_width={config.nf_coupling_width}, sa_hidden={config.nf_sa_hidden}, '
+        f'sa_num_layers={config.nf_sa_num_layers}')
+
   if config.ppo_repr_mode == 'nf' and config.uniform_sampling:
     print('[ppo_contrastive] WARNING: --uniform_sampling has no effect '
           'under --ppo_repr_mode=nf (the NF density loss never reads the '

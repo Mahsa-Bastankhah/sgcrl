@@ -16,7 +16,10 @@ import dm_env
 import env_utils
 import jax
 import numpy as np
-from torch.utils.tensorboard import SummaryWriter
+try:
+  from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+  SummaryWriter = None
 import os
 
 def obs_to_goal_1d(obs, start_index, end_index):

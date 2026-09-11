@@ -1289,6 +1289,22 @@ def run_ppo_training(
   _nf_goal_std_min = float(getattr(config, 'nf_goal_std_min', 0.1))
   _nf_normalizer_reset_done = False
 
+  _nf_restore_ckpt = str(getattr(config, 'nf_restore_checkpoint', '') or '').strip()
+  if use_nf and _nf_restore_ckpt:
+    if not os.path.exists(_nf_restore_ckpt):
+      raise FileNotFoundError(f'NF checkpoint not found: {_nf_restore_ckpt}')
+    import pickle
+    with open(_nf_restore_ckpt, 'rb') as f:
+      _nf_ckpt = pickle.load(f)
+    q_params = _nf_ckpt['params']
+    q_params_reward = q_params
+    if 'goal_mean' in _nf_ckpt:
+      nf_goal_mean = np.asarray(_nf_ckpt['goal_mean'], dtype=np.float32)
+    if 'goal_std' in _nf_ckpt:
+      nf_goal_std = np.asarray(_nf_ckpt['goal_std'], dtype=np.float32)
+    print(f'[ppo] Restored NF weights and goal stats from: {_nf_restore_ckpt} '
+          f'(step {_nf_ckpt.get("step", "?")})')
+
   # ---- per-env episode buffers (for flushing complete trajectories) -----
   ep_obs: list = [[] for _ in range(E)]
   ep_act: list = [[] for _ in range(E)]
@@ -1456,17 +1472,25 @@ def run_ppo_training(
       _rew_flat = np.asarray(nf_reward_fn(
           _reward_q_params(), _flat_obs_j, _flat_acts_j,
           jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std)))
+      _nf_logp_mean = float(_rew_flat.mean())
+      _nf_logp_std = float(_rew_flat.std())
+      _nf_logp_min = float(_rew_flat.min())
+      _nf_logp_max = float(_rew_flat.max())
     else:
       _rew_flat = np.asarray(
           reward_fn(_reward_q_params(), _flat_obs_j, _flat_acts_j))
+      _nf_logp_mean = float('nan')
+      _nf_logp_std = float('nan')
+      _nf_logp_min = float('nan')
+      _nf_logp_max = float('nan')
     roll_rew_raw[:] = _rew_flat.reshape(T, E)
     if bool(getattr(config, 'ppo_crl_add_extrinsic_reward', False)):
       # Add the sparse extrinsic success reward (roll_env_rew, already the
       # narrow drawer-only 0/1 flag -- see the success_key resolution above)
       # on top of the reps reward, BEFORE normalization, so the combined
       # signal is scaled by reward_normalizer exactly like the pure φ·ψ
-      # reward was before.
-      roll_rew_raw[:] += roll_env_rew
+      _ext_scale = float(getattr(config, 'ppo_extrinsic_reward_scale', 1.0))
+      roll_rew_raw[:] += _ext_scale * roll_env_rew
 
     # Scale reps reward by the running std of discounted returns.  Reset
     # at episode boundaries via the per-step `dones` recorded above.
@@ -1533,6 +1557,9 @@ def run_ppo_training(
     # =================================================================
     crl_metrics_agg: Dict[str, list] = {}
     _n_crl = int(config.ppo_crl_steps_per_iter)
+    _nf_freeze = bool(getattr(config, 'nf_freeze', False))
+    if use_nf and _nf_freeze:
+      _n_crl = 0
     if replay.size >= int(config.ppo_min_replay_size) and _n_crl > 0:
       if use_nf:
         if not _nf_normalizer_reset_done:
@@ -1621,6 +1648,10 @@ def run_ppo_training(
         'reward_repr_mean':      float(roll_rew.mean()),
         'reward_repr_raw_mean':  float(roll_rew_raw.mean()),
         'reward_repr_raw_std':   float(roll_rew_raw.std()),
+        'reward_nf_logp_mean':   _nf_logp_mean,
+        'reward_nf_logp_std':    _nf_logp_std,
+        'reward_nf_logp_min':    _nf_logp_min,
+        'reward_nf_logp_max':    _nf_logp_max,
         'reward_return_norm_std': (
             float(reward_normalizer.std) if reward_normalizer is not None
             else float('nan')),

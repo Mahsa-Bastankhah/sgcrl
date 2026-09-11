@@ -46,3 +46,12 @@ else:
 # --- jnp.DeviceArray ---
 if not hasattr(jnp, 'DeviceArray'):
     jnp.DeviceArray = _Array
+
+# --- jax.tree_* shims for older acme on newer JAX ---
+if not hasattr(jax, 'tree_map'):
+    jax.tree_map = jax.tree_util.tree_map
+if not hasattr(jax, 'tree_leaves'):
+    jax.tree_leaves = jax.tree_util.tree_leaves
+if not hasattr(jax, 'tree_multimap'):
+    jax.tree_multimap = jax.tree_util.tree_map
+

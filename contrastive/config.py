@@ -3,7 +3,11 @@ import dataclasses
 from typing import Any, Optional, Union, Tuple
 
 from acme import specs
-from acme.adders import reverb as adders_reverb
+try:
+  from acme.adders import reverb as adders_reverb
+  _DEFAULT_PRIORITY_TABLE = adders_reverb.DEFAULT_PRIORITY_TABLE
+except Exception:
+  _DEFAULT_PRIORITY_TABLE = 'priority_table'
 import numpy as onp
 
 
@@ -43,7 +47,7 @@ class ContrastiveConfig:
   # Replay options
   min_replay_size: int = 10000
   max_replay_size: int = 1000000
-  replay_table_name: str = adders_reverb.DEFAULT_PRIORITY_TABLE
+  replay_table_name: str = _DEFAULT_PRIORITY_TABLE
   prefetch_size: int = 4
   num_parallel_calls: Optional[int] = 4
   samples_per_insert: float = 256
@@ -269,6 +273,12 @@ class ContrastiveConfig:
   # EMA decay tau for NF params used in the PPO reward r = log p_NF(g|s,a).
   # Mirrors ppo_crl_repr_tau (CRL-only); the two are never both active.
   ppo_nf_reward_tau: float = 0.0
+  # Path to pre-trained NF checkpoint (.pkl). If set, initializes NF weights and goal stats.
+  nf_restore_checkpoint: str = ''
+  # If True, freeze NF weights and retain checkpoint normalization stats during PPO.
+  nf_freeze: bool = False
+  # Extrinsic reward multiplier when ppo_crl_add_extrinsic_reward is True.
+  ppo_extrinsic_reward_scale: float = 1.0
 
   # -------------------------------------------------------------------------
   # PPO+RND agent (`ppo_rnd.py` / `contrastive/ppo_rnd_learner.py`). Separate
