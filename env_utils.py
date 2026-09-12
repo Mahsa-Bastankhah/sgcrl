@@ -446,7 +446,7 @@ if _MANISKILL_IMPORT_ERROR is None:
   @_ms_register_env(
       'OpenCabinetDrawerThreeRoom-v1',
       asset_download_ids=['partnet_mobility_cabinet_drawer'],
-      max_episode_steps=300,
+      max_episode_steps=600,
   )
   class _MsOpenCabinetDrawerThreeRoomEnv(_MsOpenCabinetDrawerEnv):
     """Open cabinet drawer with a 3-room S-curved layout."""
@@ -600,7 +600,7 @@ if _MANISKILL_IMPORT_ERROR is None:
   @_ms_register_env(
       'CloseCabinetDrawerThreeRoom-v1',
       asset_download_ids=['partnet_mobility_cabinet_drawer'],
-      max_episode_steps=300,
+      max_episode_steps=600,
   )
   class _MsCloseCabinetDrawerThreeRoomEnv(_MsCloseCabinetDrawerMixin, _MsOpenCabinetDrawerThreeRoomEnv):
     """Close cabinet drawer with a 3-room S-curved layout."""
@@ -2667,14 +2667,14 @@ _MANISKILL_MAX_EPISODE_STEPS = {
     'maniskill_open_cabinet_drawer_chicane_wide': 400,
     'maniskill_open_cabinet_drawer_mini_hab': 200,
     'maniskill_open_cabinet_drawer_l_corridor': 400,
-    'maniskill_open_cabinet_drawer_three_room': 300,
+    'maniskill_open_cabinet_drawer_three_room': 600,
     'maniskill_close_cabinet_drawer': 100,
     'maniskill_close_cabinet_drawer_chicane': 200,
     'maniskill_close_cabinet_drawer_chicane_med': 400,
     'maniskill_close_cabinet_drawer_chicane_wide': 400,
     'maniskill_close_cabinet_drawer_mini_hab': 200,
     'maniskill_close_cabinet_drawer_l_corridor': 400,
-    'maniskill_close_cabinet_drawer_three_room': 300,
+    'maniskill_close_cabinet_drawer_three_room': 600,
     'maniskill_close_subtask_train': 600,
     # Same 600 override as close (see that entry's comment) -- the
     # adjacent-room navigation distance is identical (same scenes, same
@@ -3074,6 +3074,82 @@ def euler2quat(euler):
   return quat
 
 
+class OGBenchEnv(gym.Env):
+  """gym (old-API) wrapper around OGBench single-task environments.
+
+  Single-task OGBench environments provide the task target goal g* only
+  in info['goal'] at reset(). During step(), info does not contain 'goal'.
+  This wrapper caches current_goal on reset() and appends it to every
+  step's observation: concat([state, current_goal]).
+
+  Reward is the binary success signal info.get('success', False) (in {0.0, 1.0})
+  to stay fully compatible with SuccessObserver and downstream PPO reward shaping.
+  """
+
+  def __init__(self, dataset_name: str, fixed_start_end=None, render_mode=None, **kwargs):
+    super().__init__()
+    del fixed_start_end, kwargs
+    _require_ogbench(dataset_name)
+    self._dataset_name = dataset_name
+    self._env = _ogbench.make_env_and_datasets(
+        dataset_name, env_only=True, render_mode=render_mode)
+
+    raw_obs_shape = self._env.observation_space.shape
+    self._state_dim = int(raw_obs_shape[0])
+
+    obs, info = self._env.reset()
+    if 'goal' in info:
+      self._goal_dim = int(info['goal'].shape[0])
+      self.current_goal = np.asarray(info['goal'], dtype=np.float32).copy()
+    else:
+      self._goal_dim = self._state_dim
+      self.current_goal = np.zeros(self._goal_dim, dtype=np.float32)
+
+    total_dim = self._state_dim + self._goal_dim
+    low = np.full(total_dim, -1000.0, dtype=np.float32)
+    high = np.full(total_dim, 1000.0, dtype=np.float32)
+    if hasattr(self._env.observation_space, 'low') and hasattr(self._env.observation_space, 'high'):
+      obs_low = np.asarray(self._env.observation_space.low, dtype=np.float32)
+      obs_high = np.asarray(self._env.observation_space.high, dtype=np.float32)
+      if (np.all(np.isfinite(obs_low)) and np.all(np.isfinite(obs_high))
+          and obs_low.shape[0] == self._state_dim):
+        low = np.concatenate([obs_low, obs_low], axis=-1)
+        high = np.concatenate([obs_high, obs_high], axis=-1)
+
+    self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+    act_shape = self._env.action_space.shape
+    act_low = np.asarray(self._env.action_space.low, dtype=np.float32)
+    act_high = np.asarray(self._env.action_space.high, dtype=np.float32)
+    self.action_space = gym.spaces.Box(
+        low=act_low, high=act_high, shape=act_shape, dtype=np.float32)
+    self.STATE_DIM = self._state_dim
+
+  def reset(self):
+    obs, info = self._env.reset()
+    if 'goal' in info:
+      self.current_goal = np.asarray(info['goal'], dtype=np.float32).copy()
+    return self._get_obs(obs)
+
+  def step(self, action):
+    action = np.asarray(action, dtype=np.float32)
+    obs, reward, terminated, truncated, info = self._env.step(action)
+    success = float(bool(info.get('success', False)))
+    info_out = dict(info)
+    info_out['goal'] = self.current_goal.copy()
+    info_out['raw_env_reward'] = reward
+    return self._get_obs(obs), success, False, info_out
+
+  def _get_obs(self, obs):
+    return np.concatenate(
+        [np.asarray(obs, dtype=np.float32), self.current_goal], axis=-1).astype(np.float32)
+
+  def render(self):
+    return self._env.render()
+
+  def close(self):
+    self._env.close()
+
+
 def load(env_name, fixed_start_end=None, seed=None, render_mode=None,
         **env_kwargs):
   """Loads the train and eval environments, as well as the obs_dim.
@@ -3171,7 +3247,7 @@ def load(env_name, fixed_start_end=None, seed=None, render_mode=None,
     kwargs['render_mode'] = render_mode
   elif env_name == 'maniskill_open_cabinet_drawer_three_room':
     CLASS = ManiskillOpenCabinetDrawerThreeRoom
-    max_episode_steps = 300
+    max_episode_steps = 600
     kwargs['fixed_start_end'] = fixed_start_end
     kwargs['render_mode'] = render_mode
   elif env_name == 'maniskill_close_cabinet_drawer':
@@ -3206,7 +3282,7 @@ def load(env_name, fixed_start_end=None, seed=None, render_mode=None,
     kwargs['render_mode'] = render_mode
   elif env_name == 'maniskill_close_cabinet_drawer_three_room':
     CLASS = ManiskillCloseCabinetDrawerThreeRoom
-    max_episode_steps = 300
+    max_episode_steps = 600
     kwargs['fixed_start_end'] = fixed_start_end
     kwargs['render_mode'] = render_mode
   elif env_name == 'maniskill_close_subtask_train':
@@ -3225,6 +3301,18 @@ def load(env_name, fixed_start_end=None, seed=None, render_mode=None,
     max_episode_steps = 600
     kwargs['fixed_start_end'] = fixed_start_end
     kwargs['render_mode'] = render_mode
+  elif env_name == 'ogbench_cube_double_task2':
+    CLASS = OGBenchEnv
+    kwargs['dataset_name'] = 'cube-double-play-singletask-task2-v0'
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+    max_episode_steps = 500
+  elif env_name == 'ogbench_humanoidmaze_medium_task1':
+    CLASS = OGBenchEnv
+    kwargs['dataset_name'] = 'humanoidmaze-medium-navigate-singletask-task1-v0'
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+    max_episode_steps = 2000
   else:
     raise NotImplementedError('Unsupported environment: %s' % env_name)
 
