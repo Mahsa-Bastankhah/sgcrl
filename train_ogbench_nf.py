@@ -35,6 +35,7 @@ flags.DEFINE_string(
     'save_dir', '', 'Directory to save checkpoints and logs. Empty string defaults to $SCRATCH/ogbench_nf_exp/.'
 )
 flags.DEFINE_float('gamma', 0.99, 'Geometric discount for future goal sampling.')
+flags.DEFINE_string('goal_indices', '', 'Comma-separated observation indices to use as goal (e.g. "0,1" for 2D maze navigation). Empty string means full observation.')
 
 # Normalizing Flow Architecture knobs
 flags.DEFINE_bool('state_only', False, 'If True, learn p(g|s); if False, learn p(g|s,a).')
@@ -79,6 +80,7 @@ def main(_):
         dataset_dir=dataset_dir,
         gamma=FLAGS.gamma,
         seed=FLAGS.seed,
+        goal_indices=FLAGS.goal_indices,
     )
     obs_dim = train_dataset.obs_dim
     act_dim = train_dataset.act_dim
@@ -250,6 +252,7 @@ def main(_):
                 'obs_dim': obs_dim,
                 'act_dim': act_dim,
                 'goal_dim': goal_dim,
+                'goal_indices': FLAGS.goal_indices,
                 'config': FLAGS.flag_values_dict(),
             }
             with open(ckpt_path, 'wb') as f:

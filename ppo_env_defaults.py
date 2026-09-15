@@ -75,6 +75,8 @@ fixed_goal_dict = {
     # OGBench single-task envs: target goal is provided in reset info dict.
     'ogbench_cube_double_task2': None,
     'ogbench_humanoidmaze_medium_task1': None,
+    'ogbench_pointmaze_medium_task1': None,
+    'ogbench_pointmaze_large_task1': None,
 }
 
 # ---------------------------------------------------------------------------
@@ -178,5 +180,9 @@ PPO_ENV_DEFAULTS = {
     'ogbench_cube_double_task2': dict(
         rollout_length=256, crl_steps_per_iter=128),
     'ogbench_humanoidmaze_medium_task1': dict(
+        rollout_length=512, crl_steps_per_iter=256),
+    'ogbench_pointmaze_medium_task1': dict(
+        rollout_length=256, crl_steps_per_iter=128),
+    'ogbench_pointmaze_large_task1': dict(
         rollout_length=512, crl_steps_per_iter=256),
 }

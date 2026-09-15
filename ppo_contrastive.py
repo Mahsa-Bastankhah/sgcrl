@@ -19,6 +19,7 @@ Launchpad.  The SAC-based kappa actor stays untouched and is still
 launched via lp_contrastive.py --alg=kappa_sac.
 """
 import sgcrl_jax_acme_compat  # noqa: F401 — must precede all acme/jax imports
+import datetime
 import functools
 import json
 import os
@@ -46,6 +47,7 @@ flags.DEFINE_string('log_dir_path', 'logs/ppo/', 'Where to log metrics')
 flags.DEFINE_string('exp_name', None, 'Optional explicit experiment name.')
 flags.DEFINE_integer('seed', 0, 'Random seed')
 flags.DEFINE_bool('add_uid', False, 'Whether to add a unique id to the log directory name')
+flags.DEFINE_bool('resume', False, 'Whether to resume training from an existing checkpoint/wandb run.')
 flags.DEFINE_string('env', 'point_FourRooms', 'Environment type')
 flags.DEFINE_integer('num_steps', 8_000_000, 'Total env steps', lower_bound=0)
 flags.DEFINE_bool('sample_goals', False,
@@ -178,6 +180,10 @@ flags.DEFINE_float(
     'ppo_extrinsic_reward_scale', 1.0,
     'Multiplier on extrinsic reward (roll_env_rew) when '
     'ppo_crl_add_extrinsic_reward is True.')
+flags.DEFINE_string(
+    'goal_indices', '',
+    'Optional comma-separated goal indices for slicing observation into goal, '
+    'e.g. "0,1" for 2D maze coordinates. Empty string means full observation.')
 flags.DEFINE_bool(
     'maniskill_native_vec', False,
     'ManiSkill env_names only: collect PPO rollouts from one native '
@@ -370,9 +376,19 @@ def main(_):
       for k_src in ('nf_sa_num_layers', 'sa_num_layers'):
         if k_src in _cfg:
           config.nf_sa_num_layers = int(_cfg[k_src])
-      for k_src in ('nf_goal_enc_size', 'goal_enc_size'):
-        if k_src in _cfg:
-          config.nf_goal_enc_size = int(_cfg[k_src])
+      _g_idx = _ckpt_meta.get('goal_indices') or _cfg.get('goal_indices') or FLAGS.goal_indices
+      if _g_idx is not None and str(_g_idx).strip() != '':
+        if isinstance(_g_idx, str):
+          config.goal_indices = tuple(int(x.strip()) for x in _g_idx.split(',') if x.strip())
+        else:
+          config.goal_indices = tuple(_g_idx)
+      else:
+        config.goal_indices = None
+    elif FLAGS.goal_indices.strip() != '':
+      config.goal_indices = tuple(int(x.strip()) for x in FLAGS.goal_indices.split(',') if x.strip())
+    else:
+      config.goal_indices = None
+
     if 'params' in _ckpt_meta and 'nf_flow' in _ckpt_meta['params']:
       _plu_keys = [k for k in _ckpt_meta['params']['nf_flow'].keys() if 'plu_' in k]
       if _plu_keys:
@@ -381,7 +397,7 @@ def main(_):
         f'[ppo_contrastive] Loaded NF architecture config from checkpoint: '
         f'rep_size={config.nf_rep_size}, num_blocks={config.nf_num_blocks}, '
         f'coupling_width={config.nf_coupling_width}, sa_hidden={config.nf_sa_hidden}, '
-        f'sa_num_layers={config.nf_sa_num_layers}')
+        f'sa_num_layers={config.nf_sa_num_layers}, goal_indices={config.goal_indices}')
 
   if config.ppo_repr_mode == 'nf' and config.uniform_sampling:
     print('[ppo_contrastive] WARNING: --uniform_sampling has no effect '
@@ -474,9 +490,15 @@ def main(_):
       actor_min_std=float(config.ppo_actor_min_std))
 
   # ---- Logger ------------------------------------------------------------
-  run_dir = os.path.join(
-      config.log_dir,
-      f'{config.alg_name}_{config.env_name}_{seed}')
+  if FLAGS.resume:
+    run_name = f'{config.alg_name}_{config.env_name}_{seed}'
+  else:
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    slurm_job_id = os.environ.get('SLURM_JOB_ID')
+    run_tag = f'_{timestamp}_j{slurm_job_id}' if slurm_job_id else f'_{timestamp}'
+    run_name = f'{config.alg_name}_{config.env_name}_{seed}{run_tag}'
+
+  run_dir = os.path.join(config.log_dir, run_name)
   os.makedirs(run_dir, exist_ok=True)
   run_config_path = os.path.join(run_dir, 'run_config.json')
   run_cfg_payload = {
@@ -495,13 +517,6 @@ def main(_):
   print(f'[ppo_contrastive] wrote run config: {run_config_path}')
 
   # ---- Optional live wandb logging ---------------------------------------
-  # The wandb run id is persisted to `run_dir` so that a later invocation
-  # against the same log dir (e.g. re-running with a larger --num_steps to
-  # continue training past a checkpoint) resumes logging into the SAME
-  # wandb run instead of starting a new one -- `run_ppo_training` already
-  # restores `global_step`/`iteration` from the checkpoint and WandbLogger
-  # logs with those true step values (default.py), so resuming the run here
-  # is the last piece needed for a single continuous wandb timeline.
   wandb_run = None
   if FLAGS.wandb_project:
     if not os.environ.get('WANDB_DIR'):
@@ -509,19 +524,19 @@ def main(_):
     import wandb
     wandb_run_id_path = os.path.join(run_dir, 'wandb_run_id.txt')
     wandb_run_id = None
-    if os.path.exists(wandb_run_id_path):
+    if FLAGS.resume and os.path.exists(wandb_run_id_path):
       with open(wandb_run_id_path, 'r', encoding='utf-8') as fh:
         wandb_run_id = fh.read().strip() or None
     wandb_run = wandb.init(
         project=FLAGS.wandb_project,
         entity=(FLAGS.wandb_entity or None),
-        name=(FLAGS.wandb_run_name or f'{config.alg_name}_{env_name}_{seed}'),
+        name=(FLAGS.wandb_run_name or run_name),
         group=(FLAGS.wandb_group or config.alg_name),
         job_type='train',
         config={k: _json_safe(v) for k, v in config.__dict__.items()},
         dir=run_dir,
         id=wandb_run_id,
-        resume='allow' if wandb_run_id else None,
+        resume='allow' if (FLAGS.resume and wandb_run_id) else None,
     )
     with open(wandb_run_id_path, 'w', encoding='utf-8') as fh:
       fh.write(wandb_run.id)
@@ -587,6 +602,7 @@ def main(_):
       video_fn=video_fn,
       video_every_steps=FLAGS.video_every_steps,
       checkpoint_dir=checkpoint_dir,
+      resume=FLAGS.resume,
   )
 
   # ---- Optional end-of-training rollout video ----------------------------

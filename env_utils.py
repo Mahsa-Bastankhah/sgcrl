@@ -3313,6 +3313,18 @@ def load(env_name, fixed_start_end=None, seed=None, render_mode=None,
     kwargs['fixed_start_end'] = fixed_start_end
     kwargs['render_mode'] = render_mode
     max_episode_steps = 2000
+  elif env_name == 'ogbench_pointmaze_medium_task1':
+    CLASS = OGBenchEnv
+    kwargs['dataset_name'] = 'pointmaze-medium-navigate-singletask-task1-v0'
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+    max_episode_steps = 1000
+  elif env_name == 'ogbench_pointmaze_large_task1':
+    CLASS = OGBenchEnv
+    kwargs['dataset_name'] = 'pointmaze-large-navigate-singletask-task1-v0'
+    kwargs['fixed_start_end'] = fixed_start_end
+    kwargs['render_mode'] = render_mode
+    max_episode_steps = 1000
   else:
     raise NotImplementedError('Unsupported environment: %s' % env_name)
 

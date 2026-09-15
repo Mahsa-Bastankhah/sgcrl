@@ -1098,7 +1098,8 @@ def normalize_nf_reward_mode(reward_mode: str) -> str:
 
 def make_nf_reward_fn(nf_networks: NFDensityNetworks, obs_dim: int,
                       tanh_scale: float = 0.0,
-                      reward_mode: str = 'forward'):
+                      reward_mode: str = 'forward',
+                      goal_indices: Optional[Sequence[int]] = None):
     """Jitted reward: (params, obs, action, goal_mean, goal_std) → r_NF.
 
     ``reward_mode`` (density NLL is always raw log p, never these maps):
@@ -1120,12 +1121,15 @@ def make_nf_reward_fn(nf_networks: NFDensityNetworks, obs_dim: int,
             f'nf_reward_tanh is only valid with nf_reward_mode=forward '
             f'(got {mode!r})')
     _clip = float(NF_REWARD_LOGP_CLIP)
+    _goal_indices = jnp.asarray(goal_indices) if goal_indices is not None else None
 
     @jax.jit
     def reward_fn(nf_params, obs: jnp.ndarray, action: jnp.ndarray,
                   goal_mean: jnp.ndarray, goal_std: jnp.ndarray):
         state = obs[:, :obs_dim]
         goal  = obs[:, obs_dim:]
+        if _goal_indices is not None:
+            goal = goal[:, _goal_indices]
         goal  = (goal - goal_mean) / (goal_std + 1e-8)
         log_p = nf_log_prob(nf_networks, nf_params, state, action, goal)
         if mode == 'reverse':

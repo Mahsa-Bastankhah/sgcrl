@@ -1002,6 +1002,7 @@ def run_ppo_training(
     checkpoint_dir: Optional[str] = None,
     video_fn: Optional[Callable] = None,
     video_every_steps: int = 0,
+    resume: bool = True,
 ):
   """Top-level PPO-on-φ·ψ training loop.
 
@@ -1075,7 +1076,11 @@ def run_ppo_training(
         f"Unknown config.ppo_repr_mode={repr_mode!r}; expected 'crl' or 'nf'")
   use_nf = repr_mode == 'nf'
   obs_dim_cfg = int(config.obs_dim)
-  goal_dim_cfg = int(np.prod(obs_shape)) - obs_dim_cfg
+  goal_indices_cfg = getattr(config, 'goal_indices', None)
+  if goal_indices_cfg:
+    goal_dim_cfg = len(goal_indices_cfg)
+  else:
+    goal_dim_cfg = int(np.prod(obs_shape)) - obs_dim_cfg
   act_dim_cfg = int(np.prod(act_shape))
 
   nf_density_nets = None
@@ -1179,7 +1184,7 @@ def run_ppo_training(
   start_iteration = 0
   global_step = 0
   ppo_sgd_step = 0
-  if checkpoint_dir is not None:
+  if resume and checkpoint_dir is not None:
     _latest = os.path.join(checkpoint_dir, 'latest.pkl')
     if os.path.exists(_latest):
       _ckpt = load_checkpoint(_latest)
@@ -1223,7 +1228,8 @@ def run_ppo_training(
   crl_scan_update = None
   nf_scan_update = None
   if use_nf:
-    nf_reward_fn = _nf.make_nf_reward_fn(nf_density_nets, obs_dim=obs_dim_cfg)
+    nf_reward_fn = _nf.make_nf_reward_fn(
+        nf_density_nets, obs_dim=obs_dim_cfg, goal_indices=goal_indices_cfg)
     nf_scan_update = _nf.make_scan_nf_update_fn(
         nf_density_nets, q_optimizer, obs_dim=obs_dim_cfg,
         noise_std=float(config.nf_noise_std), repr_tau=_repr_tau)

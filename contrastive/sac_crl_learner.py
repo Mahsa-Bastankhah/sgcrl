@@ -296,6 +296,7 @@ def run_sac_crl_training(
     video_fn: Optional[Callable[..., None]] = None,
     video_every_steps: int = 0,
     checkpoint_dir: Optional[str] = None,
+    resume: bool = True,
 ) -> SACTrainingState:
   """Main training loop for standalone SAC + CRL on GPU-batched environments."""
   key = jax.random.PRNGKey(seed)
@@ -428,7 +429,7 @@ def run_sac_crl_training(
   ckpt_interval = int(getattr(config, 'ppo_checkpoint_interval', 500))
   ckpt_keep_last = 10
 
-  if checkpoint_dir and os.path.exists(os.path.join(checkpoint_dir, 'latest.pkl')):
+  if resume and checkpoint_dir and os.path.exists(os.path.join(checkpoint_dir, 'latest.pkl')):
     latest_ckpt_path = os.path.join(checkpoint_dir, 'latest.pkl')
     import pickle as _pkl
     with open(latest_ckpt_path, 'rb') as fh:

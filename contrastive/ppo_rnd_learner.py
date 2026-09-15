@@ -241,6 +241,7 @@ def run_ppo_rnd_training(
     checkpoint_dir: Optional[str] = None,
     video_fn: Optional[Callable] = None,
     video_every_steps: int = 0,
+    resume: bool = True,
 ):
   """Top-level PPO+RND training loop. See module docstring."""
   # ---- vec env ------------------------------------------------------------
@@ -359,7 +360,7 @@ def run_ppo_rnd_training(
   start_iteration = 0
   global_step = 0
   ppo_sgd_step = 0
-  if checkpoint_dir is not None:
+  if resume and checkpoint_dir is not None:
     _latest = os.path.join(checkpoint_dir, 'latest.pkl')
     if os.path.exists(_latest):
       _ckpt = load_checkpoint(_latest)
