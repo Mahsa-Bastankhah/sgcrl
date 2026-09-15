@@ -70,84 +70,84 @@ for seed in 0 1; do
   # --------------------------------------------------------------------------
   # 21. SAMI_CREATED_COMMANDS: ManiSkill Standard In-Room Open Drawer (OpenCabinetDrawer-v1) - SAC + CRL (Acme)
   # --------------------------------------------------------------------------
-  # echo "python sac_contrastive.py \
-  #     --env=maniskill_open_cabinet_drawer \
-  #     --seed=${seed} \
-  #     --num_steps=600000000 \
-  #     --log_dir_path=maniskill_open_cabinet_drawer_sac/ \
-  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-  #     --ppo_crl_steps_per_iter=128 \
-  #     --actor_learning_rate=3e-4 \
-  #     --learning_rate=3e-4 \
-  #     --discount=0.99 \
-  #     --batch_size=256 \
-  #     --ppo_num_envs=512 \
-  #     --ppo_checkpoint_interval=20 \
-  #     --maniskill_native_vec \
-  #     --uniform_sampling \
-  #     --wandb_project=${WANDB_PROJECT} \
-  #     --wandb_entity=${WANDB_ENTITY} \
-  #     --wandb_group=sac_crl_open_cabinet_drawer \
-  #     --render_video \
-  #     --video_every_steps=5000000" >> "$TASK_FILE"
-  #
+  echo "python sac_contrastive.py \
+      --env=maniskill_open_cabinet_drawer \
+      --seed=${seed} \
+      --num_steps=600000000 \
+      --log_dir_path=maniskill_open_cabinet_drawer_sac/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_crl_steps_per_iter=128 \
+      --actor_learning_rate=3e-4 \
+      --learning_rate=3e-4 \
+      --discount=0.99 \
+      --batch_size=256 \
+      --ppo_num_envs=512 \
+      --ppo_checkpoint_interval=20 \
+      --maniskill_native_vec \
+      --uniform_sampling \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=sac_crl_open_cabinet_drawer \
+      --render_video \
+      --video_every_steps=5000000" >> "$TASK_FILE"
+
   # --------------------------------------------------------------------------
   # 22. SAMI_CREATED_COMMANDS: ManiSkill Standard In-Room Close Drawer (CloseCabinetDrawer-v1) - SAC + CRL (Acme)
   # --------------------------------------------------------------------------
-  # echo "python sac_contrastive.py \
-  #     --env=maniskill_close_cabinet_drawer \
-  #     --seed=${seed} \
-  #     --num_steps=600000000 \
-  #     --log_dir_path=maniskill_close_cabinet_drawer_sac/ \
-  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-  #     --ppo_crl_steps_per_iter=128 \
-  #     --actor_learning_rate=3e-4 \
-  #     --learning_rate=3e-4 \
-  #     --discount=0.99 \
-  #     --batch_size=256 \
-  #     --ppo_num_envs=512 \
-  #     --ppo_checkpoint_interval=20 \
-  #     --maniskill_native_vec \
-  #     --uniform_sampling \
-  #     --wandb_project=${WANDB_PROJECT} \
-  #     --wandb_entity=${WANDB_ENTITY} \
-  #     --wandb_group=sac_crl_close_cabinet_drawer \
-  #     --render_video \
-  #     --video_every_steps=5000000" >> "$TASK_FILE"
-  #
+  echo "python sac_contrastive.py \
+      --env=maniskill_close_cabinet_drawer \
+      --seed=${seed} \
+      --num_steps=600000000 \
+      --log_dir_path=maniskill_close_cabinet_drawer_sac/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_crl_steps_per_iter=128 \
+      --actor_learning_rate=3e-4 \
+      --learning_rate=3e-4 \
+      --discount=0.99 \
+      --batch_size=256 \
+      --ppo_num_envs=512 \
+      --ppo_checkpoint_interval=20 \
+      --maniskill_native_vec \
+      --uniform_sampling \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=sac_crl_close_cabinet_drawer \
+      --render_video \
+      --video_every_steps=5000000" >> "$TASK_FILE"
+
   # --------------------------------------------------------------------------
   # 23. SAMI_CREATED_COMMANDS: ManiSkill Standard In-Room Open Drawer (OpenCabinetDrawer-v1) - PPO + NF
   # --------------------------------------------------------------------------
-  # echo "python ppo_contrastive.py \
-  #     --env=maniskill_open_cabinet_drawer \
-  #     --seed=${seed} \
-  #     --num_steps=600000000 \
-  #     --log_dir_path=ppo_maniskill_open_cabinet_drawer_nf_mixtask_1M/ \
-  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-  #     --ppo_repr_mode=nf \
-  #     --nf_rep_size=64 \
-  #     --nf_num_blocks=6 \
-  #     --nf_coupling_width=192 \
-  #     --nf_sa_hidden=192 \
-  #     --nf_sa_num_layers=3 \
-  #     --nf_grad_clip=1.0 \
-  #     --nf_noise_std=0.05 \
-  #     --nf_goal_std_min=0.02 \
-  #     --nf_goal_enc_size=0 \
-  #     --nf_mix_task_goal_stats \
-  #     --ppo_crl_steps_per_iter=10 \
-  #     --ppo_ent_coef=0.05 \
-  #     --ppo_actor_min_std=0.01 \
-  #     --ppo_discount=0.99 \
-  #     --ppo_clip_coef=0.2 \
-  #     --ppo_nf_reward_tau=0.5 \
-  #     --ppo_num_envs=512 \
-  #     --maniskill_native_vec \
-  #     --wandb_project=${WANDB_PROJECT} \
-  #     --wandb_entity=${WANDB_ENTITY} \
-  #     --wandb_group=ppo_nf_goal_fast_mixtask \
-  #     --render_video \
-  #     --video_every_steps=5000000" >> "$TASK_FILE"
+  echo "python ppo_contrastive.py \
+      --env=maniskill_open_cabinet_drawer \
+      --seed=${seed} \
+      --num_steps=600000000 \
+      --log_dir_path=ppo_maniskill_open_cabinet_drawer_nf_mixtask_1M/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_repr_mode=nf \
+      --nf_rep_size=64 \
+      --nf_num_blocks=6 \
+      --nf_coupling_width=192 \
+      --nf_sa_hidden=192 \
+      --nf_sa_num_layers=3 \
+      --nf_grad_clip=1.0 \
+      --nf_noise_std=0.05 \
+      --nf_goal_std_min=0.02 \
+      --nf_goal_enc_size=0 \
+      --nf_mix_task_goal_stats \
+      --ppo_crl_steps_per_iter=10 \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=0.01 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --ppo_nf_reward_tau=0.5 \
+      --ppo_num_envs=512 \
+      --maniskill_native_vec \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_nf_goal_fast_mixtask \
+      --render_video \
+      --video_every_steps=5000000" >> "$TASK_FILE"
   #
   # --------------------------------------------------------------------------
   # 24. SAMI_CREATED_COMMANDS: ManiSkill-HAB Open Subtask (OpenSubtaskTrain-v0) - PPO + NF
@@ -186,28 +186,28 @@ for seed in 0 1; do
   #     --video_every_steps=5000000" >> "$TASK_FILE"
   #
   #
-  # # --------------------------------------------------------------------------
-  # # 2. ManiSkill In-Room Push Drawer (CloseCabinetDrawer) - PPO + RND
-  # # --------------------------------------------------------------------------
-  # echo "python ppo_rnd.py \
-  #     --env=maniskill_close_cabinet_drawer \
-  #     --seed=${seed} \
-  #     --num_steps=600000000 \
-  #     --log_dir_path=maniskill_close_cabinet_drawer_rnd/ \
-  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-  #     --ppo_ent_coef=0.05 \
-  #     --ppo_actor_min_std=0.01 \
-  #     --ppo_discount=0.99 \
-  #     --ppo_clip_coef=0.2 \
-  #     --rnd_int_coef=1.0 \
-  #     --rnd_ext_coef=1.0 \
-  #     --rnd_int_discount=0.99 \
-  #     --ppo_num_envs=512 \
-  #     --maniskill_native_vec \
-  #     --wandb_project=${WANDB_PROJECT} \
-  #     --wandb_entity=${WANDB_ENTITY} \
-  #     --wandb_group=ppo_close_cabinet_drawer_rnd \
-  #     --render_video" >> "$TASK_FILE"
+  # --------------------------------------------------------------------------
+  # 2. ManiSkill In-Room Push Drawer (CloseCabinetDrawer) - PPO + RND
+  # --------------------------------------------------------------------------
+  echo "python ppo_rnd.py \
+      --env=maniskill_close_cabinet_drawer \
+      --seed=${seed} \
+      --num_steps=600000000 \
+      --log_dir_path=maniskill_close_cabinet_drawer_rnd/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=0.01 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --rnd_int_coef=1.0 \
+      --rnd_ext_coef=1.0 \
+      --rnd_int_discount=0.99 \
+      --ppo_num_envs=512 \
+      --maniskill_native_vec \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_close_cabinet_drawer_rnd \
+      --render_video" >> "$TASK_FILE"
 
   # # --------------------------------------------------------------------------
   # # 3. ManiSkill-HAB Adjacent-Room Spawn -> Close Drawer - PPO + CRL
@@ -697,37 +697,37 @@ for seed in 0 1; do
   # --------------------------------------------------------------------------
   # 26. SAMI_CREATED_COMMANDS: Chicane Wide (+1.0m) Open Drawer - PPO + NF
   # --------------------------------------------------------------------------
-  echo "python ppo_contrastive.py \
-      --env=maniskill_open_cabinet_drawer_chicane_wide \
-      --seed=${seed} \
-      --num_steps=700000000 \
-      --log_dir_path=ppo_open_cabinet_drawer_chicane_wide_nf/ \
-      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-      --ppo_repr_mode=nf \
-      --nf_rep_size=64 \
-      --nf_num_blocks=6 \
-      --nf_coupling_width=192 \
-      --nf_sa_hidden=192 \
-      --nf_sa_num_layers=3 \
-      --nf_grad_clip=1.0 \
-      --nf_noise_std=0.05 \
-      --nf_goal_std_min=0.02 \
-      --nf_goal_enc_size=0 \
-      --nf_mix_task_goal_stats \
-      --ppo_crl_steps_per_iter=10 \
-      --ppo_ent_coef=0.05 \
-      --ppo_actor_min_std=0.01 \
-      --ppo_discount=0.99 \
-      --ppo_clip_coef=0.2 \
-      --ppo_nf_reward_tau=0.5 \
-      --ppo_num_envs=512 \
-      --maniskill_native_vec \
-      --wandb_project=${WANDB_PROJECT} \
-      --wandb_entity=${WANDB_ENTITY} \
-      --wandb_group=ppo_open_cabinet_drawer_chicane_wide_nf \
-      --render_video \
-      --video_every_steps=5000000" >> "$TASK_FILE"
-  #
+  # echo "python ppo_contrastive.py \
+  #     --env=maniskill_open_cabinet_drawer_chicane_wide \
+  #     --seed=${seed} \
+  #     --num_steps=700000000 \
+  #     --log_dir_path=ppo_open_cabinet_drawer_chicane_wide_nf/ \
+  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+  #     --ppo_repr_mode=nf \
+  #     --nf_rep_size=64 \
+  #     --nf_num_blocks=6 \
+  #     --nf_coupling_width=192 \
+  #     --nf_sa_hidden=192 \
+  #     --nf_sa_num_layers=3 \
+  #     --nf_grad_clip=1.0 \
+  #     --nf_noise_std=0.05 \
+  #     --nf_goal_std_min=0.02 \
+  #     --nf_goal_enc_size=0 \
+  #     --nf_mix_task_goal_stats \
+  #     --ppo_crl_steps_per_iter=10 \
+  #     --ppo_ent_coef=0.05 \
+  #     --ppo_actor_min_std=0.01 \
+  #     --ppo_discount=0.99 \
+  #     --ppo_clip_coef=0.2 \
+  #     --ppo_nf_reward_tau=0.5 \
+  #     --ppo_num_envs=512 \
+  #     --maniskill_native_vec \
+  #     --wandb_project=${WANDB_PROJECT} \
+  #     --wandb_entity=${WANDB_ENTITY} \
+  #     --wandb_group=ppo_open_cabinet_drawer_chicane_wide_nf \
+  #     --render_video \
+  #     --video_every_steps=5000000" >> "$TASK_FILE"
+  # #
   # # --------------------------------------------------------------------------
   # # 27. SAMI_CREATED_COMMANDS: L-Corridor Open Drawer - PPO + NF
   # # --------------------------------------------------------------------------
@@ -830,87 +830,87 @@ for seed in 0 1; do
   #     --render_video \
   #     --video_every_steps=5000000" >> "$TASK_FILE"
 
-  # # --------------------------------------------------------------------------
-  # # 30. SAMI_CREATED_COMMANDS: L-Corridor Close Drawer - PPO + NF
-  # # --------------------------------------------------------------------------
-  # echo "python ppo_contrastive.py \
-  #     --env=maniskill_close_cabinet_drawer_l_corridor \
-  #     --seed=${seed} \
-  #     --num_steps=700000000 \
-  #     --log_dir_path=ppo_close_cabinet_drawer_l_corridor_nf/ \
-  #     --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-  #     --ppo_repr_mode=nf \
-  #     --nf_rep_size=64 \
-  #     --nf_num_blocks=6 \
-  #     --nf_coupling_width=192 \
-  #     --nf_sa_hidden=192 \
-  #     --nf_sa_num_layers=3 \
-  #     --nf_grad_clip=1.0 \
-  #     --nf_noise_std=0.05 \
-  #     --nf_goal_std_min=0.02 \
-  #     --nf_goal_enc_size=0 \
-  #     --nf_mix_task_goal_stats \
-  #     --ppo_crl_steps_per_iter=10 \
-  #     --ppo_ent_coef=0.05 \
-  #     --ppo_actor_min_std=0.01 \
-  #     --ppo_discount=0.99 \
-  #     --ppo_clip_coef=0.2 \
-  #     --ppo_nf_reward_tau=0.5 \
-  #     --ppo_num_envs=512 \
-  #     --maniskill_native_vec \
-  #     --wandb_project=${WANDB_PROJECT} \
-  #     --wandb_entity=${WANDB_ENTITY} \
-  #     --wandb_group=ppo_close_cabinet_drawer_l_corridor_nf \
-  #     --render_video \
-  #     --video_every_steps=5000000" >> "$TASK_FILE"
+  # --------------------------------------------------------------------------
+  # 30. SAMI_CREATED_COMMANDS: L-Corridor Close Drawer - PPO + NF
+  # --------------------------------------------------------------------------
+  echo "python ppo_contrastive.py \
+      --env=maniskill_close_cabinet_drawer_l_corridor \
+      --seed=${seed} \
+      --num_steps=700000000 \
+      --log_dir_path=ppo_close_cabinet_drawer_l_corridor_nf/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_repr_mode=nf \
+      --nf_rep_size=64 \
+      --nf_num_blocks=6 \
+      --nf_coupling_width=192 \
+      --nf_sa_hidden=192 \
+      --nf_sa_num_layers=3 \
+      --nf_grad_clip=1.0 \
+      --nf_noise_std=0.05 \
+      --nf_goal_std_min=0.02 \
+      --nf_goal_enc_size=0 \
+      --nf_mix_task_goal_stats \
+      --ppo_crl_steps_per_iter=10 \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=0.01 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --ppo_nf_reward_tau=0.5 \
+      --ppo_num_envs=512 \
+      --maniskill_native_vec \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_close_cabinet_drawer_l_corridor_nf \
+      --render_video \
+      --video_every_steps=5000000" >> "$TASK_FILE"
 
-#   # --------------------------------------------------------------------------
-#   # 31. SAMI_CREATED_COMMANDS: L-Corridor Close Drawer - SAC + CRL (Acme / SGCRL)
-#   # --------------------------------------------------------------------------
-#   echo "python sac_contrastive.py \
-#       --env=maniskill_close_cabinet_drawer_l_corridor \
-#       --seed=${seed} \
-#       --num_steps=700000000 \
-#       --log_dir_path=sac_crl_close_cabinet_drawer_l_corridor/ \
-#       --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-#       --ppo_crl_steps_per_iter=256 \
-#       --actor_learning_rate=3e-4 \
-#       --learning_rate=3e-4 \
-#       --discount=0.99 \
-#       --batch_size=256 \
-#       --ppo_num_envs=512 \
-#       --ppo_checkpoint_interval=20 \
-#       --maniskill_native_vec \
-#       --uniform_sampling \
-#       --wandb_project=${WANDB_PROJECT} \
-#       --wandb_entity=${WANDB_ENTITY} \
-#       --wandb_group=sac_crl_close_cabinet_drawer_l_corridor \
-#       --render_video \
-#       --video_every_steps=5000000" >> "$TASK_FILE"
-#
-#   # --------------------------------------------------------------------------
-#   # 32. SAMI_CREATED_COMMANDS: L-Corridor Close Drawer - PPO + RND
-#   # --------------------------------------------------------------------------
-#   echo "python ppo_rnd.py \
-#       --env=maniskill_close_cabinet_drawer_l_corridor \
-#       --seed=${seed} \
-#       --num_steps=700000000 \
-#       --log_dir_path=ppo_close_cabinet_drawer_l_corridor_rnd/ \
-#       --hidden_layer_sizes=\"256,256,256,256,256,256\" \
-#       --ppo_ent_coef=0.05 \
-#       --ppo_actor_min_std=0.01 \
-#       --ppo_discount=0.99 \
-#       --ppo_clip_coef=0.2 \
-#       --rnd_int_coef=1.0 \
-#       --rnd_ext_coef=1.0 \
-#       --rnd_int_discount=0.99 \
-#       --ppo_num_envs=512 \
-#       --maniskill_native_vec \
-#       --wandb_project=${WANDB_PROJECT} \
-#       --wandb_entity=${WANDB_ENTITY} \
-#       --wandb_group=ppo_close_cabinet_drawer_l_corridor_rnd \
-#       --render_video \
-#       --video_every_steps=5000000" >> "$TASK_FILE"
+  # --------------------------------------------------------------------------
+  # 31. SAMI_CREATED_COMMANDS: L-Corridor Close Drawer - SAC + CRL (Acme / SGCRL)
+  # --------------------------------------------------------------------------
+  echo "python sac_contrastive.py \
+      --env=maniskill_close_cabinet_drawer_l_corridor \
+      --seed=${seed} \
+      --num_steps=700000000 \
+      --log_dir_path=sac_crl_close_cabinet_drawer_l_corridor/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_crl_steps_per_iter=256 \
+      --actor_learning_rate=3e-4 \
+      --learning_rate=3e-4 \
+      --discount=0.99 \
+      --batch_size=256 \
+      --ppo_num_envs=512 \
+      --ppo_checkpoint_interval=20 \
+      --maniskill_native_vec \
+      --uniform_sampling \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=sac_crl_close_cabinet_drawer_l_corridor \
+      --render_video \
+      --video_every_steps=5000000" >> "$TASK_FILE"
+
+  # --------------------------------------------------------------------------
+  # 32. SAMI_CREATED_COMMANDS: L-Corridor Close Drawer - PPO + RND
+  # --------------------------------------------------------------------------
+  echo "python ppo_rnd.py \
+      --env=maniskill_close_cabinet_drawer_l_corridor \
+      --seed=${seed} \
+      --num_steps=700000000 \
+      --log_dir_path=ppo_close_cabinet_drawer_l_corridor_rnd/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=0.01 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --rnd_int_coef=1.0 \
+      --rnd_ext_coef=1.0 \
+      --rnd_int_discount=0.99 \
+      --ppo_num_envs=512 \
+      --maniskill_native_vec \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_close_cabinet_drawer_l_corridor_rnd \
+      --render_video \
+      --video_every_steps=5000000" >> "$TASK_FILE"
 #
 #   # --------------------------------------------------------------------------
 #   # 33. SAMI_CREATED_COMMANDS: S-Shape (Three-Room) Close Drawer - PPO + NF
@@ -946,6 +946,64 @@ for seed in 0 1; do
 #       --render_video \
 #       --video_every_steps=5000000" >> "$TASK_FILE"
 #
+  # --------------------------------------------------------------------------
+  # 34. SAMI_CREATED_COMMANDS: ManiSkill Standard In-Room Open Drawer (OpenCabinetDrawer-v1) - PPO + RND
+  # --------------------------------------------------------------------------
+  echo "python ppo_rnd.py \
+      --env=maniskill_open_cabinet_drawer \
+      --seed=${seed} \
+      --num_steps=600000000 \
+      --log_dir_path=maniskill_open_cabinet_drawer_rnd/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=0.01 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --rnd_int_coef=1.0 \
+      --rnd_ext_coef=1.0 \
+      --rnd_int_discount=0.99 \
+      --ppo_num_envs=512 \
+      --maniskill_native_vec \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_open_cabinet_drawer_rnd \
+      --render_video \
+      --video_every_steps=5000000" >> "$TASK_FILE"
+
+  # --------------------------------------------------------------------------
+  # 35. SAMI_CREATED_COMMANDS: ManiSkill Standard In-Room Close Drawer (CloseCabinetDrawer-v1) - PPO + NF
+  # --------------------------------------------------------------------------
+  echo "python ppo_contrastive.py \
+      --env=maniskill_close_cabinet_drawer \
+      --seed=${seed} \
+      --num_steps=600000000 \
+      --log_dir_path=ppo_maniskill_close_cabinet_drawer_nf/ \
+      --hidden_layer_sizes=\"256,256,256,256,256,256\" \
+      --ppo_repr_mode=nf \
+      --nf_rep_size=64 \
+      --nf_num_blocks=6 \
+      --nf_coupling_width=192 \
+      --nf_sa_hidden=192 \
+      --nf_sa_num_layers=3 \
+      --nf_grad_clip=1.0 \
+      --nf_noise_std=0.05 \
+      --nf_goal_std_min=0.02 \
+      --nf_goal_enc_size=0 \
+      --nf_mix_task_goal_stats \
+      --ppo_crl_steps_per_iter=10 \
+      --ppo_ent_coef=0.05 \
+      --ppo_actor_min_std=0.01 \
+      --ppo_discount=0.99 \
+      --ppo_clip_coef=0.2 \
+      --ppo_nf_reward_tau=0.5 \
+      --ppo_num_envs=512 \
+      --maniskill_native_vec \
+      --wandb_project=${WANDB_PROJECT} \
+      --wandb_entity=${WANDB_ENTITY} \
+      --wandb_group=ppo_close_cabinet_drawer_nf \
+      --render_video \
+      --video_every_steps=5000000" >> "$TASK_FILE"
+  #
 done
 
 # ==============================================================================
