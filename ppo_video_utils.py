@@ -48,9 +48,12 @@ def build_networks(env_name, seed, hidden_layer_sizes, fixed_start_end=None,
   """
   cfg = config if config is not None else contrastive.ContrastiveConfig()
 
+  load_kwargs = dict(render_mode=render_mode)
+  if cfg.max_episode_steps > 0:
+    load_kwargs['max_episode_steps'] = cfg.max_episode_steps - 1
   gym_env, obs_dim, max_episode_steps = env_utils.load(
       env_name, fixed_start_end=fixed_start_end, seed=seed,
-      render_mode=render_mode)
+      **load_kwargs)
   # Wrapping (not re-building) gym_env is side-effect free: GymWrapper's
   # __init__ only converts gym.spaces to acme specs, no reset()/step() --
   # so this avoids spinning up a second, throwaway ManiSkill/SAPIEN scene

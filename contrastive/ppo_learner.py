@@ -1045,12 +1045,15 @@ def run_ppo_training(
         _success_key = 'drawer_closed'
       elif _env_name == 'maniskill_open_subtask_train':
         _success_key = 'drawer_open'
+    max_ep_steps = (int(config.max_episode_steps) - 1
+                    if config.max_episode_steps > 0 else None)
     vec_env = _env_utils.ManiskillVecEnv(
         _env_name, config.ppo_num_envs,
         obs_dim=int(config.obs_dim),
         start_index=int(config.start_index),
         end_index=int(config.end_index),
-        success_key=_success_key)
+        success_key=_success_key,
+        max_episode_steps=max_ep_steps)
     print(f'[ppo] maniskill native vec env: {_env_name}, '
           f'num_envs={config.ppo_num_envs} (single GPU-batched sim), '
           f'success_key={_success_key!r}')
@@ -1227,6 +1230,7 @@ def run_ppo_training(
   nf_reward_fn = None
   crl_scan_update = None
   nf_scan_update = None
+  nf_eval_categorical = None
   if use_nf:
     nf_reward_fn = _nf.make_nf_reward_fn(
         nf_density_nets, obs_dim=obs_dim_cfg, goal_indices=goal_indices_cfg)
@@ -1236,6 +1240,13 @@ def run_ppo_training(
     if _use_repr_ema:
       print(f'[ppo] NF reward repr EMA: tau={_repr_tau} '
             f'(reward uses a slow copy of NF params)')
+
+    @jax.jit
+    def nf_eval_categorical(params, state, action, goal, goal_mean, goal_std):
+      goal_norm = (goal - goal_mean) / (goal_std + 1e-8)
+      pairwise_logp = _nf.compute_pairwise_log_prob(
+          nf_density_nets, params, state, action, goal_norm)
+      return _nf.compute_categorical_metrics(pairwise_logp)
   else:
     reward_fn = make_reward_fn(networks)
     crl_scan_update = make_scan_crl_update_fn(
@@ -1609,6 +1620,16 @@ def run_ppo_training(
             q_params, q_opt_state, q_params_reward, _stacked, key,
             jnp.asarray(nf_goal_mean), jnp.asarray(nf_goal_std))
         crl_metrics_agg = {k_: [float(v)] for k_, v in m.items()}
+        if nf_eval_categorical is not None:
+          m_cat = nf_eval_categorical(
+              q_params,
+              _stacked['obs'][0, :, :obs_dim_cfg],
+              _stacked['action'][0],
+              _stacked['obs'][0, :, obs_dim_cfg:],
+              jnp.asarray(nf_goal_mean),
+              jnp.asarray(nf_goal_std))
+          for k_, v in m_cat.items():
+            crl_metrics_agg[k_] = [float(v)]
       else:
         # Pre-sample all N batches in NumPy, stack to (N, B, dim), and run
         # all N CRL steps in a single jax.lax.scan (one JIT dispatch instead
@@ -1677,6 +1698,10 @@ def run_ppo_training(
     if use_nf:
       log['crl/density_loss'] = float('nan')
       log['crl/log_p_mean'] = float('nan')
+      log['crl/categorical_accuracy'] = float('nan')
+      log['crl/top_5_accuracy'] = float('nan')
+      log['crl/margin'] = float('nan')
+      log['crl/implicit_infonce'] = float('nan')
     else:
       log['crl/crl_loss'] = float('nan')
       log['crl/categorical_accuracy'] = float('nan')

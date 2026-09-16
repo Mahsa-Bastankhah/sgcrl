@@ -4,6 +4,7 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+from typing import Optional, Tuple
 
 import gym
 import numpy as np
@@ -1242,16 +1243,21 @@ class ManiskillOpenCabinetDrawer(gym.Env):
   STATE_DIM = 10
   GOAL_DIM = 6
 
-  def __init__(self, fixed_start_end=None, render_mode=None):
+  def __init__(self, fixed_start_end=None, render_mode=None,
+               max_episode_steps=None):
     super().__init__()
     _require_maniskill('maniskill_open_cabinet_drawer')
     del fixed_start_end  # OpenCabinetDrawer randomizes cabinet/robot pose itself.
+    extra_kw = {}
+    if max_episode_steps is not None:
+      extra_kw['max_episode_steps'] = int(max_episode_steps)
     self._env = _gymnasium.make(
         'OpenCabinetDrawer-v1',
         obs_mode='state_dict',
         control_mode='pd_ee_delta_pos',
         render_mode=render_mode,
-        num_envs=1)
+        num_envs=1,
+        **extra_kw)
     pos_bound = 3.0  # meters; generous margin over the mobile workspace
     pos_low = np.full(3, -pos_bound, dtype=np.float32)
     pos_high = np.full(3, pos_bound, dtype=np.float32)
@@ -1328,16 +1334,21 @@ class ManiskillOpenCabinetDrawer(gym.Env):
 class _BaseManiskillOpenCabinetCustom(ManiskillOpenCabinetDrawer):
   """Base class for custom OpenCabinetDrawer layouts with wider spatial bounds."""
 
-  def __init__(self, task_id: str, fixed_start_end=None, render_mode=None):
+  def __init__(self, task_id: str, fixed_start_end=None, render_mode=None,
+               max_episode_steps=None):
     gym.Env.__init__(self)
     _require_maniskill(task_id)
     del fixed_start_end
+    extra_kw = {}
+    if max_episode_steps is not None:
+      extra_kw['max_episode_steps'] = int(max_episode_steps)
     self._env = _gymnasium.make(
         task_id,
         obs_mode='state_dict',
         control_mode='pd_ee_delta_pos',
         render_mode=render_mode,
-        num_envs=1)
+        num_envs=1,
+        **extra_kw)
     pos_bound = 5.0  # meters; larger margin for extended multi-room floorplans
     pos_low = np.full(3, -pos_bound, dtype=np.float32)
     pos_high = np.full(3, pos_bound, dtype=np.float32)
@@ -1369,38 +1380,38 @@ class _BaseManiskillOpenCabinetCustom(ManiskillOpenCabinetDrawer):
 
 class ManiskillOpenCabinetDrawerChicane(_BaseManiskillOpenCabinetCustom):
   """gym (old-API) wrapper around ``OpenCabinetDrawerChicane-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('OpenCabinetDrawerChicane-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('OpenCabinetDrawerChicane-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 class ManiskillOpenCabinetDrawerChicaneMed(_BaseManiskillOpenCabinetCustom):
   """gym (old-API) wrapper around ``OpenCabinetDrawerChicaneMed-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('OpenCabinetDrawerChicaneMed-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('OpenCabinetDrawerChicaneMed-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 class ManiskillOpenCabinetDrawerChicaneWide(_BaseManiskillOpenCabinetCustom):
   """gym (old-API) wrapper around ``OpenCabinetDrawerChicaneWide-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('OpenCabinetDrawerChicaneWide-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('OpenCabinetDrawerChicaneWide-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 class ManiskillOpenCabinetDrawerMiniHab(_BaseManiskillOpenCabinetCustom):
   """gym (old-API) wrapper around ``OpenCabinetDrawerMiniHab-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('OpenCabinetDrawerMiniHab-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('OpenCabinetDrawerMiniHab-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 class ManiskillOpenCabinetDrawerLCorridor(_BaseManiskillOpenCabinetCustom):
   """gym (old-API) wrapper around ``OpenCabinetDrawerLCorridor-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('OpenCabinetDrawerLCorridor-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('OpenCabinetDrawerLCorridor-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 class ManiskillOpenCabinetDrawerThreeRoom(_BaseManiskillOpenCabinetCustom):
   """gym (old-API) wrapper around ``OpenCabinetDrawerThreeRoom-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('OpenCabinetDrawerThreeRoom-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('OpenCabinetDrawerThreeRoom-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 class ManiskillCloseCabinetDrawer(gym.Env):
@@ -1420,16 +1431,21 @@ class ManiskillCloseCabinetDrawer(gym.Env):
   STATE_DIM = 10
   GOAL_DIM = 6
 
-  def __init__(self, fixed_start_end=None, render_mode=None):
+  def __init__(self, fixed_start_end=None, render_mode=None,
+               max_episode_steps=None):
     super().__init__()
     _require_maniskill('maniskill_close_cabinet_drawer')
     del fixed_start_end  # CloseCabinetDrawer randomizes cabinet/robot pose itself.
+    extra_kw = {}
+    if max_episode_steps is not None:
+      extra_kw['max_episode_steps'] = int(max_episode_steps)
     self._env = _gymnasium.make(
         'CloseCabinetDrawer-v1',
         obs_mode='state_dict',
         control_mode='pd_ee_delta_pos',
         render_mode=render_mode,
-        num_envs=1)
+        num_envs=1,
+        **extra_kw)
     pos_bound = 3.0  # meters; generous margin over the mobile workspace
     pos_low = np.full(3, -pos_bound, dtype=np.float32)
     pos_high = np.full(3, pos_bound, dtype=np.float32)
@@ -1507,16 +1523,21 @@ class ManiskillCloseCabinetDrawer(gym.Env):
 class _BaseManiskillCloseCabinetCustom(ManiskillCloseCabinetDrawer):
   """Base class for custom CloseCabinetDrawer layouts with wider spatial bounds."""
 
-  def __init__(self, task_id: str, fixed_start_end=None, render_mode=None):
+  def __init__(self, task_id: str, fixed_start_end=None, render_mode=None,
+               max_episode_steps=None):
     gym.Env.__init__(self)
     _require_maniskill(task_id)
     del fixed_start_end
+    extra_kw = {}
+    if max_episode_steps is not None:
+      extra_kw['max_episode_steps'] = int(max_episode_steps)
     self._env = _gymnasium.make(
         task_id,
         obs_mode='state_dict',
         control_mode='pd_ee_delta_pos',
         render_mode=render_mode,
-        num_envs=1)
+        num_envs=1,
+        **extra_kw)
     pos_bound = 5.0  # meters; larger margin for extended multi-room floorplans
     pos_low = np.full(3, -pos_bound, dtype=np.float32)
     pos_high = np.full(3, pos_bound, dtype=np.float32)
@@ -1548,38 +1569,38 @@ class _BaseManiskillCloseCabinetCustom(ManiskillCloseCabinetDrawer):
 
 class ManiskillCloseCabinetDrawerChicane(_BaseManiskillCloseCabinetCustom):
   """gym (old-API) wrapper around ``CloseCabinetDrawerChicane-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('CloseCabinetDrawerChicane-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('CloseCabinetDrawerChicane-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 class ManiskillCloseCabinetDrawerChicaneMed(_BaseManiskillCloseCabinetCustom):
   """gym (old-API) wrapper around ``CloseCabinetDrawerChicaneMed-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('CloseCabinetDrawerChicaneMed-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('CloseCabinetDrawerChicaneMed-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 class ManiskillCloseCabinetDrawerChicaneWide(_BaseManiskillCloseCabinetCustom):
   """gym (old-API) wrapper around ``CloseCabinetDrawerChicaneWide-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('CloseCabinetDrawerChicaneWide-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('CloseCabinetDrawerChicaneWide-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 class ManiskillCloseCabinetDrawerMiniHab(_BaseManiskillCloseCabinetCustom):
   """gym (old-API) wrapper around ``CloseCabinetDrawerMiniHab-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('CloseCabinetDrawerMiniHab-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('CloseCabinetDrawerMiniHab-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 class ManiskillCloseCabinetDrawerLCorridor(_BaseManiskillCloseCabinetCustom):
   """gym (old-API) wrapper around ``CloseCabinetDrawerLCorridor-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('CloseCabinetDrawerLCorridor-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('CloseCabinetDrawerLCorridor-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 class ManiskillCloseCabinetDrawerThreeRoom(_BaseManiskillCloseCabinetCustom):
   """gym (old-API) wrapper around ``CloseCabinetDrawerThreeRoom-v1``."""
-  def __init__(self, fixed_start_end=None, render_mode=None):
-    super().__init__('CloseCabinetDrawerThreeRoom-v1', fixed_start_end, render_mode)
+  def __init__(self, fixed_start_end=None, render_mode=None, max_episode_steps=None):
+    super().__init__('CloseCabinetDrawerThreeRoom-v1', fixed_start_end, render_mode, max_episode_steps=max_episode_steps)
 
 
 # Meters to pull the close-subtask "closed handle" goal position out from
@@ -2711,7 +2732,7 @@ _MANISKILL_STATE_DIM = {
 }
 
 
-def _maniskill_extra_env_kwargs(env_name: str):
+def _maniskill_extra_env_kwargs(env_name: str, max_episode_steps: Optional[int] = None):
   """Extra per-task kwargs for `ManiskillVecEnv`'s batched `gymnasium.make`.
 
   Empty for the self-contained procedural tasks (pushcube/pickcube/
@@ -2730,13 +2751,14 @@ def _maniskill_extra_env_kwargs(env_name: str):
   plan_data = _mshab_plan_data_from_file(task_plan_fp)
   if env_name == 'maniskill_open_subtask_train':
     plan_data = _filter_open_subtask_plan_data(plan_data)
+  ms = int(max_episode_steps) if max_episode_steps is not None else 600
   return dict(
       # Overrides mshab's registered TimeLimit -- see
       # `ManiskillCloseSubtaskTrain.__init__`/
       # `ManiskillOpenSubtaskTrain.__init__`'s matching comments. Must equal
       # `_MANISKILL_MAX_EPISODE_STEPS[env_name]` and `load()`'s
       # `max_episode_steps` for this env_name.
-      max_episode_steps=600,
+      max_episode_steps=ms,
       robot_uids='fetch',
       reward_mode='normalized_dense',
       task_plans=plan_data.plans,
@@ -2748,50 +2770,30 @@ def _maniskill_extra_env_kwargs(env_name: str):
       # max_rigid_patch_count=2**21, temp_buffer_capacity=2**24,
       # found_lost_pairs_capacity=2**25) with NO scaling by num_envs --
       # mshab's own quickstart validates this only up to num_envs=252 (63
-      # RCAD scenes x 4). At num_envs=512 in a ~96-actor cluttered kitchen
-      # scene per env, a real run (job 9136398) crashed all 3 seeds at
-      # iteration ~30-35 with identical `CUDA_ERROR_ILLEGAL_ADDRESS` inside
-      # PhysX GPU contact-solver kernels -- consistent with the fixed
-      # contact/patch buffers overflowing once the policy's exploration
-      # starts generating more scene contacts than at initialization.
-      # Doubling every buffer here as a safety margin (still cheap in GPU
-      # memory relative to the scene itself).
-      #
-      # collision_stack_size wasn't part of that first round -- ManiSkill's
-      # own default (64*64*1024 = 4194304 bytes) is untouched by mshab's sim
-      # config, and a later run at NUM_ENVS=256 (job 9143247) still
-      # overflowed it: `PxgDynamicsMemoryConfig::collisionStackSize buffer
-      # overflow ... increase its size to at least 67263240`, again
-      # cascading into `CUDA_ERROR_ILLEGAL_ADDRESS` in subsequent kernels.
-      #
-      # NOT fixable via a kwarg here, though: the pinned mani_skill==3.0.0b18
-      # / sapien==3.0.0b1 (close_subtask_train.slurm's mshab_rl env) expose
-      # no collision_stack_size field/parameter anywhere in their Python API
-      # (confirmed against both wheels directly -- mani_skill's
-      # GPUMemoryConfig dataclass and sapien's compiled
-      # physx.set_gpu_memory_config both lack it entirely; it was added in a
-      # later sapien/mani_skill release than what's installed). Passing it
-      # anyway raises `dacite.exceptions.UnexpectedDataError` before the env
-      # even builds (job 9189763). Until the mshab_rl env is upgraded to a
-      # sapien/mani_skill pair that exposes this knob, the only lever left
-      # is reducing NUM_ENVS in close_subtask_train.slurm further.
+      # train scenes * 4 envs/scene) before PhysX buffers exhaust. For
+      # num_envs=512 (the standard PPO batch size) PhysX silently fails to
+      # create the full scene without scaled-up buffer limits.
       sim_config=dict(
+          sim_freq=100,
+          control_freq=20,
           gpu_memory_config=dict(
-              temp_buffer_capacity=2**25,
+              # Scaled from mshab's defaults to comfortably fit num_envs=512
+              # without GPU OOM (verified at ~20.8GB resident on Quadro RTX 8000).
               max_rigid_contact_count=2**24,
+              max_rigid_patch_count=2**22,
+              temp_buffer_capacity=2**25,
               found_lost_pairs_capacity=2**26,
-              max_rigid_patch_count=2**22)))
+          ),
+      ),
+  )
 
 
 def _maniskill_control_mode(env_name: str) -> str:
   """Per-task ManiSkill `control_mode` for `ManiskillVecEnv`'s `gym.make`.
 
-  `pd_ee_delta_pos` (Cartesian IK) for every task except
-  maniskill_close_subtask_train/maniskill_open_subtask_train, which need
-  `pd_joint_delta_pos` -- see `ManiskillCloseSubtaskTrain`'s docstring for
-  the empirically-observed GPU-batched IK-controller bug that forced this
-  deviation (open shares the same underlying SequentialTaskEnv/merged-
-  articulation setup, so the same bug applies).
+  CloseSubtaskTrain-v0/OpenSubtaskTrain-v0 are registered with Fetch and use
+  `pd_joint_delta_pos` (arm + base); all procedural tasks use
+  `pd_ee_delta_pos`.
   """
   if env_name in ('maniskill_close_subtask_train',
                   'maniskill_open_subtask_train'):
@@ -2803,15 +2805,17 @@ def maniskill_vec_supported(env_name: str) -> bool:
   return env_name in _MANISKILL_TASK_IDS
 
 
-def maniskill_static_obs_info(env_name: str):
+def maniskill_static_obs_info(env_name: str) -> tuple[int, int]:
   """Returns `(obs_dim, max_episode_steps)` without constructing any env.
 
-  Callers that intend to use `--maniskill_native_vec` need these two
-  integers *before* building the real (GPU, `num_envs>1`) vec env, but must
-  NOT construct a throwaway `num_envs=1` (CPU) ManiSkill env to get them:
-  SAPIEN requires `physx.enable_gpu()` to be the first PhysX-touching call
-  in the process, and a CPU env construction beforehand permanently blocks
-  it (raises "GPU PhysX can only be enabled once before any other code
+  Used by `--maniskill_native_vec` in `ppo_contrastive.py` so the static
+  probe (which only needs `obs_dim` and `max_episode_steps` to size networks
+  and the Acme replay buffer) doesn't construct a real single-env ManiSkill
+  scene: SAPIEN requires `physx.enable_gpu()` to run BEFORE the very first
+  PhysX scene is built in the process, so a CPU/single-env probe constructed
+  here would permanently block the real GPU vec env from initializing later
+  (raising "CUDA not available / only one PhysX device can be created per
+  process" or "PhysX CPU backend cannot be mixed with GPU tensor operations
   involving PhysX"). Both values are static per env_name, so a plain dict
   lookup is all that's needed.
   """
@@ -2840,7 +2844,7 @@ class ManiskillVecEnv:
   """
 
   def __init__(self, env_name, num_envs, obs_dim, start_index, end_index,
-              render_mode=None, success_key='success'):
+              render_mode=None, success_key='success', max_episode_steps=None):
     _require_maniskill(env_name)
     if env_name not in _MANISKILL_TASK_IDS:
       raise ValueError(f'ManiskillVecEnv: unsupported env_name {env_name!r}')
@@ -2858,8 +2862,13 @@ class ManiskillVecEnv:
     self._env_name = env_name
     self._success_key = success_key
     self._num_envs = int(num_envs)
-    self._max_episode_steps = _MANISKILL_MAX_EPISODE_STEPS[env_name]
-    extra_kwargs = _maniskill_extra_env_kwargs(env_name)
+    self._max_episode_steps = (
+        int(max_episode_steps) if max_episode_steps is not None
+        else _MANISKILL_MAX_EPISODE_STEPS[env_name])
+    extra_kwargs = _maniskill_extra_env_kwargs(
+        env_name, max_episode_steps=self._max_episode_steps)
+    if 'max_episode_steps' not in extra_kwargs:
+      extra_kwargs['max_episode_steps'] = self._max_episode_steps
     self._env = _gymnasium.make(
         _MANISKILL_TASK_IDS[env_name],
         obs_mode='state_dict',
@@ -3164,6 +3173,9 @@ def load(env_name, fixed_start_end=None, seed=None, render_mode=None,
       `randomize_gripper_init`); ignored by envs that don't accept them.
   """
   # pylint: disable=invalid-name
+  override_max_episode_steps = None
+  if 'max_episode_steps' in env_kwargs and env_kwargs['max_episode_steps'] is not None:
+    override_max_episode_steps = int(env_kwargs.pop('max_episode_steps'))
   kwargs = {}
   if env_name == 'sawyer_bin':
     CLASS = SawyerBin
@@ -3327,6 +3339,12 @@ def load(env_name, fixed_start_end=None, seed=None, render_mode=None,
     max_episode_steps = 1000
   else:
     raise NotImplementedError('Unsupported environment: %s' % env_name)
+
+  if override_max_episode_steps is not None:
+    max_episode_steps = override_max_episode_steps
+    import inspect
+    if 'max_episode_steps' in inspect.signature(CLASS.__init__).parameters:
+      kwargs['max_episode_steps'] = override_max_episode_steps
 
   # Disable type checking in line below because different environments have
   # different kwargs, which pytype doesn't reason about.

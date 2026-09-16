@@ -61,6 +61,10 @@ flags.DEFINE_bool(
 # sweeps pin T / crl_steps without editing the source.
 flags.DEFINE_integer('ppo_rollout_length', -1,
                      'If >=0, overrides the per-env rollout length default.')
+flags.DEFINE_integer(
+    'max_episode_steps', -1,
+    'If >=0, overrides the environment max episode steps (horizon). '
+    'If --ppo_rollout_length is not specified, it will also match this horizon.')
 flags.DEFINE_integer('ppo_crl_steps_per_iter', -1,
                      'If >=0, overrides the per-env CRL-steps default.')
 flags.DEFINE_integer(
@@ -308,6 +312,8 @@ def main(_):
 
   if FLAGS.ppo_rollout_length >= 0:
     config.ppo_rollout_length = int(FLAGS.ppo_rollout_length)
+  elif FLAGS.max_episode_steps >= 0:
+    config.ppo_rollout_length = int(FLAGS.max_episode_steps)
   if FLAGS.ppo_crl_steps_per_iter >= 0:
     config.ppo_crl_steps_per_iter = int(FLAGS.ppo_crl_steps_per_iter)
   if FLAGS.ppo_num_envs >= 0:
@@ -428,6 +434,8 @@ def main(_):
     _env_kwargs['randomize_gripper_init'] = True
     print('[ppo_contrastive] sawyer_bin init: randomized gripper position '
           'at reset')
+  if FLAGS.max_episode_steps >= 0:
+    _env_kwargs['max_episode_steps'] = int(FLAGS.max_episode_steps)
 
   if config.ppo_maniskill_native_vec and not env_name.startswith('maniskill_'):
     print(f'[ppo_contrastive] WARNING: --maniskill_native_vec has no '
@@ -462,6 +470,8 @@ def main(_):
   if config.ppo_maniskill_native_vec:
     import env_utils as _env_utils
     obs_dim, _max_steps = _env_utils.maniskill_static_obs_info(env_name)
+    if FLAGS.max_episode_steps >= 0:
+      _max_steps = int(FLAGS.max_episode_steps)
     config.obs_dim = obs_dim
     config.max_episode_steps = _max_steps + 1
   else:
