@@ -84,6 +84,14 @@ class Args:
     checkpoint_interval: int
     max_grad_norm: float
     rnd_output_size: int
+    sawyer_randomize_init: bool = True
+    sawyer_bin_safe_grasp_reset: bool = False
+    bin_randomize_gripper_init: bool = False
+    bin_randomize_tcp_z: bool = False
+    maze_randomize_start: bool = False
+    maze_start_jitter_cells: int = 0
+    maze_start_in_cell_jitter: float = 0.0
+    video_interval: int = 0
 
 
 class RunningMeanStd:
@@ -192,6 +200,24 @@ class VecEnv:
                 close()
 
 
+class JaxRndVecEnv:
+    """Adapt ``JaxPointVecEnv`` to this trainer's 4-tuple ``step`` API."""
+
+    def __init__(self, inner: Any):
+        self._inner = inner
+        self.num_envs = int(inner.num_envs)
+
+    def reset(self) -> np.ndarray:
+        return self._inner.reset()
+
+    def step(self, actions: np.ndarray):
+        next_obs, rew, dones, term, _ = self._inner.step(actions)
+        return next_obs, rew, dones, term
+
+    def close(self) -> None:
+        return None
+
+
 class Rollout(NamedTuple):
     obs: np.ndarray
     rnd_next_inputs: np.ndarray
@@ -256,6 +282,42 @@ def parse_args() -> Args:
     )
     parser.add_argument("--max_grad_norm", type=float, default=0.5)
     parser.add_argument("--rnd_output_size", type=int, default=256)
+    parser.add_argument(
+        "--sawyer_randomize_init", action="store_true", default=True,
+        help="Randomize Sawyer object XY at reset (bin/peg).")
+    parser.add_argument(
+        "--no_sawyer_randomize_init", dest="sawyer_randomize_init",
+        action="store_false")
+    parser.add_argument(
+        "--sawyer_bin_safe_grasp_reset", action="store_true",
+        help="Bounded/rejection servo for sawyer_bin grasp init.")
+    parser.add_argument(
+        "--bin_randomize_gripper_init", action="store_true",
+        help="sawyer_bin: TCP XY ±5cm around object, z Uniform(3cm, 6cm). "
+             "Takes precedence over --bin_randomize_tcp_z.")
+    parser.add_argument(
+        "--bin_randomize_tcp_z", action="store_true",
+        help="sawyer_bin: TCP z Uniform(3cm, 6cm), XY centered on object. "
+             "Ignored if --bin_randomize_gripper_init is set.")
+    parser.add_argument(
+        "--maze_randomize_start", action="store_true",
+        help="Sample maze start over free cells (or a jitter neighborhood).",
+    )
+    parser.add_argument(
+        "--maze_start_jitter_cells", type=int, default=0,
+        help="With --maze_randomize_start, restrict starts to free cells "
+             "with Chebyshev distance <= N of the canonical start, plus "
+             "Uniform[0,1)^2 in-cell jitter. 0 = all free cells.",
+    )
+    parser.add_argument(
+        "--maze_start_in_cell_jitter", type=float, default=0.0,
+        help="Stay in the canonical start cell and add Uniform[0, jitter)^2. "
+             "Takes precedence over cell sampling. Eval/PNGs stay exact start.",
+    )
+    parser.add_argument(
+        "--video_interval", type=int, default=0,
+        help="Write maze rollout PNGs every N iterations; 0 disables.",
+    )
     ns = parser.parse_args()
     if ns.hidden_sizes is not None:
         ns.policy_hidden_sizes = ns.hidden_sizes
@@ -276,6 +338,10 @@ def parse_args() -> Args:
         parser.error("step, environment, epoch, minibatch, eval, and RND sizes must be positive")
     if batch_size % args.num_minibatches:
         parser.error("num_envs * rollout_length must divide evenly by num_minibatches")
+    if args.maze_start_jitter_cells < 0 or args.video_interval < 0:
+        parser.error("--maze_start_jitter_cells and --video_interval must be >= 0")
+    if args.maze_start_in_cell_jitter < 0.0:
+        parser.error("--maze_start_in_cell_jitter must be >= 0")
     for name in ("discount", "int_discount", "gae_lambda"):
         if not 0.0 <= getattr(args, name) <= 1.0:
             parser.error(f"--{name} must be in [0, 1]")
@@ -385,22 +451,64 @@ def main(args: Args) -> None:
     key = jax.random.PRNGKey(args.seed)
 
     def env_factory(seed: int):
+        env_kwargs = {}
+        if args.env in ("sawyer_bin", "sawyer_peg"):
+            env_kwargs["randomize_init"] = bool(args.sawyer_randomize_init)
+        if args.env == "sawyer_bin" and args.sawyer_bin_safe_grasp_reset:
+            env_kwargs["safe_grasp_reset"] = True
+        if args.env == "sawyer_bin" and args.bin_randomize_gripper_init:
+            env_kwargs["randomize_gripper_init"] = True
+        if args.env == "sawyer_bin" and args.bin_randomize_tcp_z:
+            if args.bin_randomize_gripper_init:
+                pass  # env_utils ignores tcp_z when gripper_init is on
+            else:
+                env_kwargs["randomize_tcp_z"] = True
         env, obs_dim = make_environment(
             args.env,
             start_index=0,
             end_index=-1,
             seed=seed,
             fixed_start_end=FIXED_START_END[args.env],
+            **env_kwargs,
         )
         return env, obs_dim
 
     probe, state_size = env_factory(args.seed)
+    if args.env == "sawyer_bin":
+        print(
+            f"[ppo_rnd] sawyer_bin init: randomize_init={args.sawyer_randomize_init} "
+            f"safe_grasp={args.sawyer_bin_safe_grasp_reset} "
+            f"gripper_init={args.bin_randomize_gripper_init} "
+            f"tcp_z={args.bin_randomize_tcp_z}"
+        )
     obs_size = int(np.prod(probe.observation_spec().shape))
     action_size = int(np.prod(probe.action_spec().shape))
     max_episode_steps = int(getattr(probe, "_step_limit", 149)) + 1
     del probe
 
-    vec_env = VecEnv(lambda seed: env_factory(seed)[0], args.num_envs, args.seed)
+    if args.env.startswith("point_"):
+        from envs.point_env_jax import JaxPointVecEnv
+
+        print(
+            f"[ppo_rnd] JAX maze vec-env: randomize_start="
+            f"{args.maze_randomize_start} start_jitter_cells="
+            f"{args.maze_start_jitter_cells} start_in_cell_jitter="
+            f"{args.maze_start_in_cell_jitter:g}",
+            flush=True,
+        )
+        vec_env = JaxRndVecEnv(
+            JaxPointVecEnv(
+                args.env,
+                num_envs=args.num_envs,
+                seed=args.seed,
+                fixed_start_end=FIXED_START_END[args.env],
+                randomize_start=args.maze_randomize_start,
+                start_jitter_cells=args.maze_start_jitter_cells,
+                start_in_cell_jitter=args.maze_start_in_cell_jitter,
+            )
+        )
+    else:
+        vec_env = VecEnv(lambda seed: env_factory(seed)[0], args.num_envs, args.seed)
     eval_env = env_factory(args.seed + 100_000)[0]
     (
         policy,
@@ -579,7 +687,8 @@ def main(args: Args) -> None:
     print(
         f"[ppo_rnd] env={args.env} seed={args.seed} obs={obs_size} "
         f"state={state_size} action={action_size} batch={batch_size} "
-        f"iterations={num_iterations} backend={jax.default_backend()}"
+        f"iterations={num_iterations} backend={jax.default_backend()} "
+        f"video_interval={args.video_interval}"
     )
 
     global_step = 0
@@ -753,6 +862,47 @@ def main(args: Args) -> None:
                     f"[eval] iter={iteration} return={eval_row['episode_return']:.4g} "
                     f"success={eval_row['success']:.3f}"
                 )
+
+            if (
+                args.video_interval
+                and args.env.startswith("point_")
+                and (iteration == 1 or iteration % args.video_interval == 0)
+            ):
+                from contrastive.maze_nf_render import render_maze_policy_rollouts
+
+                def _rnd_act(obs, stochastic, rng):
+                    obs_b = np.asarray(obs, dtype=np.float32)[None]
+                    normalized = normalize_obs(
+                        jnp.asarray(obs_b),
+                        obs_rms.mean.astype(np.float32),
+                        obs_rms.var.astype(np.float32),
+                    )
+                    if stochastic:
+                        action, *_ = act_value(
+                            params["policy"],
+                            params["ext_value"],
+                            params["int_value"],
+                            normalized,
+                            rng,
+                        )
+                        return np.asarray(action)[0]
+                    return np.asarray(
+                        deterministic_action(params["policy"], normalized)[0]
+                    )
+
+                out_png = run_dir / "rollouts" / f"iter_{iteration:07d}.png"
+                render_maze_policy_rollouts(
+                    env_name=args.env,
+                    act_fn=_rnd_act,
+                    out_path=str(out_png),
+                    title=(
+                        f"PPO-RND {args.env} iter={iteration} "
+                        f"steps={global_step}"
+                    ),
+                    seed=args.seed + iteration,
+                    fixed_start_end=FIXED_START_END[args.env],
+                )
+                print(f"[video] wrote {out_png}", flush=True)
 
             if args.checkpoint_interval and (
                 iteration % args.checkpoint_interval == 0

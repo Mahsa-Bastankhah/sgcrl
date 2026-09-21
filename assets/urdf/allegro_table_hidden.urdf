@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<robot name="allegro_table_hidden">
+  <!--
+    NVIDIA still creates a table actor. Park a 1 cm box far from the
+    workspace so the scene is table-free (bucket-only landing).
+  -->
+  <link name="box">
+    <visual>
+      <origin xyz="10 10 -2"/>
+      <geometry>
+        <box size="0.01 0.01 0.01"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="10 10 -2"/>
+      <geometry>
+        <box size="0.01 0.01 0.01"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="10 10 -2"/>
+      <mass value="1"/>
+      <inertia ixx="1.0" ixy="0.0" ixz="0.0"
+               iyy="1.0" iyz="0.0" izz="1.0"/>
+    </inertial>
+  </link>
+</robot>

@@ -58,6 +58,7 @@ from contrastive import nf_density as _nf
 from contrastive import ppo_learner
 from contrastive import utils as contrastive_utils
 from envs.builderbench_utils import (
+    apply_fixed_start_x,
     creative_cube_full_state_obs_dim,
     creative_cube_mj_episode_length,
     filter_pd_policy_state_obs,
@@ -104,6 +105,13 @@ class _TrainCtx:
   nf_goal_enc_size: int
   nf_goal_std_min: float
   nf_state_only: bool
+  nf_sa_hidden: int
+  nf_sa_num_layers: int
+  nf_scale_tanh: bool
+  nf_scale_tanh_c: float
+  categorical_select_classes: Optional[int]
+  categorical_select_waypoint: bool
+  fixed_start_x: Optional[float]
   act_dim: int
 
 
@@ -116,7 +124,6 @@ def _run_config_path(run_dir: str) -> str:
 
 def _load_train_ctx(env_name: str, run_dir: str) -> Tuple[_TrainCtx, Dict[str, Any]]:
   num_cubes, task_index = parse_bb_env_id(sgcrl_env_name_to_bb_env_id(env_name))
-  mj_ep_len = creative_cube_mj_episode_length(num_cubes, task_index)
   full_obs_dim = creative_cube_full_state_obs_dim(num_cubes)
   pd_obs_dim = pd_policy_state_obs_dim(num_cubes)
 
@@ -125,6 +132,12 @@ def _load_train_ctx(env_name: str, run_dir: str) -> Tuple[_TrainCtx, Dict[str, A
   flags = run_cfg.get('flags', {})
   resolved = run_cfg.get('resolved_config', {})
   ppo_defaults = run_cfg.get('ppo_env_defaults', {})
+  mj_ep_len = creative_cube_mj_episode_length(num_cubes, task_index)
+  mj_flag = flags.get(
+      'builderbench_mj_episode_length',
+      resolved.get('builderbench_mj_episode_length'))
+  if mj_flag not in (None, '', False):
+    mj_ep_len = int(mj_flag)
 
   use_pd = bool(flags.get('builderbench_use_pd', False))
   pd_duration = int(flags.get('builderbench_pd_duration', 5))
@@ -142,6 +155,19 @@ def _load_train_ctx(env_name: str, run_dir: str) -> Tuple[_TrainCtx, Dict[str, A
   if fixed_goal is None:
     fixed_goal = fixed_goal_for_env(env_name)
   permute_start_boxes = bool(flags.get('builderbench_permute_start_boxes', True))
+  fx = flags.get(
+      'builderbench_fixed_start_x',
+      resolved.get('builderbench_fixed_start_x', -1.0))
+  fixed_start_x = (None if fx is None or float(fx) < 0 else float(fx))
+  cat_select = bool(flags.get(
+      'ppo_categorical_select',
+      resolved.get('ppo_categorical_select', False)))
+  cat_classes = int(num_cubes) if cat_select else None
+  cat_wp = bool(flags.get(
+      'ppo_categorical_select_waypoint',
+      resolved.get('ppo_categorical_select_waypoint', False)))
+  if cat_wp and cat_classes is None:
+    cat_classes = int(num_cubes)
 
   if use_pd:
     macro_ep_len = mj_ep_len // pd_duration
@@ -167,12 +193,28 @@ def _load_train_ctx(env_name: str, run_dir: str) -> Tuple[_TrainCtx, Dict[str, A
       start_index=start_index,
       end_index=end_index,
       permute_start_boxes=permute_start_boxes,
-      nf_rep_size=int(resolved.get('nf_rep_size', 256)),
-      nf_num_blocks=int(resolved.get('nf_num_blocks', 12)),
-      nf_coupling_width=int(resolved.get('nf_coupling_width', 512)),
-      nf_goal_enc_size=int(resolved.get('nf_goal_enc_size', 0)),
-      nf_goal_std_min=float(resolved.get('nf_goal_std_min', 0.02)),
-      nf_state_only=bool(resolved.get('nf_state_only', False)),
+      nf_rep_size=int(resolved.get('nf_rep_size', flags.get('nf_rep_size', 64))),
+      nf_num_blocks=int(resolved.get(
+          'nf_num_blocks', flags.get('nf_num_blocks', 8))),
+      nf_coupling_width=int(resolved.get(
+          'nf_coupling_width', flags.get('nf_coupling_width', 256))),
+      nf_goal_enc_size=int(resolved.get(
+          'nf_goal_enc_size', flags.get('nf_goal_enc_size', 0))),
+      nf_goal_std_min=float(resolved.get(
+          'nf_goal_std_min', flags.get('nf_goal_std_min', 0.02))),
+      nf_state_only=bool(resolved.get(
+          'nf_state_only', flags.get('nf_state_only', False))),
+      nf_sa_hidden=int(resolved.get(
+          'nf_sa_hidden', flags.get('nf_sa_hidden', 1024))),
+      nf_sa_num_layers=int(resolved.get(
+          'nf_sa_num_layers', flags.get('nf_sa_num_layers', 4))),
+      nf_scale_tanh=bool(resolved.get(
+          'nf_scale_tanh', flags.get('nf_scale_tanh', False))),
+      nf_scale_tanh_c=float(resolved.get(
+          'nf_scale_tanh_c', flags.get('nf_scale_tanh_c', 2.0))),
+      categorical_select_classes=cat_classes,
+      categorical_select_waypoint=cat_wp,
+      fixed_start_x=fixed_start_x,
       act_dim=0,
   )
   return ctx, run_cfg
@@ -237,9 +279,18 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx, repr_mode: str):
       use_image_obs=cfg.use_image_obs,
       hidden_layer_sizes=ctx.hidden_layer_sizes,
       actor_min_std=ctx.actor_min_std,
+      categorical_select_classes=ctx.categorical_select_classes,
+      categorical_select_waypoint=bool(ctx.categorical_select_waypoint),
   )
   nf_nets = None
   if repr_mode == 'nf':
+    print(
+        f'[preimage] NF arch: rep={ctx.nf_rep_size} blocks={ctx.nf_num_blocks} '
+        f'channels={ctx.nf_coupling_width} sa={ctx.nf_sa_num_layers}x'
+        f'{ctx.nf_sa_hidden} state_only={ctx.nf_state_only} '
+        f'scale_tanh={ctx.nf_scale_tanh} catwp={ctx.categorical_select_waypoint} '
+        f'fixed_start_x={ctx.fixed_start_x}',
+        flush=True)
     nf_nets = _nf.make_nf_density_networks(
         obs_dim=int(ctx.obs_dim),
         act_dim=act_dim,
@@ -249,7 +300,11 @@ def _build_networks(env_name: str, seed: int, ctx: _TrainCtx, repr_mode: str):
         num_blocks=ctx.nf_num_blocks,
         channels=ctx.nf_coupling_width,
         goal_enc_size=ctx.nf_goal_enc_size,
+        sa_hidden=ctx.nf_sa_hidden,
+        sa_num_layers=ctx.nf_sa_num_layers,
         state_only=bool(ctx.nf_state_only),
+        scale_tanh=bool(ctx.nf_scale_tanh),
+        scale_tanh_c=float(ctx.nf_scale_tanh_c),
     )
   return networks, nf_nets, act_dim, int(obs_dim)
 
@@ -259,13 +314,17 @@ def _make_bb_env(env_id: str, ctx: _TrainCtx):
   cfg = default_config()
   cfg.num_cubes = num_cubes
   cfg.task_id = task_id
-  cfg.episode_length = creative_cube_mj_episode_length(num_cubes, task_id)
+  if ctx.use_pd:
+    cfg.episode_length = int(ctx.episode_length * ctx.pd_duration)
+  else:
+    cfg.episode_length = int(ctx.episode_length)
   cfg.permute_start_boxes = bool(ctx.permute_start_boxes)
   cfg.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
   if env_id in _MJX_PARAMS:
     cfg.nconmax, cfg.njmax = _MJX_PARAMS[env_id]
 
   base = CreativeCube(config=cfg)
+  apply_fixed_start_x(base, ctx.fixed_start_x)
   mocap_targets = base._task_mocap_targets
 
   if ctx.use_pd:
@@ -324,8 +383,15 @@ def _collect_trajectories(
     num_cubes: int,
     filter_policy_obs: bool,
     obs_dim: int,
+    post_success_steps: int = -1,
 ):
-  """Roll out stochastic trajs; return flat arrays of (s, a, render payloads)."""
+  """Roll out stochastic trajs; return flat arrays of (s, a, render payloads).
+
+  When ``post_success_steps >= 0``, keep all transitions through the action
+  that first produces hard BuilderBench success, plus that many additional
+  macro-steps afterward (so the successful state itself is included). Later
+  transitions are discarded. ``post_success_steps=-1`` keeps the full episode.
+  """
   @jax.jit
   def _one_traj(key):
     env_key, key = jax.random.split(key)
@@ -344,6 +410,9 @@ def _collect_trajectories(
         state_feat = filter_pd_policy_state_obs(obs, num_cubes)
       else:
         state_feat = obs[..., :obs_dim]
+      next_state = env.step(state, action)
+      next_state = _maybe_fix_target(
+          next_state, fixed_target_goal, mocap_targets, num_cubes)
       payload = {
           'state': state_feat[0],
           'action': action[0],
@@ -351,27 +420,43 @@ def _collect_trajectories(
           'qvel': state.data.qvel[0],
           'mocap_pos': state.info['target_mocap_pos'][0],
           'mocap_quat': state.info['target_mocap_quat'][0],
+          'next_success': next_state.metrics['success'][0],
       }
-      next_state = env.step(state, action)
-      next_state = _maybe_fix_target(
-          next_state, fixed_target_goal, mocap_targets, num_cubes)
       return (next_state, key), payload
 
     _, traj = jax.lax.scan(step, (state, key), (), length=episode_length)
     return traj
 
   states, actions, qpos, qvel, mocap_pos, mocap_quat = [], [], [], [], [], []
+  traj_indices, traj_steps, first_success_steps = [], [], []
   for i in range(num_trajs):
     key, sub = jax.random.split(key)
     traj = _one_traj(sub)
     # Bring to host once per traj.
-    states.append(np.asarray(traj['state']))
-    actions.append(np.asarray(traj['action']))
-    qpos.append(np.asarray(traj['qpos']))
-    qvel.append(np.asarray(traj['qvel']))
-    mocap_pos.append(np.asarray(traj['mocap_pos']))
-    mocap_quat.append(np.asarray(traj['mocap_quat']))
-    print(f'[preimage]   traj {i + 1}/{num_trajs} done', flush=True)
+    next_success = np.asarray(traj['next_success']).reshape(-1)
+    hit = np.flatnonzero(next_success >= 0.5)
+    first_success = int(hit[0]) if hit.size else -1
+    n_steps = int(len(next_success))
+    if int(post_success_steps) >= 0 and first_success >= 0:
+      # first_success indexes the (s,a) that produces success; +1 reaches the
+      # successful state as the next payload's qpos; then wait N more steps.
+      keep = min(n_steps, first_success + 1 + int(post_success_steps))
+    else:
+      keep = n_steps
+    states.append(np.asarray(traj['state'])[:keep])
+    actions.append(np.asarray(traj['action'])[:keep])
+    qpos.append(np.asarray(traj['qpos'])[:keep])
+    qvel.append(np.asarray(traj['qvel'])[:keep])
+    mocap_pos.append(np.asarray(traj['mocap_pos'])[:keep])
+    mocap_quat.append(np.asarray(traj['mocap_quat'])[:keep])
+    traj_indices.append(np.full(keep, i, dtype=np.int32))
+    traj_steps.append(np.arange(keep, dtype=np.int32))
+    first_success_steps.append(first_success)
+    print(
+        f'[preimage]   traj {i + 1}/{num_trajs} done '
+        f'first_success={first_success} retained={keep}/{n_steps} '
+        f'post_success_steps={int(post_success_steps)}',
+        flush=True)
 
   return {
       'state': np.concatenate(states, axis=0).astype(np.float32),
@@ -380,6 +465,9 @@ def _collect_trajectories(
       'qvel': np.concatenate(qvel, axis=0),
       'mocap_pos': np.concatenate(mocap_pos, axis=0),
       'mocap_quat': np.concatenate(mocap_quat, axis=0),
+      'traj_index': np.concatenate(traj_indices, axis=0),
+      'traj_step': np.concatenate(traj_steps, axis=0),
+      'first_success_steps': np.asarray(first_success_steps, dtype=np.int32),
   }
 
 
@@ -443,8 +531,24 @@ def _score_preimage_crl(
   return dots.astype(np.float32), score, weights
 
 
+def _free_camera(mj_model, lookat, zoom: float,
+                 azimuth: float | None = None,
+                 elevation: float | None = None):
+  """Closer free camera centered on ``lookat``. zoom=1 is the default distance."""
+  import mujoco
+  cam = mujoco.MjvCamera()
+  cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+  cam.lookat[:] = np.asarray(lookat, dtype=np.float64).reshape(3)
+  extent = float(mj_model.stat.extent) if float(mj_model.stat.extent) > 0 else 0.8
+  cam.distance = (1.5 * extent) / max(float(zoom), 1e-3)
+  cam.azimuth = float(mj_model.vis.global_.azimuth if azimuth is None else azimuth)
+  cam.elevation = float(mj_model.vis.global_.elevation if elevation is None else elevation)
+  return cam
+
+
 def _render_state(env, qpos, qvel, mocap_pos, mocap_quat,
-                  height: int = 480, width: int = 640) -> np.ndarray:
+                  height: int = 480, width: int = 640,
+                  camera=None) -> np.ndarray:
   return np.asarray(env.render_from_info(
       np.asarray(qpos),
       np.asarray(qvel),
@@ -452,6 +556,7 @@ def _render_state(env, qpos, qvel, mocap_pos, mocap_quat,
       np.asarray(mocap_quat),
       height=height,
       width=width,
+      camera=(-1 if camera is None else camera),
   ), dtype=np.uint8)
 
 
@@ -552,6 +657,18 @@ def main():
   ap.add_argument('--seed', type=int, default=0)
   ap.add_argument('--width', type=int, default=640)
   ap.add_argument('--height', type=int, default=480)
+  ap.add_argument('--cam_zoom', type=float, default=1.0,
+                  help='Free-camera zoom vs default distance (larger = closer).')
+  ap.add_argument('--cam_lookat', default='',
+                  help='x,y,z look-at. Default: mean of the hard-goal cubes.')
+  ap.add_argument('--cam_azimuth', default='',
+                  help='Override azimuth; default is the scene camera.')
+  ap.add_argument('--cam_elevation', default='',
+                  help='Override elevation; default is the scene camera.')
+  ap.add_argument('--cell_w', type=int, default=0,
+                  help='Montage cell width. 0 = max(320, width/2).')
+  ap.add_argument('--cell_h', type=int, default=0,
+                  help='Montage cell height. 0 = max(240, height/2).')
   args = ap.parse_args()
 
   if not is_builderbench_creative_env(args.env):
@@ -587,15 +704,39 @@ def main():
       f'hard_goal dim {hard_goal.shape[0]} != goal_dim {ctx.goal_dim}')
   print(f'[preimage] hard_goal={hard_goal}')
   print(f'[preimage] ctx: obs_dim={ctx.obs_dim} goal_dim={ctx.goal_dim} '
-        f'ep_len={ctx.episode_length} filter={ctx.filter_policy_obs}')
+        f'ep_len={ctx.episode_length} filter={ctx.filter_policy_obs} '
+        f'catwp={ctx.categorical_select_waypoint} '
+        f'fixed_start_x={ctx.fixed_start_x}')
 
   print('[preimage] building networks / env...', flush=True)
   networks, nf_nets, act_dim, _ = _build_networks(
       args.env, args.seed, ctx, args.repr_mode)
   ctx.act_dim = act_dim
-  video_env, _base, mocap_targets, episode_length, num_cubes = _make_bb_env(
+  video_env, base, mocap_targets, episode_length, num_cubes = _make_bb_env(
       env_id, ctx)
   assert episode_length == ctx.episode_length
+  base._mj_model.vis.global_.offwidth = max(
+      int(args.width), int(base._mj_model.vis.global_.offwidth))
+  base._mj_model.vis.global_.offheight = max(
+      int(args.height), int(base._mj_model.vis.global_.offheight))
+  if args.cam_lookat.strip():
+    lookat = np.asarray(
+        [float(x) for x in args.cam_lookat.split(',')], dtype=np.float64)
+  else:
+    lookat = hard_goal.reshape(-1, 3).mean(axis=0)
+  azimuth = None if not str(args.cam_azimuth).strip() else float(args.cam_azimuth)
+  elevation = (None if not str(args.cam_elevation).strip()
+               else float(args.cam_elevation))
+  camera = None
+  if (float(args.cam_zoom) != 1.0 or args.cam_lookat.strip()
+      or args.cam_azimuth.strip() or args.cam_elevation.strip()):
+    camera = _free_camera(
+        base._mj_model, lookat, float(args.cam_zoom),
+        azimuth=azimuth, elevation=elevation)
+  print(f'[preimage] zoom={args.cam_zoom} lookat={np.asarray(lookat).round(3).tolist()}',
+        flush=True)
+  cell_w = int(args.cell_w) if args.cell_w > 0 else max(320, int(args.width) // 2)
+  cell_h = int(args.cell_h) if args.cell_h > 0 else max(240, int(args.height) // 2)
 
   key = jax.random.PRNGKey(args.seed)
 
@@ -676,6 +817,7 @@ def main():
           data['qpos'][idx], data['qvel'][idx],
           data['mocap_pos'][idx], data['mocap_quat'][idx],
           height=args.height, width=args.width,
+          camera=camera,
       )
       step_in_pool = int(idx)
       traj_id = step_in_pool // episode_length
@@ -705,7 +847,9 @@ def main():
 
   col_labels = [f'rank {i}' for i in range(1, args.top_k + 1)]
   montage_path = os.path.join(out_dir, 'goal_preimage_montage.png')
-  _make_montage(montage_imgs, row_labels, col_labels, montage_path)
+  _make_montage(
+      montage_imgs, row_labels, col_labels, montage_path,
+      cell_w=cell_w, cell_h=cell_h)
 
   meta_path = os.path.join(out_dir, 'manifest.json')
   with open(meta_path, 'w', encoding='utf-8') as fh:

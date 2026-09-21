@@ -31,6 +31,35 @@ WALLS = {
                   [0, 0, 0, 1, 0, 0, 0, 1, 0],
                   [0, 1, 0, 1, 0, 1, 0, 1, 1],
                   [0, 1, 0, 0, 0, 1, 0, 1, 0]]),
+    # Impossible with the left corridor (cols 0–1) removed. Old (8, 2) is
+    # the new start (8, 0); old goal (6, 8) is the new goal (6, 6).
+    'ImpossibleNoLeft':
+        np.array([[0, 0, 0, 0, 0, 0, 0],
+                  [0, 1, 1, 1, 1, 1, 0],
+                  [0, 0, 0, 0, 1, 0, 0],
+                  [1, 1, 1, 0, 1, 0, 1],
+                  [0, 0, 0, 0, 1, 0, 0],
+                  [0, 1, 1, 1, 1, 1, 0],
+                  [0, 1, 0, 0, 0, 1, 0],
+                  [0, 1, 0, 1, 0, 1, 1],
+                  [0, 0, 0, 1, 0, 1, 0]]),
+    # Opened passages vs ImpossibleNoLeft, last row dropped (8x7).
+    'ImpossibleOpen':
+        np.array([[0, 0, 0, 0, 0, 0, 0],
+                  [0, 0, 0, 1, 1, 1, 0],
+                  [0, 0, 0, 0, 1, 0, 0],
+                  [1, 1, 0, 0, 1, 0, 1],
+                  [0, 0, 0, 0, 1, 0, 0],
+                  [0, 1, 1, 1, 1, 1, 0],
+                  [0, 1, 0, 0, 0, 1, 0],
+                  [0, 0, 0, 1, 0, 1, 1]]),
+    # Paper concept maze (5x5). Start (4,0), goal (4,4).
+    'MazeConcept':
+        np.array([[0, 0, 0, 0, 0],
+                  [0, 1, 1, 1, 0],
+                  [0, 0, 1, 0, 0],
+                  [1, 0, 1, 0, 1],
+                  [0, 0, 1, 0, 0]]),
     'FourRooms':  
         np.array([[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
                   [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],
@@ -218,7 +247,8 @@ class PointEnv(gym.Env):
         ]),
         dtype=np.float32)
     self._timestep = 0
-    if '11x11' in walls or '9x9' in walls or '7x7' in walls or walls == 'Impossible':
+    if ('11x11' in walls or '9x9' in walls or '7x7' in walls
+        or 'Impossible' in walls):
       self._max_episode_steps = 100
     elif walls == 'EightRooms':
       self._max_episode_steps = 100   # 2× FourRooms (11×21 grid)

@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Live comparison: original-repo SGCRL (graliuce) vs PPO+NF on Sawyer bin/peg.
+"""Live comparison: original-repo SGCRL vs PPO+NF on Sawyer bin/peg.
 
 2x2: columns = bin, peg; rows = train, eval. Mean ±1 SE across seeds.
 Train is raw. Eval is faint raw + bold centered rolling mean (window=5).
 
-SGCRL (2 seeds, live): /n/fs/mislresearch/old-sgcrl/logs/sawyer_{bin,peg}_s{0,1}/
-PPO+NF bin ent=0.05 (1 seed, rand): ..._rand_mixtaskg/
-PPO+NF bin ent=0.005 (1 seed, rand): ..._rand_ent0005_mixtaskg/
-PPO+NF peg (3 done, ent=0.005): ..._rand_minstd1e5_ent0005_mixtaskg/
-PPO+NF bin norand orig (seeds 0,1 Aug-12 + seed 2 new): ..._norand/
+PPO+NF (final_metaworld_runs):
+  bin norand: ..._norand_noobs/
+  bin floor-grasp: ..._floorgrasp_g04_rand_mixtaskg/
+  peg: ..._ent0005_mixtaskg/
+
+Baselines (final_baselines):
+  SGCRL, MPO+CRL, PPO+RND  (RND has eval success only; no train_success log)
 
   python scripts/plot_old_sgcrl_vs_ppo_nf_success.py
   python scripts/plot_old_sgcrl_vs_ppo_nf_success.py --watch 300
@@ -35,30 +37,34 @@ import plot_builderbench_train_success1000 as base  # noqa: E402
 
 OLD_SGCRL = '/n/fs/mislresearch/old-sgcrl/logs'
 LOG_ROOT = os.path.join(REPO, 'logs', 'final_metaworld_runs')
+BASE_ROOT = os.path.join(REPO, 'logs', 'final_baselines')
 OUT_DIR = os.path.join(REPO, 'figs', 'metaworld', 'final_metaworld_runs')
 OUT_STEM = os.path.join(OUT_DIR, 'sawyer_bin_peg_success')
 OUT_LIVE = os.path.join(OUT_DIR, 'old_sgcrl_vs_ppo_nf_success')
 
 PPO_STEPS_PER_ITER = 1024  # num_envs=4 × rollout_length=256
+RND_STEPS_PER_ITER = 2048
 LP_NUM_ACTORS = 4
 
 COLOR_SGCRL = '#0072B2'
-COLOR_PPO_ENT05 = '#D55E00'
-COLOR_PPO_ENT0005 = '#009E73'
 COLOR_PPO_NORAND = '#CC79A7'
+COLOR_PPO_FLOORGRASP = '#6A3D9A'
+COLOR_PPO_PEG = '#009E73'
+COLOR_MPO = '#E69F00'
+COLOR_RND = '#D55E00'
 
-PPO_DIR_BIN_ENT05 = (
-    'ppo_bin_nf_tiny_sa2x128_r32_b4_w128_tau085_crl10_40m'
-    '_minstd1e5_extrew1_rand_mixtaskg')
-PPO_DIR_BIN_ENT0005 = (
-    'ppo_bin_nf_tiny_sa2x128_r32_b4_w128_tau085_crl10_40m'
-    '_minstd1e5_extrew1_rand_ent0005_mixtaskg')
 PPO_DIR_BIN_NORAND = (
     'ppo_bin_nf_tiny_sa2x128_r32_b4_w128_tau085_crl10_40m'
-    '_minstd1e5_extrew1_norand')
+    '_minstd1e5_extrew1_norand_noobs')
+PPO_DIR_BIN_FLOORGRASP = (
+    'ppo_bin_nf_pegrecipe_floorgrasp_g04_rand_mixtaskg')
 PPO_DIR_PEG = (
     'ppo_peg_nf_tiny_sa2x128_r32_b4_w128_tau085_crl10_40m'
     '_extrew1_rand_minstd1e5_ent0005_mixtaskg')
+MPO_DIR_BIN = os.path.join(BASE_ROOT, 'mpo_crl_sawyer_bin')
+MPO_DIR_PEG = os.path.join(BASE_ROOT, 'mpo_crl_sawyer_peg')
+RND_DIR_BIN = os.path.join(BASE_ROOT, 'rnd_sawyer_bin')
+RND_DIR_PEG = os.path.join(BASE_ROOT, 'rnd_sawyer_peg')
 
 ENVS = (
     ('bin', 'Sawyer bin'),
@@ -109,8 +115,6 @@ def _read_xy(path: str, x_keys: tuple[str, ...], y_keys: tuple[str, ...],
     if yi is None:
       return []
     xi = next((name_to_i[k] for k in x_keys if k in name_to_i), None)
-    # Launchpad evaluator CSVs sometimes omit actor_steps; scale
-    # evaluator_steps by num_actors so the x-axis is env steps.
     eval_i = name_to_i.get('evaluator_steps')
     pts: list[tuple[int, float]] = []
     for row in reader:
@@ -142,7 +146,6 @@ def _seed_dirs(cfg_dir: str) -> list[str]:
 
 
 def _lp_run_dirs(env_key: str) -> list[str]:
-  parent = os.path.join(OLD_SGCRL, f'sawyer_{env_key}_s')
   out = []
   if not os.path.isdir(OLD_SGCRL):
     return out
@@ -156,7 +159,6 @@ def _lp_run_dirs(env_key: str) -> list[str]:
       run_dir = os.path.join(seed_root, child)
       if os.path.isdir(run_dir) and os.path.isdir(os.path.join(run_dir, 'logs')):
         out.append(run_dir)
-  del parent
   return out
 
 
@@ -195,6 +197,21 @@ def _ppo_eval_series(cfg_dir: str) -> list[list[tuple[int, float]]]:
         ('success_1000', 'success'),
         x_scale=PPO_STEPS_PER_ITER,
     )
+    if pts:
+      series.append(pts)
+  return series
+
+
+def _rnd_eval_series(cfg_dir: str) -> list[list[tuple[int, float]]]:
+  """RND eval logs use learner_steps when present; else iteration×2048."""
+  series = []
+  for run_dir in _seed_dirs(cfg_dir):
+    path = os.path.join(run_dir, 'logs', 'eval', 'logs.csv')
+    pts = _read_xy(path, ('learner_steps',), ('success_1000', 'success'))
+    if not pts:
+      pts = _read_xy(
+          path, ('iteration',), ('success_1000', 'success'),
+          x_scale=RND_STEPS_PER_ITER)
     if pts:
       series.append(pts)
   return series
@@ -262,37 +279,12 @@ def _faint_seeds(ax, seed_series, *, color, ls='-', z=2) -> None:
 def _draw() -> None:
   w = base.EVAL_SMOOTH_WINDOW
   plt.rcParams.update(_paper_rc())
-  # Independent x per panel: peg's 40M axis must not crush the live bin/SGCRL
-  # curves (sharex='col' + a finished 40M series made them look empty).
   fig, axes = plt.subplots(2, 2, figsize=(12.8, 8.4), sharex=False, sharey=True)
 
   methods = (
       {
-          'key': 'ppo_nf_ent05',
-          'label': 'PPO+NF ent=0.05 (rand)',
-          'color': COLOR_PPO_ENT05,
-          'kind': 'ppo',
-          'ls': '-',
-          'z': 3,
-          'envs': ('bin',),
-          'ppo_dir': PPO_DIR_BIN_ENT05,
-      },
-      {
-          'key': 'ppo_nf_ent0005',
-          'label': 'PPO+NF ent=0.005 (rand)',
-          'color': COLOR_PPO_ENT0005,
-          'kind': 'ppo',
-          'ls': '-',
-          'z': 4,
-          'envs': ('bin', 'peg'),
-          'ppo_dir': {
-              'bin': PPO_DIR_BIN_ENT0005,
-              'peg': PPO_DIR_PEG,
-          },
-      },
-      {
           'key': 'ppo_nf_norand',
-          'label': 'PPO+NF (norand orig.)',
+          'label': 'PPO+NF (norand)',
           'color': COLOR_PPO_NORAND,
           'kind': 'ppo',
           'ls': '-',
@@ -301,12 +293,58 @@ def _draw() -> None:
           'ppo_dir': PPO_DIR_BIN_NORAND,
       },
       {
+          'key': 'ppo_nf_floorgrasp',
+          'label': 'PPO+NF (floor-grasp)',
+          'color': COLOR_PPO_FLOORGRASP,
+          'kind': 'ppo',
+          'ls': '-',
+          'z': 5,
+          'envs': ('bin',),
+          'ppo_dir': PPO_DIR_BIN_FLOORGRASP,
+      },
+      {
+          'key': 'ppo_nf_peg',
+          'label': 'PPO+NF',
+          'color': COLOR_PPO_PEG,
+          'kind': 'ppo',
+          'ls': '-',
+          'z': 5,
+          'envs': ('peg',),
+          'ppo_dir': PPO_DIR_PEG,
+      },
+      {
+          'key': 'ppo_rnd',
+          'label': 'PPO+RND',
+          'color': COLOR_RND,
+          'kind': 'rnd',
+          'ls': '-',
+          'z': 3,
+          'envs': ('bin', 'peg'),
+          'rnd_dir': {
+              'bin': RND_DIR_BIN,
+              'peg': RND_DIR_PEG,
+          },
+      },
+      {
+          'key': 'mpo_crl',
+          'label': 'MPO+CRL',
+          'color': COLOR_MPO,
+          'kind': 'ppo_abs',
+          'ls': '-',
+          'z': 7,
+          'envs': ('bin', 'peg'),
+          'ppo_dir': {
+              'bin': MPO_DIR_BIN,
+              'peg': MPO_DIR_PEG,
+          },
+      },
+      {
           'key': 'sgcrl',
           'label': 'SGCRL (original)',
           'color': COLOR_SGCRL,
           'kind': 'lp',
           'ls': '--',
-          'z': 5,
+          'z': 6,
           'envs': ('bin', 'peg'),
       },
   )
@@ -321,6 +359,14 @@ def _draw() -> None:
       if method['kind'] == 'lp':
         t_seeds = _lp_series(env_key, 'actor')
         e_seeds = _lp_series(env_key, 'evaluator')
+      elif method['kind'] == 'rnd':
+        rnd_dir = method['rnd_dir'][env_key]
+        t_seeds = []  # RND learner logs have no train_success_*
+        e_seeds = _rnd_eval_series(rnd_dir)
+      elif method['kind'] == 'ppo_abs':
+        cfg_dir = method['ppo_dir'][env_key]
+        t_seeds = _ppo_train_series(cfg_dir)
+        e_seeds = _ppo_eval_series(cfg_dir)
       else:
         ppo_dir = method['ppo_dir']
         if isinstance(ppo_dir, dict):
@@ -365,17 +411,17 @@ def _draw() -> None:
       for m in methods
   ]
   fig.legend(
-      handles=handles, loc='upper center', ncol=4, frameon=False,
-      bbox_to_anchor=(0.5, 1.02), handlelength=2.4, columnspacing=1.6,
+      handles=handles, loc='upper center', ncol=3, frameon=False,
+      bbox_to_anchor=(0.5, 1.04), handlelength=2.4, columnspacing=1.6,
   )
-  fig.subplots_adjust(left=0.08, right=0.98, top=0.88, bottom=0.14,
+  fig.subplots_adjust(left=0.08, right=0.98, top=0.86, bottom=0.14,
                       wspace=0.16, hspace=0.32)
   fig.text(
       0.5, 0.02,
-      r'Dashed blue: SGCRL. Orange: PPO+NF ent=0.05 rand (bin). '
-      r'Green: PPO+NF ent=0.005 rand (bin/peg). '
-      r'Pink: PPO+NF norand orig (bin; seeds 0,1=Aug-12, seed 2=current code). '
-      r'Thin: per-seed. Shade: $\pm$1 s.e.  Train raw; eval roll. mean '
+      r'Dashed blue: SGCRL. Pink/purple: PPO+NF bin candidates. '
+      r'Green: PPO+NF peg. Orange: PPO+RND (eval only). '
+      r'Yellow: MPO+CRL. Thin: per-seed. Shade: $\pm$1 s.e. '
+      r'Train raw; eval roll. mean '
       f'$w$={w}.',
       ha='center', va='bottom', fontsize=CAPTION_FS, color='#333333',
   )

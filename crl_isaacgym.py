@@ -71,6 +71,7 @@ def _pre_bootstrap() -> None:
         flush=True,
     )
 
+    throw_success = _get('isaacgym_throw_success', 'in_bucket') or 'in_bucket'
     from envs.allegro_kuka_throw_env import AllegroKukaThrowVecEnv
     import envs.isaacgym_physx_bootstrap as _boot_mod
     _boot_mod._PREBUILT = AllegroKukaThrowVecEnv(
@@ -86,6 +87,7 @@ def _pre_bootstrap() -> None:
         palm_goal_xyz=palm_goal_xyz,
         table_push=table_push,
         table_push_xyz=table_push_xyz,
+        throw_success=throw_success,
     )
     print(
         f'[crl_isaacgym] PhysX ready '

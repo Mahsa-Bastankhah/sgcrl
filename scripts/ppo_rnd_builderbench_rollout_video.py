@@ -47,6 +47,9 @@ def _parse_args(argv=None):
   p.add_argument('--categorical_select', '--categorical-select',
                  action='store_true',
                  help='Load a PD checkpoint trained with CatSelect')
+  p.add_argument(
+      '--hide_targets', action='store_true',
+      help='Do not render mocap goal-marker spheres.')
   return p.parse_args(argv)
 
 
@@ -66,6 +69,28 @@ def _write_video(frames, path: str, fps: int) -> None:
       os.environ['LD_LIBRARY_PATH'] = old_ld
   if not os.path.isfile(path) or os.path.getsize(path) < 1000:
     raise RuntimeError(f'video write produced empty/missing file: {path}')
+
+
+def _render_frames_no_targets(video_env, policy_fn, video_key, episode_length):
+  """Same as get_video, but mocap goal spheres are parked off-camera."""
+  import numpy as np
+  from utils.evaluation import get_trajectory
+
+  states = get_trajectory(policy_fn, video_env, video_key, episode_length)
+  hidden = np.array([10.0, 10.0, 10.0], dtype=np.float32)
+  frames = []
+  for i in range(episode_length):
+    if i % 2 != 0:
+      continue
+    pos = np.asarray(states.info['target_mocap_pos'][i][0])
+    pos = np.broadcast_to(hidden, pos.shape).copy()
+    frames.append(video_env.render_from_info(
+        np.asarray(states.data.qpos[i][0]),
+        np.asarray(states.data.qvel[i][0]),
+        pos,
+        np.asarray(states.info['target_mocap_quat'][i][0]),
+    ))
+  return frames
 
 
 def main(args):
@@ -102,9 +127,16 @@ def main(args):
   env_class, default_config = make_env(rnd_args)
   # BuilderBench defaults to MJX warp; match training (BUILDERBENCH_MJX_IMPL=jax).
   default_config.impl = os.environ.get('BUILDERBENCH_MJX_IMPL', 'jax')
+  default_config.permute_start_boxes = bool(rnd_args.permute_start_boxes)
   print(f'[rnd_video] MJX impl={default_config.impl} ckpt_dir={ckpt_dir}')
+  print(
+      f'[rnd_video] permute_start_boxes={default_config.permute_start_boxes} '
+      f'fixed_start_x={rnd_args.fixed_start_x}')
 
   base = env_class(config=default_config)
+  if rnd_args.fixed_start_x >= 0:
+    from envs.builderbench_utils import apply_fixed_start_x
+    apply_fixed_start_x(base, rnd_args.fixed_start_x)
   if args.use_pd:
     assert default_config.episode_length % args.pd_duration == 0, (
         f'episode_length {default_config.episode_length} must divide '
@@ -159,8 +191,12 @@ def main(args):
         continue
       print(f'[rnd_video] rendering {param_file.name} ep={ep} -> {out_path.name}',
             flush=True)
-      frames = get_video(
-          args.env_id, policy_fn, env, video_key, episode_length)
+      if args.hide_targets:
+        frames = _render_frames_no_targets(
+            env, policy_fn, video_key, episode_length)
+      else:
+        frames = get_video(
+            args.env_id, policy_fn, env, video_key, episode_length)
       _write_video(frames, str(out_path), args.fps)
       print(f'[rnd_video] wrote {out_path} ({len(frames)} frames)')
 

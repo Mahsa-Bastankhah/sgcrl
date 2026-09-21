@@ -151,6 +151,37 @@ class ContrastiveConfig:
   # standalone PPO training loop in ppo_contrastive.py / ppo_learner.py.
   # -------------------------------------------------------------------------
   ppo_num_envs: int = 8
+  # Point mazes: if True, sample start over free cells (plus Uniform[0,1)^2
+  # jitter in the cell) and keep the fixed task goal.
+  ppo_maze_randomize_start: bool = False
+  # If >0 with ppo_maze_randomize_start, only free cells whose Chebyshev
+  # distance to the canonical start cell is ≤ this many cells.
+  # 0 = any free cell.
+  ppo_maze_start_jitter_cells: int = 0
+  # If >0, keep the canonical start cell and add Uniform[0, jitter)^2
+  # (clipped to that cell). Takes precedence over start-cell sampling.
+  ppo_maze_start_in_cell_jitter: float = 0.0
+  # Explicit train-start cells as (row, col) pairs. If set, sample uniformly
+  # among these free cells plus Uniform[0,1)^2. Eval stays canonical start.
+  ppo_maze_start_cells: Optional[tuple] = None
+  # If True, maze PNGs are occupancy μ(s) and μ(s)p(g|s,a)/Z from the
+  # current PPO rollout instead of the default 5-traj + logp grid.
+  ppo_maze_occupancy_preimage: bool = False
+  # Stop the run after the first eval whose success exceeds this value.
+  # <0 disables.
+  ppo_stop_on_eval_success: float = -1.0
+  # Stop after train_success_1000 stays above this value for
+  # ppo_stop_on_train_success_iters consecutive iterations. <0 disables.
+  ppo_stop_on_train_success: float = -1.0
+  ppo_stop_on_train_success_iters: int = 5
+  # Allegro trim-SA reset radius as a fraction of each controlled joint's
+  # full physical range. The legacy/default distribution uses 0.10.
+  isaacgym_control_sanity_trim_init_range_frac: float = 0.10
+  # curled = center ± frac; full_range = Uniform[lo, hi] per controlled joint.
+  isaacgym_control_sanity_trim_init_mode: str = 'curled'
+  # Allegro packed joint-coordinate representation. ``mixed`` preserves every
+  # existing checkpoint: normalized q, physical qd, normalized goal.
+  isaacgym_coordinate_mode: str = 'mixed'
   ppo_rollout_length: int = 128       # T: steps per env per iteration
   ppo_num_epochs: int = 10            # PPO update epochs over each rollout batch
   ppo_num_minibatches: int = 4        # Minibatches per epoch
@@ -261,17 +292,21 @@ class ContrastiveConfig:
   # trailing select scalar is left unchanged.  Other envs: all of s.
   ppo_crl_s_perturb_prob: float = 0.0
   ppo_crl_s_perturb_eps: float = 1e-2
-  # Penalty on ‖∇_s (φ(s,a)·ψ(s_f))‖ during InfoNCE:
+  # Penalty on ‖∇_s (φ(s,a)·ψ(s_f))‖ during InfoNCE.
+  # Diagnostics (mean/max/frac/raw) are always logged.  The regularizer
+  # enters the loss only when ppo_crl_grad_reg_coef > 0.
+  # ppo_crl_grad_reg_lam_lr == 0 (default): hinge
   #   L_reg = λ E[ max(0, ‖∇_s f‖ − c) ]
-  # Diagnostics (mean/max/frac/raw) are always logged.  The hinge is added
-  # to the loss only when ppo_crl_grad_reg_coef > 0.
-  # λ is adapted between PPO iterations via EMA so that the running average
-  # of L_reg stays ≈ ppo_crl_grad_reg_rel × L_InfoNCE (target ratio 0.1).
-  # Within each scan λ is constant, so larger excess still gives larger L_reg.
-  # ppo_crl_grad_reg_coef: initial λ (overridden quickly by EMA); 0 = not in loss.
+  #   λ adapted between PPO iters via EMA so L_reg ≈ rel × L_InfoNCE.
+  # ppo_crl_grad_reg_lam_lr > 0: NF-style primal-dual (inside the CRL scan)
+  #   L_reg = λ E[‖∇_s f‖]
+  #   λ ← clip(λ + lam_lr · (E[‖∇_s f‖] − c), λ_min, 1)
+  # ppo_crl_grad_reg_coef: initial λ; 0 = not in loss.
   ppo_crl_grad_reg_c: float = 100.0
   ppo_crl_grad_reg_coef: float = 0.0
-  ppo_crl_grad_reg_rel: float = 0.1   # target ratio: L_reg ≈ rel × L_InfoNCE
+  ppo_crl_grad_reg_rel: float = 0.1   # EMA target: L_reg ≈ rel × L_InfoNCE
+  # Dual step size for CRL λ.  0 → EMA hinge (legacy).  >0 → primal-dual.
+  ppo_crl_grad_reg_lam_lr: float = 0.0
   # NF analog of the CRL hinge, off by default.  ∇_s log p stats are always
   # logged; the hinge enters the NLL only when this flag is True (and coef>0).
   ppo_nf_grad_reg: bool = False
@@ -341,6 +376,16 @@ class ContrastiveConfig:
   # Unsuccessful episodes always have weight 1. Episode indices are drawn
   # with probability w_k / sum_i w_i. Default 1.0 recovers uniform sampling.
   ppo_success_sample_weight: float = 1.0
+  # Cap on truncated-geometric future-goal offset d in EpisodeReplay (and
+  # in-train NF binary acc). 0 = no extra cap (support is [1, T_k - t]).
+  # >0 uses max_d = min(T_k - t, crl_future_horizon), then renormalizes.
+  crl_future_horizon: int = 0
+  # After each Isaac Gym rollout: for every env that saw success this
+  # rollout, overwrite up to this many never-succeeded env columns with that
+  # success env's full T-step data before replay flush + GAE + PPO.
+  # 0 disables. Default 0. A column may contain multiple short episodes
+  # (early reset); the whole T column is copied.
+  ppo_success_replace_fails: int = 0
   # If True, add `ppo_external_reward_scale` to the PPO reward on steps where
   # hard success fires: BuilderBench metrics['success'], or Sawyer MetaWorld
   # sparse env reward (>=0.5). By default applied after shaped-reward
@@ -351,6 +396,15 @@ class ContrastiveConfig:
   ppo_use_external_reward: bool = False
   ppo_external_reward_scale: float = 1.0
   ppo_external_reward_before_norm: bool = False
+  # Isaac Gym throw: after return-norm, add this to the PPO reward on
+  # steps where the cube fell (object z < 0.1, NVIDIA fall reset).
+  # 0 disables. Timeouts are not falls.
+  ppo_isaacgym_fall_penalty: float = 0.0
+  # NF mode: subtract a slow EMA of the batch quantile before return-norm.
+  # q=0.10 means ~90% of shifted rewards are positive (r - P10).
+  # 0 disables. ema is the per-iter mix toward the current-batch quantile.
+  ppo_nf_reward_shift_q: float = 0.0
+  ppo_nf_reward_shift_ema: float = 0.1
   # Which BuilderBench success metric the external bonus uses.
   # 'hard' = all cubes within 2cm (metrics['success'], default).
   # 'very_hard' = all cubes within 1cm (metrics['very_hard_success']).
@@ -377,6 +431,9 @@ class ContrastiveConfig:
   # iterations ≈ 400k env steps (half the previous ckpt rate).
   # Set to 0 or a negative number to disable.
   ppo_checkpoint_interval: int = 400
+  # Stop after this iteration (inclusive). 0 = run all `num_steps` iters.
+  # LR / entropy anneal still use the full `num_steps` horizon.
+  ppo_max_iterations: int = 0
   # How many milestone ckpt_iter_*.pkl files to keep (FIFO prune of oldest).
   # 0 = keep all milestones (no pruning).  `latest.pkl` is always overwritten.
   ppo_checkpoint_keep_last: int = 0
@@ -386,6 +443,19 @@ class ContrastiveConfig:
   # at ~200 bytes/transition a full buffer dwarfs the params, and only the
   # resume path needs it.
   ppo_checkpoint_replay_max: int = 0
+  # Lightweight density-diagnostic snapshots every N PPO iterations.
+  # Saves only policy/reward-representation params, normalization metadata,
+  # and recent completed XY training paths under <run>/density_snapshots/.
+  # 0 disables with no extra training-loop work or files.
+  ppo_density_snapshot_interval: int = 0
+  # One-off maze diagnostic: record fixed-cell raw representation rewards and
+  # exact rollout occupancy/entry counts under <run>/cell_probe.csv.
+  # Disabled by default so normal training has no additional work or output.
+  ppo_maze_cell_probe: bool = False
+  ppo_maze_cell_probe_near_row: int = 2
+  ppo_maze_cell_probe_near_col: int = 0
+  ppo_maze_cell_probe_far_row: int = 0
+  ppo_maze_cell_probe_far_col: int = 20
   # If True, mix 50% uniformly sampled goals into each CRL replay batch so
   # that half the in-batch negatives come from the uniform goal distribution
   # rather than the replay future-state distribution.
@@ -505,6 +575,9 @@ class ContrastiveConfig:
   # If True, NF learns p(g|s) / reward r(s) instead of p(g|s,a) / r(s,a).
   # Encoder input is state only; action is ignored at train and reward time.
   nf_state_only: bool = False
+  # Allegro trim-SA only: HER/NF goal is [q, qd] while action and
+  # position-only success remain controlled-joint width.
+  isaacgym_control_sanity_goal_include_qd: bool = False
   # Sidecar backward NF p(obs_to_goal(s)|s_f) trained on the same batches.
   # Unused for PPO reward.  Off by default; opt in with nf_train_backward.
   nf_train_backward: bool = False
@@ -531,10 +604,15 @@ class ContrastiveConfig:
   ppo_actor_reset_iters: str = ''
   # If >0, last-layer actor reset when ep_length_mean < this. 0 = 0.8 * horizon.
   ppo_actor_reset_ep_len: float = 0.0
+  # Opt-in policy last-layer reset (default OFF). Independent of the BB
+  # short-episode guard above. 0 = disabled; >0 = absolute ep_length_mean
+  # threshold (e.g. 20). After a fire, wait cooldown_iters before re-arming.
+  ppo_policy_last_layer_reset_ep_len_below: float = 0.0
+  ppo_policy_last_layer_reset_cooldown_iters: int = 0
   ppo_eval_interval: int = 30  # run eval every N PPO iterations (0 = disabled)
   ppo_eval_episodes: int = 5  # number of eval episodes per eval round
-  # In-train BuilderBench video (deterministic policy + live obs_rms).
-  # 0 = disabled. Videos written under <run_dir>/videos/.
+  # In-train videos / maze PNGs (BuilderBench mp4, Sawyer NF mp4,
+  # point_* NF heatmap+traj PNG). 0 = disabled. Written under the run dir.
   ppo_video_interval: int = 0
   ppo_video_fps: int = 10
   ppo_skip_first_video: bool = True

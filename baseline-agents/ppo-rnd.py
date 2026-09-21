@@ -21,7 +21,9 @@ _ig_boot()
 # removed it. Must run after PhysX bootstrap and before import distrax.
 import sgcrl_jax_acme_compat  # noqa: F401,E402
 
+import json
 import pickle
+import subprocess
 import time
 import tyro
 import numpy as np
@@ -49,6 +51,63 @@ def count_parameters(params):
     return sum(
         int(np.prod(np.asarray(p.shape)))
         for p in jax.tree_util.tree_leaves(params))
+
+
+def _rnd_isaacgym_flags(args) -> dict:
+  return {
+      name: getattr(args, name)
+      for name in dir(args)
+      if name.startswith('isaacgym_')
+  }
+
+
+def _maybe_render_rnd_video(args, ckpt_path: str, es: int, env_steps: int) -> None:
+  """Render ~num_train_videos stochastic rollouts spread across evals."""
+  nvid = int(getattr(args, 'num_train_videos', 0) or 0)
+  if nvid <= 0 or not ckpt_path:
+    return
+  n_eval = max(1, int(args.num_eval_steps))
+  marks = {
+      max(1, int(round((k + 1) * n_eval / float(nvid))))
+      for k in range(nvid)
+  }
+  if int(es) not in marks:
+    return
+  vid_dir = Path(args.wandb_dir) / 'videos'
+  vid_dir.mkdir(parents=True, exist_ok=True)
+  flags_path = vid_dir / 'rnd_video_flags.json'
+  if not flags_path.is_file():
+    flags_path.write_text(
+        json.dumps(_rnd_isaacgym_flags(args), indent=2, sort_keys=True),
+        encoding='utf-8')
+  out = vid_dir / f'iter_{int(es):07d}_stoch.mp4'
+  script = str(_REPO_ROOT / 'scripts' / 'allegro_kuka_throw_ckpt_video.py')
+  ep = int(getattr(args, 'isaacgym_episode_length', 0) or args.rollout_length)
+  cmd = [
+      sys.executable, '-u', script,
+      f'--checkpoint={ckpt_path}',
+      f'--flags-json={flags_path}',
+      f'--output={out}',
+      f'--num-steps={ep}',
+      '--episodes=1',
+      '--fps=30',
+      f'--seed={int(args.seed) + int(es)}',
+      f'--pipeline={args.isaacgym_pipeline}',
+      '--mark-horizon=0',
+  ]
+  print(f'[ppo_rnd] train video es={es} steps={int(env_steps)} -> {out}',
+        flush=True)
+  try:
+    proc = subprocess.run(
+        cmd, check=False, capture_output=True, text=True, timeout=300)
+    if proc.returncode == 0 and out.is_file():
+      print(f'[ppo_rnd] wrote {out}', flush=True)
+    else:
+      tail = (proc.stderr or proc.stdout or '').strip().splitlines()
+      print(f'[ppo_rnd] video FAILED rc={proc.returncode}\n'
+            + '\n'.join(tail[-8:]), flush=True)
+  except Exception as exc:
+    print(f'[ppo_rnd] video FAILED: {exc}', flush=True)
 
 
 def save_params(path: str, params: Any):
@@ -202,6 +261,39 @@ class Args:
     isaacgym_episode_length: int = 300
     isaacgym_pipeline: str = 'gpu'
     isaacgym_palm_goal: bool = False
+    isaacgym_palm_goal_xyz: str = '0.17,0.08,0.57'
+    isaacgym_palm_and_object_success: bool = False
+    isaacgym_throw_success: str = 'in_bucket'
+    isaacgym_large_table: bool = False
+    # Tableside spawn (bootstrap reads the same argv before JAX).
+    isaacgym_table_spawn: bool = False
+    isaacgym_table_spawn_object_xy: str = '0.0,0.0'
+    isaacgym_table_spawn_behind: bool = False
+    isaacgym_table_spawn_behind_dy: float = 0.14
+    isaacgym_table_spawn_behind_above: float = 0.08
+    isaacgym_table_spawn_correlated_xy: float = 0.0
+    isaacgym_table_spawn_finger_curl_scale: float = 1.0
+    isaacgym_table_spawn_finger_noise: float = 0.0
+    isaacgym_table_spawn_arm_noise: float = 0.0
+    isaacgym_table_spawn_in_hand: bool = False
+    isaacgym_table_spawn_in_hand_offset: float = 0.042
+    isaacgym_table_spawn_in_hand_obj_noise: float = 0.012
+    isaacgym_table_spawn_in_hand_keep_arm: bool = False
+    isaacgym_table_spawn_in_hand_wrist_offset: float = -3.141592653589793
+    isaacgym_table_spawn_in_hand_wrist_noise: float = 0.10
+    isaacgym_fixed_target_xyz: str = '0.5,-0.3,0.4'
+    isaacgym_goal_z: float = -1.0
+    isaacgym_hide_table: bool = False
+    num_train_videos: int = 0
+    # Object-free control sanity (off|finger|hand16|hand16fig|hand16ok|...).
+    # Bootstrap reads the same argv before JAX; keep the spelling aligned.
+    isaacgym_control_sanity_mode: str = 'off'
+    # Restrict state+action to goal hand joints (bootstrap argv).
+    isaacgym_control_sanity_trim_sa: bool = False
+    # Trim-SA finger init: curled (near-default band) or full_range (URDF).
+    isaacgym_control_sanity_trim_init_mode: str = 'curled'
+    # Obs/goal/action coords: mixed | physical | fully_scaled (bootstrap argv).
+    isaacgym_coordinate_mode: str = 'mixed'
 
     # algorithm
     num_timesteps: int = 50000000
@@ -643,7 +735,13 @@ def allegro_run_eval(env, policy, key, episode_length: int, obs_dim: int):
 
     packed = _torch_to_np(env.reset())
     ep_success = np.zeros((env.num_envs,), dtype=np.float32)
+    ep_easy = np.zeros((env.num_envs,), dtype=np.float32)
+    ep_very_easy = np.zeros((env.num_envs,), dtype=np.float32)
+    ep_jfrac10 = np.zeros((env.num_envs,), dtype=np.float32)
+    ep_jfrac20 = np.zeros((env.num_envs,), dtype=np.float32)
+    ep_mae = np.full((env.num_envs,), np.inf, dtype=np.float32)
     step_success = []
+    has_levels = callable(getattr(env, 'success_levels', None))
     for _ in range(int(episode_length)):
         key, k_step = jax.random.split(key)
         state, goal = _allegro_obs_goal(packed, obs_dim)
@@ -651,16 +749,41 @@ def allegro_run_eval(env, policy, key, episode_length: int, obs_dim: int):
         actions_np = np.clip(np.asarray(actions, dtype=np.float32), -1.0, 1.0)
         next_obs_t, _, _ = env.step(
             torch.from_numpy(actions_np).to(env.device))
-        succ = _torch_to_np(env.success()).reshape(-1)
+        if has_levels:
+            levels = env.success_levels()
+            succ = _torch_to_np(levels['hard']).reshape(-1)
+            easy = _torch_to_np(levels['easy']).reshape(-1)
+            veasy = _torch_to_np(levels['very_easy']).reshape(-1)
+            j10 = _torch_to_np(levels['joint_frac_010']).reshape(-1)
+            j20 = _torch_to_np(levels['joint_frac_020']).reshape(-1)
+            mae = _torch_to_np(levels['mean_abs_joint_err']).reshape(-1)
+            ep_easy = np.maximum(ep_easy, easy)
+            ep_very_easy = np.maximum(ep_very_easy, veasy)
+            ep_jfrac10 = np.maximum(ep_jfrac10, j10)
+            ep_jfrac20 = np.maximum(ep_jfrac20, j20)
+            ep_mae = np.minimum(ep_mae, mae)
+        else:
+            succ = _torch_to_np(env.success()).reshape(-1)
         ep_success = np.maximum(ep_success, succ)
         step_success.append(succ)
         packed = _torch_to_np(next_obs_t)
     packed = _torch_to_np(env.reset())
-    return packed, key, {
+    out = {
         'eval/episode_success': float(ep_success.mean()),
         'eval/success_mean': float(np.mean(step_success)),
         'eval/num_envs': int(env.num_envs),
     }
+    if has_levels:
+        out.update({
+            'eval/easy_success': float(ep_easy.mean()),
+            'eval/very_easy_success': float(ep_very_easy.mean()),
+            'eval/joint_frac_010': float(ep_jfrac10.mean()),
+            'eval/joint_frac_020': float(ep_jfrac20.mean()),
+            'eval/mean_abs_joint_err': float(
+                np.mean(ep_mae[np.isfinite(ep_mae)])
+                if np.any(np.isfinite(ep_mae)) else float('nan')),
+        })
+    return packed, key, out
 
 
 def main(args: Args):
@@ -739,15 +862,30 @@ def main(args: Args):
         action_size = int(allegro_env.action_dim)
         allegro_packed = _torch_to_np(allegro_env.reset())
         push_xyz = _parse_xyz(args.isaacgym_table_push_xyz)
+        sanity = str(getattr(allegro_env, 'control_sanity_mode', '') or 'off')
+        if sanity and sanity != 'off':
+            rew_msg = f'reward=env.success() (control_sanity={sanity} hard)'
+        else:
+            rew_msg = 'reward=env.success() (object within 7.5cm of goal)'
         print(
             f'[ppo_rnd] allegro env_id={args.env_id} E={args.num_envs} '
             f'ep_len={episode_length} obs={obs_size} goal={goal_size} '
             f'act={action_size} table_push={bool(allegro_env.table_push)} '
             f'table_push_xyz={push_xyz} '
+            f'control_sanity={sanity} '
+            f'large_table={bool(getattr(allegro_env, "large_table", False))} '
+            f'table_spawn={bool(args.isaacgym_table_spawn)} '
+            f'table_spawn_behind={bool(args.isaacgym_table_spawn_behind)} '
+            f'behind_dy={args.isaacgym_table_spawn_behind_dy:g} '
+            f'behind_above={args.isaacgym_table_spawn_behind_above:g} '
+            f'correlated_xy={args.isaacgym_table_spawn_correlated_xy:g} '
+            f'finger_curl={args.isaacgym_table_spawn_finger_curl_scale:g} '
+            f'finger_noise={args.isaacgym_table_spawn_finger_noise:g} '
+            f'arm_noise={args.isaacgym_table_spawn_arm_noise:g} '
             f'randomize_init={bool(args.isaacgym_randomize_init)} '
             f'randomize_object_xyz={bool(allegro_env.randomize_object_xyz)} '
             f'randomize_object_shape={bool(allegro_env.randomize_object_shape)} '
-            f'reward=env.success() (object within 7.5cm of goal)',
+            f'{rew_msg}',
             flush=True)
     else:
         from builderbench.env_utils import make_env
@@ -1335,6 +1473,25 @@ def main(args: Args):
                 allegro_packed, key_eval, eval_metrics = allegro_run_eval(
                     allegro_env, eval_policy, key_eval, episode_length, obs_size)
                 metrics.update(eval_metrics)
+                # Persist Allegro eval (incl. joint_frac) for offline plots.
+                try:
+                    import csv as _csv
+                    _csv_path = Path(args.wandb_dir) / 'eval_metrics.csv'
+                    _csv_path.parent.mkdir(parents=True, exist_ok=True)
+                    _row = {
+                        'eval_step': int(es),
+                        'env_steps': int(training_state.env_steps),
+                        **{k: float(v) for k, v in eval_metrics.items()},
+                    }
+                    _write_header = not _csv_path.exists()
+                    with _csv_path.open('a', newline='') as _fh:
+                        _w = _csv.DictWriter(_fh, fieldnames=list(_row.keys()))
+                        if _write_header:
+                            _w.writeheader()
+                        _w.writerow(_row)
+                except Exception as _csv_exc:
+                    print(f'[ppo_rnd] eval_metrics.csv write failed: {_csv_exc}',
+                          flush=True)
             else:
                 metrics = evaluator.run_evaluation(
                     policy_params={'policy':training_state.params['policy'], 'normalizer':training_state.normalizer_params},
@@ -1358,6 +1515,13 @@ def main(args: Args):
                         training_state.int_reward_normalizer_params,
                     )
                 )
+                if use_allegro:
+                  _maybe_render_rnd_video(
+                      args,
+                      f'{save_path}/params_{es}.pkl',
+                      int(es),
+                      int(training_state.env_steps),
+                  )
 
             xt, data_collect_step_time, learn_step_time = time.time(), 0, 0
 

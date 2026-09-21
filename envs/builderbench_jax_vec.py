@@ -527,6 +527,39 @@ class JaxBuilderBenchVecEnv:
 
     return eval_unroll_legacy
 
+  def compile_fixed_action_episode_collector(self, unroll_length: int):
+    """Compile a complete-episode scan for fixed-dataset collection.
+
+    The returned observations have shape ``[E, T+1, state_dim]`` and use the
+    true terminal observation at the final index, never AutoReset's next
+    episode initial observation.
+    """
+    step_fn = self._step_fn
+    num_cubes = self._num_cubes
+    filter_pd = self._pd_filter_policy_obs
+    length = int(unroll_length)
+
+    @jax.jit
+    def collect(env_state: State, actions: jax.Array):
+      def one_step(state, action):
+        state_obs = _pack_obs(
+            state.obs, state.info['target_goal'],
+            num_cubes=num_cubes, filter_pd_policy=filter_pd)
+        next_state = step_fn(state, action)
+        terminal = _pack_obs(
+            next_state.info['terminal_obs'],
+            next_state.info['terminal_target_goal'],
+            num_cubes=num_cubes, filter_pd_policy=filter_pd)
+        return next_state, (state_obs, terminal, next_state.done)
+
+      final_state, (states, terminals, dones) = jax.lax.scan(
+          one_step, env_state, actions, length=length)
+      # scan is [T,E,D]; the last terminal is the successor after action T.
+      episode_obs = jnp.concatenate([states, terminals[-1:]], axis=0)
+      return final_state, jnp.swapaxes(episode_obs, 0, 1), dones
+
+    return collect
+
   @property
   def episode_length(self) -> int:
     return self._episode_length

@@ -38,7 +38,20 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
 LOG_ROOT = '/n/fs/mislresearch/sgcrl/logs'
+ALLEGRO_OLD = os.path.join(LOG_ROOT, 'allegro_old')
 SLURM_DIR = '/n/fs/mislresearch/sgcrl/slurm'
+
+
+def resolve_run_dir(log_root: str, log_dir_name: str) -> str:
+  """Config dir under ``log_root``, or an Allegro archive folder if moved."""
+  direct = os.path.join(log_root, log_dir_name)
+  if os.path.isdir(direct):
+    return direct
+  for archive in ('allegro_old', 'allegro_hand_2026-09-14'):
+    alt = os.path.join(log_root, archive, log_dir_name)
+    if os.path.isdir(alt):
+      return alt
+  return direct
 FIGS_DIR = '/n/fs/mislresearch/sgcrl/figs/builderbench/active_train_eval'
 TRAIN_METRIC = 'train_success_1000'
 TRAIN_VERY_HARD_METRIC = 'train_very_hard_success_1000'
@@ -253,7 +266,7 @@ def _log_dirs_from_slurm_files(slurm_dir: str) -> set[str]:
 
 def _has_csv(log_root: str, log_dir_name: str, split: str,
              min_size: int = 200) -> bool:
-  base = os.path.join(log_root, log_dir_name)
+  base = resolve_run_dir(log_root, log_dir_name)
   try:
     run_names = os.listdir(base)
   except OSError:
@@ -403,7 +416,7 @@ def _read_csv_seed_series(log_root: str, log_dir_name: str, *, split: str,
                           x_col: str, y_col: str
                           ) -> list[list[tuple[int, float]]]:
   """One series per seed/run folder under the config dir."""
-  base = os.path.join(log_root, log_dir_name)
+  base = resolve_run_dir(log_root, log_dir_name)
   seed_series: list[list[tuple[int, float]]] = []
   try:
     run_names = sorted(os.listdir(base))
@@ -439,7 +452,7 @@ def _read_series(log_root: str, log_dir_name: str, *, split: str,
 
 def _iter_to_env_steps_map(log_root: str, log_dir_name: str) -> dict[int, int]:
   """Map PPO iteration → env steps (``global_step``) from learner CSV."""
-  base = os.path.join(log_root, log_dir_name)
+  base = resolve_run_dir(log_root, log_dir_name)
   mapping: dict[int, int] = {}
   try:
     run_names = sorted(os.listdir(base))

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Paper figure: Sawyer bin / peg success, SGCRL vs PPO+NF.
+"""Paper figure: Sawyer bin / peg success, SGCRL vs PPO+NF vs MPO+CRL.
 
 2x2: columns = bin, peg; rows = train, eval. Mean ±1 SE across seeds.
 Train is raw. Eval is faint raw + bold centered rolling mean (window=5).
 
 SGCRL: logs/final_metaworld_runs/lp_contrastive_sawyer_{bin,peg}_40m/
 PPO+NF: logs/final_metaworld_runs/ppo_{bin,peg}_nf_tiny_...  (seeds 0, 1, 2)
+MPO+CRL: logs/final_metaworld_runs/mpo_crl_sawyer_{bin,peg}_tau0p85_40m/
 
   python paper_plot_scripts/plot_sawyer_bin_peg_success.py
   python paper_plot_scripts/plot_sawyer_bin_peg_success.py --watch 300
@@ -40,6 +41,7 @@ PPO_STEPS_PER_ITER = 1024  # num_envs=4 × rollout_length=256
 # Okabe–Ito (colorblind-safe).
 COLOR_SGCRL = '#0072B2'
 COLOR_PPO = '#D55E00'
+COLOR_MPO = '#009E73'
 
 METHODS = (
     {
@@ -62,6 +64,17 @@ METHODS = (
             'peg': ('ppo_peg_nf_tiny_sa2x128_r32_b4_w128_tau085_crl10_40m'
                     '_extrew1_rand_minstd1e5_ent0005_mixtaskg'),
         },
+        'kind': 'ppo',
+    },
+    {
+        'key': 'mpo_crl',
+        'label': 'MPO+CRL',
+        'color': COLOR_MPO,
+        'dirs': {
+            'bin': 'mpo_crl_sawyer_bin_tau0p85_40m',
+            'peg': 'mpo_crl_sawyer_peg_tau0p85_40m',
+        },
+        # Same CSV layout as PPO: learner train_success_1000, eval success_1000.
         'kind': 'ppo',
     },
 )
@@ -254,7 +267,7 @@ def _draw() -> None:
       for m in METHODS
   ]
   fig.legend(
-      handles=handles, loc='upper center', ncol=2, frameon=False,
+      handles=handles, loc='upper center', ncol=3, frameon=False,
       bbox_to_anchor=(0.5, 1.02), handlelength=2.4, columnspacing=1.8,
   )
   fig.subplots_adjust(left=0.08, right=0.98, top=0.88, bottom=0.14,

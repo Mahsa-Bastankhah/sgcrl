@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --gres=gpu:1
-#SBATCH --time=2:30:00
+#SBATCH --time=4:00:00
 #SBATCH --account=seas
 #SBATCH --array=0-1
 
@@ -115,7 +115,7 @@ GRAD_REG_C=${GRAD_REG_C:-100.0}
 GRAD_REG_REL=${GRAD_REG_REL:-0.1}
 GRAD_REG_LAM_LR=${GRAD_REG_LAM_LR:-1e-6}
 
-LOG_STEM=ppo_builderbench_creative5_task4_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_ent05to001_ep50_200m_crl10_dualgradreg_c100_lamlr1e6_valuedgr_c100_lamlr1e6_warp_2h30
+LOG_STEM=ppo_builderbench_creative5_task4_e1024_pd_nf_compact_small_sa3x192_r64_b6_w192_tau05_nopermute_fixedx01_catwp_extrew1_minstd1e5_ent05to001_ep50_200m_crl10_dualgradreg_c100_lamlr1e6_valuedgr_c100_lamlr1e6_warp_4h
 LOG_DIR="${LOG_DIR:-logs/final_runs/${LOG_STEM}/}"
 
 mkdir -p slurm/final_runs "${LOG_DIR}"

@@ -160,6 +160,9 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     self.action_space = gym.spaces.Box(
         low=-1.0, high=1.0, shape=(self._action_dim,), dtype=np.float32)
     self._max_episode_steps = self._episode_length
+    # Unjitted single-env MJX step leaks host/GPU memory (~10GB/iter in f-PG).
+    self._reset_fn = jax.jit(self._env.reset)
+    self._step_fn = jax.jit(self._env.step)
 
   @property
   def state_obs_dim(self) -> int:
@@ -205,7 +208,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
 
   def reset(self):
     self._rng, subkey = jax.random.split(self._rng)
-    state = self._env.reset(subkey)
+    state = self._reset_fn(subkey)
     state = self._maybe_fix_target(state)
     self._state = state
     self._consecutive_success = 0
@@ -215,7 +218,7 @@ class BuilderBenchCreativeGymEnv(gym.Env):
     if self._state is None:
       raise RuntimeError('step() called before reset()')
     action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
-    self._state = self._env.step(
+    self._state = self._step_fn(
         self._state, jnp.asarray(action, dtype=jnp.float32))
     obs = self._pack_obs(self._state)
     reward = float(np.asarray(self._state.reward))

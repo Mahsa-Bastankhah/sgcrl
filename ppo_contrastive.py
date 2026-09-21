@@ -374,16 +374,65 @@ flags.DEFINE_float(
     'ppo_actor_reset_ep_len', 0.0,
     'If >0, reinit the policy last layer when ep_length_mean is below this '
     'absolute length. 0 = default 80% of episode horizon. Set 1 to disable.')
+flags.DEFINE_float(
+    'ppo_policy_last_layer_reset_ep_len_below', 0.0,
+    'Opt-in: if >0, reinit ONLY the actor policy last linear / loc-scale head '
+    'when train ep_length_mean is below this absolute threshold. 0 = disabled '
+    '(default; leaves behavior unchanged). Independent of ppo_actor_reset_*.')
+flags.DEFINE_integer(
+    'ppo_policy_last_layer_reset_cooldown_iters', 0,
+    'After an opt-in last-layer reset, wait this many PPO iterations before '
+    'another can fire. 0 = no cooldown (may fire every iter while below). '
+    'Only used when ppo_policy_last_layer_reset_ep_len_below > 0.')
 flags.DEFINE_integer(
     'ppo_eval_interval', -1,
     'Run eval every N PPO iterations. <0 keeps config/env default (30). 0 disables eval.')
 flags.DEFINE_integer(
     'ppo_eval_episodes', -1,
     'Number of eval episodes per eval round. <0 keeps config default (5).')
+flags.DEFINE_boolean(
+    'ppo_maze_randomize_start', False,
+    'Point mazes only: randomize the start over free cells (continuous '
+    'jitter inside the cell) while keeping the fixed task goal. Eval and '
+    'in-train maze PNGs still use the canonical start.')
+flags.DEFINE_integer(
+    'ppo_maze_start_jitter_cells', 0,
+    'With --ppo_maze_randomize_start, restrict starts to free cells within '
+    'this Chebyshev radius of the canonical start (e.g. 2 = up to two '
+    'cells from (0,0)). 0 = any free cell.')
+flags.DEFINE_float(
+    'ppo_maze_start_in_cell_jitter', 0.0,
+    'Point mazes only: stay in the canonical start cell and add '
+    'Uniform[0, jitter)^2 (clipped to that cell). Eval/PNGs still use '
+    'the exact canonical start. Takes precedence over cell sampling.')
+flags.DEFINE_string(
+    'ppo_maze_start_cells', '',
+    'Point mazes: train starts sampled from these free cells, written as '
+    'row,col;row,col (plus Uniform[0,1)^2 in the cell). Eval stays '
+    'canonical start. Overrides Chebyshev / in-cell jitter.')
+flags.DEFINE_boolean(
+    'ppo_maze_occupancy_preimage', False,
+    'Maze PNGs: two heatmaps from this iter\'s on-policy (s,a) — '
+    'occupancy μ(s) and μ(s) p(g|s,a) / Z (goal preimage).')
+flags.DEFINE_float(
+    'ppo_stop_on_eval_success', -1.0,
+    'Stop training after the first eval with success > this value. '
+    '<0 disables.')
+flags.DEFINE_float(
+    'ppo_stop_on_train_success', -1.0,
+    'Stop after train_success_1000 stays above this value for '
+    '--ppo_stop_on_train_success_iters consecutive iters. <0 disables.')
+flags.DEFINE_integer(
+    'ppo_stop_on_train_success_iters', 5,
+    'Consecutive iters train_success_1000 must exceed '
+    '--ppo_stop_on_train_success before stopping.')
 flags.DEFINE_integer(
     'ppo_video_interval', -1,
-    'Render a deterministic BuilderBench video every N PPO iterations. '
-    '<0 keeps config default (0=disabled). 0 disables. Uses live obs_rms.')
+    'In-train video every N PPO iterations. BuilderBench/Sawyer: in-process. '
+    'Allegro: subprocess camera rollout (stochastic, no reward overlay). '
+    '<0 keeps config default; Allegro forces 100 when unset or 0 so old '
+    'jobs still get videos. Pass a positive N to override; there is no '
+    'off-switch via 0 for Allegro (ask for a code exception to disable).')
 flags.DEFINE_integer(
     'ppo_video_fps', -1,
     'FPS for in-train BuilderBench videos. <0 keeps config default (10).')
@@ -462,6 +511,16 @@ flags.DEFINE_float(
     'CRL replay: sampling weight for successful episodes (others weight 1). '
     'Episode indices are drawn proportional to w / sum(w). '
     '1.0 is uniform. <0 keeps config default (1.0).')
+flags.DEFINE_integer(
+    'crl_future_horizon', -1,
+    'Cap truncated-geometric future-goal offset at this many steps '
+    '(training replay and in-train NF binary acc). '
+    '0 = no extra cap (episode remainder only). <0 keeps config default (0).')
+flags.DEFINE_integer(
+    'ppo_success_replace_fails', -1,
+    'Isaac Gym: after each rollout, for every env that saw success, overwrite '
+    'up to N never-succeeded env columns with that success env\'s data before '
+    'replay flush + GAE + PPO. <0 keeps config default (0). 0 disables.')
 flags.DEFINE_boolean(
     'ppo_use_external_reward', False,
     'If True, add ppo_external_reward_scale to the PPO reward on hard-success '
@@ -475,6 +534,20 @@ flags.DEFINE_boolean(
     'ppo_external_reward_before_norm', False,
     'If True with ppo_use_external_reward, add the extrinsic bonus to the raw '
     'shaped reward BEFORE return-norm. Default False (add after norm).')
+flags.DEFINE_float(
+    'ppo_isaacgym_fall_penalty', 0.0,
+    'Isaac Gym throw only: after return-norm, add this to the PPO reward on '
+    'steps where the cube fell (object z < 0.1, NVIDIA fall reset). '
+    '0 disables. Timeouts are not falls.')
+flags.DEFINE_float(
+    'ppo_nf_reward_shift_q', -1.0,
+    'NF mode: before return-norm, subtract a slow EMA of this batch quantile '
+    'of raw NF rewards (0.10 = P10, so ~90% of shifted r are > 0). '
+    '0 disables. <0 keeps config default (0).')
+flags.DEFINE_float(
+    'ppo_nf_reward_shift_ema', -1.0,
+    'Per-iter EMA rate for ppo_nf_reward_shift_q. '
+    'q ← (1-β)·q + β·batch_quantile. <0 keeps config default (0.1).')
 flags.DEFINE_string(
     'ppo_external_reward_success', 'hard',
     'BuilderBench success used for the external PPO bonus: '
@@ -511,6 +584,10 @@ flags.DEFINE_integer(
     'ppo_checkpoint_interval', -1,
     'Save checkpoints every N PPO iterations. <0 keeps config default (400).')
 flags.DEFINE_integer(
+    'ppo_max_iterations', 0,
+    'Stop after this PPO iteration (inclusive). 0 = no cap. '
+    'LR/entropy anneal still follow --num_steps.')
+flags.DEFINE_integer(
     'ppo_checkpoint_keep_last', -1,
     'Max milestone ckpt_iter_*.pkl files to retain (FIFO). '
     '0 = keep all. <0 keeps config default (0 = keep all).')
@@ -519,6 +596,26 @@ flags.DEFINE_integer(
     'Serialize up to this many recent replay transitions into latest.pkl so '
     'a requeued run resumes with a warm buffer. ~195 bytes/transition. '
     '0 disables. <0 keeps config default (0 = disabled).')
+flags.DEFINE_integer(
+    'ppo_density_snapshot_interval', -1,
+    'Write lightweight policy/reward-representation + recent-trajectory '
+    'snapshots every N PPO iterations. 0 disables; <0 keeps config default.')
+flags.DEFINE_boolean(
+    'ppo_maze_cell_probe', False,
+    'One-off maze diagnostic: log raw rewards and rollout visits for two '
+    'fixed cells. Disabled by default.')
+flags.DEFINE_integer(
+    'ppo_maze_cell_probe_near_row', 2,
+    'Row of the nearby cell used by ppo_maze_cell_probe.')
+flags.DEFINE_integer(
+    'ppo_maze_cell_probe_near_col', 0,
+    'Column of the nearby cell used by ppo_maze_cell_probe.')
+flags.DEFINE_integer(
+    'ppo_maze_cell_probe_far_row', 0,
+    'Row of the far/unseen cell used by ppo_maze_cell_probe.')
+flags.DEFINE_integer(
+    'ppo_maze_cell_probe_far_col', 20,
+    'Column of the far/unseen cell used by ppo_maze_cell_probe.')
 flags.DEFINE_string(
     'ppo_crl_loss_direction', 'forward',
     "InfoNCE loss direction for PPO-CRL: 'forward' (fix anchor, vary goal) "
@@ -567,7 +664,13 @@ flags.DEFINE_float(
 flags.DEFINE_float(
     'ppo_crl_grad_reg_rel', -1.0,
     'CRL: target ratio L_reg / L_InfoNCE for adaptive λ (default 0.1). '
-    '<0 keeps config default.')
+    'Unused when ppo_crl_grad_reg_lam_lr > 0. <0 keeps config default.')
+flags.DEFINE_float(
+    'ppo_crl_grad_reg_lam_lr', -1.0,
+    'CRL: dual ascent lr for λ. '
+    '0 → EMA hinge (legacy). >0 → primal-dual inside the CRL scan: '
+    'L += λ·E[‖∇_s(φ·ψ)‖], λ ← clip(λ + lr·(‖∇‖−c), λ_min, 1). '
+    '<0 keeps config default (0).')
 flags.DEFINE_boolean(
     'ppo_nf_grad_reg', False,
     'NF: add λ·E[‖∇_s log p_NF(g|s,a)‖] to the NLL '
@@ -650,10 +753,39 @@ flags.DEFINE_boolean(
     'bin_randomize_gripper_init', False,
     'SawyerBin: randomize initial gripper TCP offset around the object at reset.')
 flags.DEFINE_boolean(
+    'bin_randomize_tcp_z', False,
+    'SawyerBin: keep TCP over the object XY but sample hover height '
+    'Uniform(3cm, 6cm). Ignored if --bin_randomize_gripper_init is set.')
+flags.DEFINE_boolean(
     'sawyer_randomize_init', True,
     'Sawyer bin/peg: if False, freeze MetaWorld object (and peg hole) spawn '
     'to the default init pose every reset. Also disables bin gripper-init '
     'noise even when --bin_randomize_gripper_init is set.')
+flags.DEFINE_boolean(
+    'sawyer_bin_metaworld_hand_init', False,
+    'SawyerBin: keep MetaWorld native open-hand reset at (0, 0.6, 0.2) '
+    'instead of moving and closing the gripper around the cube. Object '
+    'randomization remains controlled by --sawyer_randomize_init.')
+flags.DEFINE_boolean(
+    'sawyer_bin_safe_grasp_reset', False,
+    'SawyerBin: opt in to bounded grasp placement with validity checks and '
+    'rejection sampling instead of the historical unbounded mocap servo.')
+flags.DEFINE_boolean(
+    'sawyer_bin_bounded_step_mocap', False,
+    'SawyerBin: anchor each per-step mocap target to the current TCP so '
+    'tracking error cannot accumulate while contact blocks the hand.')
+flags.DEFINE_boolean(
+    'sawyer_bin_selective_antiwindup', False,
+    'SawyerBin: preserve legacy mocap integration below 15cm tracking error; '
+    'above it remove only outward radial increments and cap error at 20cm.')
+flags.DEFINE_boolean(
+    'sawyer_bin_trackerr_terminate_20cm', False,
+    'SawyerBin: terminate the episode, without reward penalty, when post-step '
+    'mocap-to-TCP tracking error exceeds 20cm.')
+flags.DEFINE_integer(
+    'sawyer_max_episode_steps', -1,
+    'Sawyer bin/peg: if >0, override the default 150-step horizon. '
+    '<=0 keeps the historical length.')
 flags.DEFINE_boolean(
     'builderbench_use_pd', False,
     'BuilderBench: wrap env in PDWrapper (short horizon). Default False = raw control.')
@@ -694,6 +826,11 @@ flags.DEFINE_list(
     'Isaac Gym (allegro_kuka_throw): fixed bucket/goal world-frame xyz '
     '(3 comma-separated floats). The object absolute position is the NF goal; '
     'this target is a constant of the env and never appears in the obs.')
+flags.DEFINE_float(
+    'isaacgym_goal_z', -1.0,
+    'Throw goal world-frame z (packed NF goal + env.goal_pos). Bucket actor '
+    'stays at isaacgym_fixed_target_xyz. <0 keeps the default (packed goal = '
+    'bucket xyz; goal_pos = bucket floor + 5 cm).')
 flags.DEFINE_bool(
     'isaacgym_randomize_init', True,
     'NVIDIA reset randomization of object pose / joints / forces. Off freezes '
@@ -708,10 +845,89 @@ flags.DEFINE_bool(
     'Mix object dimensions on reset. Off keeps a single default cube.')
 flags.DEFINE_bool(
     'isaacgym_palm_goal', False,
-    '6-D palm+object goal packing. Off = 49+3 throw packing.')
+    '6-D palm+object goal packing. Off = 49+3 throw packing '
+    '(unless --isaacgym_joint_goal).')
+flags.DEFINE_bool(
+    'isaacgym_palm_and_object_success', False,
+    'With table_push + palm_goal, success requires BOTH the cube and the '
+    'palm within success_tolerance of their goals. Default off keeps '
+    'object-only table-push success.')
+flags.DEFINE_enum(
+    'isaacgym_throw_success', 'in_bucket',
+    ['in_bucket', 'nvidia_goal', 'goal_ball'],
+    'Throw binary success. in_bucket = cube in the physical cylinder '
+    '(default). nvidia_goal = one-frame NVIDIA ball around '
+    '(bucket xy, floor + 5 cm), radius success_tolerance * keypoint_scale '
+    '(11.25 cm). goal_ball = same center, radius success_tolerance only '
+    '(7.5 cm). Does not reset or respawn on success.')
 flags.DEFINE_list(
     'isaacgym_palm_goal_xyz', ['0.17', '0.08', '0.57'],
     'Commanded palm xyz when --isaacgym_palm_goal is on.')
+flags.DEFINE_bool(
+    'isaacgym_joint_goal', False,
+    '19-D hand-q* + object goal. State stays 49-D (no palm). '
+    'HER gathers hand joints + object. Wins over --isaacgym_palm_goal.')
+flags.DEFINE_enum(
+    'isaacgym_control_sanity_mode', 'off',
+    ['off', 'finger', 'hand16', 'hand16fig', 'hand16ok', 'hand16peace',
+     'hand16point', 'hand16gun', 'arm23wave', 'index', 'six',
+     'two_finger',
+     'three2', 'four2',
+     'four2h', 'four2m', 'four2mh', 'four2mm', 'four2mmh', 'four2mmx',
+     'four2w', 'index_thumb_straight', 'palm'],
+    'Object-free control sanity task. finger: state=q,qd and goal=16 finger '
+    'positions. index: goal=4 index-finger positions. six: goal=6 '
+    'index4+middle2 positions. two_finger: goal=8 '
+    'index+middle positions. three2/four2/four2h: 2 joints (base+prox) per '
+    'finger for 3 or 4 fingers (four2h = stronger curls; four2w = weird asymmetric). '
+    'index_thumb_straight: curled 8-DOF index+thumb start to a straight goal '
+    'with intrinsically trimmed state/action coordinates. '
+    'arm23wave: state=q,qd and goal=all 23 arm+hand joint positions. '
+    'palm: state=q,qd,palm xyz and goal=palm xyz.')
+flags.DEFINE_list(
+    'isaacgym_control_sanity_palm_xyz', ['0.0', '0.0', '0.80'],
+    'Reachable palm-center xyz target for palm control sanity mode.')
+flags.DEFINE_float(
+    'isaacgym_control_sanity_finger_tol', 0.15,
+    'Max absolute finger-joint error (radians) for sanity success.')
+flags.DEFINE_float(
+    'isaacgym_control_sanity_palm_tol', 0.05,
+    'Palm Euclidean error (meters) for sanity success.')
+flags.DEFINE_bool(
+    'isaacgym_control_sanity_trim_sa', False,
+    'Restrict state+action to control-sanity goal hand joints only. '
+    'State becomes 2N (q,qd of N goal joints); action becomes N; '
+    'arm and other fingers stay at default targets.')
+flags.DEFINE_float(
+    'isaacgym_control_sanity_trim_init_range_frac', 0.10,
+    'Random trim-SA reset radius as a fraction of each controlled joint full '
+    'physical range when trim_init_mode=curled. Default 0.10 preserves '
+    'existing jobs.')
+flags.DEFINE_enum(
+    'isaacgym_control_sanity_trim_init_mode', 'curled',
+    ['curled', 'full_range'],
+    'Trim-SA controlled-joint reset distribution. '
+    'curled: center ± range_frac·(hi−lo) around curled/default pose. '
+    'full_range: independent Uniform[lo, hi] per controlled joint '
+    '(no curled-center bias); index_thumb_straight rejects balanced-success '
+    'starts.')
+flags.DEFINE_bool(
+    'isaacgym_control_sanity_q_only', False,
+    'With control_sanity_trim_sa, remove joint velocities from the state. '
+    'State becomes N normalized joint angles; action and goal remain N.')
+flags.DEFINE_bool(
+    'isaacgym_control_sanity_goal_include_qd', False,
+    'With trim-SA q,qd state, use the full [q,qd] state as the achieved/HER '
+    'goal and pack the fixed task goal as [q_goal, zeros]. Action/oracle and '
+    'position-only success remain N-dimensional. Default False preserves '
+    'existing checkpoints.')
+flags.DEFINE_enum(
+    'isaacgym_coordinate_mode', 'mixed',
+    ['mixed', 'physical', 'fully_scaled'],
+    'Allegro joint coordinate packing. mixed (default/backward compatible): '
+    '[q_norm, qd_raw], g_norm. physical: [q_raw, qd_raw], g_raw. '
+    'fully_scaled: [q_norm, clip(qd/physical_velocity_limit)], g_norm. '
+    'Policy/oracle actions remain normalized [-1,1] in every mode.')
 flags.DEFINE_bool(
     'isaacgym_table_push', False,
     'On-desk slide: object goal on the table (default or '
@@ -724,6 +940,81 @@ flags.DEFINE_bool(
     'On-desk cube spawn: ±3 cm xy, no z noise, yaw-only quat, zero joint/'
     'force noise, hardcoded hover ~8 cm above table center. Default off. '
     'Does not flip --isaacgym_randomize_init.')
+flags.DEFINE_list(
+    'isaacgym_table_spawn_object_xy', ['0.17', '0.08'],
+    'Nominal cube xy for --isaacgym_table_spawn.')
+flags.DEFINE_bool(
+    'isaacgym_table_spawn_behind', False,
+    'Use a non-contact palm standoff on the robot (+y) side of the cube.')
+flags.DEFINE_float(
+    'isaacgym_table_spawn_behind_dy', 0.14,
+    'Palm +y offset from the cube for --isaacgym_table_spawn_behind.')
+flags.DEFINE_float(
+    'isaacgym_table_spawn_behind_above', 0.08,
+    'Palm height above cube center for --isaacgym_table_spawn_behind.')
+flags.DEFINE_float(
+    'isaacgym_table_spawn_correlated_xy', 0.0,
+    'Fixed per-environment cube xy randomization radius; IK follows each '
+    'randomized cube. 0 disables.')
+flags.DEFINE_float(
+    'isaacgym_table_spawn_finger_curl_scale', 1.0,
+    'Scale applied to the table-spawn curled-paddle finger pose.')
+flags.DEFINE_float(
+    'isaacgym_table_spawn_finger_noise', 0.0,
+    'Per-reset Uniform noise on the 16 hand joints as a fraction of each '
+    'joint URDF range. 0 disables (default). Applied after the table-spawn '
+    'IK + curl pose.')
+flags.DEFINE_float(
+    'isaacgym_table_spawn_arm_noise', 0.0,
+    'Per-reset Uniform noise on the 7 arm joints as a fraction of each '
+    'joint URDF range. 0 disables (default). Applied after table-spawn IK '
+    'so the palm is often off the cube.')
+flags.DEFINE_bool(
+    'isaacgym_table_spawn_toward_bucket', False,
+    'With --isaacgym_table_spawn: IK palm onto the anti-bucket side of the '
+    'cube (standoff18: 18 cm back / 8 cm up, paddle facing the throw bucket). '
+    'Contact-free. Wins over table_spawn_behind.')
+flags.DEFINE_bool(
+    'isaacgym_table_spawn_in_hand', False,
+    'After table-spawn IK + curl, teleport the cube into the palm and '
+    'keep it there on reset. Pair with table_spawn_behind dy=0.')
+flags.DEFINE_float(
+    'isaacgym_table_spawn_in_hand_offset', 0.042,
+    'Cube center distance along palm +z (into the fingers) for in-hand init.')
+flags.DEFINE_float(
+    'isaacgym_table_spawn_in_hand_obj_noise', 0.012,
+    'Per-reset Uniform half-range (m) for cube jitter in the palm tangent '
+    'plane. 0 disables.')
+flags.DEFINE_bool(
+    'isaacgym_table_spawn_in_hand_keep_arm', False,
+    'In-hand init keeps NVIDIA throw pose v1 (no IK). Rolls A7 by '
+    '--isaacgym_table_spawn_in_hand_wrist_offset, curls fingers, snaps '
+    'the cube into the palm.')
+flags.DEFINE_float(
+    'isaacgym_table_spawn_in_hand_wrist_offset', -3.141592653589793,
+    'Added to pose-v1 A7 (wrist roll) when keep_arm in-hand is on. '
+    'Default −π flips palm-down pose v1 to palm-up.')
+flags.DEFINE_float(
+    'isaacgym_table_spawn_in_hand_wrist_noise', 0.10,
+    'Per-env Uniform half-range (rad) on A7 after the wrist offset. '
+    '0 disables.')
+flags.DEFINE_bool(
+    'isaacgym_large_table', False,
+    'Use the 1.5x1.5 m Allegro table, shifted away from the robot.')
+flags.DEFINE_bool(
+    'isaacgym_hide_table', False,
+    'Allegro throw: park NVIDIA\'s table actor far away (1 cm box) so the '
+    'workspace is table-free. Mutually exclusive with '
+    '--isaacgym_large_table. Pair with a bucket --isaacgym_fixed_target_xyz.')
+flags.DEFINE_bool(
+    'isaacgym_lock_arm_base', False,
+    'Allegro throw: freeze iiwa A1–A4 at the reset pose. Policy action '
+    'is 19-D (A5–A7 + 16 fingers). State/goal stay 49/3. Incompatible '
+    'with control_sanity_trim_sa.')
+flags.DEFINE_float(
+    'isaacgym_reset_z_above', 0.0,
+    'Allegro throw: end the episode if object z exceeds this (meters), same '
+    'path as NVIDIA fall reset (z < 0.1). 0 disables (default).')
 flags.DEFINE_string(
     'hidden_layer_sizes', '',
     'Comma-separated hidden layer widths, e.g. "256,256,256,256,256,256". '
@@ -760,6 +1051,15 @@ fixed_goal_dict = {
     # the long winding path through the maze).
     'point_Impossible': [np.array([0, 0], dtype=float),
                          np.array([6, 8], dtype=float)],
+    # Impossible minus cols 0–1. Start = old (8, 2); goal = old (6, 8).
+    'point_ImpossibleNoLeft': [np.array([8, 0], dtype=float),
+                               np.array([6, 6], dtype=float)],
+    # 8x7 opened maze. Start bottom-left (7, 0); goal same room as old (6, 6).
+    'point_ImpossibleOpen': [np.array([7, 0], dtype=float),
+                             np.array([6, 6], dtype=float)],
+    # 5x5 paper concept maze. Fixed start bottom-left; goal bottom-right.
+    'point_MazeConcept': [np.array([4, 0], dtype=float),
+                          np.array([4, 4], dtype=float)],
     # point_Maze11x11: start top-left (0,0), goal top-right (0,10).
     'point_Maze11x11':  [np.array([0, 0], dtype=float),
                          np.array([0, 10], dtype=float)],
@@ -826,6 +1126,9 @@ PPO_ENV_DEFAULTS = {
     'point_Maze11x11':   dict(rollout_length=128, crl_steps_per_iter=64),
     'point_Wall11x11':   dict(rollout_length=128, crl_steps_per_iter=64),
     'point_Impossible':  dict(rollout_length=128, crl_steps_per_iter=64),
+    'point_ImpossibleNoLeft': dict(rollout_length=128, crl_steps_per_iter=64),
+    'point_ImpossibleOpen': dict(rollout_length=128, crl_steps_per_iter=64),
+    'point_MazeConcept': dict(rollout_length=64, crl_steps_per_iter=10),
     'riverswim':         dict(rollout_length=128, crl_steps_per_iter=64),
     'sawyer_bin':        dict(rollout_length=256, crl_steps_per_iter=10),
     'sawyer_box':        dict(rollout_length=256, crl_steps_per_iter=10),
@@ -944,6 +1247,53 @@ def main(_):
   )
   config = contrastive.ContrastiveConfig(**params)
   config.repr_norm = bool(FLAGS.repr_norm)
+  config.isaacgym_control_sanity_trim_init_range_frac = float(
+      FLAGS.isaacgym_control_sanity_trim_init_range_frac)
+  if not 0.0 <= config.isaacgym_control_sanity_trim_init_range_frac <= 1.0:
+    raise ValueError(
+        '--isaacgym_control_sanity_trim_init_range_frac must be in [0, 1], '
+        f'got {config.isaacgym_control_sanity_trim_init_range_frac}')
+  config.isaacgym_control_sanity_trim_init_mode = str(
+      FLAGS.isaacgym_control_sanity_trim_init_mode).strip().lower()
+  if config.isaacgym_control_sanity_trim_init_mode not in (
+          'curled', 'full_range'):
+    raise ValueError(
+        '--isaacgym_control_sanity_trim_init_mode must be curled or '
+        f'full_range, got {config.isaacgym_control_sanity_trim_init_mode!r}')
+  if not 0.0 <= float(FLAGS.isaacgym_table_spawn_finger_noise) <= 1.0:
+    raise ValueError(
+        '--isaacgym_table_spawn_finger_noise must be in [0, 1], '
+        f'got {FLAGS.isaacgym_table_spawn_finger_noise}')
+  if not 0.0 <= float(FLAGS.isaacgym_table_spawn_arm_noise) <= 1.0:
+    raise ValueError(
+        '--isaacgym_table_spawn_arm_noise must be in [0, 1], '
+        f'got {FLAGS.isaacgym_table_spawn_arm_noise}')
+  if float(FLAGS.isaacgym_table_spawn_in_hand_offset) <= 0.0:
+    raise ValueError(
+        '--isaacgym_table_spawn_in_hand_offset must be positive, '
+        f'got {FLAGS.isaacgym_table_spawn_in_hand_offset}')
+  if float(FLAGS.isaacgym_table_spawn_in_hand_obj_noise) < 0.0:
+    raise ValueError(
+        '--isaacgym_table_spawn_in_hand_obj_noise must be non-negative, '
+        f'got {FLAGS.isaacgym_table_spawn_in_hand_obj_noise}')
+  if (bool(FLAGS.isaacgym_table_spawn_in_hand)
+          and not bool(FLAGS.isaacgym_table_spawn)):
+    raise ValueError(
+        '--isaacgym_table_spawn_in_hand requires --isaacgym_table_spawn')
+  if (bool(FLAGS.isaacgym_table_spawn_in_hand_keep_arm)
+          and not bool(FLAGS.isaacgym_table_spawn_in_hand)):
+    raise ValueError(
+        '--isaacgym_table_spawn_in_hand_keep_arm requires '
+        '--isaacgym_table_spawn_in_hand')
+  if float(FLAGS.isaacgym_table_spawn_in_hand_wrist_noise) < 0.0:
+    raise ValueError(
+        '--isaacgym_table_spawn_in_hand_wrist_noise must be non-negative, '
+        f'got {FLAGS.isaacgym_table_spawn_in_hand_wrist_noise}')
+  if (bool(FLAGS.isaacgym_lock_arm_base)
+          and bool(FLAGS.isaacgym_control_sanity_trim_sa)):
+    raise ValueError(
+        '--isaacgym_lock_arm_base is incompatible with '
+        '--isaacgym_control_sanity_trim_sa')
 
   # ---- Per-env PPO defaults (CLI flags still override) -------------------
   _use_pd = (bool(FLAGS.builderbench_use_pd)
@@ -1063,6 +1413,8 @@ def main(_):
             f'ppo_crl_steps_per_iter {config.ppo_crl_steps_per_iter} -> 0')
       config.ppo_crl_steps_per_iter = 0
   config.ppo_repr_mode = str(FLAGS.ppo_repr_mode).strip()
+  config.isaacgym_coordinate_mode = str(
+      FLAGS.isaacgym_coordinate_mode).strip().lower()
   if FLAGS.ppo_td_infonce_target_tau >= 0.0:
     config.ppo_td_infonce_target_tau = float(FLAGS.ppo_td_infonce_target_tau)
   # Allow 0.0 (term-1-only sanity); <0 keeps config default (−1 → use discount).
@@ -1136,6 +1488,8 @@ def main(_):
   config.nf_mix_task_goal_stats = bool(FLAGS.nf_mix_task_goal_stats)
   config.nf_mix_task_goal_frac = float(FLAGS.nf_mix_task_goal_frac)
   config.nf_state_only = bool(FLAGS.nf_state_only)
+  config.isaacgym_control_sanity_goal_include_qd = bool(
+      FLAGS.isaacgym_control_sanity_goal_include_qd)
   config.nf_train_backward = bool(FLAGS.nf_train_backward)
   if FLAGS.nf_backward_checkpoint_interval >= 0:
     config.nf_backward_checkpoint_interval = int(
@@ -1152,15 +1506,70 @@ def main(_):
   if str(FLAGS.ppo_actor_reset_iters or '').strip():
     config.ppo_actor_reset_iters = str(FLAGS.ppo_actor_reset_iters).strip()
   config.ppo_actor_reset_ep_len = float(FLAGS.ppo_actor_reset_ep_len)
+  config.ppo_policy_last_layer_reset_ep_len_below = float(
+      FLAGS.ppo_policy_last_layer_reset_ep_len_below)
+  config.ppo_policy_last_layer_reset_cooldown_iters = int(
+      FLAGS.ppo_policy_last_layer_reset_cooldown_iters)
   if FLAGS.ppo_eval_interval >= 0:
     config.ppo_eval_interval = int(FLAGS.ppo_eval_interval)
   if FLAGS.ppo_eval_episodes >= 0:
     config.ppo_eval_episodes = int(FLAGS.ppo_eval_episodes)
+  config.ppo_maze_randomize_start = bool(FLAGS.ppo_maze_randomize_start)
+  config.ppo_maze_start_jitter_cells = int(FLAGS.ppo_maze_start_jitter_cells)
+  config.ppo_maze_start_in_cell_jitter = float(
+      FLAGS.ppo_maze_start_in_cell_jitter)
+  _start_cells_raw = str(FLAGS.ppo_maze_start_cells or '').strip()
+  if _start_cells_raw:
+    _cells = []
+    for _part in _start_cells_raw.replace('|', ';').split(';'):
+      _part = _part.strip()
+      if not _part:
+        continue
+      _bits = [b.strip() for b in _part.split(',')]
+      if len(_bits) != 2:
+        raise ValueError(
+            f'--ppo_maze_start_cells expected row,col;row,col, got {_part!r}')
+      _cells.append((int(_bits[0]), int(_bits[1])))
+    if _cells:
+      config.ppo_maze_start_cells = tuple(_cells)
+      config.ppo_maze_randomize_start = True
+  config.ppo_maze_occupancy_preimage = bool(
+      FLAGS.ppo_maze_occupancy_preimage)
+  config.ppo_stop_on_eval_success = float(FLAGS.ppo_stop_on_eval_success)
+  config.ppo_stop_on_train_success = float(FLAGS.ppo_stop_on_train_success)
+  config.ppo_stop_on_train_success_iters = int(
+      FLAGS.ppo_stop_on_train_success_iters)
+  if config.ppo_maze_start_cells:
+    print('[ppo_contrastive] maze init: train starts sampled from cells '
+          f'{list(config.ppo_maze_start_cells)} + Uniform[0,1)^2 '
+          '(eval/renders keep exact canonical start)')
+  elif config.ppo_maze_start_in_cell_jitter > 0.0:
+    print('[ppo_contrastive] maze init: canonical start cell + '
+          f'Uniform[0, {config.ppo_maze_start_in_cell_jitter:g})^2 '
+          '(eval/renders keep exact canonical start)')
+  elif config.ppo_maze_randomize_start:
+    _jc = int(config.ppo_maze_start_jitter_cells)
+    _where = (f'free cells within {_jc} of canonical start'
+              if _jc > 0 else 'any free cell')
+    print('[ppo_contrastive] maze init: random start over '
+          f'{_where}, fixed task goal (eval/renders keep canonical start)')
   if FLAGS.ppo_video_interval >= 0:
     config.ppo_video_interval = int(FLAGS.ppo_video_interval)
   if FLAGS.ppo_video_fps >= 0:
     config.ppo_video_fps = int(FLAGS.ppo_video_fps)
   config.ppo_skip_first_video = bool(FLAGS.ppo_skip_first_video)
+  # Allegro: always record in-train videos (every 100 iters by default).
+  # Old job scripts pass --ppo_video_interval=0; force 100 so they still
+  # get clips. Explicit positive N is honored.
+  if str(FLAGS.env or '').startswith('allegro_kuka'):
+    _allegro_vid_default = 100
+    _was_vid = int(config.ppo_video_interval)
+    if _was_vid <= 0:
+      config.ppo_video_interval = _allegro_vid_default
+      print(f'[ppo_contrastive] Allegro: forcing ppo_video_interval '
+            f'{_was_vid} -> {_allegro_vid_default} (stochastic camera, '
+            f'no reward overlay; first clip at iter {_allegro_vid_default})',
+            flush=True)
   config.ppo_norm_reward = bool(FLAGS.ppo_norm_reward)
   config.ppo_norm_obs = bool(FLAGS.ppo_norm_obs)
   config.ppo_bb_pixel_obs = bool(FLAGS.ppo_bb_pixel_obs)
@@ -1179,12 +1588,21 @@ def main(_):
   if FLAGS.ppo_success_sample_weight >= 0.0:
     config.ppo_success_sample_weight = float(
         FLAGS.ppo_success_sample_weight)
+  if FLAGS.crl_future_horizon >= 0:
+    config.crl_future_horizon = int(FLAGS.crl_future_horizon)
+  if FLAGS.ppo_success_replace_fails >= 0:
+    config.ppo_success_replace_fails = int(FLAGS.ppo_success_replace_fails)
   config.ppo_use_external_reward = bool(FLAGS.ppo_use_external_reward)
   config.ppo_external_reward_scale = float(FLAGS.ppo_external_reward_scale)
   config.ppo_external_reward_before_norm = bool(
       FLAGS.ppo_external_reward_before_norm)
   config.ppo_external_reward_success = str(
       FLAGS.ppo_external_reward_success).strip().lower()
+  config.ppo_isaacgym_fall_penalty = float(FLAGS.ppo_isaacgym_fall_penalty)
+  if FLAGS.ppo_nf_reward_shift_q >= 0.0:
+    config.ppo_nf_reward_shift_q = float(FLAGS.ppo_nf_reward_shift_q)
+  if FLAGS.ppo_nf_reward_shift_ema >= 0.0:
+    config.ppo_nf_reward_shift_ema = float(FLAGS.ppo_nf_reward_shift_ema)
   config.ppo_sparse_after_success = bool(FLAGS.ppo_sparse_after_success)
   config.ppo_sparse_after_success_threshold = float(
       FLAGS.ppo_sparse_after_success_threshold)
@@ -1198,10 +1616,24 @@ def main(_):
       FLAGS.ppo_freeze_repr_after_success_iters)
   if FLAGS.ppo_checkpoint_interval >= 0:
     config.ppo_checkpoint_interval = int(FLAGS.ppo_checkpoint_interval)
+  if FLAGS.ppo_max_iterations > 0:
+    config.ppo_max_iterations = int(FLAGS.ppo_max_iterations)
   if FLAGS.ppo_checkpoint_keep_last >= 0:
     config.ppo_checkpoint_keep_last = int(FLAGS.ppo_checkpoint_keep_last)
   if FLAGS.ppo_checkpoint_replay_max >= 0:
     config.ppo_checkpoint_replay_max = int(FLAGS.ppo_checkpoint_replay_max)
+  if FLAGS.ppo_density_snapshot_interval >= 0:
+    config.ppo_density_snapshot_interval = int(
+        FLAGS.ppo_density_snapshot_interval)
+  config.ppo_maze_cell_probe = bool(FLAGS.ppo_maze_cell_probe)
+  config.ppo_maze_cell_probe_near_row = int(
+      FLAGS.ppo_maze_cell_probe_near_row)
+  config.ppo_maze_cell_probe_near_col = int(
+      FLAGS.ppo_maze_cell_probe_near_col)
+  config.ppo_maze_cell_probe_far_row = int(
+      FLAGS.ppo_maze_cell_probe_far_row)
+  config.ppo_maze_cell_probe_far_col = int(
+      FLAGS.ppo_maze_cell_probe_far_col)
   if FLAGS.ppo_crl_loss_direction.strip():
     config.ppo_crl_loss_direction = FLAGS.ppo_crl_loss_direction.strip().lower()
   if FLAGS.ppo_crl_hit_bonus.strip():
@@ -1224,6 +1656,12 @@ def main(_):
     config.ppo_crl_grad_reg_coef = float(FLAGS.ppo_crl_grad_reg_coef)
   if FLAGS.ppo_crl_grad_reg_rel >= 0.0:
     config.ppo_crl_grad_reg_rel = float(FLAGS.ppo_crl_grad_reg_rel)
+  if FLAGS.ppo_crl_grad_reg_lam_lr >= 0.0:
+    config.ppo_crl_grad_reg_lam_lr = float(FLAGS.ppo_crl_grad_reg_lam_lr)
+  if config.ppo_crl_grad_reg_lam_lr < 0.0:
+    raise ValueError(
+        'ppo_crl_grad_reg_lam_lr must be >= 0, '
+        f'got {config.ppo_crl_grad_reg_lam_lr}')
   config.ppo_nf_grad_reg = bool(FLAGS.ppo_nf_grad_reg)
   if FLAGS.ppo_nf_grad_reg_lam >= 0.0:
     config.ppo_nf_grad_reg_lam = float(FLAGS.ppo_nf_grad_reg_lam)
@@ -1340,6 +1778,7 @@ def main(_):
         f'ppo_crl_grad_reg_c={config.ppo_crl_grad_reg_c}  '
         f'ppo_crl_grad_reg_coef={config.ppo_crl_grad_reg_coef}  '
         f'ppo_crl_grad_reg_rel={config.ppo_crl_grad_reg_rel}  '
+        f'ppo_crl_grad_reg_lam_lr={config.ppo_crl_grad_reg_lam_lr}  '
         f'ppo_nf_grad_reg={config.ppo_nf_grad_reg}  '
         f'ppo_nf_grad_reg_lam={config.ppo_nf_grad_reg_lam}  '
         f'ppo_nf_grad_reg_lam_lr={config.ppo_nf_grad_reg_lam_lr}  '
@@ -1383,12 +1822,18 @@ def main(_):
         f'max_replay_size={config.max_replay_size}  '
         f'ppo_min_replay_size={config.ppo_min_replay_size}  '
         f'ppo_success_sample_weight={config.ppo_success_sample_weight}  '
+        f'crl_future_horizon={config.crl_future_horizon}  '
+        f'ppo_success_replace_fails={config.ppo_success_replace_fails}  '
         f'ppo_use_external_reward={config.ppo_use_external_reward}  '
         f'ppo_external_reward_scale={config.ppo_external_reward_scale}  '
         f'ppo_external_reward_before_norm='
         f'{config.ppo_external_reward_before_norm}  '
         f'ppo_external_reward_success='
         f'{config.ppo_external_reward_success}  '
+        f'ppo_isaacgym_fall_penalty='
+        f'{config.ppo_isaacgym_fall_penalty}  '
+        f'ppo_nf_reward_shift_q={config.ppo_nf_reward_shift_q}  '
+        f'ppo_nf_reward_shift_ema={config.ppo_nf_reward_shift_ema}  '
         f'ppo_sparse_after_success={config.ppo_sparse_after_success}  '
         f'ppo_sparse_after_success_threshold='
         f'{config.ppo_sparse_after_success_threshold}  '
@@ -1404,6 +1849,7 @@ def main(_):
         f'kde_refit_interval={config.kde_refit_interval}  '
         f'kde_bandwidth={config.kde_bandwidth}  '
         f'ckpt_interval={config.ppo_checkpoint_interval}  '
+        f'ppo_max_iterations={config.ppo_max_iterations}  '
         f'nf_bwd_ckpt_interval={config.nf_backward_checkpoint_interval}  '
         f'ckpt_keep_last={config.ppo_checkpoint_keep_last} '
         f'({"all milestones" if config.ppo_checkpoint_keep_last <= 0 else "FIFO prune"})  '
@@ -1439,12 +1885,55 @@ def main(_):
     _env_kwargs['randomize_init'] = bool(FLAGS.sawyer_randomize_init)
     if not FLAGS.sawyer_randomize_init:
       print(f'[ppo] {env_name} init: frozen (no MetaWorld object/hole randomness)')
+    if int(FLAGS.sawyer_max_episode_steps) > 0:
+      _env_kwargs['max_episode_steps'] = int(FLAGS.sawyer_max_episode_steps)
+      print(f'[ppo] {env_name} horizon: {int(FLAGS.sawyer_max_episode_steps)} '
+            '(override; default is 150)')
+  if env_name == 'sawyer_bin' and FLAGS.sawyer_bin_metaworld_hand_init:
+    _env_kwargs['metaworld_hand_init'] = True
+    print('[ppo] sawyer_bin init: MetaWorld native open hand at home')
+  if env_name == 'sawyer_bin' and FLAGS.sawyer_bin_safe_grasp_reset:
+    _env_kwargs['safe_grasp_reset'] = True
+    print('[ppo] sawyer_bin init: bounded safe grasp reset with validation')
+  if env_name == 'sawyer_bin' and FLAGS.sawyer_bin_bounded_step_mocap:
+    _env_kwargs['bounded_step_mocap'] = True
+    print('[ppo] sawyer_bin control: per-step mocap anchored to current TCP')
+  if env_name == 'sawyer_bin' and FLAGS.sawyer_bin_selective_antiwindup:
+    if FLAGS.sawyer_bin_bounded_step_mocap:
+      raise ValueError(
+          '--sawyer_bin_selective_antiwindup cannot be combined with '
+          '--sawyer_bin_bounded_step_mocap')
+    _env_kwargs['selective_antiwindup_mocap'] = True
+    print('[ppo] sawyer_bin control: selective anti-windup at 15cm, 20cm cap')
+  if env_name == 'sawyer_bin' and FLAGS.sawyer_bin_trackerr_terminate_20cm:
+    if FLAGS.sawyer_bin_selective_antiwindup:
+      raise ValueError(
+          '--sawyer_bin_trackerr_terminate_20cm cannot be combined with '
+          '--sawyer_bin_selective_antiwindup')
+    _env_kwargs['terminate_tracking_error'] = True
+    print('[ppo] sawyer_bin termination: post-step mocap error >20cm')
   if env_name == 'sawyer_bin' and FLAGS.bin_randomize_gripper_init:
-    if FLAGS.sawyer_randomize_init:
+    if FLAGS.sawyer_bin_metaworld_hand_init:
+      print('[ppo] sawyer_bin init: ignoring --bin_randomize_gripper_init '
+            '(MetaWorld native hand init requested)')
+    elif FLAGS.sawyer_randomize_init:
       _env_kwargs['randomize_gripper_init'] = True
       print('[ppo] sawyer_bin init: randomized gripper position at reset')
     else:
       print('[ppo] sawyer_bin init: ignoring --bin_randomize_gripper_init '
+            '(frozen by --sawyer_randomize_init=false)')
+  if env_name == 'sawyer_bin' and FLAGS.bin_randomize_tcp_z:
+    if FLAGS.bin_randomize_gripper_init:
+      print('[ppo] sawyer_bin init: ignoring --bin_randomize_tcp_z '
+            '(MPO XY+Z jitter already requested)')
+    elif FLAGS.sawyer_bin_metaworld_hand_init:
+      print('[ppo] sawyer_bin init: ignoring --bin_randomize_tcp_z '
+            '(MetaWorld native hand init requested)')
+    elif FLAGS.sawyer_randomize_init:
+      _env_kwargs['randomize_tcp_z'] = True
+      print('[ppo] sawyer_bin init: TCP z Uniform(3cm, 6cm), XY centered on object')
+    else:
+      print('[ppo] sawyer_bin init: ignoring --bin_randomize_tcp_z '
             '(frozen by --sawyer_randomize_init=false)')
   if env_name.startswith('builderbench_'):
     # NF + BuilderBench: freeze cube layout (no lane permute, fixed init x).
@@ -1509,24 +1998,237 @@ def main(_):
   if _use_isaacgym:
     # Isaac Gym allows only one PhysX sim per process; do NOT create a probe
     # sim.  Use the known compact packed layout from the wrapper:
-    #   state (49) = joint pos (23) + joint vel (23) + object xyz (3)
-    #   goal  (3)  = fixed target xyz
+    #   state (49) = q (23) + qd (23) + object xyz (3)   [no palm]
+    #   goal  (3)  = object xyz
+    #   joint_goal: goal (19) = hand q* (16) + object xyz; HER via indices
+    #   palm_goal:  state 52 / goal 6
     from envs.allegro_kuka_throw_env import GOAL_DIM as _IG_GOAL_THROW
+    from envs.allegro_kuka_throw_env import GOAL_DIM_JOINT as _IG_GOAL_JOINT
     from envs.allegro_kuka_throw_env import GOAL_DIM_PALM as _IG_GOAL_PALM
+    from envs.allegro_kuka_throw_env import (
+        GOAL_DIM_FINGER_CONTROL as _IG_GOAL_FINGER_CONTROL)
+    from envs.allegro_kuka_throw_env import (
+        GOAL_DIM_INDEX_CONTROL as _IG_GOAL_INDEX_CONTROL)
+    from envs.allegro_kuka_throw_env import (
+        GOAL_DIM_SIX_CONTROL as _IG_GOAL_SIX_CONTROL)
+    from envs.allegro_kuka_throw_env import (
+        GOAL_DIM_THREE2_CONTROL as _IG_GOAL_THREE2_CONTROL)
+    from envs.allegro_kuka_throw_env import (
+        GOAL_DIM_TWO_FINGER_CONTROL as _IG_GOAL_TWO_FINGER_CONTROL)
+    from envs.allegro_kuka_throw_env import (
+        GOAL_DIM_INDEX_THUMB_CONTROL as _IG_GOAL_INDEX_THUMB_CONTROL)
+    from envs.allegro_kuka_throw_env import (
+        GOAL_DIM_FOUR2_CONTROL as _IG_GOAL_FOUR2_CONTROL)
+    from envs.allegro_kuka_throw_env import (
+        GOAL_DIM_ARM23_CONTROL as _IG_GOAL_ARM23_CONTROL)
+    from envs.allegro_kuka_throw_env import (
+        CONTROL_SANITY_THREE2_HAND_INDICES as _IG_THREE2_IDX)
+    from envs.allegro_kuka_throw_env import (
+        CONTROL_SANITY_FOUR2_HAND_INDICES as _IG_FOUR2_IDX)
+    from envs.allegro_kuka_throw_env import (
+        CONTROL_SANITY_INDEX_THUMB_HAND_INDICES as _IG_INDEX_THUMB_IDX)
+    from envs.allegro_kuka_throw_env import (
+        GOAL_DIM_PALM_CONTROL as _IG_GOAL_PALM_CONTROL)
+    from envs.allegro_kuka_throw_env import JOINT_GOAL_STATE_INDICES
     from envs.allegro_kuka_throw_env import STATE_DIM as _IG_STATE_THROW
     from envs.allegro_kuka_throw_env import STATE_DIM_PALM as _IG_STATE_PALM
-    _palm = bool(FLAGS.isaacgym_palm_goal)
-    obs_dim = int(_IG_STATE_PALM if _palm else _IG_STATE_THROW)
+    from envs.allegro_kuka_throw_env import (
+        STATE_DIM_CONTROL as _IG_STATE_CONTROL)
+    from envs.allegro_kuka_throw_env import (
+        STATE_DIM_PALM_CONTROL as _IG_STATE_PALM_CONTROL)
+    _sanity = str(FLAGS.isaacgym_control_sanity_mode)
+    _joint = bool(FLAGS.isaacgym_joint_goal) and _sanity == 'off'
+    _palm = (
+        bool(FLAGS.isaacgym_palm_goal) and not _joint and _sanity == 'off')
+    if bool(FLAGS.isaacgym_joint_goal) and bool(FLAGS.isaacgym_palm_goal):
+      print('[ppo_contrastive] joint_goal on: forcing palm_goal=False')
+    if _sanity in (
+            'finger', 'hand16', 'hand16fig', 'hand16ok', 'hand16peace',
+            'hand16point', 'hand16gun', 'arm23wave', 'index', 'six',
+            'two_finger',
+            'three2', 'four2',
+            'four2h', 'four2m', 'four2mh', 'four2mm', 'four2mmh', 'four2mmx',
+            'four2w', 'index_thumb_straight'):
+      obs_dim = int(_IG_STATE_CONTROL)
+    elif _sanity == 'palm':
+      obs_dim = int(_IG_STATE_PALM_CONTROL)
+    else:
+      obs_dim = int(_IG_STATE_PALM if _palm else _IG_STATE_THROW)
     config.obs_dim = obs_dim
-    config.goal_dim = int(_IG_GOAL_PALM if _palm else _IG_GOAL_THROW)
     config.max_episode_steps = int(FLAGS.isaacgym_episode_length)
-    # Hindsight goal is the last goal_dim entries of state (object xyz, or
-    # palm+object when palm_goal is on).
-    config.start_index = int(obs_dim - config.goal_dim)
-    config.end_index = int(obs_dim)
-    print(f'[ppo_contrastive] isaacgym: palm_goal={_palm} '
+    if _sanity == 'finger':
+      config.goal_dim = int(_IG_GOAL_FINGER_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = 7
+      config.end_index = 23
+    elif _sanity == 'hand16':
+      config.goal_dim = int(_IG_GOAL_FINGER_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = 7
+      config.end_index = 23
+    elif _sanity == 'hand16fig':
+      config.goal_dim = int(_IG_GOAL_FINGER_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = 7
+      config.end_index = 23
+    elif _sanity == 'hand16ok':
+      config.goal_dim = int(_IG_GOAL_FINGER_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = 7
+      config.end_index = 23
+    elif _sanity == 'hand16peace':
+      config.goal_dim = int(_IG_GOAL_FINGER_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = 7
+      config.end_index = 23
+    elif _sanity == 'hand16point':
+      config.goal_dim = int(_IG_GOAL_FINGER_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = 7
+      config.end_index = 23
+    elif _sanity == 'hand16gun':
+      config.goal_dim = int(_IG_GOAL_FINGER_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = 7
+      config.end_index = 23
+    elif _sanity == 'arm23wave':
+      config.goal_dim = int(_IG_GOAL_ARM23_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = 0
+      config.end_index = 23
+    elif _sanity == 'index':
+      config.goal_dim = int(_IG_GOAL_INDEX_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = 7
+      config.end_index = 11
+    elif _sanity == 'six':
+      config.goal_dim = int(_IG_GOAL_SIX_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = 7
+      config.end_index = 13
+    elif _sanity == 'two_finger':
+      config.goal_dim = int(_IG_GOAL_TWO_FINGER_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = 7
+      config.end_index = 15
+    elif _sanity == 'three2':
+      config.goal_dim = int(_IG_GOAL_THREE2_CONTROL)
+      config.goal_state_indices = tuple(
+          7 + int(i) for i in _IG_THREE2_IDX)
+      config.start_index = 7
+      config.end_index = 13
+    elif _sanity == 'four2':
+      config.goal_dim = int(_IG_GOAL_FOUR2_CONTROL)
+      config.goal_state_indices = tuple(
+          7 + int(i) for i in _IG_FOUR2_IDX)
+      config.start_index = 7
+      config.end_index = 15
+    elif _sanity == 'four2h':
+      config.goal_dim = int(_IG_GOAL_FOUR2_CONTROL)
+      config.goal_state_indices = tuple(
+          7 + int(i) for i in _IG_FOUR2_IDX)
+      config.start_index = 7
+      config.end_index = 15
+    elif _sanity == 'four2m':
+      config.goal_dim = int(_IG_GOAL_FOUR2_CONTROL)
+      config.goal_state_indices = tuple(
+          7 + int(i) for i in _IG_FOUR2_IDX)
+      config.start_index = 7
+      config.end_index = 15
+    elif _sanity == 'four2mh':
+      config.goal_dim = int(_IG_GOAL_FOUR2_CONTROL)
+      config.goal_state_indices = tuple(
+          7 + int(i) for i in _IG_FOUR2_IDX)
+      config.start_index = 7
+      config.end_index = 15
+    elif _sanity == 'four2mm':
+      config.goal_dim = int(_IG_GOAL_FOUR2_CONTROL)
+      config.goal_state_indices = tuple(
+          7 + int(i) for i in _IG_FOUR2_IDX)
+      config.start_index = 7
+      config.end_index = 15
+    elif _sanity == 'four2mmh':
+      config.goal_dim = int(_IG_GOAL_FOUR2_CONTROL)
+      config.goal_state_indices = tuple(
+          7 + int(i) for i in _IG_FOUR2_IDX)
+      config.start_index = 7
+      config.end_index = 15
+    elif _sanity == 'four2mmx':
+      config.goal_dim = int(_IG_GOAL_FOUR2_CONTROL)
+      config.goal_state_indices = tuple(
+          7 + int(i) for i in _IG_FOUR2_IDX)
+      config.start_index = 7
+      config.end_index = 15
+    elif _sanity == 'four2w':
+      config.goal_dim = int(_IG_GOAL_FOUR2_CONTROL)
+      config.goal_state_indices = tuple(
+          7 + int(i) for i in _IG_FOUR2_IDX)
+      config.start_index = 7
+      config.end_index = 15
+    elif _sanity == 'index_thumb_straight':
+      config.goal_dim = int(_IG_GOAL_INDEX_THUMB_CONTROL)
+      config.goal_state_indices = tuple(
+          7 + int(i) for i in _IG_INDEX_THUMB_IDX)
+      config.start_index = 7
+      config.end_index = 23
+    elif _sanity == 'palm':
+      config.goal_dim = int(_IG_GOAL_PALM_CONTROL)
+      config.goal_state_indices = None
+      config.start_index = int(obs_dim - config.goal_dim)
+      config.end_index = int(obs_dim)
+    elif _joint:
+      config.goal_dim = int(_IG_GOAL_JOINT)
+      config.goal_state_indices = tuple(int(i) for i in JOINT_GOAL_STATE_INDICES)
+      config.start_index = 7
+      config.end_index = 23
+    else:
+      config.goal_dim = int(_IG_GOAL_PALM if _palm else _IG_GOAL_THROW)
+      config.goal_state_indices = None
+      # Hindsight is the last goal_dim entries of state (object xyz, or
+      # palm+object when palm_goal is on).
+      config.start_index = int(obs_dim - config.goal_dim)
+      config.end_index = int(obs_dim)
+    _trim_sa = (
+        bool(FLAGS.isaacgym_control_sanity_trim_sa)
+        or _sanity == 'index_thumb_straight')
+    if _trim_sa:
+      if _sanity not in (
+              'finger', 'hand16', 'hand16fig', 'hand16ok', 'hand16peace',
+            'hand16point', 'hand16gun', 'index', 'six',
+              'two_finger',
+              'three2',
+              'four2', 'four2h', 'four2m', 'four2mh', 'four2mm', 'four2mmh',
+              'four2mmx', 'four2w', 'index_thumb_straight'):
+        raise ValueError(
+            'isaacgym_control_sanity_trim_sa requires a finger-style '
+            f'control_sanity_mode, got {_sanity!r}')
+      _q_only = bool(FLAGS.isaacgym_control_sanity_q_only)
+      # Trimmed state is [q] or [q,qd]. Goal can independently be q or [q,qd].
+      controlled_dim = int(config.goal_dim)
+      obs_dim = controlled_dim if _q_only else 2 * controlled_dim
+      _goal_include_qd = bool(
+          FLAGS.isaacgym_control_sanity_goal_include_qd)
+      if _goal_include_qd and _q_only:
+        raise ValueError(
+            '--isaacgym_control_sanity_goal_include_qd requires q,qd state')
+      config.goal_dim = (
+          2 * controlled_dim if _goal_include_qd else controlled_dim)
+      config.obs_dim = obs_dim
+      config.goal_state_indices = tuple(range(config.goal_dim))
+      config.start_index = 0
+      config.end_index = config.goal_dim
+    elif FLAGS.isaacgym_control_sanity_q_only:
+      raise ValueError(
+          '--isaacgym_control_sanity_q_only requires '
+          '--isaacgym_control_sanity_trim_sa')
+    print(f'[ppo_contrastive] isaacgym: sanity={_sanity} '
+          f'palm_goal={_palm} joint_goal={_joint} trim_sa={_trim_sa} '
+          f'goal_include_qd='
+          f'{bool(FLAGS.isaacgym_control_sanity_goal_include_qd)} '
+          f'coordinate_mode={config.isaacgym_coordinate_mode} '
           f'obs_dim={obs_dim} goal_dim={config.goal_dim} '
-          f'goal_slice=state[{config.start_index}:{config.end_index}] '
+          f'goal_slice=state[{config.start_index}:{config.end_index}]'
+          f'{f" indices={config.goal_state_indices}" if config.goal_state_indices else ""} '
           f'max_episode_steps={config.max_episode_steps}')
   else:
     probe_env, obs_dim = contrastive_utils.make_environment(
@@ -1646,19 +2348,79 @@ def main(_):
         'isaacgym_episode_length': int(FLAGS.isaacgym_episode_length),
         'isaacgym_fixed_target_xyz': tuple(
             float(v) for v in FLAGS.isaacgym_fixed_target_xyz),
+        'isaacgym_goal_z': float(FLAGS.isaacgym_goal_z),
         'isaacgym_pipeline': str(FLAGS.isaacgym_pipeline).strip().lower(),
         'isaacgym_randomize_init': bool(FLAGS.isaacgym_randomize_init),
         'isaacgym_randomize_object_xyz': bool(
             FLAGS.isaacgym_randomize_object_xyz),
         'isaacgym_randomize_object_shape': bool(
             FLAGS.isaacgym_randomize_object_shape),
-        'isaacgym_palm_goal': bool(FLAGS.isaacgym_palm_goal),
+        'isaacgym_palm_goal': bool(FLAGS.isaacgym_palm_goal) and not bool(
+            FLAGS.isaacgym_joint_goal),
         'isaacgym_palm_goal_xyz': tuple(
             float(v) for v in FLAGS.isaacgym_palm_goal_xyz),
+        'isaacgym_joint_goal': bool(FLAGS.isaacgym_joint_goal),
+        'isaacgym_control_sanity_mode': str(
+            FLAGS.isaacgym_control_sanity_mode),
+        'isaacgym_control_sanity_palm_xyz': tuple(
+            float(v) for v in FLAGS.isaacgym_control_sanity_palm_xyz),
+        'isaacgym_control_sanity_finger_tol': float(
+            FLAGS.isaacgym_control_sanity_finger_tol),
+        'isaacgym_control_sanity_palm_tol': float(
+            FLAGS.isaacgym_control_sanity_palm_tol),
+        'isaacgym_control_sanity_trim_sa': bool(
+            FLAGS.isaacgym_control_sanity_trim_sa
+            or FLAGS.isaacgym_control_sanity_mode == 'index_thumb_straight'),
+        'isaacgym_control_sanity_trim_init_range_frac': float(
+            FLAGS.isaacgym_control_sanity_trim_init_range_frac),
+        'isaacgym_control_sanity_trim_init_mode': str(
+            FLAGS.isaacgym_control_sanity_trim_init_mode),
+        'isaacgym_control_sanity_q_only': bool(
+            FLAGS.isaacgym_control_sanity_q_only),
+        'isaacgym_control_sanity_goal_include_qd': bool(
+            FLAGS.isaacgym_control_sanity_goal_include_qd),
+        'isaacgym_coordinate_mode': str(FLAGS.isaacgym_coordinate_mode),
         'isaacgym_table_push': bool(FLAGS.isaacgym_table_push),
         'isaacgym_table_push_xyz': tuple(
             float(v) for v in FLAGS.isaacgym_table_push_xyz),
         'isaacgym_table_spawn': bool(FLAGS.isaacgym_table_spawn),
+        'isaacgym_table_spawn_object_xy': tuple(
+            float(v) for v in FLAGS.isaacgym_table_spawn_object_xy),
+        'isaacgym_table_spawn_behind': bool(
+            FLAGS.isaacgym_table_spawn_behind),
+        'isaacgym_table_spawn_behind_dy': float(
+            FLAGS.isaacgym_table_spawn_behind_dy),
+        'isaacgym_table_spawn_behind_above': float(
+            FLAGS.isaacgym_table_spawn_behind_above),
+        'isaacgym_table_spawn_correlated_xy': float(
+            FLAGS.isaacgym_table_spawn_correlated_xy),
+        'isaacgym_table_spawn_finger_curl_scale': float(
+            FLAGS.isaacgym_table_spawn_finger_curl_scale),
+        'isaacgym_table_spawn_finger_noise': float(
+            FLAGS.isaacgym_table_spawn_finger_noise),
+        'isaacgym_table_spawn_arm_noise': float(
+            FLAGS.isaacgym_table_spawn_arm_noise),
+        'isaacgym_table_spawn_toward_bucket': bool(
+            FLAGS.isaacgym_table_spawn_toward_bucket),
+        'isaacgym_table_spawn_in_hand': bool(
+            FLAGS.isaacgym_table_spawn_in_hand),
+        'isaacgym_table_spawn_in_hand_offset': float(
+            FLAGS.isaacgym_table_spawn_in_hand_offset),
+        'isaacgym_table_spawn_in_hand_obj_noise': float(
+            FLAGS.isaacgym_table_spawn_in_hand_obj_noise),
+        'isaacgym_table_spawn_in_hand_keep_arm': bool(
+            FLAGS.isaacgym_table_spawn_in_hand_keep_arm),
+        'isaacgym_table_spawn_in_hand_wrist_offset': float(
+            FLAGS.isaacgym_table_spawn_in_hand_wrist_offset),
+        'isaacgym_table_spawn_in_hand_wrist_noise': float(
+            FLAGS.isaacgym_table_spawn_in_hand_wrist_noise),
+        'isaacgym_large_table': bool(FLAGS.isaacgym_large_table),
+        'isaacgym_hide_table': bool(FLAGS.isaacgym_hide_table),
+        'isaacgym_palm_and_object_success': bool(
+            FLAGS.isaacgym_palm_and_object_success),
+        'isaacgym_throw_success': str(FLAGS.isaacgym_throw_success),
+        'isaacgym_lock_arm_base': bool(FLAGS.isaacgym_lock_arm_base),
+        'isaacgym_reset_z_above': float(FLAGS.isaacgym_reset_z_above),
     }
     ppo_learner_isaacgym.run_ppo_training(
         config=config,

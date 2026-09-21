@@ -87,7 +87,7 @@ def _iteration_title_card(iteration: int, width: int, height: int) -> np.ndarray
   y = (height - th) // 2 - 8
   draw.text((x + 2, y + 2), title, fill=(0, 0, 0), font=font_big)
   draw.text((x, y), title, fill=(255, 220, 90), font=font_big)
-  sub = 'CRL goal-preimage  ·  top-k support'
+  sub = 'goal-preimage  ·  top-k support'
   font_sm = _font(20)
   sb = draw.textbbox((0, 0), sub, font=font_sm)
   sw = sb[2] - sb[0]
@@ -103,6 +103,7 @@ def _rank_salient_frame(
     rank: int,
     weight: float | None = None,
     score: float | None = None,
+    score_name: str = 'φ·ψ',
 ) -> np.ndarray:
   """Overlay a large RANK badge + iteration strip on a clean render."""
   im = Image.fromarray(img).convert('RGB')
@@ -139,7 +140,7 @@ def _rank_salient_frame(
   if weight is not None:
     bits.append(f'w = {weight:.3f}')
   if score is not None:
-    bits.append(f'φ·ψ = {score:.2f}')
+    bits.append(f'{score_name} = {score:.2f}')
   if bits:
     wtxt = '   '.join(bits)
     font_w = _font(22)
@@ -180,6 +181,7 @@ def _build_topk_support_gif(
     *,
     title_ms: int = 1400,
     rank_ms: int = 700,
+    score_name: str = 'φ·ψ',
 ):
   """GIF with iteration title-card cuts + salient RANK badges."""
   frames: List[np.ndarray] = []
@@ -202,7 +204,7 @@ def _build_topk_support_gif(
       frames.append(_rank_salient_frame(
           fr, iteration=it, rank=r,
           weight=(float(wi) if show_w else None),
-          score=sc))
+          score=sc, score_name=score_name))
       durs.append(rank_ms)
 
   _write_gif(frames, out_path, durations=durs)
@@ -301,6 +303,90 @@ def _montage_row(images: List[np.ndarray], labels: List[str],
   return np.asarray(canvas)
 
 
+def _montage_grid(images: List[np.ndarray], labels: List[str],
+                 ncols: int = 4, cell_w: int = 560, cell_h: int = 420
+                 ) -> np.ndarray:
+  n = len(images)
+  ncols = max(1, min(int(ncols), n))
+  nrows = (n + ncols - 1) // ncols
+  label_h = 32
+  gap = 8
+  W = ncols * cell_w + (ncols - 1) * gap
+  H = nrows * (label_h + cell_h) + (nrows - 1) * gap
+  canvas = Image.new('RGB', (W, H), color=(16, 16, 20))
+  draw = ImageDraw.Draw(canvas)
+  for i, (im, lab) in enumerate(zip(images, labels)):
+    r, c = divmod(i, ncols)
+    x = c * (cell_w + gap)
+    y = r * (label_h + cell_h + gap)
+    draw.text((x + 8, y + 6), lab, fill=(235, 235, 240), font=_font(15))
+    tile = Image.fromarray(im).resize((cell_w, cell_h), Image.Resampling.BILINEAR)
+    canvas.paste(tile, (x, y + label_h))
+  return np.asarray(canvas)
+
+
+def _parked_mocap(template: np.ndarray) -> np.ndarray:
+  """Move mocap markers far off-table so they do not appear in renders."""
+  out = np.asarray(template, dtype=np.float64).copy()
+  flat = out.reshape(-1, 3)
+  flat[:] = (10.0, 10.0, 10.0)
+  return out.reshape(out.shape)
+
+
+def _render_goal_solid(
+    base,
+    video_env,
+    hard_goal: np.ndarray,
+    *,
+    height: int,
+    width: int,
+    camera=None,
+    slot_to_cube: np.ndarray | None = None,
+) -> np.ndarray:
+  """Render the hard-goal pyramid as solid cubes (no mocap markers).
+
+  By default cube ``i`` (among masked cubes, in index order) goes to goal
+  slot ``i``. Pass ``slot_to_cube`` (length = #goal slots) to put cube
+  ``slot_to_cube[s]`` at goal slot ``s`` — useful when success is
+  permutation-invariant and the policy uses a different color layout.
+  """
+  qpos = np.array(base._init_q, copy=True)
+  qvel = np.zeros_like(np.asarray(base._init_v))
+  goal = np.asarray(hard_goal, dtype=np.float32).reshape(-1, 3)
+  mask = np.asarray(base._target_cube_masks_data).reshape(-1).astype(bool)
+  num_cubes = int(len(mask))
+  pos = np.asarray(qpos[np.asarray(base._objs_pos_qpos_idxs)], dtype=np.float32)
+  pos = pos.reshape(num_cubes, 3)
+  if int(goal.shape[0]) != int(mask.sum()):
+    raise ValueError(
+        f'hard_goal has {goal.shape[0]} cubes but mask selects {int(mask.sum())}')
+  if slot_to_cube is None:
+    pos[mask] = goal
+  else:
+    order = np.asarray(slot_to_cube, dtype=np.int32).reshape(-1)
+    if order.shape[0] != goal.shape[0]:
+      raise ValueError(
+          f'slot_to_cube length {order.shape[0]} != goal slots {goal.shape[0]}')
+    if np.unique(order).size != order.size:
+      raise ValueError(f'slot_to_cube has duplicates: {order.tolist()}')
+    for s, cube in enumerate(order.tolist()):
+      if cube < 0 or cube >= num_cubes or not bool(mask[cube]):
+        raise ValueError(
+            f'slot_to_cube[{s}]={cube} is not a masked-in cube '
+            f'(num_cubes={num_cubes}, mask={mask.tolist()})')
+      pos[cube] = goal[s]
+  qpos[np.asarray(base._objs_pos_qpos_idxs)] = pos.reshape(-1)
+  qpos[np.asarray(base._objs_quat_qpos_idxs)] = np.tile(
+      np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), num_cubes)
+  n_task = int(base._num_task_cubes)
+  mocap_pos = np.tile(np.array([10.0, 10.0, 10.0], dtype=np.float32), n_task)
+  mocap_quat = np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), n_task)
+  return viz._render_state(
+      video_env, qpos, qvel, mocap_pos, mocap_quat,
+      height=height, width=width, camera=camera,
+  )
+
+
 def _collect_stage(
     *,
     stage_iter: int,
@@ -318,6 +404,11 @@ def _collect_stage(
     num_trajs: int,
     top_k: int,
     seed: int,
+    height: int = 480,
+    width: int = 640,
+    camera=None,
+    post_success_steps: int = -1,
+    hide_mocap: bool = False,
 ) -> Dict:
   ckpt_path = os.path.join(
       run_dir, 'checkpoints', f'ckpt_iter_{stage_iter:07d}.pkl')
@@ -351,6 +442,7 @@ def _collect_stage(
       num_cubes=num_cubes,
       filter_policy_obs=ctx.filter_policy_obs,
       obs_dim=ctx.obs_dim,
+      post_success_steps=post_success_steps,
   )
   if repr_mode == 'nf':
     raw, score, weights = viz._score_preimage_nf(
@@ -363,12 +455,26 @@ def _collect_stage(
   top_idx = np.argsort(-weights)[:top_k]
   frames = []
   for idx in top_idx:
+    mocap_pos = data['mocap_pos'][idx]
+    mocap_quat = data['mocap_quat'][idx]
+    if hide_mocap:
+      mocap_pos = _parked_mocap(mocap_pos)
     frames.append(viz._render_state(
         video_env,
         data['qpos'][idx], data['qvel'][idx],
-        data['mocap_pos'][idx], data['mocap_quat'][idx],
+        mocap_pos, mocap_quat,
+        height=height, width=width, camera=camera,
     ))
   top_w = weights[top_idx]
+  selected_traj = data['traj_index'][top_idx]
+  selected_step = data['traj_step'][top_idx]
+  print(
+      '[composite]   selected '
+      + ', '.join(
+          f'rank{rank}=traj{int(traj_i)}:t{int(step_i)}'
+          for rank, (traj_i, step_i) in enumerate(
+              zip(selected_traj, selected_step), start=1)),
+      flush=True)
   return {
       'iteration': stage_iter,
       'frames': frames,
@@ -376,6 +482,9 @@ def _collect_stage(
       'raw_scores': raw[top_idx],
       'all_weights': weights,
       'top_idx': top_idx,
+      'selected_traj': selected_traj,
+      'selected_step': selected_step,
+      'first_success_steps': data['first_success_steps'],
   }
 
 
@@ -395,6 +504,41 @@ def main():
   ap.add_argument('--top_k', type=int, default=5)
   ap.add_argument('--seed', type=int, default=0)
   ap.add_argument('--gif_ms', type=int, default=800)
+  ap.add_argument('--width', type=int, default=960)
+  ap.add_argument('--height', type=int, default=720)
+  ap.add_argument('--cam_zoom', type=float, default=5.0,
+                  help='Free-camera zoom vs default distance (larger = closer).')
+  ap.add_argument('--cam_lookat', default='',
+                  help='x,y,z look-at. Default: mean of the hard-goal cubes.')
+  ap.add_argument('--cam_azimuth', default='',
+                  help='Override azimuth; default is the scene camera.')
+  ap.add_argument('--cam_elevation', default='',
+                  help='Override elevation; default is the scene camera.')
+  ap.add_argument('--montage_ncols', type=int, default=0,
+                  help='Blend/ghost montage columns. 0 = auto (4, or 8 if many).')
+  ap.add_argument('--skip_topk_gif', action='store_true',
+                  help='Skip the long rank-cycling GIF (useful for dense iters).')
+  ap.add_argument(
+      '--post_success_steps', type=int, default=-1,
+      help=('After first hard success, keep this many extra macro-steps '
+            '(includes the successful state). -1 = keep full episode.'))
+  ap.add_argument(
+      '--hide_mocap', action='store_true',
+      help='Park mocap goal markers off-table in rendered frames.')
+  ap.add_argument(
+      '--write_goal_panel', action='store_true',
+      help='Also write goal_solid.png (hard-goal cubes, no mocap markers).')
+  ap.add_argument(
+      '--goal_cube_order', default='',
+      help=('Comma-separated cube ids for goal slots 0..N-1 when writing the '
+            'goal panel (permutation-invariant color layout). Empty = cube '
+            'index order. Example for C5T2 policy colors: 1,2,3,0,4'))
+  ap.add_argument(
+      '--goal_panel_name', default='goal_solid.png',
+      help='Filename for --write_goal_panel / --hide_mocap goal render.')
+  ap.add_argument(
+      '--goal_only', action='store_true',
+      help='Write the goal panel then exit (skip trajectory composites).')
   args = ap.parse_args()
 
   iters = [int(x) for x in args.iters.split(',') if x.strip()]
@@ -402,7 +546,9 @@ def main():
   out_dir = os.path.abspath(args.output)
   os.makedirs(out_dir, exist_ok=True)
 
-  print(f'[composite] repr_mode={args.repr_mode} iters={iters}')
+  print(f'[composite] repr_mode={args.repr_mode} iters={iters} '
+        f'post_success_steps={args.post_success_steps} '
+        f'hide_mocap={bool(args.hide_mocap)}')
   ctx, _ = viz._load_train_ctx(args.env, run_dir)
   hard_goal = np.asarray(ctx.fixed_target_goal, dtype=np.float32).reshape(-1)
   env_id = sgcrl_env_name_to_bb_env_id(args.env)
@@ -411,8 +557,47 @@ def main():
   networks, nf_nets, act_dim, _ = viz._build_networks(
       args.env, args.seed, ctx, args.repr_mode)
   ctx.act_dim = act_dim
-  video_env, _base, mocap_targets, episode_length, num_cubes = viz._make_bb_env(
+  video_env, base, mocap_targets, episode_length, num_cubes = viz._make_bb_env(
       env_id, ctx)
+  base._mj_model.vis.global_.offwidth = max(
+      int(args.width), int(base._mj_model.vis.global_.offwidth))
+  base._mj_model.vis.global_.offheight = max(
+      int(args.height), int(base._mj_model.vis.global_.offheight))
+
+  if args.cam_lookat.strip():
+    lookat = np.asarray(
+        [float(x) for x in args.cam_lookat.split(',')], dtype=np.float64)
+  else:
+    lookat = hard_goal.reshape(-1, 3).mean(axis=0)
+  azimuth = None if not str(args.cam_azimuth).strip() else float(args.cam_azimuth)
+  elevation = (None if not str(args.cam_elevation).strip()
+               else float(args.cam_elevation))
+  camera = viz._free_camera(
+      base._mj_model, lookat, float(args.cam_zoom),
+      azimuth=azimuth, elevation=elevation)
+  print(f'[composite] ep_len={episode_length} zoom={args.cam_zoom} '
+        f'lookat={np.asarray(lookat).round(3).tolist()}', flush=True)
+  score_name = 'logp' if args.repr_mode == 'nf' else 'φ·ψ'
+
+  slot_to_cube = None
+  if str(args.goal_cube_order).strip():
+    slot_to_cube = np.asarray(
+        [int(x) for x in str(args.goal_cube_order).split(',') if x.strip()],
+        dtype=np.int32)
+    print(f'[composite] goal slot_to_cube={slot_to_cube.tolist()}', flush=True)
+
+  if args.write_goal_panel or args.hide_mocap or args.goal_only:
+    goal_img = _render_goal_solid(
+        base, video_env, hard_goal,
+        height=int(args.height), width=int(args.width), camera=camera,
+        slot_to_cube=slot_to_cube)
+    goal_name = str(args.goal_panel_name).strip() or 'goal_solid.png'
+    goal_path = os.path.join(out_dir, goal_name)
+    Image.fromarray(goal_img).save(goal_path)
+    print(f'[composite] wrote {goal_path}', flush=True)
+    if args.goal_only:
+      print('[composite] goal_only: done', flush=True)
+      return
 
   stages = []
   blend_frames = []
@@ -437,6 +622,11 @@ def main():
         num_trajs=args.num_trajs,
         top_k=args.top_k,
         seed=args.seed,
+        height=int(args.height),
+        width=int(args.width),
+        camera=camera,
+        post_success_steps=int(args.post_success_steps),
+        hide_mocap=bool(args.hide_mocap),
     )
     stages.append(stage)
     stage_dir = os.path.join(out_dir, f'iter_{it:07d}')
@@ -448,7 +638,17 @@ def main():
         zip(stage['frames'], w_n, stage['raw_scores']), start=1):
       path = os.path.join(stage_dir, f'rank{r:02d}_clean.png')
       Image.fromarray(fr).save(path)
-
+    np.savez(
+        os.path.join(stage_dir, 'selected_samples.npz'),
+        top_idx=stage['top_idx'],
+        traj_index=stage['selected_traj'],
+        traj_step=stage['selected_step'],
+        weights=stage['weights'],
+        normalized_top_weights=w_n,
+        raw_scores=stage['raw_scores'],
+        first_success_steps=stage['first_success_steps'],
+        post_success_steps=np.asarray(int(args.post_success_steps)),
+    )
     blend = _weighted_blend(stage['frames'], stage['weights'])
     ghost = _ghost_max(stage['frames'], stage['weights'])
     blend_l = _label_bar(
@@ -464,46 +664,53 @@ def main():
 
     strip = _stage_strip(
         stage['frames'], stage['weights'],
-        title=(f'CRL preimage  iter={it}  '
+        title=(f'{args.repr_mode.upper()} preimage  iter={it}  '
                f'top-{args.top_k} mass={float(np.sum(w)):.3f}'))
     Image.fromarray(strip).save(os.path.join(stage_dir, 'strip.png'))
     strip_panels.append(strip)
     print(f'[composite]   top-{args.top_k} weights={w_n.round(3).tolist()} '
           f'mass={float(np.sum(w)):.4f}')
 
-  # Row montage of blends
+  # Grid montage of blends (wrap so 7 early ckpts stay readable).
   labels = [f'iter {it}' for it in iters]
   blends_only = [_weighted_blend(s['frames'], s['weights']) for s in stages]
   ghosts_only = [_ghost_max(s['frames'], s['weights']) for s in stages]
-  montage_blend = _montage_row(blends_only, labels)
-  montage_ghost = _montage_row(ghosts_only, [f'{l} ghost' for l in labels])
+  ncols = int(args.montage_ncols)
+  if ncols <= 0:
+    ncols = 8 if len(iters) > 12 else (4 if len(iters) > 4 else len(iters))
+  montage_blend = _montage_grid(blends_only, labels, ncols=ncols)
+  montage_ghost = _montage_grid(
+      ghosts_only, [f'{l} ghost' for l in labels], ncols=ncols)
   Image.fromarray(montage_blend).save(
       os.path.join(out_dir, 'blends_montage.png'))
   Image.fromarray(montage_ghost).save(
       os.path.join(out_dir, 'ghosts_montage.png'))
   print(f'[composite] wrote {out_dir}/blends_montage.png')
 
-  # Stack strips vertically
-  max_w = max(p.shape[1] for p in strip_panels)
-  total_h = sum(p.shape[0] for p in strip_panels) + 8 * (len(strip_panels) - 1)
-  big = Image.new('RGB', (max_w, total_h), color=(16, 16, 20))
-  y = 0
-  for p in strip_panels:
-    big.paste(Image.fromarray(p), (0, y))
-    y += p.shape[0] + 8
-  big.save(os.path.join(out_dir, 'strips_vertical.png'))
+  # Stack strips vertically (skip when dense — it becomes a 20k-px image).
+  if len(iters) <= 16:
+    max_w = max(p.shape[1] for p in strip_panels)
+    total_h = sum(p.shape[0] for p in strip_panels) + 8 * (len(strip_panels) - 1)
+    big = Image.new('RGB', (max_w, total_h), color=(16, 16, 20))
+    y = 0
+    for p in strip_panels:
+      big.paste(Image.fromarray(p), (0, y))
+      y += p.shape[0] + 8
+    big.save(os.path.join(out_dir, 'strips_vertical.png'))
 
   # GIFs
   _write_gif(blend_frames, os.path.join(out_dir, 'blends_over_training.gif'),
              duration_ms=args.gif_ms)
   _write_gif(ghost_frames, os.path.join(out_dir, 'ghosts_over_training.gif'),
              duration_ms=args.gif_ms)
-  _build_topk_support_gif(
-      stages,
-      os.path.join(out_dir, 'topk_support_over_training.gif'),
-      title_ms=max(1200, int(args.gif_ms * 1.5)),
-      rank_ms=max(550, args.gif_ms // 2),
-  )
+  if not args.skip_topk_gif:
+    _build_topk_support_gif(
+        stages,
+        os.path.join(out_dir, 'topk_support_over_training.gif'),
+        title_ms=max(1200, int(args.gif_ms * 1.5)),
+        rank_ms=max(550, args.gif_ms // 2),
+        score_name=score_name,
+    )
   _write_gif(blend_frames, os.path.join(out_dir, 'blends_slow.gif'),
              duration_ms=max(args.gif_ms, 1200))
 

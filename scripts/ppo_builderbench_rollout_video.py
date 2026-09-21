@@ -154,6 +154,7 @@ def _get_video(
     fixed_target_goal: Optional[np.ndarray],
     mocap_targets,
     num_cubes: int,
+    hide_targets: bool = False,
 ):
   """Roll out one episode and render frames (matches training PD macro steps).
 
@@ -171,14 +172,20 @@ def _get_video(
   )
   mocap_key = 'target_mocap'
   step_succ = _step_success_series(video_env_states)
+  if hide_targets and hasattr(video_env, '_mocap_targets_geom'):
+    video_env.model.geom_rgba[video_env._mocap_targets_geom, -1] = 0.0
   video_images = []
   n_on = 0
+  hidden = np.array([10.0, 10.0, 10.0], dtype=np.float32)
   for i in range(episode_length):
     if i % 2 == 0:
+      mocap_pos = np.asarray(video_env_states.info[f'{mocap_key}_pos'][i][0])
+      if hide_targets:
+        mocap_pos = np.broadcast_to(hidden, mocap_pos.shape).copy()
       frame = video_env.render_from_info(
           np.asarray(video_env_states.data.qpos[i][0]),
           np.asarray(video_env_states.data.qvel[i][0]),
-          np.asarray(video_env_states.info[f'{mocap_key}_pos'][i][0]),
+          mocap_pos,
           np.asarray(video_env_states.info[f'{mocap_key}_quat'][i][0]),
       )
       on = bool(step_succ is not None and float(step_succ[i]) >= 0.5)
@@ -591,6 +598,9 @@ def main():
   parser.add_argument(
       '--fixed_start_x', type=float, default=VIDEO_FIXED_START_X,
       help='Start-box x when forcing norand (ignored with --match_run_init).')
+  parser.add_argument(
+      '--hide_targets', action='store_true',
+      help='Do not render mocap goal-marker spheres.')
   args = parser.parse_args()
   if args.max_seed_attempts < 1:
     parser.error('--max_seed_attempts must be >= 1')
@@ -693,6 +703,7 @@ def main():
           fixed_target_goal=ctx.fixed_target_goal,
           mocap_targets=mocap_targets,
           num_cubes=num_cubes,
+          hide_targets=bool(args.hide_targets),
       )
       print(f'[bb_video]   seed={seed_i} frames={len(frames)} '
             f'success={success:.3f}', flush=True)

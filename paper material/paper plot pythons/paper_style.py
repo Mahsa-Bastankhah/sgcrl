@@ -15,7 +15,7 @@ Recipe
     ax.set_ylabel("Goal-Reaching Optimality")
     ax.set_title("Optimality")
     ps.style_axes(ax)
-    ps.savefig(fig, "out_paper")          # writes .png and .pdf
+    ps.savefig(fig, "out_paper")          # writes .pdf only
 
     # two panels side by side (the Dirac + preimage layout)
     fig, (ax_l, ax_r) = ps.figure("sidebyside")
@@ -298,18 +298,21 @@ def proxy(color, *, ls="-", marker=None, label="", **kwargs) -> Line2D:
     return Line2D([0], [0], color=color, ls=ls, marker=marker, label=label, **kwargs)
 
 
-def savefig(fig, path, *, pdf=True, png=True, dpi=300, pad_inches=SAVE_PAD):
-    """Write PNG and PDF next to each other. Returns the PNG path (or PDF)."""
+def savefig(fig, path, *, pdf=True, png=False, dpi=300, pad_inches=SAVE_PAD,
+            bbox_inches="tight"):
+    """Write PDF only (paper figures). Pass png=True to also write a PNG."""
     path = Path(path)
     written = []
+    kw = dict(facecolor="white", bbox_inches=bbox_inches)
+    if bbox_inches == "tight":
+        kw["pad_inches"] = pad_inches
     if png:
         p = path.with_suffix(".png")
-        fig.savefig(p, dpi=dpi, bbox_inches="tight", pad_inches=pad_inches,
-                    facecolor="white")
+        fig.savefig(p, dpi=dpi, **kw)
         written.append(p)
     if pdf:
         p = path.with_suffix(".pdf")
-        fig.savefig(p, bbox_inches="tight", pad_inches=pad_inches, facecolor="white")
+        fig.savefig(p, **kw)
         written.append(p)
     for p in written:
         print("Saved:", p)

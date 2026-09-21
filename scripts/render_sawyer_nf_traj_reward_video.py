@@ -202,11 +202,13 @@ def _build_networks(env_name: str, seed: int, settings: dict, arch: dict):
   end_index = int(arch['end_index'])
   start_index = int(arch['start_index'])
   goal_dim = int(end_index - start_index) if end_index != -1 else int(obs_dim)
+  tanh_c_s = (
+      '(c={:g})'.format(arch['nf_scale_tanh_c'])
+      if arch['nf_scale_tanh'] else '')
   print(f'[vid] NF arch: rep={arch["nf_rep_size"]} blocks={arch["nf_num_blocks"]} '
         f'channels={arch["nf_coupling_width"]} sa={arch["nf_sa_num_layers"]}x'
         f'{arch["nf_sa_hidden"]} state_only={arch["nf_state_only"]} '
-        f'scale_tanh={arch["nf_scale_tanh"]}'
-        f'{f"(c={arch["nf_scale_tanh_c"]:g})" if arch["nf_scale_tanh"] else ""} '
+        f'scale_tanh={arch["nf_scale_tanh"]}{tanh_c_s} '
         f'goal_dim={goal_dim} act_dim={act_dim}', flush=True)
   nf_nets = _nf.make_nf_density_networks(
       obs_dim=int(obs_dim),

@@ -143,9 +143,9 @@ def _extract_hard_goal(env_name):
     return tuple(float(x) for x in xyz)
 
   if env_name == 'sawyer_bin':
-    # Matches env_utils.SawyerBin._get_obs goal construction.
-    goal = np.concatenate([xyz + np.array([0.0, 0.0, 0.03]),
-                           np.array([0.4]), xyz])
+    # Matches env_utils.SawyerBin._get_obs: floor object, grip≈0.4 (cube width).
+    hand = xyz + np.array([0.0, 0.0, 0.03])
+    goal = np.concatenate([hand, np.array([0.4]), xyz])
     return tuple(float(x) for x in goal)
   if env_name == 'sawyer_peg':
     # Matches env_utils.SawyerPeg._get_obs goal construction.

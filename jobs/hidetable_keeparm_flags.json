@@ -1,0 +1,23 @@
+{
+  "isaacgym_episode_length": 50,
+  "isaacgym_pipeline": "gpu",
+  "isaacgym_fixed_target_xyz": "0.00,-0.22,0.40",
+  "isaacgym_randomize_init": false,
+  "isaacgym_randomize_object_xyz": false,
+  "isaacgym_randomize_object_shape": false,
+  "isaacgym_palm_goal": false,
+  "isaacgym_table_push": false,
+  "isaacgym_table_spawn": true,
+  "isaacgym_table_spawn_object_xy": "0.0,0.0",
+  "isaacgym_table_spawn_in_hand": true,
+  "isaacgym_table_spawn_in_hand_offset": 0.042,
+  "isaacgym_table_spawn_in_hand_obj_noise": 0.0,
+  "isaacgym_table_spawn_in_hand_keep_arm": true,
+  "isaacgym_table_spawn_in_hand_wrist_offset": -3.141592653589793,
+  "isaacgym_table_spawn_in_hand_wrist_noise": 0.0,
+  "isaacgym_table_spawn_finger_curl_scale": 1.0,
+  "isaacgym_table_spawn_finger_noise": 0.0,
+  "isaacgym_table_spawn_arm_noise": 0.0,
+  "isaacgym_hide_table": true,
+  "isaacgym_large_table": false
+}

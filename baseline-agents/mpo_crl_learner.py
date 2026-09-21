@@ -709,6 +709,123 @@ def _mean_device_metrics(metrics: Dict[str, Any]) -> Dict[str, float]:
   return {key: float(value) for key, value in reduced.items()}
 
 
+def _map_isaacgym_kwargs(isaacgym_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+  """Translate ppo_contrastive-style prefixed kwargs for IsaacGymVecEnv."""
+  ig_kw = dict(isaacgym_kwargs or {})
+  return {
+      'episode_length': int(ig_kw.get('isaacgym_episode_length', 300)),
+      'fixed_target_xyz': ig_kw.get(
+          'isaacgym_fixed_target_xyz', (0.5, -0.3, 0.4)),
+      'pipeline': str(ig_kw.get('isaacgym_pipeline', 'gpu')),
+      'randomize_init': bool(ig_kw.get('isaacgym_randomize_init', True)),
+      'randomize_object_xyz': bool(
+          ig_kw.get('isaacgym_randomize_object_xyz', False)),
+      'randomize_object_shape': bool(
+          ig_kw.get('isaacgym_randomize_object_shape', True)),
+      'palm_goal': bool(ig_kw.get('isaacgym_palm_goal', False)),
+      'palm_goal_xyz': ig_kw.get('isaacgym_palm_goal_xyz'),
+      'joint_goal': bool(ig_kw.get('isaacgym_joint_goal', False)),
+      'control_sanity_mode': str(
+          ig_kw.get('isaacgym_control_sanity_mode', 'off')),
+      'control_sanity_palm_xyz': ig_kw.get(
+          'isaacgym_control_sanity_palm_xyz', (0.0, 0.0, 0.80)),
+      'control_sanity_finger_tol': float(
+          ig_kw.get('isaacgym_control_sanity_finger_tol', 0.15)),
+      'control_sanity_palm_tol': float(
+          ig_kw.get('isaacgym_control_sanity_palm_tol', 0.05)),
+      'control_sanity_trim_sa': bool(
+          ig_kw.get('isaacgym_control_sanity_trim_sa', False)),
+      'control_sanity_trim_init_range_frac': float(
+          ig_kw.get('isaacgym_control_sanity_trim_init_range_frac', 0.10)),
+      'control_sanity_trim_init_mode': str(
+          ig_kw.get('isaacgym_control_sanity_trim_init_mode', 'curled')),
+      'control_sanity_q_only': bool(
+          ig_kw.get('isaacgym_control_sanity_q_only', False)),
+      'control_sanity_goal_include_qd': bool(
+          ig_kw.get('isaacgym_control_sanity_goal_include_qd', False)),
+      'coordinate_mode': str(ig_kw.get('isaacgym_coordinate_mode', 'mixed')),
+      'table_push': bool(ig_kw.get('isaacgym_table_push', False)),
+      'table_push_xyz': ig_kw.get('isaacgym_table_push_xyz'),
+      'table_spawn': bool(ig_kw.get('isaacgym_table_spawn', False)),
+      'table_spawn_object_xy': ig_kw.get('isaacgym_table_spawn_object_xy'),
+      'table_spawn_behind': bool(
+          ig_kw.get('isaacgym_table_spawn_behind', False)),
+      'table_spawn_behind_dy': float(
+          ig_kw.get('isaacgym_table_spawn_behind_dy', 0.14)),
+      'table_spawn_behind_above': float(
+          ig_kw.get('isaacgym_table_spawn_behind_above', 0.08)),
+      'table_spawn_correlated_xy': float(
+          ig_kw.get('isaacgym_table_spawn_correlated_xy', 0.0)),
+      'table_spawn_finger_curl_scale': float(
+          ig_kw.get('isaacgym_table_spawn_finger_curl_scale', 1.0)),
+      'table_spawn_finger_noise': float(
+          ig_kw.get('isaacgym_table_spawn_finger_noise', 0.0)),
+      'table_spawn_arm_noise': float(
+          ig_kw.get('isaacgym_table_spawn_arm_noise', 0.0)),
+      'table_spawn_toward_bucket': bool(
+          ig_kw.get('isaacgym_table_spawn_toward_bucket', False)),
+      'table_spawn_in_hand': bool(
+          ig_kw.get('isaacgym_table_spawn_in_hand', False)),
+      'table_spawn_in_hand_offset': float(
+          ig_kw.get('isaacgym_table_spawn_in_hand_offset', 0.042)),
+      'table_spawn_in_hand_obj_noise': float(
+          ig_kw.get('isaacgym_table_spawn_in_hand_obj_noise', 0.012)),
+      'table_spawn_in_hand_keep_arm': bool(
+          ig_kw.get('isaacgym_table_spawn_in_hand_keep_arm', False)),
+      'table_spawn_in_hand_wrist_offset': float(
+          ig_kw.get(
+              'isaacgym_table_spawn_in_hand_wrist_offset',
+              -3.141592653589793)),
+      'table_spawn_in_hand_wrist_noise': float(
+          ig_kw.get('isaacgym_table_spawn_in_hand_wrist_noise', 0.10)),
+      'large_table': bool(ig_kw.get('isaacgym_large_table', False)),
+      'hide_table': bool(ig_kw.get('isaacgym_hide_table', False)),
+      'throw_success': str(ig_kw.get('isaacgym_throw_success', 'in_bucket')),
+      'reset_z_above': float(ig_kw.get('isaacgym_reset_z_above', 0.0) or 0.0),
+      'goal_z': (
+          None if float(ig_kw.get('isaacgym_goal_z', -1.0)) < 0.0
+          else float(ig_kw['isaacgym_goal_z'])),
+  }
+
+
+def _isaac_eval_metrics(vec_env, target_mode, policy_params, action_spec):
+  """One vectorized eval episode on the shared PhysX sim (no second create)."""
+  ep_len = int(vec_env.episode_length)
+  n_envs = int(vec_env.num_envs)
+  obs = vec_env.reset()
+  hard = np.zeros(n_envs, dtype=np.float32)
+  easy = np.zeros(n_envs, dtype=np.float32)
+  very_easy = np.zeros(n_envs, dtype=np.float32)
+  joint_010 = np.zeros(n_envs, dtype=np.float32)
+  joint_020 = np.zeros(n_envs, dtype=np.float32)
+  returns = np.zeros(n_envs, dtype=np.float32)
+  mae = np.zeros(n_envs, dtype=np.float32)
+  for _ in range(ep_len):
+    action = np.asarray(target_mode(policy_params, jnp.asarray(obs)))
+    action = np.clip(
+        np.nan_to_num(action, nan=0.0),
+        np.asarray(action_spec.minimum),
+        np.asarray(action_spec.maximum)).astype(np.float32)
+    obs, reward, _, _, _ = vec_env.step(action)
+    returns += np.asarray(reward, dtype=np.float32)
+    hard = np.maximum(hard, vec_env.last_success)
+    easy = np.maximum(easy, vec_env.last_easy_success)
+    very_easy = np.maximum(very_easy, vec_env.last_very_easy_success)
+    joint_010 = np.maximum(joint_010, vec_env.last_joint_frac_010)
+    joint_020 = np.maximum(joint_020, vec_env.last_joint_frac_020)
+    mae = np.asarray(vec_env.last_mean_abs_joint_err, dtype=np.float32)
+  return [{
+      'success': float(hard.mean()),
+      'easy_success': float(easy.mean()),
+      'very_easy_success': float(very_easy.mean()),
+      'joint_frac_010': float(joint_010.mean()),
+      'joint_frac_020': float(joint_020.mean()),
+      'mean_abs_joint_err': float(mae.mean()),
+      'episode_return': float(returns.mean()),
+      'episode_length': float(ep_len),
+  }]
+
+
 def run_mpo_crl_training(
     config,
     mpo_config: MPOCRLConfig,
@@ -720,15 +837,50 @@ def run_mpo_crl_training(
     seed: int = 0,
     checkpoint_dir: Optional[str] = None,
     builderbench_kwargs: Optional[Dict[str, Any]] = None,
+    isaacgym_kwargs: Optional[Dict[str, Any]] = None,
 ) -> MPOCRLTrainingState:
   """Run online target-policy collection with MPO and geometric CRL updates."""
-  probe_env = env_factory(seed)
-  environment_spec = specs.make_environment_spec(probe_env)
+  env_name = str(getattr(config, 'env_name', '') or '')
+  use_isaac = env_name.startswith('allegro_kuka')
+  vec_env = None
+  if use_isaac:
+    from contrastive.ppo_learner_isaacgym import (
+        IsaacGymVecEnv,
+        _haiku_init_device,
+        _isaacgym_init_on_cpu_then_gpu,
+    )
+    vec_env = IsaacGymVecEnv(
+        env_name=env_name,
+        num_envs=int(mpo_config.num_envs),
+        seed=int(seed * 31),
+        isaacgym_kwargs=_map_isaacgym_kwargs(isaacgym_kwargs),
+    )
+    packed = int(np.prod(vec_env.observation_shape))
+    act_dim = int(np.prod(vec_env.action_shape))
+    environment_spec = specs.EnvironmentSpec(
+        observations=specs.Array(
+            shape=(packed,), dtype=np.float32, name='observation'),
+        actions=specs.BoundedArray(
+            shape=(act_dim,), dtype=np.float32,
+            minimum=-1.0, maximum=1.0, name='action'),
+        rewards=specs.Array(shape=(), dtype=np.float32, name='reward'),
+        discounts=specs.BoundedArray(
+            shape=(), dtype=np.float32, minimum=0.0, maximum=1.0,
+            name='discount'),
+    )
+    print(
+        f'[mpo-crl] using native-batched Isaac Gym vec env '
+        f'(E={vec_env.num_envs} packed={packed} act={act_dim} '
+        f'prebuilt={getattr(vec_env, "used_prebuilt", False)})',
+        flush=True)
+  else:
+    probe_env = env_factory(seed)
+    environment_spec = specs.make_environment_spec(probe_env)
+    del probe_env
   crl_networks = network_factory(spec=environment_spec)
   action_spec = environment_spec.actions
   action_min = jnp.asarray(action_spec.minimum, dtype=jnp.float32)
   action_max = jnp.asarray(action_spec.maximum, dtype=jnp.float32)
-  del probe_env
 
   policy_network = make_mpo_policy(
       environment_spec,
@@ -753,10 +905,20 @@ def run_mpo_crl_training(
 
   key = jax.random.PRNGKey(seed)
   key, policy_key, q_key, critic_key = jax.random.split(key, 4)
-  policy_params = policy_network.init(policy_key)
-  crl_params = crl_networks.q_network.init(q_key)
-  critic_params = (
-      critic_network.init(critic_key) if critic_network is not None else None)
+  if use_isaac:
+    with _haiku_init_device(True):
+      policy_params = policy_network.init(policy_key)
+      crl_params = crl_networks.q_network.init(q_key)
+      critic_params = (
+          critic_network.init(critic_key)
+          if critic_network is not None else None)
+    policy_params, crl_params, critic_params = _isaacgym_init_on_cpu_then_gpu(
+        True, (policy_params, crl_params, critic_params))
+  else:
+    policy_params = policy_network.init(policy_key)
+    crl_params = crl_networks.q_network.init(q_key)
+    critic_params = (
+        critic_network.init(critic_key) if critic_network is not None else None)
   mpo_module = mpo_losses.MPO(
       epsilon=mpo_config.epsilon,
       epsilon_mean=mpo_config.epsilon_mean,
@@ -869,7 +1031,6 @@ def run_mpo_crl_training(
       return carry, metrics
     return jax.lax.scan(body, scan_state, batches)
 
-  env_name = str(getattr(config, 'env_name', '') or '')
   use_jax_bb = env_name.startswith('builderbench_')
   if use_jax_bb:
     import importlib.util as _ilu
@@ -890,18 +1051,28 @@ def run_mpo_crl_training(
         fixed_target_goal=_bb_kw.get('fixed_target_goal'),
         permute_start_boxes=bool(
             _bb_kw.get('builderbench_permute_start_boxes', True)),
+        mj_episode_length=_bb_kw.get('builderbench_mj_episode_length'),
+        fixed_start_x=_bb_kw.get('builderbench_fixed_start_x'),
     )
     print(f'[mpo-crl] using JAX-batched BuilderBench vec env '
           f'(E={mpo_config.num_envs})')
+  elif use_isaac:
+    pass
   else:
     vec_env = ppo_learner.VecEnv(
         env_factory, int(mpo_config.num_envs), seed=seed * 31)
+  _future_horizon = int(getattr(config, 'crl_future_horizon', 0) or 0)
   episode_replay = ppo_learner.EpisodeReplay(
       capacity=int(config.max_replay_size),
       obs_dim=int(config.obs_dim),
       discount=float(config.discount),
       start_index=int(config.start_index),
-      end_index=int(config.end_index))
+      end_index=int(config.end_index),
+      future_horizon=_future_horizon)
+  if _future_horizon > 0:
+    print(f'[mpo-crl] CRL future-goal horizon cap: {_future_horizon} '
+          f'(positives sampled with d ≤ {_future_horizon})',
+          flush=True)
   policy_replay = (
       TransitionReplay(
           int(config.max_replay_size),
@@ -1007,6 +1178,8 @@ def run_mpo_crl_training(
         fixed_target_goal=_bb_kw.get('fixed_target_goal'),
         permute_start_boxes=bool(
             _bb_kw.get('builderbench_permute_start_boxes', True)),
+        mj_episode_length=_bb_kw.get('builderbench_mj_episode_length'),
+        fixed_start_x=_bb_kw.get('builderbench_fixed_start_x'),
     )
     bb_eval_unroll = bb_eval_vec.compile_eval_unroll(
         target_mode, unroll_length=bb_eval_vec.episode_length)
@@ -1022,12 +1195,22 @@ def run_mpo_crl_training(
   episode_lengths = np.zeros(num_envs, dtype=np.int32)
   recent_returns: list[float] = []
   recent_lengths: list[int] = []
-  # BuilderBench: track episode success from env metrics (dense reward ≠ success).
-  track_train_success = bool(use_jax_bb and hasattr(vec_env, 'last_success'))
+  # BuilderBench / Allegro: env metrics (dense reward ≠ success). Sawyer:
+  # sparse 0/1 env reward, same as PPO train_success_1000 / SuccessObserver.
+  track_train_success = bool(
+      use_isaac
+      or (use_jax_bb and hasattr(vec_env, 'last_success'))
+      or env_name.lower().startswith('sawyer_'))
   recent_success: list[float] = []
   recent_very_hard_success: list[float] = []
   ep_success_max = np.zeros(num_envs, dtype=np.float32)
   ep_very_hard_success_max = np.zeros(num_envs, dtype=np.float32)
+  if use_isaac:
+    print('[mpo-crl] logging train_success_mean / train_success_1000 from '
+          'Isaac last_success (hard)', flush=True)
+  elif track_train_success and not use_jax_bb:
+    print('[mpo-crl] logging train_success_mean / train_success_1000 from '
+          'Sawyer sparse env reward (env_rew >= 0.5)', flush=True)
 
   learner_logger = logger_fn(label='learner')
   eval_logger = logger_fn(label='eval')
@@ -1181,6 +1364,12 @@ def run_mpo_crl_training(
           episode_actions[index].append(action[index].copy())
           episode_returns[index] += float(reward[index])
           episode_lengths[index] += 1
+          if use_isaac:
+            ep_success_max[index] = max(
+                ep_success_max[index],
+                float(vec_env.last_success[index]))
+          elif track_train_success and float(reward[index]) >= 0.5:
+            ep_success_max[index] = 1.0
           if dones[index]:
             episode_obs[index].append(terminal_obs[index].copy())
             episode_replay.add_episode(
@@ -1190,6 +1379,10 @@ def run_mpo_crl_training(
             recent_lengths.append(int(episode_lengths[index]))
             recent_returns[:] = recent_returns[-100:]
             recent_lengths[:] = recent_lengths[-100:]
+            if track_train_success:
+              recent_success.append(float(ep_success_max[index] >= 0.5))
+              recent_success[:] = recent_success[-1000:]
+              ep_success_max[index] = 0.0
             episode_obs[index] = [next_obs[index].copy()]
             episode_actions[index] = []
             episode_returns[index] = 0.0
@@ -1295,7 +1488,17 @@ def run_mpo_crl_training(
     learner_logger.write(log)
 
     if mpo_config.eval_interval > 0 and iteration % mpo_config.eval_interval == 0:
-      if bb_eval_unroll is not None:
+      if use_isaac:
+        episode_metrics = _isaac_eval_metrics(
+            vec_env, target_mode, state.target_policy_params, action_spec)
+        obs = vec_env.reset()
+        episode_obs = [[obs[i].copy()] for i in range(num_envs)]
+        episode_actions = [[] for _ in range(num_envs)]
+        episode_returns[:] = 0.0
+        episode_lengths[:] = 0
+        ep_success_max[:] = 0.0
+        ep_very_hard_success_max[:] = 0.0
+      elif bb_eval_unroll is not None:
         eval_steps = bb_eval_unroll(
             bb_eval_vec.reset_state(), state.target_policy_params)
         episode_metrics = ppo_learner._bb_ep_metrics_from_eval_steps(

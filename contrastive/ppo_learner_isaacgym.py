@@ -260,6 +260,109 @@ class RunningMeanStd:
       self.count = self.max_count
 
 
+def _achieved_goals_from_packed(
+    packed: np.ndarray,
+    obs_dim: int,
+    start_index: int,
+    end_index: int,
+    goal_state_indices,
+) -> np.ndarray:
+  """Slice achieved-goal coords from packed ``[state; goal]`` observations."""
+  states = packed[..., :int(obs_dim)]
+  if goal_state_indices is not None:
+    idx = np.asarray(goal_state_indices, dtype=np.int32)
+    return states[..., idx]
+  return states[..., int(start_index):int(end_index)]
+
+
+def nf_eval_binary_accuracy(
+    packed_te: np.ndarray,
+    acts_te: np.ndarray,
+    dones_te: np.ndarray,
+    *,
+    obs_dim: int,
+    start_index: int,
+    end_index: int,
+    goal_state_indices,
+    discount: float,
+    nf_reward_fn,
+    nf_params,
+    goal_mean: np.ndarray,
+    goal_std: np.ndarray,
+    rng: np.random.Generator,
+    future_horizon: int = 0,
+) -> tuple:
+  """Eval NF rank accuracy: P[log p(g+|s,a) > log p(g-|s,a)].
+
+  Positive goal = truncated-geometric same-episode future (EpisodeReplay).
+  Negative goal = achieved goal from a different eval env at a random t.
+  Pairs that would cross a reset are dropped. Returns (accuracy, n_pairs).
+  """
+  if packed_te.ndim != 3 or acts_te.ndim != 3 or dones_te.ndim != 2:
+    return float('nan'), 0
+  t_len, n_env, _ = packed_te.shape
+  if t_len < 2 or n_env < 2:
+    return float('nan'), 0
+  achieved = _achieved_goals_from_packed(
+      packed_te, obs_dim, start_index, end_index, goal_state_indices)
+  max_delta = np.zeros((t_len, n_env), dtype=np.int32)
+  for t in range(t_len - 1):
+    ok = np.ones(n_env, dtype=bool)
+    for delta in range(1, t_len - t):
+      ok &= ~np.asarray(dones_te[t + delta - 1], dtype=bool)
+      max_delta[t] = np.where(ok, delta, max_delta[t])
+  anchors = []
+  actions = []
+  pos_goals = []
+  neg_goals = []
+  log_disc = float(np.log(float(discount))) if 0.0 < discount < 1.0 else 0.0
+  for env_i in range(n_env):
+    for t in range(t_len - 1):
+      md = int(max_delta[t, env_i])
+      if int(future_horizon) > 0:
+        md = min(md, int(future_horizon))
+      if md < 1:
+        continue
+      if log_disc < 0.0:
+        trunc_cdf = 1.0 - float(discount) ** md
+        u = float(rng.random()) * trunc_cdf
+        delta = 1 + int(np.floor(np.log1p(-u) / log_disc))
+        delta = int(np.clip(delta, 1, md))
+      else:
+        delta = int(rng.integers(1, md + 1))
+      neg_e = int(rng.integers(0, n_env - 1))
+      if neg_e >= env_i:
+        neg_e += 1
+      neg_t = int(rng.integers(0, t_len))
+      anchors.append(packed_te[t, env_i, :int(obs_dim)])
+      actions.append(acts_te[t, env_i])
+      pos_goals.append(achieved[t + delta, env_i])
+      neg_goals.append(achieved[neg_t, neg_e])
+  n_pairs = len(anchors)
+  if n_pairs < 1:
+    return float('nan'), 0
+  anchors_a = np.asarray(anchors, dtype=np.float32)
+  actions_a = np.asarray(actions, dtype=np.float32)
+  pos_obs = np.concatenate(
+      [anchors_a, np.asarray(pos_goals, dtype=np.float32)], axis=-1)
+  neg_obs = np.concatenate(
+      [anchors_a, np.asarray(neg_goals, dtype=np.float32)], axis=-1)
+  gmean = jnp.asarray(goal_mean)
+  gstd = jnp.asarray(goal_std)
+  pos = np.asarray(
+      nf_reward_fn(
+          nf_params, jnp.asarray(pos_obs), jnp.asarray(actions_a),
+          gmean, gstd),
+      dtype=np.float32)
+  neg = np.asarray(
+      nf_reward_fn(
+          nf_params, jnp.asarray(neg_obs), jnp.asarray(actions_a),
+          gmean, gstd),
+      dtype=np.float32)
+  acc = float(np.mean(pos > neg))
+  return acc, n_pairs
+
+
 def _normalize_packed_obs(
     obs: jnp.ndarray,
     mean: jnp.ndarray,
@@ -382,7 +485,8 @@ class EpisodeReplay:
             (w_k = success_sample_weight if episode k succeeded else 1;
              default weight 1 recovers Uniform)
       t  ~ Uniform[0, T_k - 1]
-      d  ~ TruncatedGeometric(1 - γ,  range=[1, T_k - t])
+      d  ~ TruncatedGeometric(1 - γ,  range=[1, min(T_k - t, H)])
+            (H = future_horizon if >0 else T_k - t)
       j  = t + d
       obs       = [ s_t       ;  obs_to_goal_2d(s_j) ]
       action    =   a_t
@@ -416,7 +520,8 @@ class EpisodeReplay:
   def __init__(self, capacity: int, obs_dim: int, discount: float,
                start_index: int, end_index: int,
                success_sample_weight: float = 1.0,
-               goal_state_indices=None):
+               goal_state_indices=None,
+               future_horizon: int = 0):
     self._cap = capacity
     self._obs_dim = obs_dim               # state slice size
     self._discount = float(discount)
@@ -428,6 +533,11 @@ class EpisodeReplay:
       self._goal_state_indices = np.asarray(
           goal_state_indices, dtype=np.int32).reshape(-1)
     self._success_sample_weight = float(success_sample_weight)
+    self._future_horizon = int(future_horizon)
+    if self._future_horizon < 0:
+      raise ValueError(
+          'future_horizon must be >= 0, got '
+          f'{self._future_horizon}')
     if self._success_sample_weight <= 0.0:
       raise ValueError(
           'success_sample_weight must be > 0, got '
@@ -644,6 +754,8 @@ class EpisodeReplay:
     #     Matches `flatten_fn`'s categorical with probs ∝ γ^(j-t) normalized
     #     to the in-episode future states only.
     max_d = lens - t                                         # (B,)  ≥ 1
+    if self._future_horizon > 0:
+      max_d = np.minimum(max_d, np.int64(self._future_horizon))
     trunc_cdf = 1.0 - np.power(self._discount,
                                max_d.astype(np.float64))     # CDF at max_d
     u_d = rng.random(B) * trunc_cdf                          # U ∈ [0, trunc_cdf)
@@ -736,6 +848,63 @@ class EpisodeReplay:
     if 'future_state' in batch:
       out['future_state'] = batch['future_state']
     return out
+
+
+def _replace_fail_env_columns_with_success(
+    *,
+    n_replace: int,
+    success_te: np.ndarray,
+    column_arrays: list,
+    rng: np.random.Generator,
+    env_arrays: Optional[list] = None,
+) -> dict:
+  """Overwrite never-succeeded env columns with success-env columns.
+
+  ``success_te`` is ``(T, E)`` per-step success. For each env that saw
+  success at least once, copy its full T-column into up to ``n_replace``
+  envs that never succeeded (without reuse). Mutates arrays in
+  ``column_arrays`` in place (each must be indexable as ``arr[:, env]``).
+  Optional ``env_arrays`` are per-env vectors ``(E, ...)`` (e.g. bootstrap
+  ``obs`` / ``next_done``) copied the same way via ``arr[dst] = arr[src]``.
+
+  Returns a small stats dict for logging.
+  """
+  n = int(n_replace)
+  if n <= 0 or success_te is None:
+    return {'n_succ_envs': 0, 'n_fail_envs': 0, 'n_replaced': 0}
+  succ_mask = np.asarray(success_te, dtype=np.float32).max(axis=0) >= 0.5
+  succ_envs = np.flatnonzero(succ_mask)
+  fail_envs = np.flatnonzero(~succ_mask)
+  if succ_envs.size == 0 or fail_envs.size == 0:
+    return {
+        'n_succ_envs': int(succ_envs.size),
+        'n_fail_envs': int(fail_envs.size),
+        'n_replaced': 0,
+    }
+  fail_pool = fail_envs.tolist()
+  rng.shuffle(fail_pool)
+  n_replaced = 0
+  env_arrs = env_arrays or []
+  for s in succ_envs.tolist():
+    if not fail_pool:
+      break
+    take = fail_pool[:n]
+    fail_pool = fail_pool[n:]
+    for f in take:
+      for arr in column_arrays:
+        if arr is None:
+          continue
+        arr[:, f] = arr[:, s]
+      for arr in env_arrs:
+        if arr is None:
+          continue
+        arr[f] = arr[s]
+      n_replaced += 1
+  return {
+      'n_succ_envs': int(succ_envs.size),
+      'n_fail_envs': int(fail_envs.size),
+      'n_replaced': int(n_replaced),
+  }
 
 
 def _flush_rollout_episodes_to_replay(
@@ -1242,6 +1411,7 @@ def make_ppo_update_fn(
 
   Combined loss (CleanRL-style):
       L  =  pg_loss  -  ent_coef * entropy  +  vf_coef * v_loss
+           [+ λ · E[‖∇_s V‖] if ppo_value_grad_reg]
 
   * pg_loss:   clipped surrogate,  max(-adv*ratio, -adv*clip(ratio))
   * v_loss:    clipped MSE (optional) against `returns`
@@ -1254,8 +1424,10 @@ def make_ppo_update_fn(
       `ent_coef` is the static `config.ppo_ent_coef` and `update()` keeps its
       original 4-argument signature.
 
-  Returns a function `update(params, opt_state, batch, key[, step])` that
-  does one SGD step and returns (new_params, new_opt_state, metrics_dict).
+  Returns a function `update(..., vgr_lam)` that does one SGD step and
+  returns (new_params, new_opt_state, metrics_dict). Dual λ for
+  value-grad-reg is carried as `vgr_lam` and written back to
+  `metrics['value_grad_reg_lam']`.
   """
   clip_coef = float(config.ppo_clip_coef)
   vf_coef = float(config.ppo_vf_coef)
@@ -1270,8 +1442,20 @@ def make_ppo_update_fn(
   gidx = getattr(config, 'goal_state_indices', None)
   det_select = bool(getattr(config, 'ppo_deterministic_select_dim', False))
   _kl_pen = float(getattr(config, 'ppo_kl_penalty_coef', 0.0)) > 0
+  _vgr = bool(getattr(config, 'ppo_value_grad_reg', False)) and obs_dim > 0
+  _vgr_c = float(getattr(config, 'ppo_value_grad_reg_c', 100.0))
+  _vgr_lam_lr = float(getattr(config, 'ppo_value_grad_reg_lam_lr', 1e-6))
+  _vgr_dual = _vgr and _vgr_lam_lr > 0.0
+  _vgr_lam_min = 1e-8
+  _vgr_lam_max = 1.0
+  if _vgr:
+    print(
+        f'[ppo] value dual-gradreg: c={_vgr_c} lam_lr={_vgr_lam_lr}'
+        f'{" (dual)" if _vgr_dual else " (fixed λ)"}',
+        flush=True)
 
-  def _ppo_loss_core(params, batch, key, obs_mean, obs_var, ent_coef):
+  def _ppo_loss_core(params, batch, key, obs_mean, obs_var, ent_coef,
+                     lam_val):
     """Shared PPO loss computation. Returns (total, dist, network_obs, metrics)."""
     network_obs = _normalize_packed_obs(
         batch['obs'], obs_mean, obs_var, obs_dim=obs_dim, start_index=si,
@@ -1318,6 +1502,35 @@ def make_ppo_update_fn(
     # ---- combined loss ----
     total = pg_loss - ent_coef * entropy_mean + vf_coef * v_loss
 
+    zero = jnp.array(0.0, dtype=total.dtype)
+    vgr_gnorm_mean = zero
+    vgr_gnorm_max = zero
+    vgr_frac_above = zero
+    vgr_raw = zero
+    vgr_pen = zero
+    vgr_lam_m = zero
+    if _vgr:
+      def _one_v(s, g):
+        packed = jnp.concatenate([s, g], axis=-1)
+        return jnp.reshape(
+            networks.value_network.apply(params['value'], packed[None]), ())
+
+      def _v_gnorm(s, g):
+        gs = jax.grad(_one_v, argnums=0)(s, g)
+        return optax.safe_norm(gs, 1e-8)
+
+      s_sl = network_obs[:, :obs_dim]
+      g_sl = network_obs[:, obs_dim:]
+      v_gnorms = jax.vmap(_v_gnorm)(s_sl, g_sl)
+      vgr_gnorm_mean = jnp.mean(v_gnorms)
+      vgr_gnorm_max = jnp.max(v_gnorms)
+      vgr_frac_above = jnp.mean(
+          (v_gnorms > _vgr_c).astype(total.dtype))
+      vgr_raw = jnp.mean(jnp.maximum(v_gnorms - _vgr_c, 0.0))
+      vgr_lam_m = lam_val.astype(total.dtype)
+      vgr_pen = vgr_lam_m * vgr_gnorm_mean
+      total = total + vgr_pen
+
     # ---- diagnostics ----
     approx_kl = jnp.mean((ratio - 1.0) - logratio)  # http://joschu.net/blog/kl-approx.html
     old_approx_kl = jnp.mean(-logratio)
@@ -1342,18 +1555,39 @@ def make_ppo_update_fn(
         'policy_scale_min': jnp.min(policy_scale),
         'ent_coef': jnp.asarray(ent_coef, dtype=jnp.float32),
     }
+    if _vgr:
+      metrics.update({
+          'value_grad_reg': vgr_pen,
+          'value_grad_reg_raw': vgr_raw,
+          'value_grad_reg_lam': vgr_lam_m,
+          'value_grad_s_norm_mean': vgr_gnorm_mean,
+          'value_grad_s_norm_max': vgr_gnorm_max,
+          'value_grad_s_frac_above_c': vgr_frac_above,
+      })
     return total, dist, network_obs, metrics
+
+  def _dual_vgr_lam(lam_val, metrics):
+    metrics = dict(metrics)
+    if _vgr_dual:
+      gnorm_sg = jax.lax.stop_gradient(metrics['value_grad_s_norm_mean'])
+      lam_new = jnp.clip(
+          lam_val + _vgr_lam_lr * (gnorm_sg - _vgr_c),
+          _vgr_lam_min, _vgr_lam_max)
+      metrics['value_grad_reg_lam'] = lam_new
+    elif _vgr:
+      metrics['value_grad_reg_lam'] = lam_val
+    return metrics
 
   if _kl_pen:
     # PPO-penalty path: loss includes β·KL(π_rollout ‖ π_now).
     # old_policy_params_j: rollout-time policy params (stop-gradiented inside).
     # kl_beta_j: current β scalar; adapted per minibatch by the host loop.
     def ppo_loss_kl(params, batch, key, obs_mean, obs_var,
-                    old_policy_params_j, kl_beta_j, step=None):
+                    old_policy_params_j, kl_beta_j, vgr_lam, step=None):
       ent_coef = (ent_coef_schedule(step) if ent_coef_schedule is not None
                   else ent_coef_const)
       total, dist, network_obs, metrics = _ppo_loss_core(
-          params, batch, key, obs_mean, obs_var, ent_coef)
+          params, batch, key, obs_mean, obs_var, ent_coef, vgr_lam)
       dist_old = _policy_dist_maybe_det_select(
           networks.policy_network.apply(
               jax.lax.stop_gradient(old_policy_params_j), network_obs),
@@ -1371,51 +1605,52 @@ def make_ppo_update_fn(
     if ent_coef_schedule is not None:
       @jax.jit
       def update(params, opt_state, batch, key, obs_mean, obs_var, step,
-                 old_policy_params_j, kl_beta_j):
+                 old_policy_params_j, kl_beta_j, vgr_lam):
         (_, metrics), grads = grad_fn(
             params, batch, key, obs_mean, obs_var,
-            old_policy_params_j, kl_beta_j, step)
+            old_policy_params_j, kl_beta_j, vgr_lam, step)
         updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, _dual_vgr_lam(vgr_lam, metrics)
     else:
       @jax.jit
       def update(params, opt_state, batch, key, obs_mean, obs_var,
-                 old_policy_params_j, kl_beta_j):
+                 old_policy_params_j, kl_beta_j, vgr_lam):
         (_, metrics), grads = grad_fn(
             params, batch, key, obs_mean, obs_var,
-            old_policy_params_j, kl_beta_j)
+            old_policy_params_j, kl_beta_j, vgr_lam)
         updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, _dual_vgr_lam(vgr_lam, metrics)
 
   else:
-    # Default path (no KL penalty): zero overhead, unchanged behaviour.
-    def ppo_loss(params, batch, key, obs_mean, obs_var, step=None):
+    # Default path (no KL penalty): zero overhead when value-grad-reg is off.
+    def ppo_loss(params, batch, key, obs_mean, obs_var, vgr_lam, step=None):
       ent_coef = (ent_coef_schedule(step) if ent_coef_schedule is not None
                   else ent_coef_const)
       total, _, _, metrics = _ppo_loss_core(
-          params, batch, key, obs_mean, obs_var, ent_coef)
+          params, batch, key, obs_mean, obs_var, ent_coef, vgr_lam)
       return total, metrics
 
     grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
 
     if ent_coef_schedule is not None:
       @jax.jit
-      def update(params, opt_state, batch, key, obs_mean, obs_var, step):
+      def update(params, opt_state, batch, key, obs_mean, obs_var, step,
+                 vgr_lam):
         (_, metrics), grads = grad_fn(
-            params, batch, key, obs_mean, obs_var, step)
+            params, batch, key, obs_mean, obs_var, vgr_lam, step)
         updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, _dual_vgr_lam(vgr_lam, metrics)
     else:
       @jax.jit
-      def update(params, opt_state, batch, key, obs_mean, obs_var):
+      def update(params, opt_state, batch, key, obs_mean, obs_var, vgr_lam):
         (_, metrics), grads = grad_fn(
-            params, batch, key, obs_mean, obs_var)
+            params, batch, key, obs_mean, obs_var, vgr_lam)
         updates, new_opt_state = ppo_optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, metrics
+        return new_params, new_opt_state, _dual_vgr_lam(vgr_lam, metrics)
 
   return update
 
@@ -1653,8 +1888,10 @@ def make_crl_update_fn(
       if do_grad_reg:
         grad_reg_lam = lam_val.astype(nce_loss.dtype)
         grad_reg = grad_reg_lam * grad_reg_raw
+      else:
+        grad_reg = grad_reg_raw
 
-    total_loss = nce_loss + grad_reg
+    total_loss = nce_loss + (grad_reg if do_grad_reg else zero)
 
     if train_logits.ndim == 2:
       narrow_logits = train_logits[:, :batch_size]
@@ -2273,6 +2510,13 @@ class IsaacGymVecEnv:
     if prebuilt is not None:
       self._env = prebuilt
       self.used_prebuilt = True
+      want_coordinate_mode = str(kw.get('coordinate_mode', 'mixed'))
+      got_coordinate_mode = str(
+          getattr(self._env, 'coordinate_mode', 'mixed'))
+      if got_coordinate_mode != want_coordinate_mode:
+        raise RuntimeError(
+            'prebuilt Allegro coordinate mode mismatch: '
+            f'{got_coordinate_mode!r} != {want_coordinate_mode!r}')
       got_e = int(self._env.num_envs)
       want_e = int(num_envs)
       if got_e != want_e:
@@ -2292,9 +2536,64 @@ class IsaacGymVecEnv:
           randomize_object_shape=bool(kw.get('randomize_object_shape', True)),
           palm_goal=bool(kw.get('palm_goal', False)),
           palm_goal_xyz=kw.get('palm_goal_xyz'),
+          joint_goal=bool(kw.get('joint_goal', False)),
+          control_sanity_mode=str(kw.get('control_sanity_mode', '')),
+          control_sanity_palm_xyz=tuple(
+              kw.get('control_sanity_palm_xyz', (0.0, 0.0, 0.80))),
+          control_sanity_finger_tol=float(
+              kw.get('control_sanity_finger_tol', 0.15)),
+          control_sanity_palm_tol=float(
+              kw.get('control_sanity_palm_tol', 0.05)),
+          control_sanity_trim_sa=bool(
+              kw.get('control_sanity_trim_sa', False)),
+          control_sanity_trim_init_range_frac=float(
+              kw.get('control_sanity_trim_init_range_frac', 0.10)),
+          control_sanity_trim_init_mode=str(
+              kw.get('control_sanity_trim_init_mode', 'curled')),
+          control_sanity_q_only=bool(
+              kw.get('control_sanity_q_only', False)),
+          control_sanity_goal_include_qd=bool(
+              kw.get('control_sanity_goal_include_qd', False)),
+          coordinate_mode=str(kw.get('coordinate_mode', 'mixed')),
           table_push=bool(kw.get('table_push', False)),
           table_push_xyz=kw.get('table_push_xyz'),
           table_spawn=bool(kw.get('table_spawn', False)),
+          table_spawn_object_xy=kw.get('table_spawn_object_xy'),
+          table_spawn_behind=bool(kw.get('table_spawn_behind', False)),
+          table_spawn_behind_dy=float(
+              kw.get('table_spawn_behind_dy', 0.14)),
+          table_spawn_behind_above=float(
+              kw.get('table_spawn_behind_above', 0.08)),
+          table_spawn_correlated_xy=float(
+              kw.get('table_spawn_correlated_xy', 0.0)),
+          table_spawn_finger_curl_scale=float(
+              kw.get('table_spawn_finger_curl_scale', 1.0)),
+          table_spawn_finger_noise=float(
+              kw.get('table_spawn_finger_noise', 0.0)),
+          table_spawn_arm_noise=float(
+              kw.get('table_spawn_arm_noise', 0.0)),
+          table_spawn_toward_bucket=bool(
+              kw.get('table_spawn_toward_bucket', False)),
+          table_spawn_in_hand=bool(
+              kw.get('table_spawn_in_hand', False)),
+          table_spawn_in_hand_offset=float(
+              kw.get('table_spawn_in_hand_offset', 0.042)),
+          table_spawn_in_hand_obj_noise=float(
+              kw.get('table_spawn_in_hand_obj_noise', 0.012)),
+          table_spawn_in_hand_keep_arm=bool(
+              kw.get('table_spawn_in_hand_keep_arm', False)),
+          table_spawn_in_hand_wrist_offset=float(
+              kw.get('table_spawn_in_hand_wrist_offset', -3.141592653589793)),
+          table_spawn_in_hand_wrist_noise=float(
+              kw.get('table_spawn_in_hand_wrist_noise', 0.10)),
+          large_table=bool(kw.get('large_table', False)),
+          hide_table=bool(kw.get('hide_table', False)),
+          palm_and_object_success=bool(
+              kw.get('palm_and_object_success', False)),
+          throw_success=str(kw.get('throw_success', 'in_bucket')),
+          goal_z=kw.get('goal_z'),
+          reset_z_above=float(kw.get('reset_z_above', 0.0) or 0.0),
+          lock_arm_base=bool(kw.get('lock_arm_base', False)),
       )
       self.used_prebuilt = False
     self._num_envs = int(self._env.num_envs)
@@ -2302,14 +2601,45 @@ class IsaacGymVecEnv:
     self._act_dim = int(self._env.action_dim)
     self.episode_length = int(self._env.max_episode_steps)
     self.last_success = np.zeros(self._num_envs, dtype=np.float32)
+    self.last_easy_success = np.zeros(self._num_envs, dtype=np.float32)
+    self.last_very_easy_success = np.zeros(self._num_envs, dtype=np.float32)
+    self.last_joint_frac_010 = np.zeros(self._num_envs, dtype=np.float32)
+    self.last_joint_frac_020 = np.zeros(self._num_envs, dtype=np.float32)
+    self.last_mean_abs_joint_err = np.zeros(
+        self._num_envs, dtype=np.float32)
+    self.last_fall = np.zeros(self._num_envs, dtype=np.float32)
+
+  def _refresh_success(self) -> None:
+    levels = self._env.success_levels()
+    self.last_success = (
+        levels['hard'].detach().cpu().numpy().astype(np.float32).reshape(-1))
+    self.last_easy_success = (
+        levels['easy'].detach().cpu().numpy().astype(np.float32).reshape(-1))
+    self.last_very_easy_success = (
+        levels['very_easy'].detach().cpu().numpy()
+        .astype(np.float32).reshape(-1))
+    self.last_joint_frac_010 = (
+        levels['joint_frac_010'].detach().cpu().numpy()
+        .astype(np.float32).reshape(-1))
+    self.last_joint_frac_020 = (
+        levels['joint_frac_020'].detach().cpu().numpy()
+        .astype(np.float32).reshape(-1))
+    self.last_mean_abs_joint_err = (
+        levels['mean_abs_joint_err'].detach().cpu().numpy()
+        .astype(np.float32).reshape(-1))
 
   def reset(self) -> np.ndarray:
     obs = self._env.reset()  # torch (E, obs_dim_total)
     try:
-      self.last_success = (
-          self._env.success().detach().cpu().numpy().astype(np.float32).reshape(-1))
+      self._refresh_success()
     except Exception:
       self.last_success = np.zeros(self._num_envs, dtype=np.float32)
+      self.last_easy_success = np.zeros(self._num_envs, dtype=np.float32)
+      self.last_very_easy_success = np.zeros(self._num_envs, dtype=np.float32)
+      self.last_joint_frac_010 = np.zeros(self._num_envs, dtype=np.float32)
+      self.last_joint_frac_020 = np.zeros(self._num_envs, dtype=np.float32)
+      self.last_mean_abs_joint_err = np.zeros(
+          self._num_envs, dtype=np.float32)
     return obs.detach().cpu().numpy().astype(np.float32)
 
   def step(
@@ -2329,8 +2659,15 @@ class IsaacGymVecEnv:
     info_rewards = np.full(self._num_envs, np.nan, dtype=np.float32)
     # Sparse throw success: object xyz within env success_tolerance of the
     # fixed target.  Not the dense Isaac Gym shaping reward.
-    self.last_success = (
-        self._env.success().detach().cpu().numpy().astype(np.float32).reshape(-1))
+    self._refresh_success()
+    fall = getattr(self._env, 'last_fall', None)
+    if fall is None:
+      self.last_fall = np.zeros(self._num_envs, dtype=np.float32)
+    elif hasattr(fall, 'detach'):
+      self.last_fall = (
+          fall.detach().cpu().numpy().astype(np.float32).reshape(-1))
+    else:
+      self.last_fall = np.asarray(fall, dtype=np.float32).reshape(-1)
     return next_obs, env_rewards, dones, terminal_obs, info_rewards
 
   @property
@@ -2644,6 +2981,8 @@ def run_ppo_training(
   _env_name = str(getattr(config, 'env_name', '') or '')
   _use_isaacgym = _env_name.startswith('allegro_kuka')
   _use_jax_bb_vec = _env_name.startswith('builderbench_')
+  _index_sanity = False
+  _control_sanity = False
 
   # Isaac Gym GPU PhysX must create_sim BEFORE JAX initializes a CUDA context.
   # Preview 4 otherwise fails with missing kernels
@@ -2651,6 +2990,14 @@ def run_ppo_training(
   vec_env = None
   if _use_isaacgym:
     _ig_kw = dict(builderbench_kwargs or {})
+    _index_sanity = str(
+        _ig_kw.get('isaacgym_control_sanity_mode', 'off')
+    ) in ('index', 'six', 'two_finger', 'three2', 'four2', 'four2h', 'four2m',
+          'four2mh', 'four2mm', 'four2mmh', 'four2mmx', 'four2w',
+          'index_thumb_straight', 'hand16', 'hand16fig', 'hand16ok',
+          'hand16peace', 'hand16point', 'hand16gun', 'arm23wave')
+    _control_sanity = (
+        str(_ig_kw.get('isaacgym_control_sanity_mode', 'off')) != 'off')
     vec_env = IsaacGymVecEnv(
         env_name=_env_name,
         num_envs=int(config.ppo_num_envs),
@@ -2659,6 +3006,9 @@ def run_ppo_training(
             'episode_length': int(_ig_kw.get('isaacgym_episode_length', 300)),
             'fixed_target_xyz': _ig_kw.get(
                 'isaacgym_fixed_target_xyz', (0.5, -0.3, 0.4)),
+            'goal_z': (
+                None if float(_ig_kw.get('isaacgym_goal_z', -1.0)) < 0.0
+                else float(_ig_kw['isaacgym_goal_z'])),
             'pipeline': str(_ig_kw.get('isaacgym_pipeline', 'gpu')),
             'randomize_init': bool(_ig_kw.get('isaacgym_randomize_init', True)),
             'randomize_object_xyz': bool(
@@ -2667,9 +3017,77 @@ def run_ppo_training(
                 _ig_kw.get('isaacgym_randomize_object_shape', True)),
             'palm_goal': bool(_ig_kw.get('isaacgym_palm_goal', False)),
             'palm_goal_xyz': _ig_kw.get('isaacgym_palm_goal_xyz'),
+            'joint_goal': bool(_ig_kw.get('isaacgym_joint_goal', False)),
+            'control_sanity_mode': str(
+                _ig_kw.get('isaacgym_control_sanity_mode', 'off')),
+            'control_sanity_palm_xyz': _ig_kw.get(
+                'isaacgym_control_sanity_palm_xyz', (0.0, 0.0, 0.80)),
+            'control_sanity_finger_tol': float(
+                _ig_kw.get('isaacgym_control_sanity_finger_tol', 0.15)),
+            'control_sanity_palm_tol': float(
+                _ig_kw.get('isaacgym_control_sanity_palm_tol', 0.05)),
+            'control_sanity_trim_sa': bool(
+                _ig_kw.get('isaacgym_control_sanity_trim_sa', False)),
+            'control_sanity_trim_init_range_frac': float(
+                _ig_kw.get(
+                    'isaacgym_control_sanity_trim_init_range_frac', 0.10)),
+            'control_sanity_trim_init_mode': str(
+                _ig_kw.get(
+                    'isaacgym_control_sanity_trim_init_mode', 'curled')),
+            'control_sanity_q_only': bool(
+                _ig_kw.get('isaacgym_control_sanity_q_only', False)),
+            'control_sanity_goal_include_qd': bool(
+                _ig_kw.get(
+                    'isaacgym_control_sanity_goal_include_qd', False)),
+            'coordinate_mode': str(
+                _ig_kw.get('isaacgym_coordinate_mode', 'mixed')),
             'table_push': bool(_ig_kw.get('isaacgym_table_push', False)),
             'table_push_xyz': _ig_kw.get('isaacgym_table_push_xyz'),
             'table_spawn': bool(_ig_kw.get('isaacgym_table_spawn', False)),
+            'table_spawn_object_xy': _ig_kw.get(
+                'isaacgym_table_spawn_object_xy'),
+            'table_spawn_behind': bool(
+                _ig_kw.get('isaacgym_table_spawn_behind', False)),
+            'table_spawn_behind_dy': float(
+                _ig_kw.get('isaacgym_table_spawn_behind_dy', 0.14)),
+            'table_spawn_behind_above': float(
+                _ig_kw.get('isaacgym_table_spawn_behind_above', 0.08)),
+            'table_spawn_correlated_xy': float(
+                _ig_kw.get('isaacgym_table_spawn_correlated_xy', 0.0)),
+            'table_spawn_finger_curl_scale': float(
+                _ig_kw.get('isaacgym_table_spawn_finger_curl_scale', 1.0)),
+            'table_spawn_finger_noise': float(
+                _ig_kw.get('isaacgym_table_spawn_finger_noise', 0.0)),
+            'table_spawn_arm_noise': float(
+                _ig_kw.get('isaacgym_table_spawn_arm_noise', 0.0)),
+            'table_spawn_toward_bucket': bool(
+                _ig_kw.get('isaacgym_table_spawn_toward_bucket', False)),
+            'table_spawn_in_hand': bool(
+                _ig_kw.get('isaacgym_table_spawn_in_hand', False)),
+            'table_spawn_in_hand_offset': float(
+                _ig_kw.get('isaacgym_table_spawn_in_hand_offset', 0.042)),
+            'table_spawn_in_hand_obj_noise': float(
+                _ig_kw.get('isaacgym_table_spawn_in_hand_obj_noise', 0.012)),
+            'table_spawn_in_hand_keep_arm': bool(
+                _ig_kw.get('isaacgym_table_spawn_in_hand_keep_arm', False)),
+            'table_spawn_in_hand_wrist_offset': float(
+                _ig_kw.get(
+                    'isaacgym_table_spawn_in_hand_wrist_offset',
+                    -3.141592653589793)),
+            'table_spawn_in_hand_wrist_noise': float(
+                _ig_kw.get('isaacgym_table_spawn_in_hand_wrist_noise', 0.10)),
+            'large_table': bool(
+                _ig_kw.get('isaacgym_large_table', False)),
+            'hide_table': bool(
+                _ig_kw.get('isaacgym_hide_table', False)),
+            'palm_and_object_success': bool(
+                _ig_kw.get('isaacgym_palm_and_object_success', False)),
+            'throw_success': str(
+                _ig_kw.get('isaacgym_throw_success', 'in_bucket')),
+            'reset_z_above': float(
+                _ig_kw.get('isaacgym_reset_z_above', 0.0) or 0.0),
+            'lock_arm_base': bool(
+                _ig_kw.get('isaacgym_lock_arm_base', False)),
         },
     )
     print(f'[ppo] using native-batched Isaac Gym vec env '
@@ -2681,22 +3099,50 @@ def run_ppo_training(
           f'randomize_object_shape='
           f'{bool(_ig_kw.get("isaacgym_randomize_object_shape", True))}, '
           f'palm_goal={bool(_ig_kw.get("isaacgym_palm_goal", False))}, '
+          f'joint_goal={bool(_ig_kw.get("isaacgym_joint_goal", False))}, '
+          f'control_sanity='
+          f'{_ig_kw.get("isaacgym_control_sanity_mode", "off")}, '
+          f'trim_sa='
+          f'{bool(_ig_kw.get("isaacgym_control_sanity_trim_sa", False))}, '
+          f'trim_init_mode='
+          f'{_ig_kw.get("isaacgym_control_sanity_trim_init_mode", "curled")}, '
+          f'trim_init_range_frac='
+          f'{float(_ig_kw.get("isaacgym_control_sanity_trim_init_range_frac", 0.10)):g}, '
+          f'q_only='
+          f'{bool(_ig_kw.get("isaacgym_control_sanity_q_only", False))}, '
+          f'goal_include_qd='
+          f'{bool(_ig_kw.get("isaacgym_control_sanity_goal_include_qd", False))}, '
+          f'coordinate_mode='
+          f'{_ig_kw.get("isaacgym_coordinate_mode", "mixed")}, '
           f'table_push={bool(_ig_kw.get("isaacgym_table_push", False))}, '
           f'table_spawn={bool(_ig_kw.get("isaacgym_table_spawn", False))}, '
+          f'table_spawn_behind='
+          f'{bool(_ig_kw.get("isaacgym_table_spawn_behind", False))}, '
+          f'table_spawn_toward_bucket='
+          f'{bool(_ig_kw.get("isaacgym_table_spawn_toward_bucket", False))}, '
+          f'table_spawn_in_hand='
+          f'{bool(_ig_kw.get("isaacgym_table_spawn_in_hand", False))}, '
+          f'large_table={bool(_ig_kw.get("isaacgym_large_table", False))}, '
+          f'hide_table={bool(_ig_kw.get("isaacgym_hide_table", False))}, '
+          f'throw_success='
+          f'{_ig_kw.get("isaacgym_throw_success", "in_bucket")}, '
+          f'reset_z_above={float(_ig_kw.get("isaacgym_reset_z_above", 0.0) or 0.0):g}, '
+          f'lock_arm_base='
+          f'{bool(_ig_kw.get("isaacgym_lock_arm_base", False))}, '
           f'prebuilt={getattr(vec_env, "used_prebuilt", False)})')
 
   # ---- build networks from env spec -------------------------------------
   if _use_isaacgym:
     # Isaac Gym allows only one PhysX sim per process, so we must NOT create a
     # throwaway probe env just to read the spec.  Build the spec manually from
-    # the known packed dims: obs = [state(obs_dim) | goal(goal_dim)], act = 23,
-    # actions bounded in [-1, 1] (Isaac Gym normalized action space).
+    # the known packed dims: obs = [state(obs_dim) | goal(goal_dim)], act from
+    # the live vec env (23 by default; smaller under control_sanity_trim_sa).
     _obs_total = int(config.obs_dim) + int(
         getattr(config, 'goal_dim', 0) or 0)
     if _obs_total <= int(config.obs_dim):
       # goal_dim not set on config: fall back to packed 52 (=49 state + 3 goal).
       _obs_total = int(config.obs_dim) + 3
-    _act_dim = 23
+    _act_dim = int(vec_env.action_shape[0]) if vec_env is not None else 23
     _obs_spec = _specs.Array(
         shape=(_obs_total,), dtype=np.float32, name='observation')
     _act_spec = _specs.BoundedArray(
@@ -2709,6 +3155,10 @@ def run_ppo_training(
         observations=_obs_spec, actions=_act_spec,
         rewards=_rew_spec, discounts=_disc_spec)
     networks = network_factory(spec=spec)
+    print(f'[ppo] isaacgym network spec: obs_total={_obs_total} '
+          f'act_dim={_act_dim} (config.obs_dim={int(config.obs_dim)} '
+          f'goal_dim={int(getattr(config, "goal_dim", 0) or 0)})',
+          flush=True)
   else:
     probe_env = env_factory(seed)
     spec = _specs.make_environment_spec(probe_env)
@@ -4036,6 +4486,29 @@ def run_ppo_training(
           f'NF logp overlay, fps={_video_fps}, dir={sawyer_video_dir}',
           flush=True)
 
+  # Allegro in-train video: subprocess a 1-env camera rollout (Isaac Gym
+  # cannot host a second sim in this process). Stochastic, no reward overlay.
+  allegro_video_dir = None
+  _allegro_vid_script = None
+  _allegro_pipeline = 'gpu'
+  _allegro_in_train_video = (
+      bool(_use_isaacgym)
+      and str(_env_name).startswith('allegro_kuka')
+      and _video_interval > 0
+      and checkpoint_dir is not None)
+  if _allegro_in_train_video:
+    allegro_video_dir = os.path.join(os.path.dirname(checkpoint_dir), 'videos')
+    os.makedirs(allegro_video_dir, exist_ok=True)
+    _allegro_vid_script = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'scripts', 'allegro_kuka_throw_ckpt_video.py')
+    _allegro_pipeline = str(
+        os.environ.get('ISAACGYM_PIPELINE', 'gpu') or 'gpu')
+    print(f'[ppo] Allegro in-train video: every {_video_interval} iters '
+          f'(skip iter 0), stochastic 1-ep camera, no reward overlay, '
+          f'fps=30, subprocess={_allegro_vid_script}, '
+          f'dir={allegro_video_dir}', flush=True)
+
   @jax.jit
   def value_only(value_p, obs, obs_mean, obs_var):
     obs = _normalize_packed_obs(
@@ -4086,6 +4559,7 @@ def run_ppo_training(
     raise ValueError(
         'ppo_success_sample_weight must be > 0, got '
         f'{_success_sample_weight}')
+  _future_horizon = int(getattr(config, 'crl_future_horizon', 0) or 0)
   replay = EpisodeReplay(
       capacity=int(config.max_replay_size),
       obs_dim=int(config.obs_dim),
@@ -4093,12 +4567,32 @@ def run_ppo_training(
       start_index=int(config.start_index),
       end_index=int(config.end_index),
       success_sample_weight=_success_sample_weight,
-      goal_state_indices=_goal_state_indices)
+      goal_state_indices=_goal_state_indices,
+      future_horizon=_future_horizon)
+  if _future_horizon > 0:
+    print(f'[ppo] CRL future-goal horizon cap: {_future_horizon} '
+          '(truncated-geometric max_d = min(T-t, cap); also NF binary acc)')
   np_rng = np.random.default_rng(seed + 12345)
   if _success_sample_weight != 1.0:
     print('[ppo] CRL episode sampling: successful trajectories weight='
           f'{_success_sample_weight:g}, others weight=1 '
           '(sample proportional to w / sum w)')
+  _success_replace_n = int(
+      getattr(config, 'ppo_success_replace_fails', 0) or 0)
+  # Isaac only: defer mid-loop replay insert so we can overwrite fail
+  # columns with success columns before flush + GAE + PPO.
+  _defer_isaac_replay = bool(_use_isaacgym and _success_replace_n > 0)
+  if _use_isaacgym:
+    if _defer_isaac_replay:
+      print('[ppo] success→fail replace: ON  '
+            f'ppo_success_replace_fails={_success_replace_n} '
+            '(per success env, overwrite up to N never-succeeded T-columns '
+            'before replay flush + GAE + PPO)',
+            flush=True)
+    else:
+      print('[ppo] success→fail replace: OFF  '
+            'ppo_success_replace_fails=0',
+            flush=True)
 
   use_external_reward = bool(
       getattr(config, 'ppo_use_external_reward', False))
@@ -4142,6 +4636,38 @@ def run_ppo_training(
           f'source={external_reward_success}  '
           f'scale={external_reward_scale:g} '
           f'(added {_when} on {_src} steps; both 2cm and 1cm are logged)')
+
+  isaacgym_fall_penalty = float(
+      getattr(config, 'ppo_isaacgym_fall_penalty', 0.0) or 0.0)
+  _use_fall_pen = abs(isaacgym_fall_penalty) > 0.0
+  if _use_fall_pen:
+    if not _use_isaacgym:
+      raise ValueError(
+          'ppo_isaacgym_fall_penalty requires env=allegro_kuka_throw '
+          '(Isaac Gym object-z fall mask)')
+    print('[ppo] isaacgym fall penalty enabled: '
+          f'scale={isaacgym_fall_penalty:g} '
+          '(added AFTER reward normalisation when object z < 0.1 '
+          'pre-reset; timeouts are not falls)',
+          flush=True)
+
+  _nf_shift_q_frac = float(
+      getattr(config, 'ppo_nf_reward_shift_q', 0.0) or 0.0)
+  _nf_shift_ema = float(
+      getattr(config, 'ppo_nf_reward_shift_ema', 0.1) or 0.1)
+  _use_nf_shift = bool(use_nf and 0.0 < _nf_shift_q_frac < 1.0)
+  _nf_shift_value = None
+  if _use_nf_shift:
+    if not 0.0 < _nf_shift_ema <= 1.0:
+      raise ValueError(
+          'ppo_nf_reward_shift_ema must be in (0, 1], got '
+          f'{_nf_shift_ema:g}')
+    print('[ppo] NF reward quantile shift: ON  '
+          f'subtract EMA of batch P{100.0 * _nf_shift_q_frac:.0f} '
+          f'(ema={_nf_shift_ema:g}) before return-norm; '
+          '~{:.0%} of shifted r should be > 0'.format(
+              1.0 - _nf_shift_q_frac),
+          flush=True)
 
   sparse_after_success = bool(
       getattr(config, 'ppo_sparse_after_success', False))
@@ -4204,9 +4730,19 @@ def run_ppo_training(
   recent_flow_dense_returns: list = []
   recent_lengths: list = []
   recent_success: list = []
+  recent_easy_success: list = []
+  recent_very_easy_success: list = []
   recent_very_hard_success: list = []
+  recent_joint_frac_010: list = []
+  recent_joint_frac_020: list = []
+  recent_mean_abs_joint_err: list = []
   ep_success_max = np.zeros(E, dtype=np.float32)
+  ep_easy_success_max = np.zeros(E, dtype=np.float32)
+  ep_very_easy_success_max = np.zeros(E, dtype=np.float32)
   ep_very_hard_success_max = np.zeros(E, dtype=np.float32)
+  ep_joint_frac_010_max = np.zeros(E, dtype=np.float32)
+  ep_joint_frac_020_max = np.zeros(E, dtype=np.float32)
+  ep_mean_abs_joint_err_min = np.full(E, np.inf, dtype=np.float32)
   ep_repr_r0 = np.zeros(E, dtype=np.float32)
   ep_repr_r0_valid = np.zeros(E, dtype=bool)
   _rT_r0_succ = float('nan')
@@ -4290,8 +4826,9 @@ def run_ppo_training(
   obs = vec_env.reset()
   next_done = np.zeros(E, dtype=np.float32)
   s0_states = np.asarray(obs[:, :int(config.obs_dim)], dtype=np.float32).copy()
-  if _use_jax_bb_vec:
-    # ndarray carries for the vectorized episode flush (BB GPU path).
+  if _use_jax_bb_vec or _defer_isaac_replay:
+    # ndarray carries for the vectorized episode flush (BB GPU path, or
+    # Isaac deferred flush after success→fail column replace).
     ep_obs = [obs[i:i + 1].astype(np.float32).copy() for i in range(E)]
     ep_act = [
         np.zeros((0, act_dim_cfg), dtype=np.float32) for _ in range(E)]
@@ -4335,6 +4872,14 @@ def run_ppo_training(
   # s0 state tracked for dirac_target: batched reward call after rollout.
   roll_s0_states = np.zeros(
       (T, E, int(config.obs_dim)), dtype=np.float32)
+  # Isaac deferred-replay path: store next/terminal obs for post-replace flush.
+  roll_next_obs = None
+  roll_term_obs = None
+  if _defer_isaac_replay:
+    roll_next_obs = np.zeros((T, E) + obs_shape, dtype=np.float32)
+    roll_term_obs = np.zeros((T, E) + obs_shape, dtype=np.float32)
+  _succ_replace_stats = {
+      'n_succ_envs': 0, 'n_fail_envs': 0, 'n_replaced': 0}
 
   # ---- reward normalizer (CleanRL NormalizeReward) ----------------------
   # Normalizes the reps-based reward by the running std of discounted
@@ -4359,6 +4904,10 @@ def run_ppo_training(
       reward_normalizer.load_state_dict(_resume_extra['reward_normalizer'])
       _resumed_reward_norm = True
       print(f'[ppo] resumed reward normalizer: std={reward_normalizer.std:.3f}')
+    if _use_nf_shift and 'nf_reward_shift' in _resume_extra:
+      _nf_shift_value = float(_resume_extra['nf_reward_shift'])
+      print(f'[ppo] resumed NF reward shift q={_nf_shift_value:.4f}',
+            flush=True)
     if 'replay' in _resume_extra:
       if replay.load_state_dict(_resume_extra['replay']):
         print(f'[ppo] resumed replay buffer: {replay.size} transitions '
@@ -4415,6 +4964,21 @@ def run_ppo_training(
     _nf_lam_lr_log = float(getattr(config, 'ppo_nf_grad_reg_lam_lr', -1.0))
     _nf_lam_mode = 'fixed' if _nf_lam_lr_log == 0.0 else 'dual (inside scan)'
     print(f'[ppo] NF grad-reg λ init={_gr_lam}  mode={_nf_lam_mode}')
+  _vgr_do = bool(getattr(config, 'ppo_value_grad_reg', False)) and obs_dim_cfg > 0
+  _vgr_lam_cfg = float(getattr(config, 'ppo_value_grad_reg_lam', -1.0))
+  if _vgr_do:
+    if _vgr_lam_cfg >= 0.0:
+      _vgr_lam_init = float(_vgr_lam_cfg)
+    else:
+      _vgr_lam_init = float(max(_gr_coef_cfg, 5e-4))
+    print(
+        f'[ppo] value grad-reg λ init={_vgr_lam_init}  '
+        f'c={float(getattr(config, "ppo_value_grad_reg_c", 100.0))}  '
+        f'lam_lr={float(getattr(config, "ppo_value_grad_reg_lam_lr", 1e-6))}',
+        flush=True)
+  else:
+    _vgr_lam_init = 0.0
+  _vgr_lam_j = jnp.asarray(_vgr_lam_init, dtype=jnp.float32)
   # Skip logging keys for features that are off. λ / ∇_s diagnostics stay
   # even when the regularizer is not in the loss.
   _hit_on = bool((getattr(config, 'ppo_crl_hit_bonus', '') or '').strip())
@@ -4471,6 +5035,8 @@ def run_ppo_training(
           flush=True)
 
   for iteration in range(start_iteration, num_iterations):
+    _succ_replace_stats = {
+        'n_succ_envs': 0, 'n_fail_envs': 0, 'n_replaced': 0}
     # One immutable snapshot is shared by every network call in this
     # iteration. Stats are advanced from raw rollout states only after eval.
     iter_obs_mean = np.asarray(obs_rms.mean, dtype=np.float32).copy()
@@ -4499,6 +5065,8 @@ def run_ppo_training(
     # =================================================================
     _roll_success = None
     _roll_very_hard = None
+    _isaac_fall = None
+    _fall_pen = None
     # Snapshot before flush: completed-episode success may span rollouts.
     _ep_succ_at_start = np.asarray(ep_success_max, dtype=np.float32).copy()
     # When set, reward / GAE / PPO consume these device arrays directly
@@ -4583,8 +5151,22 @@ def run_ppo_training(
       global_step += T * E
     else:
       _isaac_success = None
-      if _use_isaacgym and use_external_reward:
+      _isaac_easy_success = None
+      _isaac_very_easy_success = None
+      _isaac_joint_frac_010 = None
+      _isaac_joint_frac_020 = None
+      _isaac_mean_abs_joint_err = None
+      if _use_isaacgym and _use_fall_pen:
+        _isaac_fall = np.zeros((T, E), dtype=np.float32)
+      if _use_isaacgym and (
+              use_external_reward or _defer_isaac_replay):
         _isaac_success = np.zeros((T, E), dtype=np.float32)
+        if _index_sanity:
+          _isaac_easy_success = np.zeros((T, E), dtype=np.float32)
+          _isaac_very_easy_success = np.zeros((T, E), dtype=np.float32)
+          _isaac_joint_frac_010 = np.zeros((T, E), dtype=np.float32)
+          _isaac_joint_frac_020 = np.zeros((T, E), dtype=np.float32)
+          _isaac_mean_abs_joint_err = np.zeros((T, E), dtype=np.float32)
       for t in range(T):
         roll_obs[t] = obs
         roll_dones[t] = next_done
@@ -4612,59 +5194,122 @@ def run_ppo_training(
         roll_flow_dense_rew[t] = info_rew
         # Store step-level dones for the post-rollout reward normalizer loop.
         roll_step_dones[t] = dones.astype(np.float32)
+        if _defer_isaac_replay:
+          roll_next_obs[t] = next_obs
+          roll_term_obs[t] = terminal_obs
         _step_success = None
-        if _use_isaacgym and (_track_train_success or use_external_reward):
+        if _use_isaacgym and (
+                _track_train_success or use_external_reward
+                or _defer_isaac_replay):
           _raw_succ = getattr(vec_env, 'last_success', None)
           if _raw_succ is not None:
             _step_success = np.asarray(_raw_succ, dtype=np.float32)
             if _isaac_success is not None:
               _isaac_success[t] = _step_success
+            if _index_sanity:
+              _isaac_easy_success[t] = np.asarray(
+                  vec_env.last_easy_success, dtype=np.float32)
+              _isaac_very_easy_success[t] = np.asarray(
+                  vec_env.last_very_easy_success, dtype=np.float32)
+              _isaac_joint_frac_010[t] = np.asarray(
+                  vec_env.last_joint_frac_010, dtype=np.float32)
+              _isaac_joint_frac_020[t] = np.asarray(
+                  vec_env.last_joint_frac_020, dtype=np.float32)
+              _isaac_mean_abs_joint_err[t] = np.asarray(
+                  vec_env.last_mean_abs_joint_err, dtype=np.float32)
+        if _isaac_fall is not None:
+          _raw_fall = getattr(vec_env, 'last_fall', None)
+          if _raw_fall is not None:
+            _isaac_fall[t] = np.asarray(_raw_fall, dtype=np.float32)
 
-        # Episode flushing / per-env accounting.
-        for i in range(E):
-          ep_act[i].append(action[i].copy())
-          ep_return[i] += float(env_rew[i])
-          if not np.isnan(info_rew[i]):
-            ep_flow_dense_return[i] += float(info_rew[i])
-            ep_has_flow_dense[i] = True
-          ep_len[i] += 1
-          if _track_train_success:
-            if _step_success is not None:
-              if float(_step_success[i]) >= 0.5:
-                ep_success_max[i] = 1.0
-            elif float(env_rew[i]) >= 0.5:
-              ep_success_max[i] = 1.0
-          if dones[i]:
-            ep_obs[i].append(terminal_obs[i].copy())
-            try:
-              replay.add_episode(
-                  np.stack(ep_obs[i], axis=0),
-                  np.stack(ep_act[i], axis=0))
-            except AssertionError:
-              pass  # degenerate len-0 episodes; skip
-            ep_obs[i] = [next_obs[i].copy()]  # auto-reset state seeds next ep
-            s0_states[i] = next_obs[i, :int(config.obs_dim)].copy()
-            ep_act[i] = []
-            recent_returns.append(float(ep_return[i]))
-            if ep_has_flow_dense[i]:
-              recent_flow_dense_returns.append(float(ep_flow_dense_return[i]))
-            recent_lengths.append(int(ep_len[i]))
+        if _defer_isaac_replay:
+          # Episode→replay flush happens after success→fail column replace.
+          pass
+        else:
+          # Episode flushing / per-env accounting.
+          for i in range(E):
+            ep_act[i].append(action[i].copy())
+            ep_return[i] += float(env_rew[i])
+            if not np.isnan(info_rew[i]):
+              ep_flow_dense_return[i] += float(info_rew[i])
+              ep_has_flow_dense[i] = True
+            ep_len[i] += 1
             if _track_train_success:
-              recent_success.append(float(ep_success_max[i] >= 0.5))
-              ep_success_max[i] = 0.0
-              if len(recent_success) > 1000:
-                del recent_success[:-1000]
-            ep_return[i] = 0.0
-            ep_flow_dense_return[i] = 0.0
-            ep_has_flow_dense[i] = False
-            ep_len[i] = 0
-            if len(recent_returns) > 100:
-              recent_returns.pop(0)
-              recent_lengths.pop(0)
-            if len(recent_flow_dense_returns) > 100:
-              recent_flow_dense_returns.pop(0)
-          else:
-            ep_obs[i].append(next_obs[i].copy())
+              if _step_success is not None:
+                if float(_step_success[i]) >= 0.5:
+                  ep_success_max[i] = 1.0
+                if (_index_sanity
+                    and float(vec_env.last_easy_success[i]) >= 0.5):
+                  ep_easy_success_max[i] = 1.0
+                if (_index_sanity
+                    and float(vec_env.last_very_easy_success[i]) >= 0.5):
+                  ep_very_easy_success_max[i] = 1.0
+                if _index_sanity:
+                  ep_joint_frac_010_max[i] = max(
+                      ep_joint_frac_010_max[i],
+                      float(vec_env.last_joint_frac_010[i]))
+                  ep_joint_frac_020_max[i] = max(
+                      ep_joint_frac_020_max[i],
+                      float(vec_env.last_joint_frac_020[i]))
+                  ep_mean_abs_joint_err_min[i] = min(
+                      ep_mean_abs_joint_err_min[i],
+                      float(vec_env.last_mean_abs_joint_err[i]))
+              elif float(env_rew[i]) >= 0.5:
+                ep_success_max[i] = 1.0
+            if dones[i]:
+              ep_obs[i].append(terminal_obs[i].copy())
+              try:
+                replay.add_episode(
+                    np.stack(ep_obs[i], axis=0),
+                    np.stack(ep_act[i], axis=0))
+              except AssertionError:
+                pass  # degenerate len-0 episodes; skip
+              ep_obs[i] = [next_obs[i].copy()]  # auto-reset state seeds next ep
+              s0_states[i] = next_obs[i, :int(config.obs_dim)].copy()
+              ep_act[i] = []
+              recent_returns.append(float(ep_return[i]))
+              if ep_has_flow_dense[i]:
+                recent_flow_dense_returns.append(float(ep_flow_dense_return[i]))
+              recent_lengths.append(int(ep_len[i]))
+              if _track_train_success:
+                recent_success.append(float(ep_success_max[i] >= 0.5))
+                ep_success_max[i] = 0.0
+                if _index_sanity:
+                  recent_easy_success.append(
+                      float(ep_easy_success_max[i] >= 0.5))
+                  recent_very_easy_success.append(
+                      float(ep_very_easy_success_max[i] >= 0.5))
+                  recent_joint_frac_010.append(
+                      float(ep_joint_frac_010_max[i]))
+                  recent_joint_frac_020.append(
+                      float(ep_joint_frac_020_max[i]))
+                  _mae = float(ep_mean_abs_joint_err_min[i])
+                  recent_mean_abs_joint_err.append(
+                      _mae if np.isfinite(_mae) else float('nan'))
+                  ep_easy_success_max[i] = 0.0
+                  ep_very_easy_success_max[i] = 0.0
+                  ep_joint_frac_010_max[i] = 0.0
+                  ep_joint_frac_020_max[i] = 0.0
+                  ep_mean_abs_joint_err_min[i] = float('inf')
+                  if len(recent_easy_success) > 1000:
+                    del recent_easy_success[:-1000]
+                    del recent_very_easy_success[:-1000]
+                    del recent_joint_frac_010[:-1000]
+                    del recent_joint_frac_020[:-1000]
+                    del recent_mean_abs_joint_err[:-1000]
+                if len(recent_success) > 1000:
+                  del recent_success[:-1000]
+              ep_return[i] = 0.0
+              ep_flow_dense_return[i] = 0.0
+              ep_has_flow_dense[i] = False
+              ep_len[i] = 0
+              if len(recent_returns) > 100:
+                recent_returns.pop(0)
+                recent_lengths.pop(0)
+              if len(recent_flow_dense_returns) > 100:
+                recent_flow_dense_returns.pop(0)
+            else:
+              ep_obs[i].append(next_obs[i].copy())
 
         obs = next_obs
         next_done = dones.astype(np.float32)
@@ -4672,13 +5317,57 @@ def run_ppo_training(
 
       # Allegro: per-step env.success() (object at goal). Sawyer: sparse 0/1
       # env reward. Do not use Allegro env_rew here — that is NVIDIA dense.
-      if use_external_reward and _roll_success is None:
+      if _roll_success is None:
         if _isaac_success is not None:
           _roll_success = _isaac_success
-        else:
+        elif use_external_reward:
           _roll_success = (
               (np.asarray(roll_env_rew, dtype=np.float32) >= 0.5)
               .astype(np.float32))
+
+      if _defer_isaac_replay:
+        _succ_replace_stats = _replace_fail_env_columns_with_success(
+            n_replace=_success_replace_n,
+            success_te=_isaac_success,
+            column_arrays=[
+                roll_obs, roll_acts, roll_logp, roll_vals, roll_dones,
+                roll_env_rew, roll_flow_dense_rew, roll_step_dones,
+                roll_s0_states if use_dirac_target else None,
+                roll_next_obs, roll_term_obs, _isaac_success,
+                _isaac_fall,
+            ],
+            rng=np_rng,
+        )
+        _roll_success = _isaac_success
+        hard_goal_visit_count = _flush_rollout_episodes_to_replay(
+            actions=roll_acts,
+            env_rew=roll_env_rew,
+            dones=roll_step_dones.astype(bool),
+            terminal_obs=roll_term_obs,
+            next_obs=roll_next_obs,
+            success=_isaac_success if _track_train_success else None,
+            ep_obs=ep_obs,
+            ep_act=ep_act,
+            ep_return=ep_return,
+            ep_len=ep_len,
+            ep_success_max=ep_success_max,
+            s0_states=s0_states,
+            obs_dim=int(config.obs_dim),
+            recent_returns=recent_returns,
+            recent_lengths=recent_lengths,
+            recent_success=recent_success,
+            use_crl_td3_switch=use_crl_td3_switch,
+            hard_goal_visit_count=hard_goal_visit_count,
+            replay=replay,
+        )
+        if (int(_succ_replace_stats.get('n_replaced', 0)) > 0
+                and (iteration <= 5 or iteration % 50 == 0)):
+          print(
+              f'[ppo] success→fail replace iter={iteration} '
+              f'succ_envs={_succ_replace_stats["n_succ_envs"]} '
+              f'fail_envs={_succ_replace_stats["n_fail_envs"]} '
+              f'replaced={_succ_replace_stats["n_replaced"]}',
+              flush=True)
 
     _switch_after_this_iteration = (
         use_crl_td3_switch
@@ -4782,6 +5471,20 @@ def run_ppo_training(
          roll_rew_raw, roll_step_dones, _succ_for_delta,
          ep_repr_r0, ep_repr_r0_valid, _ep_succ_at_start)
 
+    _nf_shift_batch = float('nan')
+    _nf_shift_frac_pos = float('nan')
+    if _use_nf_shift and not sparse_reward_only:
+      _nf_shift_batch = float(
+          np.percentile(roll_rew_raw, 100.0 * _nf_shift_q_frac))
+      if _nf_shift_value is None:
+        _nf_shift_value = _nf_shift_batch
+      else:
+        _nf_shift_value = (
+            (1.0 - _nf_shift_ema) * float(_nf_shift_value)
+            + _nf_shift_ema * _nf_shift_batch)
+      roll_rew_raw -= np.float32(_nf_shift_value)
+      _nf_shift_frac_pos = float((roll_rew_raw > 0.0).mean())
+
     # Hard / very-hard success external bonus (opt-in).
     # Default: after return-norm so the fixed scale is not washed out.
     # Optional: before return-norm (absorbed into running return std).
@@ -4819,6 +5522,12 @@ def run_ppo_training(
             and not external_reward_before_norm
             and not sparse_reward_only):
       roll_rew += _ext
+
+    if _use_fall_pen and _isaac_fall is not None:
+      _fall_pen = (
+          isaacgym_fall_penalty
+          * (_isaac_fall >= 0.5).astype(np.float32))
+      roll_rew += _fall_pen
 
     # Latch after sustained high train success: sparse-only reward and/or
     # freeze representations. Sparse-after always uses 2cm train_success_mean.
@@ -4980,28 +5689,35 @@ def run_ppo_training(
         key, k_mb = jax.random.split(key)
         params_before = ppo_params
         opt_before = ppo_opt_state
+        vgr_lam_before = _vgr_lam_j
         if ent_coef_schedule is not None and _kl_penalty_on:
           ppo_params, ppo_opt_state, m = ppo_update(
               ppo_params, ppo_opt_state, batch, k_mb,
               iter_obs_mean_j, iter_obs_var_j,
               jnp.asarray(ppo_sgd_step, dtype=jnp.int32),
               _old_ppo_policy_params_j,
-              jnp.asarray(_kl_beta, dtype=jnp.float32))
+              jnp.asarray(_kl_beta, dtype=jnp.float32),
+              _vgr_lam_j)
         elif ent_coef_schedule is not None:
           ppo_params, ppo_opt_state, m = ppo_update(
               ppo_params, ppo_opt_state, batch, k_mb,
               iter_obs_mean_j, iter_obs_var_j,
-              jnp.asarray(ppo_sgd_step, dtype=jnp.int32))
+              jnp.asarray(ppo_sgd_step, dtype=jnp.int32),
+              _vgr_lam_j)
         elif _kl_penalty_on:
           ppo_params, ppo_opt_state, m = ppo_update(
               ppo_params, ppo_opt_state, batch, k_mb,
               iter_obs_mean_j, iter_obs_var_j,
               _old_ppo_policy_params_j,
-              jnp.asarray(_kl_beta, dtype=jnp.float32))
+              jnp.asarray(_kl_beta, dtype=jnp.float32),
+              _vgr_lam_j)
         else:
           ppo_params, ppo_opt_state, m = ppo_update(
               ppo_params, ppo_opt_state, batch, k_mb,
-              iter_obs_mean_j, iter_obs_var_j)
+              iter_obs_mean_j, iter_obs_var_j,
+              _vgr_lam_j)
+        if _vgr_do:
+          _vgr_lam_j = m['value_grad_reg_lam']
         _mb_approx = float(m['approx_kl'])
         _mb_analytic = (
             float(m['analytic_kl']) if _kl_penalty_on else float('nan'))
@@ -5016,6 +5732,7 @@ def run_ppo_training(
           # Discard this minibatch's update and end the iteration.
           ppo_params = params_before
           ppo_opt_state = opt_before
+          _vgr_lam_j = vgr_lam_before
           early_stop = True
           _rolled_back = True
           _es_epoch = int(epoch)
@@ -5432,6 +6149,12 @@ def run_ppo_training(
     }
     if reward_normalizer is not None:
       log['reward_return_norm_std'] = float(reward_normalizer.std)
+    if _use_nf_shift:
+      log['nf/reward_shift_q'] = (
+          float(_nf_shift_value) if _nf_shift_value is not None
+          else float('nan'))
+      log['nf/reward_shift_batch_q'] = float(_nf_shift_batch)
+      log['nf/reward_shift_frac_pos'] = float(_nf_shift_frac_pos)
     if _track_train_success:
       log['train_success_mean'] = (
           float(np.mean(recent_success[-100:]))
@@ -5439,6 +6162,26 @@ def run_ppo_training(
       log['train_success_1000'] = (
           float(np.mean(recent_success[-1000:]))
           if recent_success else float('nan'))
+      if _index_sanity and _isaac_easy_success is not None:
+        log['train_easy_success_step_rate'] = float(
+            np.mean(_isaac_easy_success))
+        log['train_very_easy_success_step_rate'] = float(
+            np.mean(_isaac_very_easy_success))
+        log['train_joint_frac_010_step_mean'] = float(
+            np.mean(_isaac_joint_frac_010))
+        log['train_joint_frac_020_step_mean'] = float(
+            np.mean(_isaac_joint_frac_020))
+        log['train_mean_abs_joint_err_step_mean'] = float(
+            np.mean(_isaac_mean_abs_joint_err))
+        log['train_joint_frac_010_1000'] = (
+            float(np.mean(recent_joint_frac_010[-1000:]))
+            if recent_joint_frac_010 else float('nan'))
+        log['train_joint_frac_020_1000'] = (
+            float(np.mean(recent_joint_frac_020[-1000:]))
+            if recent_joint_frac_020 else float('nan'))
+        log['train_mean_abs_joint_err_1000'] = (
+            float(np.nanmean(recent_mean_abs_joint_err[-1000:]))
+            if recent_mean_abs_joint_err else float('nan'))
       if _use_jax_bb_vec:
         log['train_very_hard_success_mean'] = (
             float(np.mean(recent_very_hard_success[-100:]))
@@ -5446,7 +6189,7 @@ def run_ppo_training(
         log['train_very_hard_success_1000'] = (
             float(np.mean(recent_very_hard_success[-1000:]))
             if recent_very_hard_success else float('nan'))
-    if _use_isaacgym:
+    if _use_isaacgym and not _control_sanity:
       # Object xyz is always the last 3 dims of state. Packed goal object
       # is last 3 of goal (palm-goal is [palm, object_in_bucket]).
       if rollout_j is not None and 'obs' in rollout_j:
@@ -5466,6 +6209,18 @@ def run_ppo_training(
       log['object_z_mean'] = float(_obj_xyz[..., 2].mean())
       log['object_goal_dist_mean'] = float(_obj_dist.mean())
       log['object_z_frac_below_01'] = float((_obj_xyz[..., 2] < 0.1).mean())
+      if _isaac_fall is not None:
+        log['train_fall_step_rate'] = float((_isaac_fall >= 0.5).mean())
+      if _fall_pen is not None:
+        log['reward_fall_penalty_mean'] = float(_fall_pen.mean())
+      log['object_z_frac_above_1'] = float((_obj_xyz[..., 2] > 1.0).mean())
+      if _defer_isaac_replay:
+        log['ppo/succ_replace_n_succ_envs'] = float(
+            _succ_replace_stats.get('n_succ_envs', 0))
+        log['ppo/succ_replace_n_fail_envs'] = float(
+            _succ_replace_stats.get('n_fail_envs', 0))
+        log['ppo/succ_replace_n_replaced'] = float(
+            _succ_replace_stats.get('n_replaced', 0))
     if use_crl_td3_switch:
       log['reward_source_td3'] = float(_reward_uses_td3_this_iter)
       log['reward_td3_weight'] = float(_reward_td3_weight)
@@ -5754,11 +6509,37 @@ def run_ppo_training(
         # then rebuild training episode buffers so the next rollout matches
         # PhysX state.
         obs = vec_env.reset()
+        _eval_obs_dim = int(np.asarray(obs).shape[-1])
+        _eval_act_dim = int(act_dim_cfg)
+        eval_packed = np.zeros((int(T), E, _eval_obs_dim), dtype=np.float32)
+        eval_acts = np.zeros((int(T), E, _eval_act_dim), dtype=np.float32)
+        eval_dones = np.zeros((int(T), E), dtype=bool)
         any_succ = np.zeros(E, dtype=np.float32)
+        any_easy_succ = np.zeros(E, dtype=np.float32)
+        any_very_easy_succ = np.zeros(E, dtype=np.float32)
+        best_joint_frac_010 = np.zeros(E, dtype=np.float32)
+        best_joint_frac_020 = np.zeros(E, dtype=np.float32)
+        best_mean_abs_joint_err = np.full(E, np.inf, dtype=np.float32)
         _rs0 = getattr(vec_env, 'last_success', None)
         if _rs0 is not None:
           any_succ = np.maximum(
               any_succ, np.asarray(_rs0, dtype=np.float32).reshape(-1))
+        if _index_sanity:
+          any_easy_succ = np.maximum(
+              any_easy_succ,
+              np.asarray(vec_env.last_easy_success, dtype=np.float32))
+          any_very_easy_succ = np.maximum(
+              any_very_easy_succ,
+              np.asarray(vec_env.last_very_easy_success, dtype=np.float32))
+          best_joint_frac_010 = np.maximum(
+              best_joint_frac_010,
+              np.asarray(vec_env.last_joint_frac_010, dtype=np.float32))
+          best_joint_frac_020 = np.maximum(
+              best_joint_frac_020,
+              np.asarray(vec_env.last_joint_frac_020, dtype=np.float32))
+          best_mean_abs_joint_err = np.minimum(
+              best_mean_abs_joint_err,
+              np.asarray(vec_env.last_mean_abs_joint_err, dtype=np.float32))
         ep_ret = np.zeros(E, dtype=np.float32)
         ep_n = np.zeros(E, dtype=np.int32)
         still = np.ones(E, dtype=bool)
@@ -5769,11 +6550,30 @@ def run_ppo_training(
                   iter_obs_mean_j, iter_obs_var_j))
           a = np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=-1.0)
           a = np.clip(a, -1.0, 1.0)
+          eval_packed[_t] = np.asarray(obs, dtype=np.float32)
+          eval_acts[_t] = np.asarray(a, dtype=np.float32)
           next_obs, env_rew, dones, _, _ = vec_env.step(a)
+          eval_dones[_t] = np.asarray(dones, dtype=bool)
           _rs = getattr(vec_env, 'last_success', None)
           if _rs is not None:
             any_succ = np.maximum(
                 any_succ, np.asarray(_rs, dtype=np.float32).reshape(-1))
+          if _index_sanity:
+            any_easy_succ = np.maximum(
+                any_easy_succ,
+                np.asarray(vec_env.last_easy_success, dtype=np.float32))
+            any_very_easy_succ = np.maximum(
+                any_very_easy_succ,
+                np.asarray(vec_env.last_very_easy_success, dtype=np.float32))
+            best_joint_frac_010 = np.maximum(
+                best_joint_frac_010,
+                np.asarray(vec_env.last_joint_frac_010, dtype=np.float32))
+            best_joint_frac_020 = np.maximum(
+                best_joint_frac_020,
+                np.asarray(vec_env.last_joint_frac_020, dtype=np.float32))
+            best_mean_abs_joint_err = np.minimum(
+                best_mean_abs_joint_err,
+                np.asarray(vec_env.last_mean_abs_joint_err, dtype=np.float32))
           _still_f = still.astype(np.float32)
           ep_ret += np.asarray(env_rew, dtype=np.float32) * _still_f
           ep_n += still.astype(np.int32)
@@ -5785,20 +6585,82 @@ def run_ppo_training(
         for i in range(E):
           eval_success_obs._success.append(bool(succ_bit[i]))
         succ_1000 = float(np.mean(eval_success_obs._success[-1000:]))
+        nf_bin_acc = float('nan')
+        nf_bin_n = 0
+        nf_bin_acc_rand = float('nan')
+        nf_bin_n_rand = 0
+        if use_nf and nf_reward_fn is not None:
+          _gmean_j, _gstd_j = _nf_apply_goal_stats()
+          _nf_bin_kwargs = dict(
+              obs_dim=int(config.obs_dim),
+              start_index=int(config.start_index),
+              end_index=int(
+                  config.end_index if config.end_index != -1
+                  else config.obs_dim),
+              goal_state_indices=_goal_state_indices,
+              discount=float(config.discount),
+              nf_reward_fn=nf_reward_fn,
+              nf_params=_reward_q_params(),
+              goal_mean=np.asarray(_gmean_j, dtype=np.float32),
+              goal_std=np.asarray(_gstd_j, dtype=np.float32),
+              future_horizon=int(
+                  getattr(config, 'crl_future_horizon', 0) or 0),
+          )
+          nf_bin_acc, nf_bin_n = nf_eval_binary_accuracy(
+              eval_packed, eval_acts, eval_dones,
+              rng=np.random.default_rng(int(seed) + 17 * int(iteration) + 3),
+              **_nf_bin_kwargs)
+          # Second collector: Uniform[-1,1] actions on a fresh reset.
+          obs = vec_env.reset()
+          rand_packed = np.zeros_like(eval_packed)
+          rand_acts = np.zeros_like(eval_acts)
+          rand_dones = np.zeros_like(eval_dones)
+          _rand_rng = np.random.default_rng(
+              int(seed) + 31 * int(iteration) + 5)
+          for _t in range(int(T)):
+            a = _rand_rng.uniform(
+                -1.0, 1.0, size=(E, _eval_act_dim)).astype(np.float32)
+            rand_packed[_t] = np.asarray(obs, dtype=np.float32)
+            rand_acts[_t] = a
+            obs, _, dones, _, _ = vec_env.step(a)
+            rand_dones[_t] = np.asarray(dones, dtype=bool)
+          nf_bin_acc_rand, nf_bin_n_rand = nf_eval_binary_accuracy(
+              rand_packed, rand_acts, rand_dones,
+              rng=np.random.default_rng(int(seed) + 41 * int(iteration) + 7),
+              **_nf_bin_kwargs)
         ep_metrics_list = [
             {
                 'episode_return': float(ep_ret[i]),
                 'episode_length': int(ep_n[i]),
                 'success': float(succ_bit[i]),
                 'success_1000': succ_1000,
+                'nf_binary_accuracy': nf_bin_acc,
+                'nf_binary_accuracy_n': float(nf_bin_n),
+                'nf_binary_accuracy_random': nf_bin_acc_rand,
+                'nf_binary_accuracy_random_n': float(nf_bin_n_rand),
+                **({
+                    'easy_success': float(any_easy_succ[i] >= 0.5),
+                    'very_easy_success': float(
+                        any_very_easy_succ[i] >= 0.5),
+                    'joint_frac_010': float(best_joint_frac_010[i]),
+                    'joint_frac_020': float(best_joint_frac_020[i]),
+                    'mean_abs_joint_err': float(
+                        best_mean_abs_joint_err[i]
+                        if np.isfinite(best_mean_abs_joint_err[i])
+                        else float('nan')),
+                } if _index_sanity else {}),
             }
             for i in range(E)
         ]
         _n_eval = int(E)
         next_done = np.zeros(E, dtype=np.float32)
         for i in range(E):
-          ep_obs[i] = [obs[i].copy()]
-          ep_act[i] = []
+          if _defer_isaac_replay:
+            ep_obs[i] = obs[i:i + 1].astype(np.float32).copy()
+            ep_act[i] = np.zeros((0, act_dim_cfg), dtype=np.float32)
+          else:
+            ep_obs[i] = [obs[i].copy()]
+            ep_act[i] = []
           ep_return[i] = 0.0
           ep_flow_dense_return[i] = 0.0
           ep_has_flow_dense[i] = False
@@ -5850,7 +6712,20 @@ def run_ppo_training(
       print(f'[ppo] eval iter={iteration}: {_gpu_part}'
             f'total={_eval_total_s:.2f}s E={_n_eval} '
             f'success={agg.get("success", float("nan")):.3f} '
-            f'very_hard={agg.get("very_hard_success", float("nan")):.3f}',
+            f'very_hard={agg.get("very_hard_success", float("nan")):.3f}'
+            + (f' jfrac10={agg.get("joint_frac_010", float("nan")):.3f} '
+               f'jfrac20={agg.get("joint_frac_020", float("nan")):.3f} '
+               f'mae={agg.get("mean_abs_joint_err", float("nan")):.3f}'
+               if _index_sanity else '')
+            + (f' nfbin={agg.get("nf_binary_accuracy", float("nan")):.3f}'
+               f' n={int(agg.get("nf_binary_accuracy_n", 0) or 0)}'
+               if np.isfinite(agg.get('nf_binary_accuracy', float('nan')))
+               else '')
+            + (f' nfbin_rand={agg.get("nf_binary_accuracy_random", float("nan")):.3f}'
+               f' n={int(agg.get("nf_binary_accuracy_random_n", 0) or 0)}'
+               if np.isfinite(agg.get(
+                   'nf_binary_accuracy_random', float('nan')))
+               else ''),
             flush=True)
 
     # =================================================================
@@ -5993,6 +6868,8 @@ def run_ppo_training(
         _checkpoint_extra['nf_time_ema'] = nf_time_ema
       if reward_normalizer is not None:
         _checkpoint_extra['reward_normalizer'] = reward_normalizer.state_dict()
+      if _use_nf_shift and _nf_shift_value is not None:
+        _checkpoint_extra['nf_reward_shift'] = float(_nf_shift_value)
       ckpt_kw = dict(
           policy_params=ppo_params['policy'],
           value_params=ppo_params['value'],
@@ -6015,6 +6892,63 @@ def run_ppo_training(
             _checkpoint_extra, replay=_replay_state)
       _save_checkpoint(os.path.join(checkpoint_dir, 'latest.pkl'), **ckpt_kw)
       _prune_old_checkpoints(checkpoint_dir, ckpt_keep_last)
+
+    # =================================================================
+    # 7b. Allegro in-train video (subprocess; needs a ckpt on disk)
+    # =================================================================
+    if (_allegro_in_train_video
+        and allegro_video_dir is not None
+        and iteration % _video_interval == 0
+        and not (iteration == 0 and _skip_first_video)):
+      import subprocess as _sp
+      import sys as _sys
+      import time as _time
+      _vid_ckpt = os.path.join(
+          checkpoint_dir, f'ckpt_iter_{iteration:07d}.pkl')
+      if not os.path.isfile(_vid_ckpt):
+        # Video interval without a milestone this iter: dump a lean ckpt.
+        _vid_ckpt = os.path.join(checkpoint_dir, '_in_train_video.pkl')
+        _save_checkpoint(
+            _vid_ckpt,
+            policy_params=ppo_params['policy'],
+            value_params=ppo_params['value'],
+            q_params=q_params,
+            ppo_opt_state=ppo_opt_state,
+            q_opt_state=q_opt_state,
+            iteration=iteration,
+            global_step=global_step,
+            key=key,
+            q_params_ema=(q_params_reward if _use_repr_ema else None),
+            td3_policy_target=(
+                td3_policy_target if _use_td3_target_policy else None),
+            extra_state=None)
+      _vid_out = os.path.join(
+          allegro_video_dir, f'iter_{int(iteration):07d}_stoch.mp4')
+      _vid_t0 = _time.time()
+      _cmd = [
+          _sys.executable, '-u', _allegro_vid_script,
+          f'--checkpoint={_vid_ckpt}',
+          f'--output={_vid_out}',
+          '--episodes=1',
+          '--fps=30',
+          f'--seed={int(seed) + int(iteration)}',
+          f'--pipeline={_allegro_pipeline}',
+      ]
+      try:
+        _proc = _sp.run(
+            _cmd, check=False, capture_output=True, text=True, timeout=300)
+        if _proc.returncode == 0 and os.path.isfile(_vid_out):
+          print(f'[ppo] allegro video iter={iteration}: wrote {_vid_out} '
+                f'in {_time.time() - _vid_t0:.1f}s', flush=True)
+        else:
+          _err = (_proc.stderr or _proc.stdout or '').strip().splitlines()
+          _tail = '\n'.join(_err[-8:]) if _err else '(no output)'
+          print(f'[ppo] allegro video iter={iteration}: FAILED '
+                f'rc={_proc.returncode} after {_time.time() - _vid_t0:.1f}s\n'
+                f'{_tail}', flush=True)
+      except Exception as _vid_exc:
+        print(f'[ppo] allegro video iter={iteration}: FAILED after '
+              f'{_time.time() - _vid_t0:.1f}s: {_vid_exc}', flush=True)
 
   # ---- return final state in case the caller wants to checkpoint --------
   return PPOTrainingState(

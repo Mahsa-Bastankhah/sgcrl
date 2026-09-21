@@ -261,6 +261,7 @@ def make_td3_density_update_fn(
     obs_norm_clip: float = 10.0,
     goal_state_indices=None,
     fb_loss: bool = False,
+    _return_replay_pos_scores: bool = False,
 ):
   """Jitted TD3 twin-Q update over one EpisodeReplay batch.
 
@@ -410,6 +411,12 @@ def make_td3_density_update_fn(
         online_params['qf1'], obs_network, action_flat)
     q2 = density_nets.qf2_net.apply(
         online_params['qf2'], obs_network, action_flat)
+    if use_cross:
+      q1_paired = jnp.diag(q1.reshape(B, B))
+    else:
+      q1_paired = q1
+    replay_pos_scores = jax.lax.stop_gradient(
+        jnp.log((1.0 - gamma) * jnp.maximum(q1_paired, 1e-8)))
     qf1_mse = jnp.mean((q1 - target_q) ** 2)
     qf2_mse = jnp.mean((q2 - target_q) ** 2)
 
@@ -441,6 +448,9 @@ def make_td3_density_update_fn(
         'td3_qf2_mse': qf2_mse,
         'td3_q1_mean': jnp.mean(q1),
         'td3_q2_mean': jnp.mean(q2),
+        'replay_pos_logp_mean': jnp.mean(replay_pos_scores),
+        'replay_pos_logp_p10': jnp.percentile(replay_pos_scores, 10.0),
+        'replay_pos_logp_p90': jnp.percentile(replay_pos_scores, 90.0),
         'td3_target_mean': jnp.mean(target_q),
         'td3_reward_mean': jnp.mean(rewards_flat),
         'td3_goal_hit_frac': jnp.mean(rewards_flat),
@@ -452,6 +462,8 @@ def make_td3_density_update_fn(
       # Diagonal = original paired (s_i, g_i) hits; useful sanity check vs
       # the full B² hit rate which includes many intentional negatives.
       metrics['td3_goal_hit_frac_diag'] = jnp.mean(jnp.diag(rewards))
+    if _return_replay_pos_scores:
+      metrics['_replay_pos_logp_values'] = replay_pos_scores
     return loss, metrics
 
   grad_fn = jax.value_and_grad(_critic_loss, has_aux=True)
@@ -568,6 +580,7 @@ def make_scan_td3_update_fn(
       obs_norm_clip=obs_norm_clip,
       goal_state_indices=goal_state_indices,
       fb_loss=fb_loss,
+      _return_replay_pos_scores=True,
   )
   use_ema = 0.0 < float(repr_tau) < 1.0
   _tau = float(repr_tau)
@@ -594,8 +607,14 @@ def make_scan_td3_update_fn(
             scan_step,
             (q_params, opt_state, params_ema, key, policy_target_params),
             batches))
+    replay_pos_scores = metrics.pop('_replay_pos_logp_values').reshape(-1)
     # Average metrics across the N scanned critic steps.
     metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+    metrics['replay_pos_logp_mean'] = jnp.mean(replay_pos_scores)
+    metrics['replay_pos_logp_p10'] = jnp.percentile(
+        replay_pos_scores, 10.0)
+    metrics['replay_pos_logp_p90'] = jnp.percentile(
+        replay_pos_scores, 90.0)
     return (q_params, opt_state, params_ema, key, policy_target_params,
             metrics)
 

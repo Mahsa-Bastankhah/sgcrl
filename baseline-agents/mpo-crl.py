@@ -21,6 +21,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
   sys.path.insert(0, str(_ROOT))
 
+# Allegro / Isaac Gym: create GPU PhysX BEFORE JAX/TF take the CUDA context.
+from envs.isaacgym_physx_bootstrap import maybe_create_from_argv as _ig_boot
+_ig_boot()
+
 import sgcrl_jax_acme_compat  # noqa: E402,F401
 
 from absl import app, flags  # noqa: E402
@@ -136,6 +140,137 @@ def _comma_ints(value: str):
   return tuple(int(item) for item in value.split(',') if item.strip())
 
 
+def _configure_allegro_packing(config):
+  """Match ppo_contrastive packing for Allegro throw and control-sanity modes."""
+  from envs.allegro_kuka_throw_env import GOAL_DIM
+  from envs.allegro_kuka_throw_env import GOAL_DIM_ARM23_CONTROL
+  from envs.allegro_kuka_throw_env import GOAL_DIM_FINGER_CONTROL
+  from envs.allegro_kuka_throw_env import STATE_DIM
+  from envs.allegro_kuka_throw_env import STATE_DIM_CONTROL
+
+  sanity = str(FLAGS.isaacgym_control_sanity_mode).strip().lower()
+  if sanity in ('', 'none'):
+    sanity = 'off'
+  if bool(FLAGS.isaacgym_control_sanity_trim_sa):
+    raise ValueError(
+        'MPO-CRL Allegro is only wired for the untrimmed 46-D state '
+        '(no --isaacgym_control_sanity_trim_sa)')
+  if sanity == 'off':
+    if bool(FLAGS.isaacgym_joint_goal) or bool(FLAGS.isaacgym_palm_goal):
+      raise ValueError(
+          'MPO-CRL Allegro throw packing supports object-goal only '
+          '(no --isaacgym_joint_goal / --isaacgym_palm_goal)')
+    # Same as ppo_contrastive default throw: state = q+qd+object xyz (49),
+    # goal = bucket xyz (3). Hindsight is the last 3 state entries.
+    config.obs_dim = int(STATE_DIM)
+    config.goal_dim = int(GOAL_DIM)
+    config.start_index = int(STATE_DIM - GOAL_DIM)
+    config.end_index = int(STATE_DIM)
+  elif sanity not in (
+      'finger', 'hand16', 'hand16fig', 'hand16ok', 'hand16peace',
+      'hand16point', 'hand16gun', 'arm23wave'):
+    raise ValueError(
+        'MPO-CRL Allegro currently supports off/finger/hand16/hand16fig/'
+        'hand16ok/hand16peace/hand16point/hand16gun/arm23wave, '
+        f'got {sanity!r}')
+  else:
+    config.obs_dim = int(STATE_DIM_CONTROL)
+    if sanity == 'arm23wave':
+      config.goal_dim = int(GOAL_DIM_ARM23_CONTROL)
+      config.start_index = 0
+      config.end_index = 23
+    else:
+      config.goal_dim = int(GOAL_DIM_FINGER_CONTROL)
+      config.start_index = 7
+      config.end_index = 23
+  config.goal_state_indices = None
+  config.max_episode_steps = int(FLAGS.isaacgym_episode_length)
+  print(
+      f'[mpo-crl] allegro packing: mode={sanity} state={config.obs_dim} '
+      f'goal={config.goal_dim} start={config.start_index} '
+      f'end={config.end_index} T={config.max_episode_steps}',
+      flush=True)
+
+
+def _isaacgym_kwargs_from_flags():
+  """Same Isaac kwargs dict ppo_contrastive passes into the Isaac learner."""
+  return {
+      'isaacgym_episode_length': int(FLAGS.isaacgym_episode_length),
+      'isaacgym_fixed_target_xyz': tuple(
+          float(v) for v in FLAGS.isaacgym_fixed_target_xyz),
+      'isaacgym_pipeline': str(FLAGS.isaacgym_pipeline).strip().lower(),
+      'isaacgym_randomize_init': bool(FLAGS.isaacgym_randomize_init),
+      'isaacgym_randomize_object_xyz': bool(
+          FLAGS.isaacgym_randomize_object_xyz),
+      'isaacgym_randomize_object_shape': bool(
+          FLAGS.isaacgym_randomize_object_shape),
+      'isaacgym_palm_goal': bool(FLAGS.isaacgym_palm_goal) and not bool(
+          FLAGS.isaacgym_joint_goal),
+      'isaacgym_palm_goal_xyz': tuple(
+          float(v) for v in FLAGS.isaacgym_palm_goal_xyz),
+      'isaacgym_joint_goal': bool(FLAGS.isaacgym_joint_goal),
+      'isaacgym_control_sanity_mode': str(
+          FLAGS.isaacgym_control_sanity_mode),
+      'isaacgym_control_sanity_palm_xyz': tuple(
+          float(v) for v in FLAGS.isaacgym_control_sanity_palm_xyz),
+      'isaacgym_control_sanity_finger_tol': float(
+          FLAGS.isaacgym_control_sanity_finger_tol),
+      'isaacgym_control_sanity_palm_tol': float(
+          FLAGS.isaacgym_control_sanity_palm_tol),
+      'isaacgym_control_sanity_trim_sa': bool(
+          FLAGS.isaacgym_control_sanity_trim_sa
+          or FLAGS.isaacgym_control_sanity_mode == 'index_thumb_straight'),
+      'isaacgym_control_sanity_trim_init_range_frac': float(
+          FLAGS.isaacgym_control_sanity_trim_init_range_frac),
+      'isaacgym_control_sanity_trim_init_mode': str(
+          FLAGS.isaacgym_control_sanity_trim_init_mode),
+      'isaacgym_control_sanity_q_only': bool(
+          FLAGS.isaacgym_control_sanity_q_only),
+      'isaacgym_control_sanity_goal_include_qd': bool(
+          FLAGS.isaacgym_control_sanity_goal_include_qd),
+      'isaacgym_coordinate_mode': str(FLAGS.isaacgym_coordinate_mode),
+      'isaacgym_table_push': bool(FLAGS.isaacgym_table_push),
+      'isaacgym_table_push_xyz': tuple(
+          float(v) for v in FLAGS.isaacgym_table_push_xyz),
+      'isaacgym_table_spawn': bool(FLAGS.isaacgym_table_spawn),
+      'isaacgym_table_spawn_object_xy': tuple(
+          float(v) for v in FLAGS.isaacgym_table_spawn_object_xy),
+      'isaacgym_table_spawn_behind': bool(
+          FLAGS.isaacgym_table_spawn_behind),
+      'isaacgym_table_spawn_behind_dy': float(
+          FLAGS.isaacgym_table_spawn_behind_dy),
+      'isaacgym_table_spawn_behind_above': float(
+          FLAGS.isaacgym_table_spawn_behind_above),
+      'isaacgym_table_spawn_correlated_xy': float(
+          FLAGS.isaacgym_table_spawn_correlated_xy),
+      'isaacgym_table_spawn_finger_curl_scale': float(
+          FLAGS.isaacgym_table_spawn_finger_curl_scale),
+      'isaacgym_table_spawn_finger_noise': float(
+          FLAGS.isaacgym_table_spawn_finger_noise),
+      'isaacgym_table_spawn_arm_noise': float(
+          FLAGS.isaacgym_table_spawn_arm_noise),
+      'isaacgym_table_spawn_toward_bucket': bool(
+          FLAGS.isaacgym_table_spawn_toward_bucket),
+      'isaacgym_table_spawn_in_hand': bool(
+          FLAGS.isaacgym_table_spawn_in_hand),
+      'isaacgym_table_spawn_in_hand_offset': float(
+          FLAGS.isaacgym_table_spawn_in_hand_offset),
+      'isaacgym_table_spawn_in_hand_obj_noise': float(
+          FLAGS.isaacgym_table_spawn_in_hand_obj_noise),
+      'isaacgym_table_spawn_in_hand_keep_arm': bool(
+          FLAGS.isaacgym_table_spawn_in_hand_keep_arm),
+      'isaacgym_table_spawn_in_hand_wrist_offset': float(
+          FLAGS.isaacgym_table_spawn_in_hand_wrist_offset),
+      'isaacgym_table_spawn_in_hand_wrist_noise': float(
+          FLAGS.isaacgym_table_spawn_in_hand_wrist_noise),
+      'isaacgym_large_table': bool(FLAGS.isaacgym_large_table),
+      'isaacgym_hide_table': bool(FLAGS.isaacgym_hide_table),
+      'isaacgym_throw_success': str(FLAGS.isaacgym_throw_success),
+      'isaacgym_reset_z_above': float(FLAGS.isaacgym_reset_z_above),
+      'isaacgym_goal_z': float(FLAGS.isaacgym_goal_z),
+  }
+
+
 def main(_):
   env_name = FLAGS.env
   seed = int(FLAGS.seed)
@@ -167,6 +302,8 @@ def main(_):
         FLAGS.ppo_crl_loss_direction.strip().lower())
   if FLAGS.hidden_layer_sizes.strip():
     config.hidden_layer_sizes = _comma_ints(FLAGS.hidden_layer_sizes)
+  if FLAGS.crl_future_horizon >= 0:
+    config.crl_future_horizon = int(FLAGS.crl_future_horizon)
 
   default_rollout = int(config.ppo_rollout_length)
   default_crl_updates = int(config.ppo_crl_steps_per_iter)
@@ -251,41 +388,92 @@ def main(_):
       total_steps = BUILDERBENCH_NUM_STEPS
       config.max_number_of_steps = total_steps
 
+  # Allegro goals are baked into the PhysX wrapper; there is no sgcrl
+  # fixed_goal_dict entry (same skip as ppo_contrastive).
+  use_isaac = env_name.startswith('allegro_kuka')
   fixed_start_end = (
-      ppo_entry.fixed_goal_for_env(env_name) if config.fix_goals else None)
+      None if use_isaac
+      else (ppo_entry.fixed_goal_for_env(env_name) if config.fix_goals else None))
   if mpo_config.use_td_critic and fixed_start_end is None:
     raise ValueError(
         '--mpo_use_td_critic trains G(s,a) without a goal input and therefore '
         'requires a fixed goal; remove --sample_goals and use an environment '
         'with a configured fixed goal')
   env_kwargs = {}
+  if env_name in ('sawyer_bin', 'sawyer_peg'):
+    env_kwargs['randomize_init'] = bool(FLAGS.sawyer_randomize_init)
+    if not FLAGS.sawyer_randomize_init:
+      print(f'[mpo] {env_name} init: frozen (no MetaWorld object/hole randomness)')
+  if env_name == 'sawyer_bin' and FLAGS.sawyer_bin_safe_grasp_reset:
+    env_kwargs['safe_grasp_reset'] = True
+    print('[mpo] sawyer_bin init: bounded safe grasp reset with validation')
   if env_name == 'sawyer_bin' and FLAGS.bin_randomize_gripper_init:
-    env_kwargs['randomize_gripper_init'] = True
+    if FLAGS.sawyer_bin_metaworld_hand_init:
+      print('[mpo] sawyer_bin init: ignoring --bin_randomize_gripper_init '
+            '(MetaWorld native hand init requested)')
+    elif FLAGS.sawyer_randomize_init:
+      env_kwargs['randomize_gripper_init'] = True
+      print('[mpo] sawyer_bin init: randomized gripper position at reset')
+    else:
+      print('[mpo] sawyer_bin init: ignoring --bin_randomize_gripper_init '
+            '(frozen by --sawyer_randomize_init=false)')
+  if env_name == 'sawyer_bin' and FLAGS.bin_randomize_tcp_z:
+    if FLAGS.bin_randomize_gripper_init:
+      print('[mpo] sawyer_bin init: ignoring --bin_randomize_tcp_z '
+            '(MPO XY+Z jitter already requested)')
+    elif FLAGS.sawyer_bin_metaworld_hand_init:
+      print('[mpo] sawyer_bin init: ignoring --bin_randomize_tcp_z '
+            '(MetaWorld native hand init requested)')
+    elif FLAGS.sawyer_randomize_init:
+      env_kwargs['randomize_tcp_z'] = True
+      print('[mpo] sawyer_bin init: TCP z Uniform(3cm, 6cm), XY centered on object')
+    else:
+      print('[mpo] sawyer_bin init: ignoring --bin_randomize_tcp_z '
+            '(frozen by --sawyer_randomize_init=false)')
   if env_name.startswith('builderbench_'):
     env_kwargs.update(
         builderbench_use_pd=bool(FLAGS.builderbench_use_pd),
         builderbench_pd_duration=int(FLAGS.builderbench_pd_duration),
         builderbench_permute_start_boxes=bool(
             FLAGS.builderbench_permute_start_boxes))
+    if float(FLAGS.builderbench_fixed_start_x) >= 0:
+      env_kwargs['builderbench_fixed_start_x'] = float(
+          FLAGS.builderbench_fixed_start_x)
+    if int(FLAGS.builderbench_mj_episode_length) > 0:
+      env_kwargs['builderbench_mj_episode_length'] = int(
+          FLAGS.builderbench_mj_episode_length)
 
-  def env_factory(factory_seed):
-    env, _ = contrastive_utils.make_environment(
-        env_name, config.start_index, config.end_index, factory_seed,
+  isaacgym_kwargs = None
+  if use_isaac:
+    _configure_allegro_packing(config)
+    isaacgym_kwargs = _isaacgym_kwargs_from_flags()
+
+    def env_factory(factory_seed):
+      raise RuntimeError(
+          'Allegro MPO-CRL uses IsaacGymVecEnv, not env_factory')
+
+    def eval_env_factory(factory_seed):
+      raise RuntimeError(
+          'Allegro MPO-CRL eval uses the shared IsaacGymVecEnv')
+  else:
+    def env_factory(factory_seed):
+      env, _ = contrastive_utils.make_environment(
+          env_name, config.start_index, config.end_index, factory_seed,
+          fixed_start_end=fixed_start_end, **env_kwargs)
+      return env
+
+    def eval_env_factory(factory_seed):
+      env, _ = contrastive_utils.make_environment(
+          env_name, config.start_index, config.end_index, factory_seed,
+          fixed_start_end=ppo_entry.fixed_goal_for_env(env_name), **env_kwargs)
+      return env
+
+    probe_env, obs_dim = contrastive_utils.make_environment(
+        env_name, config.start_index, config.end_index, seed,
         fixed_start_end=fixed_start_end, **env_kwargs)
-    return env
-
-  def eval_env_factory(factory_seed):
-    env, _ = contrastive_utils.make_environment(
-        env_name, config.start_index, config.end_index, factory_seed,
-        fixed_start_end=ppo_entry.fixed_goal_for_env(env_name), **env_kwargs)
-    return env
-
-  probe_env, obs_dim = contrastive_utils.make_environment(
-      env_name, config.start_index, config.end_index, seed,
-      fixed_start_end=fixed_start_end, **env_kwargs)
-  config.obs_dim = int(obs_dim)
-  config.max_episode_steps = int(getattr(probe_env, '_step_limit')) + 1
-  del probe_env
+    config.obs_dim = int(obs_dim)
+    config.max_episode_steps = int(getattr(probe_env, '_step_limit')) + 1
+    del probe_env
 
   network_factory = functools.partial(
       contrastive.make_networks,
@@ -340,7 +528,9 @@ def main(_):
       f'{mpo_config.critic_target_update_rate} reward_norm='
       f'{mpo_config.normalize_critic_reward} reward_norm_rate='
       f'{mpo_config.critic_reward_norm_rate} bootstrap_actions='
-      f'{mpo_config.bootstrap_action_samples} run_dir={run_dir}')
+      f'{mpo_config.bootstrap_action_samples} '
+      f'crl_future_horizon={int(getattr(config, "crl_future_horizon", 0) or 0)} '
+      f'run_dir={run_dir}')
 
   _bb_kwargs = None
   if env_name.startswith('builderbench_'):
@@ -359,7 +549,8 @@ def main(_):
       total_steps=total_steps,
       seed=seed,
       checkpoint_dir=os.path.join(run_dir, 'checkpoints'),
-      builderbench_kwargs=_bb_kwargs)
+      builderbench_kwargs=_bb_kwargs,
+      isaacgym_kwargs=isaacgym_kwargs)
 
 
 if __name__ == '__main__':

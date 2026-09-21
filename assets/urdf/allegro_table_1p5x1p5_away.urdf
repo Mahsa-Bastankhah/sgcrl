@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<robot name="allegro_table_1p5x1p5_away">
+  <!--
+    Actor origin and top height match NVIDIA's table_narrow. The tabletop
+    keeps the robot-facing edge at y=+0.2 and expands away from the robot:
+      x = [-0.75, +0.75], y = [-1.30, +0.20], top z = 0.53.
+  -->
+  <link name="box">
+    <visual>
+      <origin xyz="0 -0.55 0"/>
+      <geometry>
+        <box size="1.5 1.5 0.3"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 -0.55 0"/>
+      <geometry>
+        <box size="1.5 1.5 0.3"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 -0.55 0"/>
+      <mass value="500"/>
+      <inertia ixx="1000.0" ixy="0.0" ixz="0.0"
+               iyy="1000.0" iyz="0.0" izz="1000.0"/>
+    </inertial>
+  </link>
+</robot>

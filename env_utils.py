@@ -157,6 +157,22 @@ def load(env_name, fixed_start_end=None, seed=None, **env_kwargs):
       kwargs['randomize_gripper_init'] = env_kwargs['randomize_gripper_init']
     if 'randomize_init' in env_kwargs:
       kwargs['randomize_init'] = env_kwargs['randomize_init']
+    if 'metaworld_hand_init' in env_kwargs:
+      kwargs['metaworld_hand_init'] = env_kwargs['metaworld_hand_init']
+    if 'safe_grasp_reset' in env_kwargs:
+      kwargs['safe_grasp_reset'] = env_kwargs['safe_grasp_reset']
+    if 'randomize_tcp_z' in env_kwargs:
+      kwargs['randomize_tcp_z'] = env_kwargs['randomize_tcp_z']
+    if 'bounded_step_mocap' in env_kwargs:
+      kwargs['bounded_step_mocap'] = env_kwargs['bounded_step_mocap']
+    if 'selective_antiwindup_mocap' in env_kwargs:
+      kwargs['selective_antiwindup_mocap'] = env_kwargs[
+          'selective_antiwindup_mocap']
+    if 'terminate_tracking_error' in env_kwargs:
+      kwargs['terminate_tracking_error'] = env_kwargs[
+          'terminate_tracking_error']
+    if int(env_kwargs.get('max_episode_steps', 0) or 0) > 0:
+      max_episode_steps = int(env_kwargs['max_episode_steps'])
   elif env_name == 'sawyer_box':
     CLASS = SawyerBox
     max_episode_steps = 150
@@ -167,6 +183,8 @@ def load(env_name, fixed_start_end=None, seed=None, **env_kwargs):
     kwargs['fixed_start_end'] = fixed_start_end
     if 'randomize_init' in env_kwargs:
       kwargs['randomize_init'] = env_kwargs['randomize_init']
+    if int(env_kwargs.get('max_episode_steps', 0) or 0) > 0:
+      max_episode_steps = int(env_kwargs['max_episode_steps'])
   elif env_name == 'sawyer_reach':
     CLASS = SawyerReach
     max_episode_steps = 150
@@ -357,9 +375,11 @@ def resolve_uniform_goal_bounds(
 class SawyerBin(_MW_BIN):
   """Wrapper for the SawyerBin environment."""
 
-  # Goal slice of ``_get_obs()`` (7-d): [goal_xyz+offset, grip, goal_xyz].
-  # Ranges from ``reset()`` goal sampling (bin_goal ± 0.05, interp to object,
-  # z ∈ [0.03, 0.12]); empirically verified on bin-picking-v2.
+  # Goal slice of ``_get_obs()`` (7-d): [grasp_hand, grip≈cube width, object=_goal].
+  # ψ: fingers around the cube on the floor at the success target.
+  # Success still only checks ‖object − _goal‖.
+  PSI_TCP_ABOVE_OBJ = 0.03  # finger/TCP geometry for a grasp around the cube
+  PSI_GRIPPER = 0.4         # ≈ cube width 0.04 m / 0.1 (tight hold, not 0)
   UNIFORM_GOAL_OBS_LOW = np.array(
       [-0.22, 0.64, 0.01, 0.2, -0.22, 0.64, 0.01], dtype=np.float32)
   UNIFORM_GOAL_OBS_HIGH = np.array(
@@ -369,14 +389,66 @@ class SawyerBin(_MW_BIN):
     """Bounds on the goal block appended in ``_get_obs`` (for CRL uniform negs)."""
     return self.UNIFORM_GOAL_OBS_LOW.copy(), self.UNIFORM_GOAL_OBS_HIGH.copy()
 
+  def _set_gripper_obs_width(self, target: float) -> float:
+    """Set finger joints to the closest requested normalized aperture."""
+    target = float(np.clip(target, 0.0, 1.0))
+    r_id = self.model.joint_name2id('r_close')
+    l_id = self.model.joint_name2id('l_close')
+    r_adr = int(self.model.jnt_qposadr[r_id])
+    l_adr = int(self.model.jnt_qposadr[l_id])
+    cached = getattr(self, '_gripper_width_alpha', None)
+    if cached is not None:
+      self.data.qpos[r_adr] = 0.04 * cached
+      self.data.qpos[l_adr] = -0.03 * cached
+      self.sim.forward()
+      right = self._get_site_pos('rightEndEffector')
+      left = self._get_site_pos('leftEndEffector')
+      return float(np.clip(np.linalg.norm(right - left) / 0.1, 0., 1.))
+
+    best = None
+    # Calibrate against the actual finger-site distance instead of assuming
+    # which endpoint is open in this MetaWorld XML.
+    for alpha in np.linspace(0.0, 1.0, 101):
+      self.data.qpos[r_adr] = 0.04 * alpha
+      self.data.qpos[l_adr] = -0.03 * alpha
+      self.sim.forward()
+      right = self._get_site_pos('rightEndEffector')
+      left = self._get_site_pos('leftEndEffector')
+      width = float(np.clip(np.linalg.norm(right - left) / 0.1, 0., 1.))
+      err = abs(width - target)
+      if best is None or err < best[0]:
+        best = (err, float(alpha), width)
+    _, alpha, width = best
+    self._gripper_width_alpha = alpha
+    self.data.qpos[r_adr] = 0.04 * alpha
+    self.data.qpos[l_adr] = -0.03 * alpha
+    self.sim.forward()
+    return width
+
   def __init__(self, fixed_start_end=None, randomize_gripper_init=False,
-               randomize_init=True):
+               randomize_init=True, metaworld_hand_init=False,
+               safe_grasp_reset=False, randomize_tcp_z=False,
+               bounded_step_mocap=False, selective_antiwindup_mocap=False,
+               terminate_tracking_error=False):
     _require_metaworld('sawyer_bin')
     self._goal = np.zeros(3)
+    self._gripper_width_alpha = None
+    self._metaworld_hand_init = bool(metaworld_hand_init)
+    self._safe_grasp_reset = bool(safe_grasp_reset)
+    self._bounded_step_mocap = bool(bounded_step_mocap)
+    self._selective_antiwindup_mocap = bool(selective_antiwindup_mocap)
+    self._terminate_tracking_error = bool(terminate_tracking_error)
+    if self._bounded_step_mocap and self._selective_antiwindup_mocap:
+      raise ValueError(
+          'bounded_step_mocap and selective_antiwindup_mocap are separate '
+          'controller modes and cannot be combined')
     # Freeze-init runs must also pin the gripper TCP (no offset noise).
     self._randomize_init = bool(randomize_init)
     self._randomize_gripper_init = (
         bool(randomize_gripper_init) and self._randomize_init)
+    self._randomize_tcp_z = (
+        bool(randomize_tcp_z) and self._randomize_init
+        and not self._randomize_gripper_init)
     super(SawyerBin, self).__init__()
     self._partially_observable = False
     self._freeze_rand_vec = False
@@ -387,8 +459,54 @@ class SawyerBin(_MW_BIN):
       self.random_init = False
     self.reset()
 
-  def reset(self):
-    super(SawyerBin, self).reset()
+  def set_xyz_action(self, action):
+    """Set the TCP target without accumulating mocap tracking error."""
+    if self._selective_antiwindup_mocap:
+      action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
+      pos_delta = action * float(self.action_scale)
+      tcp = np.asarray(self.get_endeff_pos(), dtype=np.float64)
+      mocap = np.asarray(self.data.mocap_pos[0], dtype=np.float64)
+      error = mocap - tcp
+      error_norm = float(np.linalg.norm(error))
+
+      # Below the threshold this is exactly MetaWorld's legacy integrator:
+      # mocap_target <- mocap_target + action_scale * clipped_action.
+      if error_norm < 0.15:
+        return super(SawyerBin, self).set_xyz_action(action)
+
+      # Once tracking error is large, remove only the proposed increment's
+      # outward radial component. Tangential and error-reducing motion remains.
+      if error_norm > 0.0:
+        outward_dir = error / error_norm
+        outward = float(np.dot(pos_delta, outward_dir))
+        if outward > 0.0:
+          pos_delta = pos_delta - outward * outward_dir
+      target = np.clip(mocap + pos_delta, self.mocap_low, self.mocap_high)
+
+      # Hard backstop on the integrator state. This is intentionally not
+      # global action clipping: only mocap-target/TCP separation is projected.
+      target_error = target - tcp
+      target_error_norm = float(np.linalg.norm(target_error))
+      if target_error_norm > 0.20:
+        target = tcp + (0.20 / target_error_norm) * target_error
+        target = np.clip(target, self.mocap_low, self.mocap_high)
+      self.data.set_mocap_pos('mocap', target)
+      self.data.set_mocap_quat(
+          'mocap', np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float64))
+      return None
+
+    if not self._bounded_step_mocap:
+      return super(SawyerBin, self).set_xyz_action(action)
+
+    action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
+    pos_delta = action * float(self.action_scale)
+    tcp = np.asarray(self.get_endeff_pos(), dtype=np.float64)
+    target = np.clip(tcp + pos_delta, self.mocap_low, self.mocap_high)
+    self.data.set_mocap_pos('mocap', target)
+    self.data.set_mocap_quat(
+        'mocap', np.array([1.0, 0.0, 1.0, 0.0], dtype=np.float64))
+
+  def _set_reset_goal(self):
     body_id = self.model.body_name2id('bin_goal')
     pos1 = self.sim.data.body_xpos[body_id].copy()
     pos1 += np.random.uniform(-0.05, 0.05, 3)
@@ -402,31 +520,109 @@ class SawyerBin(_MW_BIN):
         self._goal[2] = np.random.uniform(0.03, 0.12)
     self._target_pos = self._goal
 
-    # ── Move gripper to be just above / touching the object at episode start ──
-    # The agent begins with its fingers around the cube (open, ready to grasp)
-    # rather than at the default arm-retracted position.
-    obj_pos     = self._get_pos_objects().copy()
+  def _grasp_target(self, obj_pos):
+    tcp_z = float(self.PSI_TCP_ABOVE_OBJ)
     if self._randomize_gripper_init:
-      grip_target = obj_pos + np.array([
+      return obj_pos + np.array([
           np.random.uniform(-0.05, 0.05),
           np.random.uniform(-0.05, 0.05),
-          np.random.uniform(0.01, 0.06),
+          np.random.uniform(tcp_z, tcp_z + 0.03),
       ], dtype=np.float64)
-    else:
-      grip_target = obj_pos + np.array([0., 0., 0.03], dtype=np.float64)
-    mocap_pos   = grip_target.copy()
-    mocap_quat  = np.array([1., 0., 1., 0.], dtype=np.float64)
-    for _ in range(50):
-        mocap_pos += grip_target - self.get_endeff_pos()
-        self.data.set_mocap_pos('mocap', mocap_pos)
-        self.data.set_mocap_quat('mocap', mocap_quat)
-        self.do_simulation([-1, 1], self.frame_skip)   # gripper open
+    if self._randomize_tcp_z:
+      return obj_pos + np.array([
+          0., 0., np.random.uniform(tcp_z, tcp_z + 0.03),
+      ], dtype=np.float64)
+    return obj_pos + np.array([0., 0., tcp_z], dtype=np.float64)
+
+  def _legacy_grasp_reset(self):
+    """Original unbounded mocap servo, retained for historical runs."""
+    obj_pos = self._get_pos_objects().copy()
+    grip_target = self._grasp_target(obj_pos)
+    mocap_pos = grip_target.copy()
+    mocap_quat = np.array([1., 0., 1., 0.], dtype=np.float64)
+    for _ in range(100):
+      mocap_pos += grip_target - self.get_endeff_pos()
+      self.data.set_mocap_pos('mocap', mocap_pos)
+      self.data.set_mocap_quat('mocap', mocap_quat)
+      self.do_simulation([-1, 1], self.frame_skip)
     self.sim.forward()
-    # Re-lock object position in case physics nudged it during arm movement.
     self._set_obj_xyz(obj_pos)
+    self._set_gripper_obs_width(self.PSI_GRIPPER)
+    self.sim.forward()
+    return self._get_obs()
+
+  def _bounded_grasp_reset(self, obj_pos, grip_target):
+    """Move to ``grip_target`` without integrating tracking error."""
+    mocap_quat = np.array([1., 0., 1., 0.], dtype=np.float64)
+    target = np.asarray(grip_target, dtype=np.float64)
+
+    for _ in range(150):
+      tcp = np.asarray(self.get_endeff_pos(), dtype=np.float64)
+      error = target - tcp
+      if np.linalg.norm(error) <= 0.005:
+        break
+      mocap = np.asarray(self.data.mocap_pos[0], dtype=np.float64)
+      correction = np.clip(0.5 * error, -0.01, 0.01)
+      command = np.clip(mocap + correction, self.mocap_low, self.mocap_high)
+      self.data.set_mocap_pos('mocap', command)
+      self.data.set_mocap_quat('mocap', mocap_quat)
+      self.do_simulation([-1, 1], self.frame_skip)
+    else:
+      return False
+
+    # Let the arm settle while open, then restore the sampled object and set
+    # the desired aperture as the final operation (simulation would otherwise
+    # immediately drive the fingers open again).
+    self._set_obj_xyz(obj_pos)
+    for _ in range(5):
+      self.do_simulation([-1, 1], self.frame_skip)
+    self._set_obj_xyz(obj_pos)
+    width = self._set_gripper_obs_width(self.PSI_GRIPPER)
     self.sim.forward()
 
-    return self._get_obs()
+    hand = np.asarray(self.get_endeff_pos(), dtype=np.float64)
+    obj = np.asarray(self._get_pos_objects(), dtype=np.float64)
+    # Centered hover: hand must stay over the cube. MPO-style jitter: hand
+    # must reach the sampled TCP target and the object must stay put
+    # (no unbounded mocap shove).
+    if self._randomize_gripper_init or self._randomize_tcp_z:
+      pose_ok = (
+          np.linalg.norm(hand - target) <= 0.025
+          and np.linalg.norm(obj - np.asarray(obj_pos, dtype=np.float64)) <= 0.015)
+    else:
+      delta = hand - obj
+      pose_ok = (
+          np.linalg.norm(delta[:2]) <= 0.02
+          and 0.0 <= delta[2] <= 0.06)
+    return bool(
+        np.all(np.isfinite(hand))
+        and np.all(np.isfinite(obj))
+        and pose_ok
+        and abs(float(width) - float(self.PSI_GRIPPER)) <= 0.05)
+
+  def reset(self):
+    # Preserve the exact historical reset unless the opt-in safe path is used.
+    if not self._safe_grasp_reset:
+      super(SawyerBin, self).reset()
+      self._set_reset_goal()
+      if self._metaworld_hand_init:
+        return self._get_obs()
+      return self._legacy_grasp_reset()
+
+    # Rejection sampling defines the intended reset distribution conditioned
+    # on a reachable, physically realized floor grasp.
+    for _ in range(25):
+      super(SawyerBin, self).reset()
+      self._set_reset_goal()
+      if self._metaworld_hand_init:
+        return self._get_obs()
+      obj_pos = self._get_pos_objects().copy()
+      grip_target = self._grasp_target(obj_pos)
+      if self._bounded_grasp_reset(obj_pos, grip_target):
+        return self._get_obs()
+    raise RuntimeError(
+        'SawyerBin safe_grasp_reset could not produce a valid grasp in '
+        '25 sampled resets')
 
   def step(self, action):
     super(SawyerBin, self).step(action)
@@ -434,14 +630,30 @@ class SawyerBin(_MW_BIN):
     dist = np.linalg.norm(self._goal - obj_pos)
     obs = self._get_obs()
     r = float(dist < 0.05)  # Taken from metaworld
-    done = False
+    tracking_error = float(np.linalg.norm(
+        np.asarray(self.data.mocap_pos[0], dtype=np.float64)
+        - np.asarray(self.get_endeff_pos(), dtype=np.float64)))
+    tracking_error_termination = bool(
+        self._terminate_tracking_error and tracking_error > 0.20)
+    done = tracking_error_termination
     info = {}
+    if self._terminate_tracking_error:
+      info = {
+          'mocap_tracking_error': tracking_error,
+          'tracking_error_termination': tracking_error_termination,
+      }
         
     return obs, r, done, info
 
+  def _psi_held_object(self) -> np.ndarray:
+    """Object pose in the ψ goal: on the floor at the success target ``_goal``."""
+    return np.asarray(self._goal, dtype=np.float32).copy()
+
   def _ideal_grasp_hand(self) -> np.ndarray:
-    """TCP pose for ψ goal: directly above the cube in the target bin."""
-    return self._goal + np.array([0.0, 0.0, 0.03], dtype=np.float32)
+    """TCP pose for ψ goal: closed-grasp TCP just above the floor cube."""
+    return (self._psi_held_object()
+            + np.array([0.0, 0.0, float(self.PSI_TCP_ABOVE_OBJ)],
+                       dtype=np.float32))
 
   def _get_obs(self):
     pos_hand = self.get_endeff_pos()
@@ -453,11 +665,14 @@ class SawyerBin(_MW_BIN):
     gripper_distance_apart = np.clip(gripper_distance_apart / 0.1, 0., 1.)
     obs = np.concatenate((pos_hand, [gripper_distance_apart],
                           self._get_pos_objects()))
-    # ψ goal: cube in target bin, gripper closed and holding it.
-    #   hand  = cube centre + 3 cm (grasp TCP above object)
-    #   gripper = 0.0 (fully closed)
-    #   object  = _goal (cube in target bin)
-    goal = np.concatenate([self._ideal_grasp_hand(), [0.0], self._goal])
+    # ψ goal: fingers around the cube sitting on the floor at ``_goal``.
+    # Success (step) still only checks ‖object − _goal‖.
+    #   object  = _goal (floor / bin target)
+    #   hand    = object + (0,0,PSI_TCP_ABOVE_OBJ)
+    #   gripper = PSI_GRIPPER (≈0.4 = cube-width hold)
+    held_obj = self._psi_held_object()
+    goal = np.concatenate(
+        [self._ideal_grasp_hand(), [float(self.PSI_GRIPPER)], held_obj])
 
     return np.concatenate([obs, goal]).astype(np.float32)
 

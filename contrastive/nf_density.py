@@ -579,6 +579,7 @@ def make_nf_density_update_fn(
     policy_network_apply=None,
     sample_fn=None,
     policy_goal: Optional[np.ndarray] = None,
+    _return_raw: bool = False,
 ):
     """Jitted update with separate grads for SA encoder, goal encoder, and NF flow.
 
@@ -600,7 +601,9 @@ def make_nf_density_update_fn(
       λ step (maximize): λ ← clip(λ + lam_lr · (gnorm_mean − c), λ_min, 1)
     lam_lr = 0 keeps the old behaviour (λ injected from outside each iter).
     ∇_s log p diagnostics are always computed and logged; coef=0 keeps
-    them out of the loss.
+    them out of the loss.  ``nf_grad_reg`` is the loss term when the
+    penalty is on, otherwise the unweighted hinge (same as
+    ``nf_grad_reg_raw``) so unused runs still write a useful series.
 
     task_goal_frac in (0, 1]: for that fraction of the batch, the ∇_s log p
     regularizer / diagnostics use the env task goal instead of replay g.
@@ -761,6 +764,9 @@ def make_nf_density_update_fn(
                 grad_reg_lam = lam_val.astype(nll.dtype)
                 # Lagrangian penalty: λ · E[‖∇_s log p‖] (dual and fixed-λ).
                 grad_reg = grad_reg_lam * gnorm_mean
+            else:
+                # Log the hinge even when the penalty is not in the loss.
+                grad_reg = grad_reg_raw
 
         time_reg_raw = zero
         time_reg = zero
@@ -779,7 +785,7 @@ def make_nf_density_update_fn(
             time_reg_raw = jnp.mean((log_p - log_p_old) ** 2)
             time_reg = jnp.asarray(_time_reg_eta, dtype=nll.dtype) * time_reg_raw
 
-        loss = nll + grad_reg + time_reg
+        loss = nll + (grad_reg if _do_grad_reg else zero) + time_reg
         metrics = {
             'density_loss': nll,
             'nf_total_loss': loss,
@@ -799,6 +805,8 @@ def make_nf_density_update_fn(
             's_raw_mean': s_raw_mean,
             's_mean': s_mean,
         }
+        if _return_raw:
+            metrics['_replay_pos_logp_values'] = jax.lax.stop_gradient(log_p)
         if _do_time_reg:
             metrics['nf_time_reg'] = time_reg
             metrics['nf_time_reg_raw'] = time_reg_raw
@@ -912,7 +920,8 @@ def make_scan_nf_update_fn(
       time_reg_eta=time_reg_eta,
       policy_network_apply=policy_network_apply,
       sample_fn=sample_fn,
-      policy_goal=policy_goal)
+      policy_goal=policy_goal,
+      _return_raw=True)
   use_ema = 0.0 < float(repr_tau) < 1.0
   _tau = float(repr_tau)
   _init_lam_py = max(grad_reg_coef, 5e-4) if grad_reg_coef > 0.0 else 0.0
@@ -948,7 +957,13 @@ def make_scan_nf_update_fn(
 
     (params, opt_state, params_ema, key, lam), metrics = jax.lax.scan(
         scan_step, (params, opt_state, params_ema, key, lam), batches)
+    replay_pos_scores = metrics.pop('_replay_pos_logp_values').reshape(-1)
     metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+    metrics['replay_pos_logp_mean'] = jnp.mean(replay_pos_scores)
+    metrics['replay_pos_logp_p10'] = jnp.percentile(
+        replay_pos_scores, 10.0)
+    metrics['replay_pos_logp_p90'] = jnp.percentile(
+        replay_pos_scores, 90.0)
     return params, opt_state, params_ema, key, lam, metrics
 
   return multi_update
@@ -993,7 +1008,8 @@ def make_scan_nf_buffer_update_fn(
       time_reg_eta=time_reg_eta,
       policy_network_apply=policy_network_apply,
       sample_fn=sample_fn,
-      policy_goal=policy_goal)
+      policy_goal=policy_goal,
+      _return_raw=True)
   use_ema = 0.0 < float(repr_tau) < 1.0
   _tau = float(repr_tau)
   _init_lam_py = max(grad_reg_coef, 5e-4) if grad_reg_coef > 0.0 else 0.0
@@ -1033,7 +1049,13 @@ def make_scan_nf_buffer_update_fn(
         scan_step,
         (params, opt_state, params_ema, buf, key, lam),
         None, length=_n_steps)
+    replay_pos_scores = metrics.pop('_replay_pos_logp_values').reshape(-1)
     metrics = jax.tree_util.tree_map(jnp.mean, metrics)
+    metrics['replay_pos_logp_mean'] = jnp.mean(replay_pos_scores)
+    metrics['replay_pos_logp_p10'] = jnp.percentile(
+        replay_pos_scores, 10.0)
+    metrics['replay_pos_logp_p90'] = jnp.percentile(
+        replay_pos_scores, 90.0)
     return params, opt_state, params_ema, buf, key, lam, metrics
 
   return multi_update

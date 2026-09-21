@@ -174,6 +174,10 @@ def _rollout_one(policy_params, gym_env, networks, render,
     dist = networks.policy_network.apply(params, obs)
     return networks.sample(dist, rng)
 
+  # MetaWorld object XY (and SawyerBin gripper parking) use np.random, not
+  # env_utils.load(seed=...). Reseed so --seed gives the same training-style
+  # init on every checkpoint in a multi-ckpt run.
+  np.random.seed(seed)
   obs = np.asarray(gym_env.reset(), dtype=np.float32)
   frames = [render()]
   total_reward = 0.0
@@ -256,6 +260,27 @@ def main():
   parser.add_argument('--max_steps', type=int, default=-1,
                       help='Override rollout length; -1 = env default.')
   parser.add_argument('--seed', type=int, default=0)
+  parser.add_argument('--vary_init_seed', action='store_true',
+                      help='Use --seed, --seed+1, ... for successive checkpoints '
+                           'so each video draws a different MetaWorld object XY.')
+  parser.add_argument(
+      '--sawyer_randomize_init', action='store_true', default=True,
+      help='Randomize Sawyer object XY at reset (default on).')
+  parser.add_argument(
+      '--no_sawyer_randomize_init', dest='sawyer_randomize_init',
+      action='store_false')
+  parser.add_argument(
+      '--sawyer_bin_safe_grasp_reset', action='store_true',
+      help='Bounded/rejection servo for sawyer_bin grasp init.')
+  parser.add_argument(
+      '--bin_randomize_gripper_init', action='store_true',
+      help='sawyer_bin MPO init: TCP XY±5cm, z Uniform(3cm, 6cm).')
+  parser.add_argument(
+      '--bin_randomize_tcp_z', action='store_true',
+      help='sawyer_bin: TCP z Uniform(3cm, 6cm), XY centered on object.')
+  parser.add_argument(
+      '--sawyer_bin_bounded_step_mocap', action='store_true',
+      help='sawyer_bin: anchor each mocap target to the current TCP.')
   args = parser.parse_args()
 
   # ----- 1. Enumerate checkpoints ----------------------------------------
@@ -273,24 +298,37 @@ def main():
   print('[rollout] building networks and inferring spec...')
   networks, _ = _build_networks(args.env, seed=args.seed)
 
+  env_kwargs = {}
+  if args.env in ('sawyer_bin', 'sawyer_peg'):
+    env_kwargs['randomize_init'] = bool(args.sawyer_randomize_init)
+  if args.env == 'sawyer_bin' and args.sawyer_bin_safe_grasp_reset:
+    env_kwargs['safe_grasp_reset'] = True
+  if args.env == 'sawyer_bin' and args.bin_randomize_gripper_init:
+    env_kwargs['randomize_gripper_init'] = True
+  if args.env == 'sawyer_bin' and args.bin_randomize_tcp_z:
+    env_kwargs['randomize_tcp_z'] = True
+  if args.env == 'sawyer_bin' and args.sawyer_bin_bounded_step_mocap:
+    env_kwargs['bounded_step_mocap'] = True
   gym_env, _, env_max_steps = env_utils.load(
-      args.env, fixed_start_end=fixed_goal_dict[args.env], seed=args.seed)
+      args.env, fixed_start_end=fixed_goal_dict[args.env], seed=args.seed,
+      **env_kwargs)
   max_steps = env_max_steps if args.max_steps < 0 else int(args.max_steps)
   camera = args.camera or _DEFAULT_CAMERA.get(args.env, 'corner')
   print(f'[rollout] env={args.env}  max_steps={max_steps}  '
-        f'camera={camera}  rotate={args.rotate}°')
+        f'camera={camera}  rotate={args.rotate}°  env_kwargs={env_kwargs}')
 
   render = _get_render_fn(gym_env, args.width, args.height, camera,
                           rotate_deg=args.rotate)
 
   # ----- 3. Render one video per checkpoint ------------------------------
   multi = len(ckpt_entries) > 1
-  for label, path in ckpt_entries:
+  for ckpt_i, (label, path) in enumerate(ckpt_entries):
     print(f'[rollout] === {label}  ({path}) ===')
     ckpt = ppo_learner.load_checkpoint(path)
     policy_params = ckpt['policy_params']
+    roll_seed = int(args.seed) + ckpt_i if args.vary_init_seed else int(args.seed)
     print(f'[rollout]   iteration={ckpt.get("iteration")} '
-          f'global_step={ckpt.get("global_step")}')
+          f'global_step={ckpt.get("global_step")}  init_seed={roll_seed}')
 
     frames, stats = _rollout_one(
         policy_params=policy_params,
@@ -299,7 +337,7 @@ def main():
         render=render,
         max_steps=max_steps,
         stochastic=args.stochastic,
-        seed=args.seed,
+        seed=roll_seed,
     )
     print(f'[rollout]   length={stats["length"]}  '
           f'total_reward={stats["total_reward"]:.3f}  '
